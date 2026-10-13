@@ -248,6 +248,18 @@ Next:
 - A new machine has no recordings of its own under `~/Library/Logs`, so
   replay the checked-in ones:
   `.venv/bin/python tools/brepkit_corpus/replay.py --corpus ../brepkit/buzzcad-corpus`.
+- On Linux (set up 2026-10-13 on the `bizon` box, Python 3.10):
+  - BuzzCAD records here too, at the same path:
+    `~/Library/Logs/BuzzCAD/brepkit-corpus`, and syncs it on exit.
+  - Rust is in `~/.cargo/bin`, which is not on PATH: `export PATH="$HOME/.cargo/bin:$PATH"`.
+  - Make the venv with BuzzCAD's README line (`python3 -m venv .venv`, then its
+    `pip install`). Do not also install `cadquery-ocp`: it writes over the
+    `cadquery-ocp-novtk` that build123d needs, and OCP then crashes.
+  - The Linux OCP wheels have no `OCP.OCP.collections`. `replay.py` now falls
+    back to `TopTools_IndexedMapOfShape`, as `corpus.py` already did; that
+    change is BuzzCAD commit c49cd60. Without it every case "fails"
+    with a ModuleNotFoundError. A replay like that must be deleted from
+    `replays/`, or the next replay's "Since" compares against it.
 
 ## Progress
 
@@ -263,3 +275,4 @@ library files.
 | 2026-10-13 | 201 | 25 | 0 | 16 | 0 | 82 | io: a plane written facing in (face turned against it, as Open CASCADE writes far sides) reads as brepkit builds one, facing out and unreversed. algo: the assembler's shell orientation readings count a planar face's holes (they read the outer loop alone, so a holed part far from the origin read inward: "no outer shell found"). 3 "no outer shell" failures and 11 "faces" now pass; no regressions |
 | 2026-10-13 | 207 | 25 | 0 | 10 | 0 | 82 | algo (phase_ff): a plane x cylinder/cone line section that misses the plane face's true outline is dropped (only the faces' boxes were checked, and an L-shaped wall's box spans its notch). The spurious generator had cut the cutter's wall into a grid with the plate's circles. 6 atlas_e1 cuts now pass; no regressions. Left: 8 mesh-fallback booleans, 2 fillets |
 | 2026-10-13 | 208 | 26 | 0 | 8 | 0 | 82 | algo (builder): an unsplit planar face's classification sample avoids its holes, and its offsets are sized by its curves (a ring bounded by two circles has one vertex per loop, so it was sampled at its centre, in its hole, read Inside a disc fused into it, and dropped). 2 fallbacks now exact (1 pass, 1 faces); no regressions. Left: 6 mesh-fallback booleans (4 are a box pressed flat on a holed plate, holes crossing the contact outline), 2 fillets |
+| 2026-10-13 | 234 | 26 | 0 | 9 | 0 | 83 | 352 cases (28 new, recorded on the Linux machine deep-thought: 26 pass, 1 failed, 1 unsupported); first replay there, replay `20261013-153819`, no brepkit change, no regressions. New failure: revolve `d043e3c5b6f5` comes out inside-out (negative volume). Left: 6 mesh-fallback booleans, 2 fillets, 1 revolve |
