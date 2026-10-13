@@ -1,5 +1,8 @@
 # brepkit — Project Guidelines
 
+> **This is the BuzzCAD fork. Read [BUZZCAD.md](BUZZCAD.md) first:** it is the plan for this session.
+> @BUZZCAD.md
+
 brepkit is the B-Rep modeling engine behind brepjs. It provides the computational
 backend (geometry, booleans, tessellation, I/O) while brepjs provides the
 developer-facing TypeScript API.
