@@ -31,6 +31,12 @@ are real robot parts: a case's result is the part as it stood after that
 operation. `Robokan/brepkit` is public, so never copy shapes or STEP files
 from the corpus into it, except the few a regression test needs.
 
+BuzzCAD runs the sync script itself when it exits after recording new
+cases, if this fork is checked out next to it (see `kernel/corpus.py`;
+`BUZZCAD_CORPUS_SYNC=0` turns it off, output in
+`~/Library/Logs/BuzzCAD/brepkit-corpus-sync.log`). Run it by hand after a
+replay to check the replay in.
+
 On a new machine, run `git submodule update --init buzzcad-corpus` after
 cloning. `scripts/sync-buzzcad-corpus.sh` pulls the corpus repo, adds this
 machine's recordings and replays, then commits and pushes them. It only adds
