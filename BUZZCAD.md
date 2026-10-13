@@ -183,6 +183,66 @@ Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`
   you.
 - **License.** brepkit is AGPL-3.0, and so is the bridge.
 
+## Sending fixes upstream
+
+Fixes go to `andymai/brepkit` as one PR per fix, from branches off
+`upstream/main` (never from this fork's `main`, which carries fork-only
+files). Follow the `pr-workflow` skill. Upstream bans the reference kernel's
+name in code, commit messages and PR text, so word around it ("some STEP
+writers", "a reference kernel"); leave BuzzCAD and corpus names out too.
+
+**In flight (2026-10-13).** Seven PR branches are pushed to `origin`
+(Robokan/brepkit), each `upstream/main` plus one fix. Their PR descriptions
+are in `buzzcad-prs/`. No PR is open yet.
+
+| branch | body | status |
+|---|---|---|
+| fix/shell-orientation-holes | shell.md | tested; open first |
+| fix/step-outer-loop-by-area | outer.md | not tested yet |
+| fix/step-vertex-loop-sphere | sphere.md | not tested yet |
+| fix/step-planes-facing-out | planes.md | not tested yet; stacked on shell-orientation-holes |
+| fix/cylinder-wall-rim-notches | notch.md | tested |
+| fix/plane-cylinder-line-outside-face | line.md | tested |
+| fix/ring-face-sample | ring.md | tested |
+
+"Tested" means clippy clean and `cargo test -p brepkit-algo -p
+brepkit-operations --lib` passing (1197 tests) on that branch alone. The
+fork's `main`, with all seven fixes together, passed the full io, algo and
+operations suites (2084 tests).
+
+Next:
+
+1. Set up (once per machine):
+
+   ```bash
+   git remote add upstream https://github.com/andymai/brepkit.git
+   git fetch upstream origin
+   git worktree add .worktrees/upstream-prs fix/shell-orientation-holes
+   ```
+
+2. In `.worktrees/upstream-prs`, for each untested io branch:
+   `git switch <branch>`, `cargo clippy -p brepkit-io --all-targets -- -D warnings`,
+   `cargo test -p brepkit-io`.
+3. For the four algo branches, run the pose sweep and truth audit (see the
+   `pr-workflow` skill) on `upstream/main` and on the branch, and account for
+   any line that changes.
+4. Open each PR, shell-orientation-holes first, from this checkout's root
+   (the PR bodies live on the fork's `main`, not on the PR branches):
+   `gh pr create --repo andymai/brepkit --head Robokan:<branch> --title "<commit subject>" --body-file buzzcad-prs/<body>`.
+   Do not set auto-merge; merging is the maintainer's call. Record the PR
+   numbers here.
+
+### Continuing on another machine
+
+- Clone with the corpus: `git clone --recurse-submodules https://github.com/Robokan/brepkit.git`
+  (the corpus submodule is private; the account needs access to
+  Robokan/buzzcad-corpus).
+- BuzzCAD sits next to it (`sparkpack/BuzzCAD`) with its `.venv`; the bridge
+  builds against `../brepkit` by path.
+- A new machine has no recordings of its own under `~/Library/Logs`, so
+  replay the checked-in ones:
+  `.venv/bin/python tools/brepkit_corpus/replay.py --corpus ../brepkit/buzzcad-corpus`.
+
 ## Progress
 
 Baseline: 2026-10-13, brepkit 4.1.49, 309 cases from BuzzCAD's example and
