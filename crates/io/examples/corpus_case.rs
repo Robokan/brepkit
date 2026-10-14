@@ -294,6 +294,11 @@ fn main() {
         match brepkit_algo::gfa::boolean(&mut topo, bop, a[0], b[0]) {
             Ok(s) => {
                 println!("raw GFA: {}", census(&topo, s));
+                // OUT=<file.step>: the raw result, for the per-face table mode
+                if let Ok(out) = std::env::var("OUT") {
+                    std::fs::write(&out, brepkit_io::step::write_step(&topo, &[s]).unwrap())
+                        .unwrap();
+                }
                 open_edges(&topo, s);
                 if std::env::var("FACES").is_ok() {
                     face_table(&topo, s);
