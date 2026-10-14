@@ -314,7 +314,12 @@ fn main() {
         op,
         a[0],
         b[0],
-        BooleanOptions::default(),
+        // NOUNIFY=1: leave co-surface faces split, to tell the merge's
+        // effect from the boolean's
+        BooleanOptions {
+            unify_faces: std::env::var("NOUNIFY").is_err(),
+            ..BooleanOptions::default()
+        },
     );
     let fell_back = brepkit_operations::boolean::mesh_fallback_count() > before;
     match r {
