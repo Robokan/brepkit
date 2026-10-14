@@ -55,10 +55,16 @@ for dir in "$SRC"/replays/*/; do
   newest="$name"
 done
 
-# failures/ for the newest replay only (deletes only inside this repo's copy)
+# failures/ for the newest replay only (deletes only inside this repo's copy).
+# Newest in this repo, not in $SRC: a machine with no replays of its own, or a
+# replay run with --corpus on this repo, must not lose the newest export.
+keep=""
+for dir in "$DEST"/replays/*/; do
+  [ -d "$dir" ] && keep="$(basename "$dir")"
+done
 for dir in "$DEST"/replays/*/; do
   [ -d "$dir" ] || continue
-  [ "$(basename "$dir")" = "$newest" ] || rm -rf "$dir/failures"
+  [ "$(basename "$dir")" = "$keep" ] || rm -rf "$dir/failures"
 done
 if [ -n "$newest" ] && [ -d "$SRC/replays/$newest/failures" ]; then
   rsync -a --delete "$SRC/replays/$newest/failures/" "$DEST/replays/$newest/failures/"
