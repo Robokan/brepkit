@@ -1722,16 +1722,7 @@ fn split_periodic_face_by_winding_chain(
     face_id: FaceId,
     tol: f64,
 ) -> Option<Vec<SplitSubFace>> {
-    struct Separator {
-        v_seam: f64,
-        v_opposite: f64,
-        lower: Vec<OrientedPCurveEdge>,
-        upper: Vec<OrientedPCurveEdge>,
-    }
-
-    let (u_start, period) = special_cases::band_period(surface)?;
-    let half = 0.5 * period;
-    let close_tol = tol * 100.0;
+    let (_, period) = special_cases::band_period(surface)?;
 
     // Every section must belong to some winding chain; any other section
     // would be silently dropped, so the face is deferred instead.
@@ -1747,6 +1738,44 @@ fn split_periodic_face_by_winding_chain(
     if chains.is_empty() {
         return None;
     }
+    bands_from_winding_chains(
+        surface,
+        boundary_edges,
+        sections,
+        chains,
+        rank,
+        reversed,
+        face_id,
+        tol,
+    )
+}
+
+/// The bands of a u-periodic lateral cut by `chains`, each a closed chain of
+/// `sections` (`(index, traversed start→end)`) winding the period once: the
+/// band builder of [`split_periodic_face_by_winding_chain`]. `None` unless
+/// every chain reaches the seam meridian, stays strictly between the rims,
+/// and the chains stack without crossing.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn bands_from_winding_chains(
+    surface: &FaceSurface,
+    boundary_edges: &[OrientedPCurveEdge],
+    sections: &[SectionEdge],
+    chains: Vec<Vec<(usize, bool)>>,
+    rank: Rank,
+    reversed: bool,
+    face_id: FaceId,
+    tol: f64,
+) -> Option<Vec<SplitSubFace>> {
+    struct Separator {
+        v_seam: f64,
+        v_opposite: f64,
+        lower: Vec<OrientedPCurveEdge>,
+        upper: Vec<OrientedPCurveEdge>,
+    }
+
+    let (u_start, period) = special_cases::band_period(surface)?;
+    let half = 0.5 * period;
+    let close_tol = tol * 100.0;
 
     let special_cases::BandStack {
         seam_u,
@@ -1924,6 +1953,289 @@ fn split_periodic_face_by_winding_chain(
         });
     }
     Some(bands)
+}
+
+/// Split a u-periodic cylinder/cone lateral along two saddles that touch:
+/// the section of two crossing cylinders of one radius, four half ellipses
+/// joining the two points where the cylinders touch. On each wall two of the
+/// halves run each way round between those points; the lower of each side
+/// form one saddle and the upper the other, each winding the wall once, and
+/// between them lie two lenses (inside the other cylinder) that meet only at
+/// the touch points. The wall splits into the band below the lower saddle,
+/// the band above the upper one, and the two lenses. `None` (the caller
+/// falls through) unless the sections are exactly such four paths.
+#[allow(clippy::too_many_lines)]
+fn split_periodic_face_by_touching_saddles(
+    surface: &FaceSurface,
+    boundary_edges: &[OrientedPCurveEdge],
+    sections: &[SectionEdge],
+    rank: Rank,
+    reversed: bool,
+    face_id: FaceId,
+    tol: f64,
+) -> Option<Vec<SplitSubFace>> {
+    const SAMPLES: usize = 32;
+    let (_, period) = special_cases::band_period(surface)?;
+    let half = 0.5 * period;
+    let weld = tol * 100.0;
+    let wrap = |d: f64| -> f64 { (d + half).rem_euclid(period) - half };
+    let seam_u = boundary_seam_u(boundary_edges, surface, tol)?;
+
+    // Cut each section where it crosses the seam meridian, found along the
+    // section itself: a half ellipse ends half a turn from where it starts,
+    // so its ends alone do not tell which way round it runs.
+    let mut pieces: Vec<SectionEdge> = Vec::with_capacity(sections.len() + 2);
+    for s in sections {
+        if (s.start - s.end).length() <= weld {
+            return None;
+        }
+        let (t0, t1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+        let at = |t: f64| s.curve_3d.evaluate_with_endpoints(t, s.start, s.end);
+        let off = |t: f64| surface.project_point(at(t)).map(|(u, _)| wrap(u - seam_u));
+        let mut cut = None;
+        for k in 0..SAMPLES {
+            #[allow(clippy::cast_precision_loss)]
+            let (ta, tb) = (
+                t0 + (t1 - t0) * k as f64 / SAMPLES as f64,
+                t0 + (t1 - t0) * (k + 1) as f64 / SAMPLES as f64,
+            );
+            let (fa, fb) = (off(ta)?, off(tb)?);
+            if fa * fb < 0.0 && (fa - fb).abs() < half {
+                let (mut lo, mut hi) = (ta, tb);
+                for _ in 0..60 {
+                    let tm = 0.5 * (lo + hi);
+                    if (off(tm)? > 0.0) == (fa > 0.0) {
+                        lo = tm;
+                    } else {
+                        hi = tm;
+                    }
+                }
+                cut = Some(at(0.5 * (lo + hi)));
+                break;
+            }
+        }
+        match cut {
+            Some(p) if (p - s.start).length() > weld && (p - s.end).length() > weld => {
+                let mut first = s.clone();
+                first.end = p;
+                let mut second = s.clone();
+                second.start = p;
+                for piece in [&mut first, &mut second] {
+                    piece.start_uv_a = None;
+                    piece.end_uv_a = None;
+                    piece.start_uv_b = None;
+                    piece.end_uv_b = None;
+                    piece.pave_block_id = None;
+                }
+                pieces.push(first);
+                pieces.push(second);
+            }
+            _ => pieces.push(s.clone()),
+        }
+    }
+
+    // The touch points: the two ends that four pieces meet at. Every other
+    // end (a seam cut) joins exactly two.
+    let mut ends: Vec<(Point3, usize)> = Vec::new();
+    for s in &pieces {
+        for p in [s.start, s.end] {
+            match ends.iter_mut().find(|(q, _)| (*q - p).length() <= weld) {
+                Some(entry) => entry.1 += 1,
+                None => ends.push((p, 1)),
+            }
+        }
+    }
+    let touch: Vec<Point3> = ends.iter().filter(|e| e.1 == 4).map(|e| e.0).collect();
+    if touch.len() != 2 || ends.iter().any(|e| e.1 != 4 && e.1 != 2) {
+        return None;
+    }
+    let (p, q) = (touch[0], touch[1]);
+
+    // The four paths from p to q, each piece as (index, traversed start→end).
+    let mut used = vec![false; pieces.len()];
+    let mut paths: Vec<Vec<(usize, bool)>> = Vec::new();
+    for first in 0..pieces.len() {
+        let leaves = if (pieces[first].start - p).length() <= weld {
+            true
+        } else if (pieces[first].end - p).length() <= weld {
+            false
+        } else {
+            continue;
+        };
+        let mut path = vec![(first, leaves)];
+        used[first] = true;
+        loop {
+            let &(i, fwd) = path.last()?;
+            let to = if fwd { pieces[i].end } else { pieces[i].start };
+            if (to - q).length() <= weld {
+                break;
+            }
+            if (to - p).length() <= weld || path.len() > pieces.len() {
+                return None;
+            }
+            let next = (0..pieces.len()).find_map(|j| {
+                if used[j] {
+                    None
+                } else if (pieces[j].start - to).length() <= weld {
+                    Some((j, true))
+                } else if (pieces[j].end - to).length() <= weld {
+                    Some((j, false))
+                } else {
+                    None
+                }
+            })?;
+            used[next.0] = true;
+            path.push(next);
+        }
+        paths.push(path);
+    }
+    if paths.len() != 4 || used.iter().any(|u| !u) {
+        return None;
+    }
+
+    // Each path's (u, v) from p, u unwrapped along it.
+    let path_uv = |path: &[(usize, bool)]| -> Option<Vec<(f64, f64)>> {
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        for &(i, fwd) in path {
+            let s = &pieces[i];
+            let (t0, t1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+            for k in 0..=SAMPLES {
+                #[allow(clippy::cast_precision_loss)]
+                let f = k as f64 / SAMPLES as f64;
+                let f = if fwd { f } else { 1.0 - f };
+                let pt = s
+                    .curve_3d
+                    .evaluate_with_endpoints(t0 + (t1 - t0) * f, s.start, s.end);
+                let (u, v) = surface.project_point(pt)?;
+                let u = out.last().map_or(u, |&(pu, _)| pu + wrap(u - pu));
+                out.push((u, v));
+            }
+        }
+        Some(out)
+    };
+    let uvs: Vec<Vec<(f64, f64)>> = paths
+        .iter()
+        .map(|path| path_uv(path))
+        .collect::<Option<_>>()?;
+    let turn = |uv: &[(f64, f64)]| uv.last().map_or(0.0, |l| l.0) - uv[0].0;
+    // v at the middle of a side, read off a path at the u nearest it.
+    let v_at = |uv: &[(f64, f64)], u: f64| {
+        uv.iter()
+            .min_by(|a, b| (a.0 - u).abs().total_cmp(&(b.0 - u).abs()))
+            .map_or(0.0, |s| s.1)
+    };
+
+    // Two paths each way round, the lower and the upper of each side.
+    let mut sides: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    for (k, uv) in uvs.iter().enumerate() {
+        sides[usize::from(turn(uv) < 0.0)].push(k);
+    }
+    let mut pairs: Vec<(usize, usize, f64)> = Vec::with_capacity(2);
+    for side in &sides {
+        let [a, b] = side[..] else {
+            return None;
+        };
+        let u_mid = uvs[a][0].0 + 0.5 * turn(&uvs[a]);
+        let (va, vb) = (v_at(&uvs[a], u_mid), v_at(&uvs[b], u_mid));
+        if (va - vb).abs() <= weld {
+            return None;
+        }
+        let (lo, hi) = if va < vb { (a, b) } else { (b, a) };
+        pairs.push((lo, hi, u_mid));
+    }
+    let reversed_path = |path: &[(usize, bool)]| -> Vec<(usize, bool)> {
+        path.iter().rev().map(|&(i, f)| (i, !f)).collect()
+    };
+    let saddle = |a: usize, b: usize| -> Vec<(usize, bool)> {
+        let mut chain = paths[a].clone();
+        chain.extend(reversed_path(&paths[b]));
+        chain
+    };
+    let chains = vec![
+        saddle(pairs[0].0, pairs[1].0),
+        saddle(pairs[0].1, pairs[1].1),
+    ];
+    let bands = bands_from_winding_chains(
+        surface,
+        boundary_edges,
+        &pieces,
+        chains,
+        rank,
+        reversed,
+        face_id,
+        tol,
+    )?;
+    let [low, _pinched, high] = <[SplitSubFace; 3]>::try_from(bands).ok()?;
+
+    // The lenses: on each side, out along the lower path and back along the
+    // upper, wound counter-clockwise about the surface normal as every
+    // stored outer wire is.
+    let mut out = vec![low, high];
+    for &(lo, hi, u_mid) in &pairs {
+        let mut loop_entries = paths[lo].clone();
+        loop_entries.extend(reversed_path(&paths[hi]));
+        let mut wire: Vec<OrientedPCurveEdge> = Vec::with_capacity(loop_entries.len());
+        let mut u_prev: Option<f64> = None;
+        for (i, fwd) in loop_entries {
+            let s = &pieces[i];
+            let (from, to) = if fwd {
+                (s.start, s.end)
+            } else {
+                (s.end, s.start)
+            };
+            let (u_raw0, v0) = surface.project_point(from)?;
+            let (u_raw1, v1) = surface.project_point(to)?;
+            let u0 = u_prev.map_or(u_raw0, |up| up + wrap(u_raw0 - up));
+            let (t0, t1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+            let mid = s
+                .curve_3d
+                .evaluate_with_endpoints(0.5 * (t0 + t1), s.start, s.end);
+            let (u_mid_raw, _) = surface.project_point(mid)?;
+            let u_half = u0 + wrap(u_mid_raw - u_raw0);
+            let u1 = u_half + wrap(u_raw1 - u_mid_raw);
+            u_prev = Some(u1);
+            wire.push(OrientedPCurveEdge {
+                curve_3d: s.curve_3d.clone(),
+                pcurve: match rank {
+                    Rank::A => s.pcurve_a.clone(),
+                    Rank::B => s.pcurve_b.clone(),
+                },
+                start_uv: Point2::new(u0, v0),
+                end_uv: Point2::new(u1, v1),
+                start_3d: from,
+                end_3d: to,
+                forward: fwd,
+                source_edge_idx: None,
+                pave_block_id: s.pave_block_id,
+            });
+        }
+        let mut poly: Vec<(f64, f64)> = uvs[lo].clone();
+        poly.extend(uvs[hi].iter().rev().copied());
+        let trapezoid: f64 = poly
+            .iter()
+            .zip(poly.iter().cycle().skip(1))
+            .map(|(a, b)| (b.0 - a.0) * (b.1 + a.1))
+            .sum();
+        if trapezoid >= 0.0 {
+            wire.reverse();
+            for edge in &mut wire {
+                std::mem::swap(&mut edge.start_uv, &mut edge.end_uv);
+                std::mem::swap(&mut edge.start_3d, &mut edge.end_3d);
+                edge.forward = !edge.forward;
+            }
+        }
+        let v_mid = 0.5 * (v_at(&uvs[lo], u_mid) + v_at(&uvs[hi], u_mid));
+        out.push(SplitSubFace {
+            surface: surface.clone(),
+            outer_wire: wire,
+            inner_wires: Vec::new(),
+            reversed,
+            parent: face_id,
+            rank,
+            precomputed_interior: Some(surface.evaluate(u_mid, v_mid)?),
+        });
+    }
+    Some(out)
 }
 
 /// Split a u-periodic cylinder/cone lateral (two closed rims, or a pointed
@@ -6040,6 +6352,24 @@ fn split_face_2d_impl(
     } else {
         sections
     };
+
+    // Two equal cylinders crossing: four half ellipses between the points
+    // where they touch, two saddles winding the wall and two lenses.
+    if u_periodic
+        && !is_plane
+        && original_inner_wires.is_empty()
+        && let Some(pieces) = split_periodic_face_by_touching_saddles(
+            &surface,
+            &boundary_edges,
+            sections,
+            rank,
+            reversed,
+            face_id,
+            tol.linear,
+        )
+    {
+        return pieces;
+    }
 
     // Band shortcut: closed section circles on a u-periodic face split it
     // into stacked bands, not discs. Requires seam-anchored circles (see

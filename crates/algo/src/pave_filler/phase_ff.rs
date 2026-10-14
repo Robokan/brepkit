@@ -5831,6 +5831,10 @@ fn compute_raw_curves(
             }
         }
 
+        (FaceSurface::Cylinder(c1), FaceSurface::Cylinder(c2)) if cylinders_cross(c1, c2) => {
+            Ok(crossing_cylinder_arcs(c1, c2)?)
+        }
+
         (FaceSurface::Cone(c1), FaceSurface::Cone(c2)) => {
             // Coaxial cones meet at a single circle that coincides with their
             // shared cap rim. Emit it as an exact Circle so the closed-circle
@@ -6510,6 +6514,79 @@ fn plane_cylinder_parallel_lines(
 }
 
 /// Exact section circles and ellipses as raw curves over their full turn.
+/// Whether two cylinders of one radius cross: their axes meet at an angle.
+/// They then meet in two ellipses that touch each other where the
+/// cylinders touch, at the two ends of the axes' common perpendicular.
+fn cylinders_cross(
+    c1: &brepkit_math::surfaces::CylindricalSurface,
+    c2: &brepkit_math::surfaces::CylindricalSurface,
+) -> bool {
+    let tol = Tolerance::new();
+    let cross = c1.axis().cross(c2.axis());
+    let sin = cross.length();
+    if sin < 1e-6 || (c1.radius() - c2.radius()).abs() > tol.linear {
+        return false;
+    }
+    let gap = (c2.origin() - c1.origin()).dot(cross) / sin;
+    gap.abs() <= tol.linear
+}
+
+/// The section of two crossing cylinders of one radius `r`, as the four
+/// half ellipses between the points where they touch, each in two quarters. With `a1`, `a2` the
+/// axes at angle `θ` meeting at `o`, and `m` their common perpendicular, the
+/// ellipses lie in the planes bisecting the axes: one has semi-axes
+/// `r / sin(θ/2)` along `a1 + a2` and `r` along `m`, the other
+/// `r / cos(θ/2)` along `a1 - a2` and `r` along `m`. Both pass through the
+/// touch points `o ± r m`; split there, each wall sees two saddles that wind
+/// it and two lenses inside the other cylinder, joined at those points.
+fn crossing_cylinder_arcs(
+    c1: &brepkit_math::surfaces::CylindricalSurface,
+    c2: &brepkit_math::surfaces::CylindricalSurface,
+) -> Result<Vec<RawCurve>, AlgoError> {
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    let (a1, a2) = (c1.axis(), c2.axis());
+    let r = c1.radius();
+    let m = a1.cross(a2).normalize()?;
+    // Where the axes meet: the point of axis 1 closest to axis 2.
+    let w = c1.origin() - c2.origin();
+    let alpha = a1.dot(a2);
+    let s = (alpha * w.dot(a2) - w.dot(a1)) / (1.0 - alpha * alpha);
+    let o = c1.origin() + a1 * s;
+    let mut arcs = Vec::with_capacity(8);
+    for d in [a1 + a2, a1 - a2] {
+        let d = d.normalize()?;
+        // `d` leans from axis 1 by half the angle to axis 2 (or its
+        // supplement); its component across axis 1 reaches radius `r`.
+        let across = (1.0 - d.dot(a1).powi(2)).max(0.0).sqrt();
+        let ellipse =
+            brepkit_math::curves::Ellipse3D::with_axes(o, d.cross(m), r / across, r, d, m)?;
+        // Each half in two at its major vertex: an open arc reads as its
+        // shorter way round between its ends, which a half turn lacks.
+        for t_range in [
+            (-FRAC_PI_2, 0.0),
+            (0.0, FRAC_PI_2),
+            (FRAC_PI_2, PI),
+            (PI, PI + FRAC_PI_2),
+        ] {
+            let p_start = ParametricCurve::evaluate(&ellipse, t_range.0);
+            let p_end = ParametricCurve::evaluate(&ellipse, t_range.1);
+            let samples = (0..=16).map(|k| {
+                let t = t_range.0 + (t_range.1 - t_range.0) * f64::from(k) / 16.0;
+                ParametricCurve::evaluate(&ellipse, t)
+            });
+            arcs.push(RawCurve {
+                bbox: Aabb3::from_points(samples),
+                curve: EdgeCurve::Ellipse(ellipse.clone()),
+                t_range,
+                p_start,
+                p_end,
+            });
+        }
+    }
+    Ok(arcs)
+}
+
 fn exact_raw_curves(exacts: Vec<analytic_intersection::ExactIntersectionCurve>) -> Vec<RawCurve> {
     let domain = (0.0, std::f64::consts::TAU);
     exacts

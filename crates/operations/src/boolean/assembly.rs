@@ -757,7 +757,70 @@ pub(super) fn validate_boolean_result(
         }
     }
 
+    // A hole in a cylinder or cone wall is a patch of the wall. A loop that
+    // runs round the axis bounds no patch: it cuts the wall in two, and a
+    // face keeping both parts as one, with the loop as a "hole", has no
+    // inside (two equal cylinders crossing leave each wall so, with the two
+    // section ellipses as holes). Nothing downstream reads such a face
+    // right, so the result is refused.
+    for fid in brepkit_topology::explorer::solid_faces(topo, solid)? {
+        let face = topo.face(fid)?;
+        if !matches!(
+            face.surface(),
+            FaceSurface::Cylinder(_) | FaceSurface::Cone(_)
+        ) {
+            continue;
+        }
+        for &wid in face.inner_wires() {
+            if loop_winds_round_axis(topo, face.surface(), wid)? {
+                return Err(crate::OperationsError::InvalidInput {
+                    reason: format!(
+                        "boolean result has a {} face whose hole runs round the axis",
+                        face.surface().type_tag()
+                    ),
+                });
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Whether a wire on a cylinder or cone turns once round its axis: the
+/// angle `u` along the wire, unwrapped, ends a full turn from where it began.
+fn loop_winds_round_axis(
+    topo: &Topology,
+    surface: &FaceSurface,
+    wid: WireId,
+) -> Result<bool, crate::OperationsError> {
+    const SAMPLES: usize = 32;
+    let mut turned = 0.0_f64;
+    let mut last: Option<f64> = None;
+    for oe in topo.wire(wid)?.edges() {
+        let edge = topo.edge(oe.edge())?;
+        let (sp, ep) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
+        for i in 0..=SAMPLES {
+            #[allow(clippy::cast_precision_loss)]
+            let f = i as f64 / SAMPLES as f64;
+            let f = if oe.is_forward() { f } else { 1.0 - f };
+            let p = edge
+                .curve()
+                .evaluate_with_endpoints((t1 - t0).mul_add(f, t0), sp, ep);
+            let Some((u, _)) = surface.project_point(p) else {
+                return Ok(false);
+            };
+            if let Some(prev) = last {
+                let du = u - prev;
+                turned += du - std::f64::consts::TAU * (du / std::f64::consts::TAU).round();
+            }
+            last = Some(u);
+        }
+    }
+    Ok(turned.abs() > std::f64::consts::PI)
 }
 
 /// Lenient validation for terminal results with no remaining fallback

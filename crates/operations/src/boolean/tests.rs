@@ -1840,31 +1840,65 @@ fn intersect_two_equal_cylinders() {
     assert!(vol > 0.0, "intersection volume should be positive: {vol}");
 }
 
-/// Fuse two equal cylinders crossing perpendicularly (the classic Steinmetz
-/// solid). The intersection seam of two equal perpendicular cylinders is two
-/// closed planar ellipses; the result must be an exact analytic, watertight
-/// solid — two mutually-trimmed cylinder walls (each carrying the two lens
-/// ellipses as holes) plus four planar end caps — NOT a mesh fallback.
-#[test]
-fn fuse_perpendicular_cylinders_is_analytic_watertight() {
+/// Two equal cylinders, r = 3 and 20 long, crossing at right angles
+/// through their middles (the classic Steinmetz cross).
+fn perpendicular_cylinders(topo: &mut Topology) -> (SolidId, SolidId) {
     use brepkit_math::mat::Mat4;
 
+    let c1 = crate::primitives::make_cylinder(topo, 3.0, 20.0).unwrap();
+    crate::transform::transform_solid(topo, c1, &Mat4::translation(0.0, 0.0, -10.0)).unwrap();
+    let c2 = crate::primitives::make_cylinder(topo, 3.0, 20.0).unwrap();
+    crate::transform::transform_solid(topo, c2, &Mat4::rotation_y(std::f64::consts::FRAC_PI_2))
+        .unwrap();
+    crate::transform::transform_solid(topo, c2, &Mat4::translation(-10.0, 0.0, 0.0)).unwrap();
+    (c1, c2)
+}
+
+/// 2·V_cyl − V_Steinmetz: the two cylinders share the Steinmetz solid,
+/// 16·r³/3 = 144 at r = 3.
+fn perpendicular_cylinders_fused_volume() -> f64 {
+    2.0 * std::f64::consts::PI * 9.0 * 20.0 - 16.0 * 27.0 / 3.0
+}
+
+/// Fusing two equal cylinders that cross at right angles: the two section
+/// ellipses each run round both walls and cross each other, so they cut
+/// each wall into its two arms and the two lenses inside the other
+/// cylinder. A wall kept whole with the ellipses as "holes" has no inside,
+/// and must never come out; until the walls split into their arms, the
+/// fuse falls back.
+#[test]
+fn fuse_perpendicular_cylinders_never_keeps_a_wall_holed_round_its_axis() {
     let mut topo = Topology::new();
-    let c1 = crate::primitives::make_cylinder(&mut topo, 3.0, 20.0).unwrap();
-    crate::transform::transform_solid(&mut topo, c1, &Mat4::translation(0.0, 0.0, -10.0)).unwrap();
-    let c2 = crate::primitives::make_cylinder(&mut topo, 3.0, 20.0).unwrap();
-    crate::transform::transform_solid(
-        &mut topo,
-        c2,
-        &Mat4::rotation_y(std::f64::consts::FRAC_PI_2),
-    )
-    .unwrap();
-    crate::transform::transform_solid(&mut topo, c2, &Mat4::translation(-10.0, 0.0, 0.0)).unwrap();
+    let (c1, c2) = perpendicular_cylinders(&mut topo);
 
     let res = boolean(&mut topo, BooleanOp::Fuse, c1, c2).unwrap();
 
-    // Analytic surface mix: two cylinder walls + four planar caps, not a mesh
-    // fallback plane explosion.
+    for fid in brepkit_topology::explorer::solid_faces(&topo, res).unwrap() {
+        let face = topo.face(fid).unwrap();
+        if matches!(face.surface(), FaceSurface::Cylinder(_)) {
+            assert!(
+                face.inner_wires().is_empty(),
+                "a cylinder wall kept the section ellipses as holes"
+            );
+        }
+    }
+    let expect = perpendicular_cylinders_fused_volume();
+    let vol = crate::measure::solid_volume(&topo, res, 0.01).unwrap();
+    assert!(
+        (vol - expect).abs() < expect * 0.01,
+        "fused volume {vol:.3} should match 2·V_cyl − V_Steinmetz {expect:.3} (within 1%)"
+    );
+}
+
+/// The same fuse, exact: each wall split into its two arms, four cylinder
+/// faces and four planar end caps, watertight, not a mesh fallback.
+#[test]
+fn fuse_perpendicular_cylinders_is_analytic_watertight() {
+    let mut topo = Topology::new();
+    let (c1, c2) = perpendicular_cylinders(&mut topo);
+
+    let res = boolean(&mut topo, BooleanOp::Fuse, c1, c2).unwrap();
+
     let faces = brepkit_topology::explorer::solid_faces(&topo, res).unwrap();
     let mut cylinders = 0;
     let mut planes = 0;
@@ -1876,15 +1910,10 @@ fn fuse_perpendicular_cylinders_is_analytic_watertight() {
         }
     }
     assert_eq!(
-        cylinders, 2,
-        "expected two mutually-trimmed walls, got {cylinders}"
+        cylinders, 4,
+        "expected each wall's two arms, got {cylinders}"
     );
     assert_eq!(planes, 4, "expected four end caps, got {planes}");
-    assert!(
-        faces.len() <= 8,
-        "analytic result must be a handful of faces, not a mesh fallback (got {})",
-        faces.len()
-    );
 
     // Watertight: every edge shared by exactly two faces.
     let mut edge_use: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -1906,16 +1935,43 @@ fn fuse_perpendicular_cylinders_is_analytic_watertight() {
         "result must be manifold (over-shared edges = {over})"
     );
 
-    // Volume = 2·V_cyl − V_Steinmetz; the intersection of two equal r=3
-    // perpendicular cylinders is the Steinmetz solid, 16·r³/3 = 144.
-    let v_cyl = std::f64::consts::PI * 9.0 * 20.0;
-    let v_steinmetz = 16.0 * 27.0 / 3.0;
-    let v_expect = 2.0 * v_cyl - v_steinmetz;
+    let expect = perpendicular_cylinders_fused_volume();
     let vol = crate::measure::solid_volume(&topo, res, 0.01).unwrap();
     assert!(
-        (vol - v_expect).abs() < v_expect * 0.01,
-        "fused volume {vol:.3} should match 2·V_cyl − V_Steinmetz {v_expect:.3} (within 1%)"
+        (vol - expect).abs() < expect * 1e-6,
+        "fused volume {vol} should match 2·V_cyl − V_Steinmetz {expect}"
     );
+}
+
+/// Cutting one of two crossing equal cylinders from the other leaves its two
+/// arms, its caps and the other's two lenses; intersecting them leaves the
+/// four lenses, the Steinmetz solid. Both exact, at their closed-form
+/// volumes.
+#[test]
+fn perpendicular_cylinders_cut_and_common_are_exact() {
+    let steinmetz = 16.0 * 27.0 / 3.0;
+    let cylinder = std::f64::consts::PI * 9.0 * 20.0;
+    for (op, faces_expect, volume_expect) in [
+        (BooleanOp::Cut, 6, cylinder - steinmetz),
+        (BooleanOp::Intersect, 4, steinmetz),
+    ] {
+        let mut topo = Topology::new();
+        let (c1, c2) = perpendicular_cylinders(&mut topo);
+        let res = boolean(&mut topo, op, c1, c2).unwrap();
+        // a handful of faces, every lens and arm a cylinder: not a mesh
+        let faces = brepkit_topology::explorer::solid_faces(&topo, res).unwrap();
+        assert_eq!(faces.len(), faces_expect, "{op:?} faces");
+        let cylinders = faces
+            .iter()
+            .filter(|&&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cylinder(_)))
+            .count();
+        assert_eq!(cylinders, 4, "{op:?} cylinder faces");
+        let vol = crate::measure::solid_volume(&topo, res, 0.01).unwrap();
+        assert!(
+            (vol - volume_expect).abs() < 1e-6 * volume_expect,
+            "{op:?} volume {vol} vs {volume_expect}"
+        );
+    }
 }
 
 /// Fuse two overlapping cylinders (r=5,h=20 and r=3,h=20, offset x=2).
