@@ -8853,3 +8853,47 @@ fn fuse_box_top_crossing_plate_hole_keeps_the_open_part() {
         brepkit_check::classify::PointClassification::Inside
     );
 }
+
+/// A box fused under a holed plate, its side face through the hole's axis
+/// and the hole's seam on that face: the side cuts the hole's wall along
+/// the seam and the line opposite it, and the box's top cuts a half circle
+/// across it. The seam's split must keep its own copy's u, the plate-side
+/// rim (cut at the seam's antipode only to lay the wall out) must come back
+/// whole to pair with the plate's, and the fuse stays exact.
+#[test]
+fn fuse_box_side_through_hole_axis_on_its_seam_is_exact() {
+    use brepkit_math::mat::Mat4;
+    use std::f64::consts::PI;
+
+    let mut topo = Topology::new();
+    // plate x [-10, 10], y [-10, 10], z [0, 3]
+    let plate = crate::primitives::make_box(&mut topo, 20.0, 20.0, 3.0).unwrap();
+    crate::transform::transform_solid(&mut topo, plate, &Mat4::translation(-10.0, -10.0, 0.0))
+        .unwrap();
+    // hole r = 1.7 along z through the origin, its seam on the plane y = 0
+    let pin = crate::primitives::make_cylinder(&mut topo, 1.7, 5.0).unwrap();
+    crate::transform::transform_solid(&mut topo, pin, &Mat4::translation(0.0, 0.0, -1.0)).unwrap();
+    let holed = boolean(&mut topo, BooleanOp::Cut, plate, pin).unwrap();
+    // box x [-14, 4], y [0, 8], z [-5, 2]: its side y = 0 through the
+    // hole's axis, 2 into the plate, out past the plate's edge
+    let block = crate::primitives::make_box(&mut topo, 18.0, 8.0, 7.0).unwrap();
+    crate::transform::transform_solid(&mut topo, block, &Mat4::translation(-14.0, 0.0, -5.0))
+        .unwrap();
+
+    let res = boolean(&mut topo, BooleanOp::Fuse, holed, block).unwrap();
+
+    let faces = brepkit_topology::explorer::solid_faces(&topo, res).unwrap();
+    assert!(
+        faces.len() < 40
+            && faces
+                .iter()
+                .any(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cylinder(_))),
+        "the fuse fell back to a mesh ({} faces)",
+        faces.len()
+    );
+    // the box fills the half of the hole it covers, up to its top
+    let r = 1.7_f64;
+    let plate_v = 20.0 * 20.0 * 3.0 - PI * r * r * 3.0;
+    let overlap = 14.0 * 8.0 * 2.0 - 0.5 * PI * r * r * 2.0;
+    assert_volume_near(&topo, res, plate_v + 18.0 * 8.0 * 7.0 - overlap, 1e-6);
+}

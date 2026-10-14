@@ -192,6 +192,20 @@ pub(super) fn split_boundary_edges_at_3d_points(
                     u,
                     (edge.end_uv.y() - edge.start_uv.y()).mul_add(t, edge.start_uv.y()),
                 )
+            } else if matches!(
+                (&edge.curve_3d, surface),
+                (EdgeCurve::Line, FaceSurface::Cylinder(_))
+            ) && (edge.end_uv.x() - edge.start_uv.x()).abs() <= 1e-9
+            {
+                // A ruling of a cylinder lies at one u, and so does a split
+                // on it: projected, a split on the far copy of the seam would
+                // take the near copy's u, and its two pieces would cut across
+                // the whole face (a box's side through a hole's axis, its
+                // section on the hole's seam).
+                brepkit_math::vec::Point2::new(
+                    edge.start_uv.x(),
+                    (edge.end_uv.y() - edge.start_uv.y()).mul_add(t, edge.start_uv.y()),
+                )
             } else {
                 project_point_on_surface(split_3d, surface, &[], None)
             };
