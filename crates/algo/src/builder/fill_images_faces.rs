@@ -3677,6 +3677,61 @@ struct BoundaryArc {
     forward: bool,
 }
 
+/// A straight section along a whole cylinder wall's axis (a wall with no
+/// holes, bounded by its two rims and the seam): `Some(true)` when both
+/// ends lie between the rims, so the line lies on the wall end to end;
+/// `Some(false)` when it runs past a rim. `None` for any other face or
+/// line, which the boundary clip reads. A ruling inside the band crosses no
+/// boundary, and the planar polygon test the clip falls back on means
+/// nothing on a curved wall: a parallel cylinder's wall crossing a ring of
+/// small holes lost every such line, and the wall never split.
+fn ruling_inside_band(
+    topo: &Topology,
+    face: &brepkit_topology::face::Face,
+    line_start: Point3,
+    line_end: Point3,
+    tol: f64,
+) -> Option<bool> {
+    let FaceSurface::Cylinder(cyl) = face.surface() else {
+        return None;
+    };
+    if !face.inner_wires().is_empty() {
+        return None;
+    }
+    let axis = cyl.axis().normalize().ok()?;
+    let span = line_end - line_start;
+    if span.length() <= tol || span.normalize().ok()?.cross(axis).length() > 1e-9 {
+        return None;
+    }
+    let off_axis = |p: Point3| {
+        let w = p - cyl.origin();
+        (w - axis * w.dot(axis)).length()
+    };
+    if (off_axis(line_start) - cyl.radius()).abs() > tol * 100.0 {
+        return None;
+    }
+    // The band: two closed circular rims and seam lines, nothing else.
+    let mut rims: Vec<f64> = Vec::new();
+    for oe in topo.wire(face.outer_wire()).ok()?.edges() {
+        let edge = topo.edge(oe.edge()).ok()?;
+        let at = topo.vertex(edge.start()).ok()?.point();
+        match edge.curve() {
+            EdgeCurve::Circle(_) if edge.start() == edge.end() => {
+                rims.push((at - cyl.origin()).dot(axis));
+            }
+            EdgeCurve::Line => {}
+            _ => return None,
+        }
+    }
+    let [a, b] = rims[..] else {
+        return None;
+    };
+    let (lo, hi) = (a.min(b), a.max(b));
+    let along = |p: Point3| (p - cyl.origin()).dot(axis);
+    let inside = |p: Point3| along(p) >= lo - tol && along(p) <= hi + tol;
+    Some(inside(line_start) && inside(line_end))
+}
+
 /// Clip a 3D line segment to a face's boundary polygon.
 ///
 /// Collects the outer wire vertices as line segments, then finds where
@@ -3697,6 +3752,10 @@ fn clip_line_to_face_boundary(
 ) -> Option<Vec<(Point3, Point3)>> {
     let face = topo.face(face_id).ok()?;
     let wire = topo.wire(face.outer_wire()).ok()?;
+
+    if let Some(inside) = ruling_inside_band(topo, face, line_start, line_end, tol) {
+        return inside.then(|| vec![(line_start, line_end)]);
+    }
 
     // Collect boundary edges as line segments (vertex positions in traversal
     // order); for curved edges keep the geometry so the section line can be

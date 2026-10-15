@@ -5831,6 +5831,12 @@ fn compute_raw_curves(
             }
         }
 
+        (FaceSurface::Cylinder(c1), FaceSurface::Cylinder(c2))
+            if cylinders_side_by_side(c1, c2) =>
+        {
+            Ok(side_by_side_cylinder_lines(c1, c2, bbox_a, bbox_b))
+        }
+
         (FaceSurface::Cylinder(c1), FaceSurface::Cylinder(c2)) if cylinders_cross(c1, c2) => {
             Ok(crossing_cylinder_arcs(c1, c2)?)
         }
@@ -6513,7 +6519,66 @@ fn plane_cylinder_parallel_lines(
     Ok(results)
 }
 
-/// Exact section circles and ellipses as raw curves over their full turn.
+/// Whether two cylinders have parallel axes that are not the same line.
+fn cylinders_side_by_side(
+    c1: &brepkit_math::surfaces::CylindricalSurface,
+    c2: &brepkit_math::surfaces::CylindricalSurface,
+) -> bool {
+    let (a1, a2) = (c1.axis(), c2.axis());
+    if a1.cross(a2).length() > 1e-9 {
+        return false;
+    }
+    let w = c2.origin() - c1.origin();
+    (w - a1 * w.dot(a1)).length() > Tolerance::new().linear
+}
+
+/// The section of two cylinders with parallel axes: the lines along the
+/// axis through the points where their circles cross, trimmed to both
+/// faces' boxes. Their circles crossing twice give two lines; touching or
+/// apart, none (a grazing line splits neither face). Marched instead, each
+/// line came back as overlapping fitted pieces short of both rims.
+fn side_by_side_cylinder_lines(
+    c1: &brepkit_math::surfaces::CylindricalSurface,
+    c2: &brepkit_math::surfaces::CylindricalSurface,
+    bbox_a: &Aabb3,
+    bbox_b: &Aabb3,
+) -> Vec<RawCurve> {
+    let axis = c1.axis();
+    let Ok(dir) = axis.normalize() else {
+        return Vec::new();
+    };
+    let w = c2.origin() - c1.origin();
+    let across = w - dir * w.dot(dir);
+    let gap = across.length();
+    let (r1, r2) = (c1.radius(), c2.radius());
+    if gap >= r1 + r2 - 1e-9 || gap <= (r1 - r2).abs() + 1e-9 {
+        return Vec::new();
+    }
+    let e = across * (1.0 / gap);
+    let f = dir.cross(e);
+    // Along `e` from axis 1 to the chord through both crossings, and half
+    // the chord's length.
+    let along = (gap * gap + r1 * r1 - r2 * r2) / (2.0 * gap);
+    let half = (r1 * r1 - along * along).max(0.0).sqrt();
+    let mut lines = Vec::with_capacity(2);
+    for side in [1.0, -1.0] {
+        let base = c1.origin() + e * along + f * (side * half);
+        let t_range = trim_t_range_to_aabb(base, dir, bbox_a, bbox_b);
+        if (t_range.1 - t_range.0).abs() < 1e-9 {
+            continue;
+        }
+        let (p0, p1) = (base + dir * t_range.0, base + dir * t_range.1);
+        lines.push(RawCurve {
+            curve: EdgeCurve::Line,
+            bbox: Aabb3::from_points([p0, p1]),
+            t_range,
+            p_start: p0,
+            p_end: p1,
+        });
+    }
+    lines
+}
+
 /// Whether two cylinders of one radius cross: their axes meet at an angle.
 /// They then meet in two ellipses that touch each other where the
 /// cylinders touch, at the two ends of the axes' common perpendicular.
@@ -6587,6 +6652,7 @@ fn crossing_cylinder_arcs(
     Ok(arcs)
 }
 
+/// Exact section circles and ellipses as raw curves over their full turn.
 fn exact_raw_curves(exacts: Vec<analytic_intersection::ExactIntersectionCurve>) -> Vec<RawCurve> {
     let domain = (0.0, std::f64::consts::TAU);
     exacts
