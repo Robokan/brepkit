@@ -7343,84 +7343,89 @@ fn split_face_2d_impl(
         });
     }
 
-    // A closed rim split where sections end walks its whole turn from its
-    // start, which may be a period off the turn the sections ending on it
-    // sit in (a hole's rim walked against its curve, a box's side meeting it
-    // along a ruling at 3π/2 that the rim's pieces put at -π/2): the joint
-    // would never meet. Move the rim's pieces to the sections' turn when
-    // every section ending inside the rim agrees on it.
+    // One u window for the whole wall: the boundary walk can lay a rim a
+    // whole turn off the window its seam copies bound (a rim walked against
+    // its curve runs a turn below its start), and sections sit at their
+    // points' own u, which need not be in that window either; parts a turn
+    // apart never join. When the seam copies are one period apart, every
+    // closed rim's run of pieces that sections end on, and every section,
+    // moves by whole periods into the window between them.
     if u_periodic
-        && matches!(surface, FaceSurface::Cylinder(_) | FaceSurface::Cone(_))
+        && matches!(surface, FaceSurface::Cylinder(_))
         && all_edges.len() > n_boundary_edges
         && let (Some(u_period), _) = super::pcurve_compute::surface_periods(&surface)
     {
         let weld = tol.linear * 100.0;
-        let same_rim =
-            |a: &OrientedPCurveEdge, b: &OrientedPCurveEdge| match (&a.curve_3d, &b.curve_3d) {
-                (EdgeCurve::Circle(p), EdgeCurve::Circle(q)) => {
-                    (p.center() - q.center()).length() <= weld
-                        && (p.radius() - q.radius()).abs() <= weld
-                        && (a.end_3d - b.start_3d).length() <= weld
-                }
-                _ => false,
+        let seam_us: Vec<f64> = all_edges[..n_boundary_edges]
+            .iter()
+            .filter(|e| {
+                matches!(e.curve_3d, EdgeCurve::Line)
+                    && (e.start_uv.x() - e.end_uv.x()).abs() <= 1e-9
+            })
+            .map(|e| e.start_uv.x())
+            .collect();
+        let lo = seam_us.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = seam_us.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let banded = seam_us.len() >= 2
+            && ((hi - lo) - u_period).abs() <= 1e-6
+            && seam_us
+                .iter()
+                .all(|&u| (u - lo).abs() <= 1e-6 || (u - hi).abs() <= 1e-6);
+        if banded {
+            let eps = 1e-6;
+            let shift = |e: &mut OrientedPCurveEdge, by: f64| {
+                e.start_uv = Point2::new(e.start_uv.x() + by, e.start_uv.y());
+                e.end_uv = Point2::new(e.end_uv.x() + by, e.end_uv.y());
             };
-        let mut i = 0;
-        while i < n_boundary_edges {
-            let mut j = i;
-            while j + 1 < n_boundary_edges && same_rim(&all_edges[j], &all_edges[j + 1]) {
-                j += 1;
-            }
-            // The turns the sections ending at the run's inner joints sit in.
-            let mut turns: Vec<i64> = Vec::new();
-            for k in i..j {
-                let (joint, joint_u) = (all_edges[k].end_3d, all_edges[k].end_uv.x());
-                for s in &all_edges[n_boundary_edges..] {
-                    for (p, uv) in [(s.start_3d, s.start_uv), (s.end_3d, s.end_uv)] {
-                        if (p - joint).length() <= weld {
-                            #[allow(clippy::cast_possible_truncation)]
-                            turns.push(((uv.x() - joint_u) / u_period).round() as i64);
-                        }
+            let same_rim =
+                |a: &OrientedPCurveEdge, b: &OrientedPCurveEdge| match (&a.curve_3d, &b.curve_3d) {
+                    (EdgeCurve::Circle(p), EdgeCurve::Circle(q)) => {
+                        (p.center() - q.center()).length() <= weld
+                            && (p.radius() - q.radius()).abs() <= weld
+                            && (a.end_3d - b.start_3d).length() <= weld
+                    }
+                    _ => false,
+                };
+            let mut i = 0;
+            while i < n_boundary_edges {
+                if !matches!(all_edges[i].curve_3d, EdgeCurve::Circle(_)) {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i;
+                while j + 1 < n_boundary_edges && same_rim(&all_edges[j], &all_edges[j + 1]) {
+                    j += 1;
+                }
+                let (run_lo, run_hi) = all_edges[i..=j]
+                    .iter()
+                    .flat_map(|e| [e.start_uv.x(), e.end_uv.x()])
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), u| {
+                        (a.min(u), b.max(u))
+                    });
+                // Only a rim that sections end on: elsewhere the walk's own
+                // layout of a whole rim is what the tracer reads.
+                let joined = (i..j).any(|k| {
+                    let joint = all_edges[k].end_3d;
+                    all_edges[n_boundary_edges..].iter().any(|s| {
+                        (s.start_3d - joint).length() <= weld || (s.end_3d - joint).length() <= weld
+                    })
+                });
+                let turns = ((lo - run_lo) / u_period).round();
+                let by = turns * u_period;
+                if joined && turns != 0.0 && run_lo + by >= lo - eps && run_hi + by <= hi + eps {
+                    for e in &mut all_edges[i..=j] {
+                        shift(e, by);
                     }
                 }
+                i = j + 1;
             }
-            // How many of the run's two ends meet, at the u they would
-            // take, a boundary edge outside the run ending at the same point:
-            // the move must not part the rim from the seam copies it joins.
-            let ends_met = |shift: f64| {
-                let (first, last) = (&all_edges[i], &all_edges[j]);
-                [
-                    (first.start_3d, first.start_uv.x()),
-                    (last.end_3d, last.end_uv.x()),
-                ]
-                .into_iter()
-                .filter(|&(p, u)| {
-                    all_edges[..n_boundary_edges]
-                        .iter()
-                        .enumerate()
-                        .filter(|&(k, _)| k < i || k > j)
-                        .any(|(_, e)| {
-                            [(e.start_3d, e.start_uv.x()), (e.end_3d, e.end_uv.x())]
-                                .into_iter()
-                                .any(|(q, w)| {
-                                    (q - p).length() <= weld && (w - (u + shift)).abs() <= 1e-6
-                                })
-                        })
-                })
-                .count()
-            };
-            if let Some(&turn) = turns.first()
-                && turn != 0
-                && turns.iter().all(|&t| t == turn)
-                && let Ok(turn) = i32::try_from(turn).map(f64::from)
-                && ends_met(turn * u_period) > ends_met(0.0)
-            {
-                for e in &mut all_edges[i..=j] {
-                    e.start_uv =
-                        Point2::new(turn.mul_add(u_period, e.start_uv.x()), e.start_uv.y());
-                    e.end_uv = Point2::new(turn.mul_add(u_period, e.end_uv.x()), e.end_uv.y());
+            for e in &mut all_edges[n_boundary_edges..] {
+                let mid = f64::midpoint(e.start_uv.x(), e.end_uv.x());
+                let by = -((mid - lo) / u_period).floor() * u_period;
+                if by != 0.0 {
+                    shift(e, by);
                 }
             }
-            i = j + 1;
         }
     }
 
