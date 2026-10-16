@@ -2619,6 +2619,34 @@ fn junction_cross_sections_closed(
     Ok(any)
 }
 
+/// The rolling ball at a set-back trihedral corner, when its three contacts
+/// lie on it. Its pole axis is square to the patch's middle and its seam
+/// opposite it, so the patch is clear of both poles and the seam.
+fn setback_corner_ball(
+    data: &crate::spherical_triangle::VertexContactData,
+) -> Option<brepkit_math::surfaces::SphericalSurface> {
+    let center = sphere_center(data).ok()?;
+    let radius = data.radius;
+    if data
+        .contact_points
+        .iter()
+        .any(|q| ((*q - center).length() - radius).abs() > 1e-6 * radius.max(1.0))
+    {
+        return None;
+    }
+    let middle = data
+        .contact_points
+        .iter()
+        .fold(Vec3::new(0.0, 0.0, 0.0), |sum, q| sum + (*q - center));
+    let middle = middle.normalize().ok()?;
+    let pole = middle
+        .cross(data.contact_points[0] - center)
+        .normalize()
+        .ok()?;
+    brepkit_math::surfaces::SphericalSurface::with_axis_and_ref_dir(center, radius, pole, -middle)
+        .ok()
+}
+
 fn spherical_corner_surface_reversed(
     surface: &FaceSurface,
     center: Point3,
@@ -3738,7 +3766,14 @@ fn build_junction_fan(
         )
     } else if stripe_indices.len() == 3 {
         let data = multi_edge_corner_data(junction_vertex, stripe_indices, stripes, topo)?;
-        if data.contact_points.len() == 3 {
+        if data.contact_points.len() == 3
+            && is_setback_corner
+            && let Some(ball) = setback_corner_ball(&data)
+        {
+            // The set-back stripes end on the rolling ball's great circles,
+            // so the corner is that ball itself, its normal facing out.
+            (FaceSurface::Sphere(ball), false)
+        } else if data.contact_points.len() == 3 {
             let surface = build_spherical_corner_surface(&data)?;
             let reversed = if is_setback_corner {
                 let center = sphere_center(&data)?;

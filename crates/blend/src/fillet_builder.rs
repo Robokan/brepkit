@@ -3828,9 +3828,9 @@ mod tests {
                 .faces()
                 .iter()
                 .any(|&face| {
-                    matches!(topo.face(face).unwrap().surface(), FaceSurface::Nurbs(_))
+                    matches!(topo.face(face).unwrap().surface(), FaceSurface::Sphere(_))
                 }),
-            "three-stripe junction must publish a spherical NURBS patch"
+            "three-stripe junction must publish the rolling ball's patch"
         );
         assert_shell_edges_are_closed(&topo, result.solid);
     }
