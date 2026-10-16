@@ -546,6 +546,37 @@ pub(super) fn is_point_on_boundary_uv(
     false
 }
 
+/// The parameter along `line` of the first copy of `p`, shifted by whole
+/// periods of `surface`, that the line runs through ahead of its start.
+/// `None` on a surface with no period, or when no copy lies on the line.
+fn first_periodic_copy_on_line(
+    line: &brepkit_math::curves2d::Line2D,
+    p: Point2,
+    surface: &FaceSurface,
+) -> Option<f64> {
+    let (u_period, v_period) = super::super::pcurve_compute::surface_periods(surface);
+    if u_period.is_none() && v_period.is_none() {
+        return None;
+    }
+    let shifts = |period: Option<f64>| -> Vec<f64> {
+        period.map_or_else(
+            || vec![0.0],
+            |p| (-2..=2).map(|k| f64::from(k) * p).collect(),
+        )
+    };
+    let mut best: Option<f64> = None;
+    for du in shifts(u_period) {
+        for dv in shifts(v_period) {
+            let copy = Point2::new(p.x() + du, p.y() + dv);
+            let t = line.project(copy);
+            if t > 1e-9 && line.distance_to_point(copy) <= 1e-6 && best.is_none_or(|b| t < b) {
+                best = Some(t);
+            }
+        }
+    }
+    best
+}
+
 /// Extract UV endpoints from a pcurve's evaluation rather than independent
 /// surface projection. This ensures consistency -- e.g. a pcurve that goes
 /// from (pi, v) to (2pi, v) won't have its end snapped to (0, v) by the
@@ -565,6 +596,13 @@ pub(super) fn uv_endpoints_from_pcurve(
             // 3D endpoint and computing the 2D distance along the line.
             let su = line.evaluate(0.0);
             let eu_proj = project_point_on_surface(end_3d, surface, wire_pts, None);
+            // On a periodic surface the projection lands in the surface's
+            // own window, which can be whole periods off the line's run (an
+            // arc leaving u = 0 towards -u projects its end near 2pi): the
+            // line ends at the first copy of that point it runs through.
+            if let Some(t) = first_periodic_copy_on_line(line, eu_proj, surface) {
+                return (su, line.evaluate(t));
+            }
             let du = eu_proj.x() - su.x();
             let dv = eu_proj.y() - su.y();
             let len_2d = (du * du + dv * dv).sqrt();

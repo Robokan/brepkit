@@ -6893,6 +6893,17 @@ fn split_face_2d_impl(
             .filter(|sct| matches!(sct.curve_3d, EdgeCurve::Line))
             .map(|sct| (sct.start, sct.end))
             .collect();
+        // A curved section ending at a hole's vertex bridges to the opening
+        // just as a line does (a cylinder cut through a ring of round holes:
+        // its circle's arcs run from hole to hole, each ending on a rim).
+        let arc_ends: Vec<Point3> = sections
+            .iter()
+            .filter(|sct| {
+                !matches!(sct.curve_3d, EdgeCurve::Line)
+                    && (sct.start - sct.end).length() > tol.linear
+            })
+            .flat_map(|sct| [sct.start, sct.end])
+            .collect();
         let on_seg = |p: Point3, a: Point3, b: Point3| -> bool {
             let d = b - a;
             let len2 = d.dot(d);
@@ -6923,7 +6934,10 @@ fn split_face_2d_impl(
             let mut coincident: Vec<Point3> = Vec::new();
             for e in hole {
                 for p in [e.start_3d, e.end_3d] {
-                    if sec_segs.iter().any(|&(a, b)| on_seg(p, a, b))
+                    if (sec_segs.iter().any(|&(a, b)| on_seg(p, a, b))
+                        || arc_ends
+                            .iter()
+                            .any(|q| (*q - p).length() < tol.linear * 10.0))
                         && !coincident.iter().any(|q| (*q - p).length() < tol.linear)
                     {
                         coincident.push(p);
@@ -7425,6 +7439,73 @@ fn split_face_2d_impl(
                 if by != 0.0 {
                     shift(e, by);
                 }
+            }
+        }
+    }
+
+    // A section on a cylinder sits at its points' own u, which can be whole
+    // turns off the boundary it ends on (an arc leaving u = 0 on a wall laid
+    // out around 2pi). When an end meets a boundary vertex in 3D but no copy
+    // of it in UV, move the section by the one whole-turn shift that joins
+    // every such end.
+    if u_periodic
+        && matches!(surface, FaceSurface::Cylinder(_))
+        && all_edges.len() > n_boundary_edges
+        && let (Some(u_period), _) = super::pcurve_compute::surface_periods(&surface)
+    {
+        let weld = tol.linear * 100.0;
+        let corners: Vec<(Point3, Point2)> = all_edges[..n_boundary_edges]
+            .iter()
+            .flat_map(|e| [(e.start_3d, e.start_uv), (e.end_3d, e.end_uv)])
+            .collect();
+        // A ruling keeps the u its split gave it (a seam copy's own).
+        for k in n_boundary_edges..all_edges.len() {
+            if matches!(all_edges[k].curve_3d, EdgeCurve::Line) {
+                continue;
+            }
+            let mut turns: Option<Vec<i64>> = None;
+            for (p, uv) in [
+                (all_edges[k].start_3d, all_edges[k].start_uv),
+                (all_edges[k].end_3d, all_edges[k].end_uv),
+            ] {
+                let at: Vec<Point2> = corners
+                    .iter()
+                    .filter(|(q, _)| (*q - p).length() <= weld)
+                    .map(|&(_, q)| q)
+                    .collect();
+                if at.is_empty() {
+                    continue;
+                }
+                if at.iter().any(|q| (q.x() - uv.x()).abs() <= 1e-6) {
+                    turns = Some(vec![0]);
+                    break;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let mut here: Vec<i64> = at
+                    .iter()
+                    .filter_map(|q| {
+                        let t = ((q.x() - uv.x()) / u_period).round();
+                        ((q.x() - uv.x() - t * u_period).abs() <= 1e-6
+                            && (q.y() - uv.y()).abs() <= 1e-6)
+                            .then_some(t as i64)
+                    })
+                    .collect();
+                here.sort_unstable();
+                here.dedup();
+                turns = Some(match turns {
+                    None => here,
+                    Some(prev) => prev.into_iter().filter(|t| here.contains(t)).collect(),
+                });
+            }
+            if let Some(t) = turns
+                && let [t] = t[..]
+                && t != 0
+            {
+                #[allow(clippy::cast_precision_loss)]
+                let by = t as f64 * u_period;
+                let e = &mut all_edges[k];
+                e.start_uv = Point2::new(e.start_uv.x() + by, e.start_uv.y());
+                e.end_uv = Point2::new(e.end_uv.x() + by, e.end_uv.y());
             }
         }
     }
@@ -7995,6 +8076,7 @@ fn split_face_2d_impl(
     // in, the traversal walks out and back along them, spuriously
     // over-splitting the face (boundary edges are never removed, so the
     // boundary prefix and `n_boundary_edges` stay valid).
+
     if trace_split {
         let mut rows: Vec<String> = all_edges
             .iter()
@@ -9678,7 +9760,6 @@ fn plane_internal_line_loops(
     if deduped.len() < 3 {
         return None;
     }
-
     // The same footprint side can arrive both whole and as sub-segments
     // split at paves. Drop any segment that another section's endpoint
     // subdivides (collinear, strictly interior) — the sub-segments carry

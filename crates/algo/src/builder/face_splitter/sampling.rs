@@ -166,6 +166,20 @@ pub(super) fn sample_wire_loop_uv_periodic(
                 // proper unwrapping across periodic jumps at seam vertices.
                 pts.push(edge.start_uv);
                 if has_period {
+                    // Steps well under half a period, so the unwrap below
+                    // keeps the edge's own run: a rim half spans exactly
+                    // half a turn, which it would read either way.
+                    let d = edge.end_uv - edge.start_uv;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let steps = (d.x().abs().max(d.y().abs()) / 1.0).ceil().max(1.0) as usize;
+                    #[allow(clippy::cast_precision_loss)]
+                    for i in 1..steps {
+                        let t = i as f64 / steps as f64;
+                        pts.push(Point2::new(
+                            d.x().mul_add(t, edge.start_uv.x()),
+                            d.y().mul_add(t, edge.start_uv.y()),
+                        ));
+                    }
                     pts.push(edge.end_uv);
                 }
             }
