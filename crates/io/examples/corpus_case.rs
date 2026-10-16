@@ -178,6 +178,54 @@ fn open_edges(topo: &Topology, sid: SolidId) {
     }
 }
 
+/// Edges where two plane faces meet facing opposite ways: the solid folds
+/// back on itself there (a zero-thickness flap).
+fn folds(topo: &Topology, sid: SolidId) {
+    let mut users: BTreeMap<usize, Vec<(usize, brepkit_math::vec::Vec3)>> = BTreeMap::new();
+    let mut ends: BTreeMap<usize, (brepkit_math::vec::Point3, brepkit_math::vec::Point3)> =
+        BTreeMap::new();
+    for (i, fid) in solid_faces(topo, sid).unwrap().into_iter().enumerate() {
+        let face = topo.face(fid).unwrap();
+        let brepkit_topology::face::FaceSurface::Plane { normal, .. } = face.surface() else {
+            continue;
+        };
+        let n = if face.is_reversed() {
+            -*normal
+        } else {
+            *normal
+        };
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(wid).unwrap().edges() {
+                let e = topo.edge(oe.edge()).unwrap();
+                ends.insert(
+                    oe.edge().index(),
+                    (
+                        topo.vertex(e.start()).unwrap().point(),
+                        topo.vertex(e.end()).unwrap().point(),
+                    ),
+                );
+                users.entry(oe.edge().index()).or_default().push((i, n));
+            }
+        }
+    }
+    for (idx, us) in &users {
+        if us.len() == 2 && us[0].1.dot(us[1].1) < -0.999 && us[0].0 != us[1].0 {
+            let (p, q) = ends[idx];
+            println!(
+                "  fold at edge {idx} faces {} {} ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4})",
+                us[0].0,
+                us[1].0,
+                p.x(),
+                p.y(),
+                p.z(),
+                q.x(),
+                q.y(),
+                q.z()
+            );
+        }
+    }
+}
+
 /// Rewrites each reversed planar face as the same face unreversed: the
 /// plane's normal flipped and every loop run the other way (brepkit winds
 /// loops about the surface normal). An experiment: whether the reversed flag
@@ -280,10 +328,20 @@ fn main() {
     }
     println!("op={op:?} a={} solids b={} solids", a.len(), b.len());
     println!("A: {}", census(&topo, a[0]));
+    if std::env::var("FOLDS").is_ok() {
+        println!("A folds:");
+        folds(&topo, a[0]);
+        println!("B folds:");
+        folds(&topo, b[0]);
+    }
     println!("B: {}", census(&topo, b[0]));
     let mut occ_topo = Topology::new();
     if let Some(&occ) = read(&dir, "occ.step", &mut occ_topo).first() {
         println!("OCC: {}", census(&occ_topo, occ));
+        if std::env::var("FOLDS").is_ok() {
+            println!("OCC folds:");
+            folds(&occ_topo, occ);
+        }
     }
     if std::env::var("RAW").is_ok() {
         let bop = match op {
@@ -323,7 +381,14 @@ fn main() {
     );
     let fell_back = brepkit_operations::boolean::mesh_fallback_count() > before;
     match r {
-        Ok(s) => println!("brepkit (fallback={fell_back}): {}", census(&topo, s)),
+        Ok(s) => {
+            println!("brepkit (fallback={fell_back}): {}", census(&topo, s));
+            // FOLDS=1: plane faces meeting face to face
+            if std::env::var("FOLDS").is_ok() {
+                println!("result folds:");
+                folds(&topo, s);
+            }
+        }
         Err(e) => println!("brepkit error: {e}"),
     }
 }
