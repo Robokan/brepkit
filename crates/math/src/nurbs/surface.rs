@@ -10,7 +10,7 @@ use crate::vec::{Point3, Vec3};
 ///
 /// The surface is defined by degrees in the u and v directions, two knot
 /// vectors, a 2D grid of control points, and matching weights.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NurbsSurface {
     /// Polynomial degree in the u direction.
@@ -25,6 +25,22 @@ pub struct NurbsSurface {
     control_points: Vec<Vec<Point3>>,
     /// Weight grid matching `control_points` dimensions.
     weights: Vec<Vec<f64>>,
+    /// The knot spans indexed by their control boxes, built on first use by
+    /// a projection onto a surface with more spans than its coarse grid
+    /// samples.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    span_index: std::sync::OnceLock<Option<std::sync::Arc<crate::nurbs::span_index::SpanIndex>>>,
+}
+
+impl PartialEq for NurbsSurface {
+    fn eq(&self, other: &Self) -> bool {
+        self.degree_u == other.degree_u
+            && self.degree_v == other.degree_v
+            && self.knots_u == other.knots_u
+            && self.knots_v == other.knots_v
+            && self.control_points == other.control_points
+            && self.weights == other.weights
+    }
 }
 
 impl NurbsSurface {
@@ -102,6 +118,7 @@ impl NurbsSurface {
             knots_v,
             control_points,
             weights,
+            span_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -431,6 +448,15 @@ impl NurbsSurface {
                 .iter()
                 .flat_map(|row| row.iter().copied()),
         )
+    }
+
+    /// The surface's knot spans indexed by their control boxes, built on
+    /// first use; `None` when a weight is not positive.
+    #[must_use]
+    pub fn span_index(&self) -> Option<&crate::nurbs::span_index::SpanIndex> {
+        self.span_index
+            .get_or_init(|| crate::nurbs::span_index::SpanIndex::new(self).map(std::sync::Arc::new))
+            .as_deref()
     }
 
     /// Create a cached evaluator for repeated evaluation.

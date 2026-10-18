@@ -324,7 +324,7 @@ pub fn project_point_to_surface(
     // the far copy of it; where the seam has a kink it can bounce across
     // without converging, so a failed wrapped solve retries clamped.
     let wraps = surface.is_periodic_u() || surface.is_periodic_v();
-    let (u_final, v_final, pt_final) = surface_newton_refine(
+    let coarse = surface_newton_refine(
         surface, point, u_guess, v_guess, u_min, u_max, v_min, v_max, tolerance, wraps,
     )
     .or_else(|err| {
@@ -335,7 +335,15 @@ pub fn project_point_to_surface(
         } else {
             Err(err)
         }
-    })?;
+    });
+    // A surface with more knot spans than the coarse grid samples (a fitted
+    // loft with hundreds) can seed Newton in a span far from the point's
+    // own, where it settles on a local nearest point tens of millimetres
+    // off. Unless it came near the point, the spans themselves are searched.
+    if let Some(found) = search_spans_unless_near(surface, point, tolerance, coarse.as_ref().ok()) {
+        return Ok(found);
+    }
+    let (u_final, v_final, pt_final) = coarse?;
     let dist = (pt_final - point).length();
 
     Ok(SurfaceProjection {
@@ -343,6 +351,46 @@ pub fn project_point_to_surface(
         v: v_final,
         point: pt_final,
         distance: dist,
+    })
+}
+
+/// The projection found by searching the knot spans of `surface` whose
+/// control boxes hold `point`, when it has more spans than the coarse grid
+/// samples and the coarse projection `coarse` (if any) did not come within a
+/// ten-thousandth of the surface's size of `point`; `None` to keep the
+/// coarse one. A point in no span's box lies off the surface, where the
+/// coarse projection stands.
+fn search_spans_unless_near(
+    surface: &NurbsSurface,
+    point: Point3,
+    tolerance: f64,
+    coarse: Option<&(f64, f64, Point3)>,
+) -> Option<SurfaceProjection> {
+    let spans = |knots: &[f64]| knots.windows(2).filter(|w| w[1] > w[0]).count();
+    let many =
+        spans(surface.knots_u()) * spans(surface.knots_v()) > SURFACE_GRID_SIZE * SURFACE_GRID_SIZE;
+    if !many {
+        return None;
+    }
+    let size = {
+        let b = surface.aabb();
+        (b.max - b.min).length()
+    };
+    let coarse_gap = coarse.map(|&(_, _, pt)| (pt - point).length());
+    if coarse_gap.is_some_and(|g| g <= tolerance.max(1e-4 * size)) {
+        return None;
+    }
+    let (u, v, d) = surface
+        .span_index()?
+        .locate_on(surface, point, tolerance.max(1e-9 * size))?;
+    if coarse_gap.is_some_and(|g| g <= d) {
+        return None;
+    }
+    Some(SurfaceProjection {
+        u,
+        v,
+        point: surface.evaluate(u, v),
+        distance: d,
     })
 }
 

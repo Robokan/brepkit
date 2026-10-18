@@ -34,7 +34,7 @@ use crate::vec::Point3;
 pub use chaining::chain_intersection_points;
 pub use curve_surface::{CurveSurfaceHit, intersect_curve_surface};
 pub use line::intersect_line_nurbs;
-pub use plane::intersect_plane_nurbs;
+pub use plane::{intersect_plane_nurbs, intersect_plane_nurbs_in_region};
 pub use surface_seeding::intersect_nurbs_nurbs;
 
 /// Maximum work-queue entries for the branch-aware SSI marcher.

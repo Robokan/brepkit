@@ -1,8 +1,11 @@
 //! Plane-NURBS surface intersection.
 
 use crate::MathError;
+use crate::aabb::Aabb3;
+use crate::nurbs::fitting::interpolate;
+use crate::nurbs::projection::project_point_to_curve;
 use crate::nurbs::surface::NurbsSurface;
-use crate::vec::Vec3;
+use crate::vec::{Point3, Vec3};
 
 use super::chaining::build_curves_from_chains;
 use super::{IntersectionCurve, IntersectionPoint, MAX_NEWTON_ITER};
@@ -27,6 +30,27 @@ pub fn intersect_plane_nurbs(
     plane_normal: Vec3,
     plane_d: f64,
     samples: usize,
+) -> Result<Vec<IntersectionCurve>, MathError> {
+    intersect_plane_nurbs_in_region(surface, plane_normal, plane_d, samples, None)
+}
+
+/// Intersect a plane with a NURBS surface, keeping only the section's runs
+/// through `region` (all of it when `None`).
+///
+/// Each run kept is refined until the curve fitted through it holds to the
+/// section within [`SECTION_FIT_TOL`]. The grid scan's pitch is set by the
+/// whole surface, so a section through a small face otherwise gets two or
+/// three points there (see [`densify_chain`]).
+///
+/// # Errors
+///
+/// Returns an error if NURBS evaluation fails or curve fitting fails.
+pub fn intersect_plane_nurbs_in_region(
+    surface: &NurbsSurface,
+    plane_normal: Vec3,
+    plane_d: f64,
+    samples: usize,
+    region: Option<Aabb3>,
 ) -> Result<Vec<IntersectionCurve>, MathError> {
     let n = samples.max(10);
 
@@ -182,6 +206,11 @@ pub fn intersect_plane_nurbs(
             chain.push(next);
             current = next;
         }
+        // A loop ends beside its start: close it, or the section loses the
+        // stretch between its last crossing and its first.
+        if chain.len() > 2 && links[current].contains(&start) {
+            chain.push(start);
+        }
         chain
     };
     let degree_one: Vec<usize> = (0..crossings.len())
@@ -226,7 +255,149 @@ pub fn intersect_plane_nurbs(
     }
 
     // Phase 5: Fit a curve through each ordered chain.
-    build_curves_from_chains(&ordered_chains)
+    let Some(region) = region else {
+        return build_curves_from_chains(&ordered_chains);
+    };
+    let mut curves = Vec::new();
+    for chain in &ordered_chains {
+        for run in runs_through_region(chain, region) {
+            curves.extend(densify_run(surface, plane_normal, plane_d, run, region)?);
+        }
+    }
+    Ok(curves)
+}
+
+/// How far a fitted section may stray from the true one between its points,
+/// inside the region asked for.
+const SECTION_FIT_TOL: f64 = 1e-6;
+
+/// Whether the section between two of its points may pass through
+/// `region`: the box of their chord, padded by half the chord (the section
+/// may bow out that far), meets it.
+fn gap_meets(a: &IntersectionPoint, b: &IntersectionPoint, region: Aabb3) -> bool {
+    let pad = 0.5 * (b.point - a.point).length();
+    Aabb3::from_points([a.point, b.point])
+        .expanded(pad)
+        .intersects(region)
+}
+
+/// The runs of `chain` through `region`, each with one point beyond it on
+/// either side. A closed chain is turned to start in a gap clear of the
+/// region, so a run is never cut in two at the chain's seam.
+fn runs_through_region(chain: &[IntersectionPoint], region: Aabb3) -> Vec<Vec<IntersectionPoint>> {
+    let n = chain.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    let closed = (chain[0].point - chain[n - 1].point).length() < 1e-9;
+    let mut pts: Vec<IntersectionPoint> = chain.to_vec();
+    if closed {
+        let gaps = n - 1;
+        let clear = |g: usize| !gap_meets(&chain[g], &chain[g + 1], region);
+        let Some(g) =
+            (0..gaps).find(|&g| clear(g) && clear((g + gaps - 1) % gaps) && clear((g + 1) % gaps))
+        else {
+            // Every gap is near the region: the whole loop is the run.
+            return vec![pts];
+        };
+        // Start the loop at the far end of the clear gap.
+        pts = chain[g + 1..n].to_vec();
+        pts.extend_from_slice(&chain[1..=g + 1]);
+    }
+    let gaps = pts.len() - 1;
+    let meets: Vec<bool> = pts
+        .windows(2)
+        .map(|w| gap_meets(&w[0], &w[1], region))
+        .collect();
+    let keep: Vec<bool> = (0..gaps)
+        .map(|g| meets[g] || (g > 0 && meets[g - 1]) || (g + 1 < gaps && meets[g + 1]))
+        .collect();
+    let mut runs = Vec::new();
+    let mut g = 0;
+    while g < gaps {
+        if !keep[g] {
+            g += 1;
+            continue;
+        }
+        let first = g;
+        while g < gaps && keep[g] {
+            g += 1;
+        }
+        runs.push(pts[first..=g].to_vec());
+    }
+    runs
+}
+
+/// Fit a run of the section, refined until the curve interpolating it stays
+/// within [`SECTION_FIT_TOL`] of the section inside `region`.
+///
+/// The grid scan gives one point per grid line crossed, a pitch fixed by
+/// the whole surface: on a surface with hundreds of knot spans (a fitted
+/// loft) a section through a small face gets two or three points, and the
+/// curve fitted through them strays by a tenth of a millimetre between
+/// them. Its ends, cut where it crosses that face's edges, then miss the
+/// crossings of those edges with the surface, and the sections around the
+/// face never close. Each gap through the region whose refined midpoint
+/// lies off the fit gets that midpoint. The run is interpolated: an
+/// approximating fit strays by more than the tolerance.
+fn densify_run(
+    surface: &NurbsSurface,
+    plane_normal: Vec3,
+    plane_d: f64,
+    mut run: Vec<IntersectionPoint>,
+    region: Aabb3,
+) -> Result<Option<IntersectionCurve>, MathError> {
+    const MAX_ROUNDS: usize = 10;
+    const MAX_POINTS: usize = 200;
+    run.dedup_by(|b, a| (a.point - b.point).length() < 1e-9);
+    if run.len() < 2 {
+        return Ok(None);
+    }
+    let fit = |run: &[IntersectionPoint]| {
+        let positions: Vec<Point3> = run.iter().map(|p| p.point).collect();
+        interpolate(&positions, 3)
+    };
+    let mut curve = fit(&run)?;
+    for _ in 0..MAX_ROUNDS {
+        let mut denser = Vec::with_capacity(run.len() * 2);
+        for w in run.windows(2) {
+            denser.push(w[0]);
+            let (a, b) = (w[0], w[1]);
+            if !gap_meets(&a, &b, region) {
+                continue;
+            }
+            let gap = (b.point - a.point).length();
+            let mid = (
+                f64::midpoint(a.param1.0, b.param1.0),
+                f64::midpoint(a.param1.1, b.param1.1),
+            );
+            let Some(m) = refine_plane_surface_point(surface, plane_normal, plane_d, mid, None)
+            else {
+                continue;
+            };
+            // A refinement that slid off along the surface to another part
+            // of the section is no point of this gap.
+            let chord_mid = a.point + (b.point - a.point) * 0.5;
+            if (m.point - chord_mid).length() > gap
+                || (m.point - a.point).length() < 1e-9
+                || (m.point - b.point).length() < 1e-9
+            {
+                continue;
+            }
+            let off = project_point_to_curve(&curve, m.point, 1e-12)
+                .map_or(f64::INFINITY, |proj| proj.distance);
+            if off > SECTION_FIT_TOL {
+                denser.push(m);
+            }
+        }
+        denser.push(run[run.len() - 1]);
+        if denser.len() == run.len() || denser.len() > MAX_POINTS {
+            break;
+        }
+        run = denser;
+        curve = fit(&run)?;
+    }
+    Ok(Some(IntersectionCurve { curve, points: run }))
 }
 
 /// The parameter a boundary crossing holds fixed during refinement.
