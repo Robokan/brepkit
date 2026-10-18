@@ -2793,9 +2793,26 @@ fn trim_parametric_face_batch_in_place(
     copy_pcurves(topo, face_id, trimmed_face)?;
 
     // Clone only source neighbours that reference a copied boundary edge.
+    // Every face in the arena is a candidate (no edge-to-face index here),
+    // so each is read first and its wires copied only when one of them uses
+    // a split edge: copying every face's wires grew the arena by a wire per
+    // face on every trim, and a kernel holding many bodies made each fillet
+    // take seconds.
+    let split_ids: std::collections::HashSet<EdgeId> =
+        split_edges.iter().map(|(old, _)| *old).collect();
     let mut incident_replacements = Vec::new();
     for source_face in source_face_ids {
         if source_face == face_id {
+            continue;
+        }
+        let touches = {
+            let source = topo.face(source_face)?;
+            std::iter::once(source.outer_wire())
+                .chain(source.inner_wires().iter().copied())
+                .filter_map(|w| topo.wire(w).ok())
+                .any(|w| w.edges().iter().any(|oe| split_ids.contains(&oe.edge())))
+        };
+        if !touches {
             continue;
         }
         let source = topo.face(source_face)?.clone();
@@ -2851,20 +2868,19 @@ fn trim_parametric_face_batch_in_place(
 }
 /// Rebuild a planar or curved support face from all restrictions at once.
 ///
-/// Work is performed on a copy and committed only after the complete
-/// arrangement succeeds. This keeps explicit projection/intersection
-/// failures non-destructive to the source topology.
+/// The arrangement only adds entities (the trimmed face, its edges and
+/// vertices, neighbours' replacement faces and wires) and pcurves keyed to
+/// the faces it adds, so a projection or intersection failure part way
+/// leaves the source topology's own entities as they were. It used to run
+/// on a copy of the whole topology, which a kernel holding many bodies (the
+/// faceted results of earlier mesh booleans) made the cost of every trim.
 pub fn trim_parametric_face_batch(
     topo: &mut Topology,
     face_id: FaceId,
     restrictions: &[ParametricRestriction],
     split_policy: BoundarySplitPolicy<'_>,
 ) -> Result<BatchTrimResult, BlendError> {
-    let mut working = topo.clone();
-    let result =
-        trim_parametric_face_batch_in_place(&mut working, face_id, restrictions, split_policy)?;
-    *topo = working;
-    Ok(result)
+    trim_parametric_face_batch_in_place(topo, face_id, restrictions, split_policy)
 }
 
 /// Backwards-compatible planar entry point. The implementation is the same
