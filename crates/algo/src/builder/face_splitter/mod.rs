@@ -8803,9 +8803,10 @@ fn split_face_2d_impl(
                 .iter()
                 .any(|e| !matches!(e.curve_3d, EdgeCurve::Line));
             // A loop running along part of the face's boundary and back
-            // along a section (a conic tongue off a cone's rim) bounds a
+            // along a section (a conic tongue off a cone's rim, a cylinder
+            // band's piece between two sections running rim to rim) bounds a
             // region of the face too; only a loop of sections alone is a hole.
-            let on_boundary = matches!(surface, FaceSurface::Cone(_))
+            let on_boundary = matches!(surface, FaceSurface::Cone(_) | FaceSurface::Cylinder(_))
                 && wire_loop.iter().any(|e| e.source_edge_idx.is_none())
                 && wire_loop.iter().any(|e| e.source_edge_idx.is_some());
             // On a partial band, a loop of sections alone (a strut poking

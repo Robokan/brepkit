@@ -1689,6 +1689,14 @@ enum FaceExtent {
         /// azimuth and tube angle, off the point by up to twice the major
         /// radius; a march against the exact rational torus traces it.
         own_sheet: bool,
+        /// A NURBS face's own trim, read on the patch: its points placed by
+        /// a search of the patch's knot spans and held by its wires, holes
+        /// included, however they wind round a closed patch. It replaces the
+        /// window, gap and polygon, which a patch with hundreds of spans
+        /// defeats (its points project far off from a coarse grid's seed).
+        nurbs: Option<Box<crate::classifier::NurbsTrim>>,
+        /// The last point `nurbs` placed, the start for the next.
+        hint: std::cell::Cell<Option<(f64, f64)>>,
     },
 }
 
@@ -1878,6 +1886,10 @@ impl FaceExtent {
                 None => (nurbs_face_uv_polygon(topo, face_id, surface), Vec::new()),
             };
             let uv_poly = uv_poly.map(|(poly, sag)| (poly, 2.0f64.mul_add(sag, 1e-7)));
+            let nurbs = crate::classifier::NurbsTrim::of_face(topo, face_id)
+                .ok()
+                .flatten()
+                .map(Box::new);
             Some(Self::Analytic {
                 surface: surface.clone(),
                 v0,
@@ -1890,6 +1902,8 @@ impl FaceExtent {
                 uv_holes,
                 uv_base,
                 own_sheet,
+                nurbs,
+                hint: std::cell::Cell::new(None),
             })
         }
     }
@@ -1926,11 +1940,15 @@ impl FaceExtent {
             Self::Analytic {
                 exact_window,
                 uv_poly,
+                nurbs,
                 ..
-            } => match uv_poly {
-                Some((_, band)) => *band <= 1e-6,
-                None => *exact_window,
-            },
+            } => {
+                nurbs.is_none()
+                    && match uv_poly {
+                        Some((_, band)) => *band <= 1e-6,
+                        None => *exact_window,
+                    }
+            }
         }
     }
 
@@ -1970,6 +1988,11 @@ impl FaceExtent {
                             || point_to_polygon_dist(uv, h) <= depth
                     })
             }
+            Self::Analytic {
+                nurbs: Some(trim),
+                hint,
+                ..
+            } => trim.contains_strict(p, hint, depth),
             Self::Analytic {
                 surface,
                 v0,
@@ -2029,6 +2052,11 @@ impl FaceExtent {
                         && point_to_polygon_dist(uv, h) > *margin
                 })
             }
+            Self::Analytic {
+                nurbs: Some(trim),
+                hint,
+                ..
+            } => trim.contains(p, hint, 10.0 * Tolerance::new().linear),
             Self::Analytic {
                 surface,
                 v0,
@@ -2633,6 +2661,40 @@ fn restrict_curves_to_faces(
             && b1 - b0 < N
             && !matches!(surf_a, FaceSurface::Plane { .. })
             && !matches!(surf_b, FaceSurface::Plane { .. })
+        {
+            emit_curve_windows(
+                topo, fa, fb, &raw, ext_a, ext_b, &inb, N, closed, tol, junctions, &mut out,
+            );
+            continue;
+        }
+        // OPEN section of a NURBS patch across a plane face whose boundary
+        // holds curves (a disc's rim): `trim_open_curve_to_plane_face_lines`
+        // trims against straight edges only, and the patch's own splitter
+        // never trims it, so it would cross the patch whole, far past the
+        // plane face, and the sections round the plane face never close on
+        // the patch. Emit its in-both windows, whose ends land on the plane
+        // face's rim.
+        let rimmed_by_curves = |f: FaceId, surf: &FaceSurface| {
+            matches!(surf, FaceSurface::Plane { .. })
+                && topo.face(f).is_ok_and(|face| {
+                    std::iter::once(face.outer_wire())
+                        .chain(face.inner_wires().iter().copied())
+                        .filter_map(|w| topo.wire(w).ok())
+                        .flat_map(|w| {
+                            w.edges()
+                                .iter()
+                                .map(brepkit_topology::wire::OrientedEdge::edge)
+                        })
+                        .filter_map(|e| topo.edge(e).ok())
+                        .any(|e| !edge_curve_is_straight(e.curve()))
+                })
+        };
+        if !closed
+            && window_open_curves
+            && b1 - b0 < N
+            && matches!(raw.curve, EdgeCurve::NurbsCurve(_))
+            && ((matches!(surf_a, FaceSurface::Nurbs(_)) && rimmed_by_curves(fb, surf_b))
+                || (matches!(surf_b, FaceSurface::Nurbs(_)) && rimmed_by_curves(fa, surf_a)))
         {
             emit_curve_windows(
                 topo, fa, fb, &raw, ext_a, ext_b, &inb, N, closed, tol, junctions, &mut out,
@@ -5401,7 +5463,7 @@ fn compute_face_bbox(topo: &Topology, face_id: FaceId, tol: Tolerance) -> Result
         }
     }
 
-    // A sphere or torus face bulges beyond its boundary edges (a hemisphere's
+    // A sphere, torus or NURBS face bulges beyond its boundary edges (a hemisphere's
     // only boundary is its equatorial circle; a full torus's are two degenerate
     // seam points), so the boundary-sampled bbox underestimates the true extent
     // and the broad-phase would wrongly reject genuinely intersecting pairs.
@@ -5422,6 +5484,9 @@ fn compute_face_bbox(topo: &Topology, face_id: FaceId, tol: Tolerance) -> Result
         FaceSurface::Torus(t) if face_boundary_all_degenerate(topo, face_id, tol)? => {
             Some(t.aabb())
         }
+        // A NURBS face can bulge far past its boundary (a lofted wall
+        // between its two rims); its control net bounds it.
+        FaceSurface::Nurbs(n) => Some(n.aabb()),
         _ => None,
     };
 
@@ -6014,7 +6079,7 @@ fn compute_raw_curves(
 
         (FaceSurface::Plane { normal, d }, FaceSurface::Nurbs(nurbs))
         | (FaceSurface::Nurbs(nurbs), FaceSurface::Plane { normal, d }) => {
-            plane_nurbs_intersection(*normal, *d, nurbs)
+            plane_nurbs_intersection(*normal, *d, nurbs, bbox_a, bbox_b)
         }
 
         (analytic_surf, FaceSurface::Nurbs(nurbs)) if analytic_surf.as_analytic().is_some() => {
@@ -6810,12 +6875,36 @@ fn analytic_analytic_intersection(
 }
 
 /// Plane-NURBS intersection.
+///
+/// Only the section within both faces' boxes can lie on both faces, so only
+/// its runs there are kept, refined to hold to the true section.
 fn plane_nurbs_intersection(
     normal: Vec3,
     d: f64,
     nurbs: &brepkit_math::nurbs::surface::NurbsSurface,
+    bbox_a: &Aabb3,
+    bbox_b: &Aabb3,
 ) -> Result<Vec<RawCurve>, AlgoError> {
-    let isect_curves = nurbs_isect::intersect_plane_nurbs(nurbs, normal, d, NURBS_SAMPLES)?;
+    let region = Aabb3 {
+        min: Point3::new(
+            bbox_a.min.x().max(bbox_b.min.x()),
+            bbox_a.min.y().max(bbox_b.min.y()),
+            bbox_a.min.z().max(bbox_b.min.z()),
+        ),
+        max: Point3::new(
+            bbox_a.max.x().min(bbox_b.max.x()),
+            bbox_a.max.y().min(bbox_b.max.y()),
+            bbox_a.max.z().min(bbox_b.max.z()),
+        ),
+    }
+    .expanded(Tolerance::new().linear * 10.0);
+    let isect_curves = nurbs_isect::intersect_plane_nurbs_in_region(
+        nurbs,
+        normal,
+        d,
+        NURBS_SAMPLES,
+        Some(region),
+    )?;
 
     let mut results = Vec::new();
     for ic in isect_curves {
@@ -7133,13 +7222,48 @@ fn circle_exits_plane_boundary(
             let Ok(edge) = topo.edge(oe.edge()) else {
                 continue;
             };
-            if !matches!(edge.curve(), EdgeCurve::Line) {
-                continue;
-            }
             let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
                 continue;
             };
             let (sp, ep) = (sv.point(), ev.point());
+            if !matches!(edge.curve(), EdgeCurve::Line) {
+                // A curved edge in the plane crosses the circle where its
+                // distance from the centre passes the radius (a wall's
+                // junction with the plane, bulging past it by a fraction of
+                // a millimetre over an arc no probe below lands in).
+                const PIECES: u32 = 64;
+                let curve = edge.curve();
+                let (t0, t1) = curve.domain_with_endpoints(sp, ep);
+                let at = |f: f64| curve.evaluate_with_endpoints((t1 - t0).mul_add(f, t0), sp, ep);
+                let off = |f: f64| (at(f) - circle.center()).length() - circle.radius();
+                for k in 0..PIECES {
+                    let (mut lo, mut hi) = (
+                        f64::from(k) / f64::from(PIECES),
+                        f64::from(k + 1) / f64::from(PIECES),
+                    );
+                    let (mut f_lo, f_hi) = (off(lo), off(hi));
+                    if f_lo * f_hi >= 0.0 {
+                        continue;
+                    }
+                    for _ in 0..60 {
+                        let mid = f64::midpoint(lo, hi);
+                        let f_mid = off(mid);
+                        if (f_mid > 0.0) == (f_lo > 0.0) {
+                            (lo, f_lo) = (mid, f_mid);
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    let p = at(f64::midpoint(lo, hi));
+                    let at_endpoint = (p - sp).length() < tol.linear * 10.0
+                        || (p - ep).length() < tol.linear * 10.0;
+                    if !at_endpoint {
+                        return true;
+                    }
+                    probes.push(circle.project(p).rem_euclid(tau));
+                }
+                continue;
+            }
             for (p, t) in circle.intersect_segment(sp, ep, tol.linear) {
                 let at_endpoint =
                     (p - sp).length() < tol.linear * 10.0 || (p - ep).length() < tol.linear * 10.0;
@@ -7338,6 +7462,7 @@ fn circle_face_hits(
             // edge running along the circle (a fillet's contact curve) adds no
             // crossing, as a coincident arc does not.
             curve @ EdgeCurve::NurbsCurve(_) => {
+                const PIECES: u32 = 64;
                 let off_circle = |p: Point3| (circle.evaluate(circle.project(p)) - p).length();
                 let (t0, t1) = curve.domain_with_endpoints(sv.point(), ev.point());
                 let mid = curve.evaluate_with_endpoints(0.5 * (t0 + t1), sv.point(), ev.point());
@@ -7347,6 +7472,48 @@ fn circle_face_hits(
                             let t = circle.project(p).rem_euclid(std::f64::consts::TAU);
                             edge_hits.push((t, p, Some(oe.edge())));
                         }
+                    }
+                }
+                // An edge in the circle's plane crossing it between its
+                // ends (a wall's junction with a plane face, bulging past a
+                // bore's circle over a short arc): where its distance from
+                // the centre passes the radius by more than the tolerance on
+                // both sides. One running along the circle (a fillet's
+                // contact curve) only wavers about it.
+                let at = |f: f64| {
+                    curve.evaluate_with_endpoints((t1 - t0).mul_add(f, t0), sv.point(), ev.point())
+                };
+                let in_plane = (0..=PIECES).all(|k| {
+                    circle
+                        .normal()
+                        .dot(at(f64::from(k) / f64::from(PIECES)) - circle.center())
+                        .abs()
+                        <= tol.linear * 100.0
+                });
+                if in_plane && off_circle(mid) > tol.linear * 10.0 {
+                    let clear = tol.linear * 10.0;
+                    let gap = |f: f64| (at(f) - circle.center()).length() - circle.radius();
+                    for k in 0..PIECES {
+                        let (mut lo, mut hi) = (
+                            f64::from(k) / f64::from(PIECES),
+                            f64::from(k + 1) / f64::from(PIECES),
+                        );
+                        let (mut g_lo, g_hi) = (gap(lo), gap(hi));
+                        if g_lo * g_hi >= 0.0 || g_lo.abs() <= clear || g_hi.abs() <= clear {
+                            continue;
+                        }
+                        for _ in 0..60 {
+                            let m = f64::midpoint(lo, hi);
+                            let g = gap(m);
+                            if (g > 0.0) == (g_lo > 0.0) {
+                                (lo, g_lo) = (m, g);
+                            } else {
+                                hi = m;
+                            }
+                        }
+                        let p = circle.evaluate(circle.project(at(f64::midpoint(lo, hi))));
+                        let t = circle.project(p).rem_euclid(std::f64::consts::TAU);
+                        edge_hits.push((t, p, Some(oe.edge())));
                     }
                 }
             }
