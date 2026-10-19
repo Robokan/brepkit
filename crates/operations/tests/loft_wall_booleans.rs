@@ -8,9 +8,8 @@
 //! section across the wall was trimmed only against straight edges, so a
 //! disc's faces left their sections running on past the disc's rim; and a
 //! piece of the disc's wall between two sections running rim to rim, with
-//! no seam line in its boundary, was read as a hole. The disc case is the
-//! shape of the real parts these came from; it still waits on the wall's
-//! boundary layout (see its `ignore`).
+//! no seam line in its boundary, was read as a hole; and the disc wall's far
+//! rim, walked against its curve, was laid out a turn off its near one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -147,7 +146,7 @@ fn lofted(topo: &mut Topology) -> SolidId {
 
 /// A disc of radius `r` and thickness `t` about the x axis, centred at
 /// `centre`: its wall's seam at the surface's u = 3pi/2, its rim circles
-/// starting at u = 0, as a file may write a cylinder face.
+/// starting there, as the STEP reader starts a closed circle at its vertex.
 fn disc(topo: &mut Topology, centre: Point3, r: f64, t: f64) -> SolidId {
     let axis = Vec3::new(1.0, 0.0, 0.0);
     let base = centre - axis * (0.5 * t);
@@ -157,7 +156,7 @@ fn disc(topo: &mut Topology, centre: Point3, r: f64, t: f64) -> SolidId {
     let vt = topo.add_vertex(Vertex::new(cyl.evaluate(seam_u, t), 1e-7));
     let rim = |v: f64| {
         let c = base + axis * v;
-        Circle3D::new_with_ref(c, axis, r, cyl.evaluate(0.0, v) - c).unwrap()
+        Circle3D::new_with_ref(c, axis, r, cyl.evaluate(seam_u, v) - c).unwrap()
     };
     let near = topo.add_edge(Edge::new(vb, vb, EdgeCurve::Circle(rim(0.0))));
     let far = topo.add_edge(Edge::new(vt, vt, EdgeCurve::Circle(rim(t))));
@@ -207,9 +206,6 @@ fn wall_radius(z: f64) -> f64 {
 }
 
 #[test]
-#[ignore = "the disc wall's boundary is laid out a turn off on one rim: its far rim, walked \
-            against its curve, runs from u = 0 down a turn while the near rim runs up one, so \
-            both seam copies land on one u and the sections never join the boundary"]
 fn a_disc_through_a_loft_wall_intersects_exactly() {
     let mut topo = Topology::new();
     let loft = lofted(&mut topo);

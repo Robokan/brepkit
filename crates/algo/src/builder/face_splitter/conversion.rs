@@ -343,6 +343,24 @@ fn resolve_seam_endpoint_uv(edges: &mut [OrientedPCurveEdge], surface: &FaceSurf
         .iter()
         .position(|e| at_apex(e.start_3d) && !at_apex(e.end_3d));
     // Walk from an edge anchored off the seam so continuity has a reference.
+    // A closed rim that starts on a seam line, as the STEP reader starts a
+    // closed circle at its vertex: its samples run from the vertex, so a rim
+    // walked against its curve is traversed from its stored end back to its
+    // start. (One starting elsewhere keeps the walk's own reading.)
+    let seam_line_at = |u: f64| {
+        edges.iter().any(|l| {
+            matches!(l.curve_3d, brepkit_topology::edge::EdgeCurve::Line)
+                && (l.start_uv.x() - l.end_uv.x()).abs() <= 1e-9
+                && (l.start_uv.x() - u)
+                    .rem_euclid(TAU)
+                    .min((u - l.start_uv.x()).rem_euclid(TAU))
+                    <= 1e-9
+        })
+    };
+    let anchored: Vec<bool> = edges
+        .iter()
+        .map(|e| (e.start_3d - e.end_3d).length() < 1e-10 && seam_line_at(e.start_uv.x()))
+        .collect();
     let Some(first) = leaves_apex.or_else(|| edges.iter().position(|e| !at_seam(e.start_uv.x())))
     else {
         return;
@@ -360,7 +378,7 @@ fn resolve_seam_endpoint_uv(edges: &mut [OrientedPCurveEdge], surface: &FaceSurf
     // projects to, so shifting it "nearest" would move it a period away
     // from the seam lines it shares vertices with.
     let nearest = |u: f64, target: f64| -> f64 { u - ((u - target) / TAU).round() * TAU };
-    let mut cur = if leaves_apex.is_some() {
+    let mut cur = if leaves_apex.is_some() || (anchored[first] && !edges[first].forward) {
         edges[first].end_uv.x()
     } else {
         edges[first].start_uv.x()
@@ -368,6 +386,14 @@ fn resolve_seam_endpoint_uv(edges: &mut [OrientedPCurveEdge], surface: &FaceSurf
     for k in 0..n {
         let e = &mut edges[(first + k) % n];
         let is_closed = (e.start_3d - e.end_3d).length() < 1e-10;
+        if is_closed && anchored[(first + k) % n] && matches!(surface, FaceSurface::Cylinder(_)) {
+            cur = if e.forward {
+                e.end_uv.x()
+            } else {
+                e.start_uv.x()
+            };
+            continue;
+        }
         if is_closed && !matches!(surface, FaceSurface::Cone(_)) {
             cur = e.end_uv.x();
             continue;

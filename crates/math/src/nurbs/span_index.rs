@@ -27,6 +27,8 @@ struct Span {
 #[derive(Debug, Clone)]
 pub struct SpanIndex {
     spans: Vec<Span>,
+    /// Each span's padded control box, by span index.
+    boxes: Vec<Aabb3>,
     bvh: Bvh,
     /// The largest control box diagonal, the scale of the surface's pieces.
     scale: f64,
@@ -97,6 +99,7 @@ impl SpanIndex {
         Some(Self {
             spans,
             bvh: Bvh::build(&boxes),
+            boxes: boxes.into_iter().map(|(_, b)| b).collect(),
             scale,
         })
     }
@@ -214,6 +217,53 @@ impl SpanIndex {
             .bvh
             .query_closest_with_distance(p, &|i| in_span(i).2.powi(2))?;
         Some(in_span(best))
+    }
+
+    /// The point of `surface` closest to `p` nearer than `bound`, as `(u, v,
+    /// distance)`: only spans whose boxes come nearer than the best point
+    /// so far are searched, nearest box first. `None` when no span comes
+    /// nearer than `bound`.
+    #[must_use]
+    pub fn closest_point_within(
+        &self,
+        surface: &NurbsSurface,
+        p: Point3,
+        bound: f64,
+    ) -> Option<(f64, f64, f64)> {
+        let reach = Vec3::new(bound, bound, bound);
+        let around = Aabb3 {
+            min: p - reach,
+            max: p + reach,
+        };
+        let mut near: Vec<(f64, usize)> = self
+            .bvh
+            .query_overlap(&around)
+            .into_iter()
+            .map(|i| (self.boxes[i].distance_squared_to_point(p).sqrt(), i))
+            .filter(|&(d, _)| d < bound)
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut best: Option<(f64, f64, f64)> = None;
+        for (box_gap, i) in near {
+            if box_gap >= best.map_or(bound, |b| b.2) {
+                break;
+            }
+            let span = self.spans[i];
+            let found = closest_from(
+                surface,
+                p,
+                (
+                    f64::midpoint(span.u.0, span.u.1),
+                    f64::midpoint(span.v.0, span.v.1),
+                ),
+                span.u,
+                span.v,
+            );
+            if found.2 < best.map_or(bound, |b| b.2) {
+                best = Some(found);
+            }
+        }
+        best
     }
 
     /// Where `p` lies on `surface`, if it lies on it: of the spans whose
