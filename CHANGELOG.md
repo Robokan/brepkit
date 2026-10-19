@@ -1,5 +1,26 @@
 # Changelog
 
+## [4.2.2](https://github.com/andymai/brepkit/compare/v4.2.1...v4.2.2) (2026-10-15)
+
+
+### Bug Fixes
+
+* mesh the folded freeform panel within tolerance ([#2039](https://github.com/andymai/brepkit/issues/2039)) ([d50265d](https://github.com/andymai/brepkit/commit/d50265dcbcd252f5212b7ec596eb68ca7380bbad))
+
+## [4.2.1](https://github.com/andymai/brepkit/compare/v4.2.0...v4.2.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* **operations:** mesh v-closed NURBS faces, pole meridians and seamed sphere caps ([#2036](https://github.com/andymai/brepkit/issues/2036)) ([41c7e5f](https://github.com/andymai/brepkit/commit/41c7e5f10b9a6269a587a1cecdeffba07e3470dd))
+
+## [4.2.0](https://github.com/andymai/brepkit/compare/v4.1.49...v4.2.0) (2026-10-14)
+
+
+### Features
+
+* **io:** read STEP units, assembly placements, surface models and seamless faces ([#2035](https://github.com/andymai/brepkit/issues/2035)) ([3405058](https://github.com/andymai/brepkit/commit/3405058e1e159f1cb0718d5966d22e06d49ea5a3))
+
 ## [4.1.49](https://github.com/andymai/brepkit/compare/v4.1.48...v4.1.49) (2026-10-11)
 
 
