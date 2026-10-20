@@ -424,9 +424,23 @@ fn fill_ef_in(topo: &Topology, arena: &mut GfaArena) {
                     // a notch ceiling stands 0.0026 off the ceiling at 20% of
                     // its chord, crossing it at 11 degrees.
                     let straight = matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line);
-                    let band = if straight && matches!(surface, FaceSurface::Plane { .. }) {
+                    //
+                    // An analytic curved face takes no leaf a macroscopic
+                    // distance off it either: the grazes the ratio was calibrated on lie
+                    // against plane walls, and a cylinder's rim arc that
+                    // crosses another cylinder at its two ends (a pipe's end
+                    // circle across a post) stands 18% of its chord off it.
+                    let plane = matches!(surface, FaceSurface::Plane { .. });
+                    let quadric = matches!(
+                        surface,
+                        FaceSurface::Cylinder(_)
+                            | FaceSurface::Cone(_)
+                            | FaceSurface::Sphere(_)
+                            | FaceSurface::Torus(_)
+                    );
+                    let band = if straight && plane {
                         (IN_FACE_MAX_DEVIATION_RATIO * chord).min(crate::ds::shape_store::MAX_WIDEN)
-                    } else if straight {
+                    } else if straight || quadric {
                         (IN_FACE_MAX_DEVIATION_RATIO * chord).min(IN_FACE_MAX_DEVIATION_ABS)
                     } else {
                         IN_FACE_MAX_DEVIATION_RATIO * chord
