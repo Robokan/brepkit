@@ -402,6 +402,37 @@ pub(super) fn tessellate_revolution_band_shared(
         if !whole_turn && (winding.abs() - TAU).abs() > 1e-6 {
             return Ok(false);
         }
+        // The sweep pairs the rims by angle, so each must advance in u one
+        // way all round: a pin's section through a bore's mouth runs back on
+        // itself where the pin's wall is tangent to the bore's, and sorting
+        // its samples by angle stitched the fold across itself.
+        if !whole_turn {
+            let mut at: Option<brepkit_topology::vertex::VertexId> = None;
+            let mut prev: Option<f64> = None;
+            for &ci in cycle {
+                let (eid, sv, ev) = curved[ci];
+                let Some(ids) = edge_global_indices.get(&eid) else {
+                    return Ok(false);
+                };
+                let along = !matches!(at, Some(v) if v != sv);
+                at = Some(if along { ev } else { sv });
+                let ordered: Box<dyn Iterator<Item = &u32>> = if along {
+                    Box::new(ids.iter())
+                } else {
+                    Box::new(ids.iter().rev())
+                };
+                for &gid in ordered {
+                    let (u, _) = project(merged.positions[gid as usize]);
+                    if let Some(p) = prev {
+                        let du = wrap_pi(u - p);
+                        if du * winding < -1e-9 {
+                            return Ok(false);
+                        }
+                    }
+                    prev = Some(u);
+                }
+            }
+        }
     }
 
     // Pull each rim's shared global vertex IDs. Chained pieces share their
