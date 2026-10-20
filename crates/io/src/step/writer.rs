@@ -333,11 +333,27 @@ impl StepWriteContext {
             }
         };
 
+        // A fitted curve can run against its edge (a piece of a closed
+        // section loop, stored from its end back): its span then runs down,
+        // and the edge's sense must say so, or a reader takes the curve from
+        // the start vertex onward, the other way round the loop.
+        let same_sense = match edge.curve() {
+            EdgeCurve::NurbsCurve(_) => {
+                let sp = topo.vertex(edge.start()).map_err(topo_err)?.point();
+                let ep = topo.vertex(edge.end()).map_err(topo_err)?.point();
+                let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
+                t0 <= t1
+            }
+            _ => true,
+        };
         let edge_curve = self.next_id();
         self.write_entity(
             edge_curve,
             "EDGE_CURVE",
-            &format!("'', #{start_vp}, #{end_vp}, #{curve_id}, .T.)"),
+            &format!(
+                "'', #{start_vp}, #{end_vp}, #{curve_id}, {})",
+                if same_sense { ".T." } else { ".F." }
+            ),
         );
 
         self.edge_map.insert(key, edge_curve);
