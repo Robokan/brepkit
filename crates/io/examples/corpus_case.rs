@@ -38,7 +38,8 @@ fn census(topo: &Topology, sid: SolidId) -> String {
     }
     let vol =
         brepkit_operations::measure::oriented_solid_volume(topo, sid, 0.01).unwrap_or(f64::NAN);
-    format!("{mix:?} volume={vol:.4}")
+    let sv = brepkit_operations::measure::solid_volume(topo, sid, 0.001).unwrap_or(f64::NAN);
+    format!("{mix:?} volume={vol:.4} solid_volume={sv:.4}")
 }
 
 fn faces(path: &Path) {
@@ -117,6 +118,37 @@ fn face_table(topo: &Topology, sid: SolidId) {
             u8::from(face.is_reversed()),
             1 + face.inner_wires().len()
         );
+        // WIRES=<i,j,...>: those faces' loops, edge by edge
+        if std::env::var("WIRES").is_ok_and(|v| v.split(',').any(|t| t == i.to_string())) {
+            for w in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+                println!("  loop");
+                for oe in topo.wire(w).unwrap().edges() {
+                    let e = topo.edge(oe.edge()).unwrap();
+                    let (p, q) = (
+                        topo.vertex(oe.oriented_start(e)).unwrap().point(),
+                        topo.vertex(oe.oriented_end(e)).unwrap().point(),
+                    );
+                    let (es, ee) = (
+                        topo.vertex(e.start()).unwrap().point(),
+                        topo.vertex(e.end()).unwrap().point(),
+                    );
+                    let dom = e.curve().domain_with_endpoints(es, ee);
+                    println!(
+                        "    e{} {} dom=({:.4},{:.4}) ({:.3},{:.3},{:.3})->({:.3},{:.3},{:.3})",
+                        oe.edge().index(),
+                        e.curve().type_tag(),
+                        dom.0,
+                        dom.1,
+                        p.x(),
+                        p.y(),
+                        p.z(),
+                        q.x(),
+                        q.y(),
+                        q.z()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -366,6 +398,58 @@ fn main() {
         }
         return;
     }
+    // A cut by a body of several solids runs as the bridge runs it: each
+    // cutter whose box meets the part, in turn. STEP=<i> stops before cutter
+    // i and writes the part so far to part.step and the cutter to tool.step,
+    // for the case's failing step to be replayed alone.
+    if op == BooleanOp::Cut && (b.len() > 1 || a.len() > 1) {
+        let stop: Option<usize> = std::env::var("STEP").ok().and_then(|v| v.parse().ok());
+        for (ai, &part) in a.iter().enumerate() {
+            let mut s = part;
+            for (j, &c) in b.iter().enumerate() {
+                let (pb, cb) = (
+                    brepkit_operations::measure::solid_bounding_box(&topo, s).unwrap(),
+                    brepkit_operations::measure::solid_bounding_box(&topo, c).unwrap(),
+                );
+                if !pb.intersects(cb) {
+                    continue;
+                }
+                if stop == Some(j) {
+                    std::fs::write(
+                        "part.step",
+                        brepkit_io::step::write_step(&topo, &[s]).unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        "tool.step",
+                        brepkit_io::step::write_step(&topo, &[c]).unwrap(),
+                    )
+                    .unwrap();
+                    println!("wrote part.step and tool.step for solid {ai}, cutter {j}");
+                    return;
+                }
+                let before = brepkit_operations::boolean::mesh_fallback_count();
+                match brepkit_operations::boolean::boolean_with_options(
+                    &mut topo,
+                    op,
+                    s,
+                    c,
+                    BooleanOptions::default(),
+                ) {
+                    Ok(r) => {
+                        let fb = brepkit_operations::boolean::mesh_fallback_count() > before;
+                        println!("solid {ai} cutter {j}: fallback={fb} {}", census(&topo, r));
+                        s = r;
+                    }
+                    Err(e) => {
+                        println!("solid {ai} cutter {j}: error {e}");
+                        break;
+                    }
+                }
+            }
+        }
+        return;
+    }
     let before = brepkit_operations::boolean::mesh_fallback_count();
     let r = brepkit_operations::boolean::boolean_with_options(
         &mut topo,
@@ -383,6 +467,37 @@ fn main() {
     match r {
         Ok(s) => {
             println!("brepkit (fallback={fell_back}): {}", census(&topo, s));
+            if std::env::var("FACES").is_ok() {
+                face_table(&topo, s);
+            }
+            // SOLIDMESH=1: each face's area in the solid's shared-edge mesh
+            if std::env::var("SOLIDMESH").is_ok() {
+                let (mesh, offsets) =
+                    brepkit_operations::tessellate::tessellate_solid_grouped_with_tolerance(
+                        &topo,
+                        s,
+                        0.01,
+                        brepkit_math::chord::DEFAULT_ANGULAR_TOL,
+                    )
+                    .unwrap();
+                let faces = solid_faces(&topo, s).unwrap();
+                for (fi, span) in offsets.windows(2).enumerate() {
+                    let mut area = 0.0;
+                    let mut vol = 0.0;
+                    for t in mesh.indices[span[0] as usize..span[1] as usize].chunks_exact(3) {
+                        let [a, b, c] = [0, 1, 2].map(|k| mesh.positions[t[k] as usize]);
+                        area += (b - a).cross(c - a).length() / 2.0;
+                        let o = brepkit_math::vec::Point3::new(0.0, 0.0, 0.0);
+                        let (a, b, c) = (a - o, b - o, c - o);
+                        vol += a.dot(b.cross(c)) / 6.0;
+                    }
+                    let exact = brepkit_operations::measure::face_area(&topo, faces[fi], 0.01)
+                        .unwrap_or(f64::NAN);
+                    println!(
+                        "solidmesh face {fi:3} area={area:12.4} exact={exact:12.4} vol={vol:12.4}"
+                    );
+                }
+            }
             // FOLDS=1: plane faces meeting face to face
             if std::env::var("FOLDS").is_ok() {
                 println!("result folds:");
