@@ -447,6 +447,32 @@ pub(super) fn circle_edge_is_iso_v_rim(
         && u_span.abs() < std::f64::consts::TAU - 1e-9
 }
 
+/// The span of `curve` that an edge from `start` to `end` traces, in the
+/// order the edge runs. On a closed NURBS curve `domain_with_endpoints` reads
+/// an edge run against the curve as the whole loop (its reversed projection
+/// pair could be a sub-arc across the curve's seam); the edge's ends read the
+/// other way round give its own span, reversed. A section that is a piece of
+/// a closed intersection loop (a pin crossing a bore's mouth) has such a
+/// reversed copy, and sampling the whole loop found the far piece's ends on
+/// it.
+fn traversal_domain(curve: &EdgeCurve, start: Point3, end: Point3) -> (f64, f64) {
+    let span = curve.domain_with_endpoints(start, end);
+    if let EdgeCurve::NurbsCurve(n) = curve
+        && (start - end).length() > 1e-9
+    {
+        let whole = brepkit_math::traits::ParametricCurve::domain(n);
+        let is_whole =
+            |d: (f64, f64)| (d.0 - whole.0).abs() < 1e-12 && (d.1 - whole.1).abs() < 1e-12;
+        if is_whole(span) {
+            let back = curve.domain_with_endpoints(end, start);
+            if !is_whole(back) && !is_whole((back.1, back.0)) {
+                return (back.1, back.0);
+            }
+        }
+    }
+    span
+}
+
 /// Find split parameters on a marched-NURBS SECTION edge by sampled
 /// point-to-curve projection.
 ///
@@ -470,9 +496,7 @@ pub(super) fn find_splits_on_nurbs_section(
     // evaluations per candidate point, which turned each pad-fuse face split
     // into ~700ms (the lite magnet scenarios' timeout class). One domain
     // computation per edge, then direct parametric evaluation.
-    let (dom0, dom1) = edge
-        .curve_3d
-        .domain_with_endpoints(edge.start_3d, edge.end_3d);
+    let (dom0, dom1) = traversal_domain(&edge.curve_3d, edge.start_3d, edge.end_3d);
     let dom_span = dom1 - dom0;
     let eval_at = |t: f64| -> Point3 {
         edge.curve_3d

@@ -387,11 +387,19 @@ fn resolve_seam_endpoint_uv(edges: &mut [OrientedPCurveEdge], surface: &FaceSurf
         let e = &mut edges[(first + k) % n];
         let is_closed = (e.start_3d - e.end_3d).length() < 1e-10;
         if is_closed && anchored[(first + k) % n] && matches!(surface, FaceSurface::Cylinder(_)) {
-            cur = if e.forward {
-                e.end_uv.x()
+            // It starts where the walk is, on the seam line it leaves from:
+            // moved by whole periods onto the running u (reached by a seam
+            // line a turn away from the copy it is stored at, it lay a turn
+            // off the rest of the wall).
+            let (from, to) = if e.forward {
+                (e.start_uv.x(), e.end_uv.x())
             } else {
-                e.start_uv.x()
+                (e.end_uv.x(), e.start_uv.x())
             };
+            let shift = nearest(from, cur) - from;
+            e.start_uv = Point2::new(e.start_uv.x() + shift, e.start_uv.y());
+            e.end_uv = Point2::new(e.end_uv.x() + shift, e.end_uv.y());
+            cur = to + shift;
             continue;
         }
         if is_closed && !matches!(surface, FaceSurface::Cone(_)) {

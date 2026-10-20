@@ -8438,7 +8438,19 @@ fn split_plane_line_at_curved_boundaries(
                 matches!(e.curve(), EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_))
             })
         });
-        if !curved {
+        // A round hole the polygon clips cannot see either: they bound the
+        // line by the outline alone, and a ruling across a hole's mouth (a
+        // pin straddling a wall where a bore opens) ran on through it.
+        let holed = with_holes
+            && face.inner_wires().iter().any(|&wid| {
+                topo.wire(wid).is_ok_and(|w| {
+                    w.edges().iter().any(|oe| {
+                        topo.edge(oe.edge())
+                            .is_ok_and(|e| matches!(e.curve(), EdgeCurve::Circle(_)))
+                    })
+                })
+            });
+        if !curved && !holed {
             continue;
         }
         let mut hits: Vec<Point3> = Vec::new();

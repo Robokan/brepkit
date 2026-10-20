@@ -1642,6 +1642,7 @@ fn split_sections_at_seam_meridian(
     sections: &[SectionEdge],
     surface: &FaceSurface,
     seam_u: f64,
+    wire_pts: &[Point3],
     tol: f64,
 ) -> Vec<SectionEdge> {
     use std::f64::consts::{PI, TAU};
@@ -1689,6 +1690,22 @@ fn split_sections_at_seam_meridian(
             piece.start_uv_b = None;
             piece.end_uv_b = None;
             piece.pave_block_id = None;
+            // A NURBS pcurve reads its UV ends off its own ends, which are
+            // the whole section's: each half gets its own on this face.
+            if matches!(piece.pcurve_a, brepkit_math::curves2d::Curve2D::Nurbs(_))
+                || matches!(piece.pcurve_b, brepkit_math::curves2d::Curve2D::Nurbs(_))
+            {
+                let pcurve = compute_pcurve_on_surface(
+                    &piece.curve_3d,
+                    piece.start,
+                    piece.end,
+                    surface,
+                    wire_pts,
+                    None,
+                );
+                piece.pcurve_a = pcurve.clone();
+                piece.pcurve_b = pcurve;
+            }
         }
         out.push(first);
         out.push(second);
@@ -6338,16 +6355,19 @@ fn split_face_2d_impl(
     // boundary-splitting below anchors the seam edge at the same 3D point
     // and the graphs share a vertex.
     // A conic section crossing a cone's seam ruling needs the same anchor to
-    // pass from one seam copy to the other.
+    // pass from one seam copy to the other, and so does any section crossing
+    // a cylinder's seam line: a loop that closes across it (a pin through a
+    // bore's mouth, its seam inside the bite) has its pieces laid a turn
+    // apart in UV, and only a vertex on the seam joins them.
     let seam_anchored_sections: Vec<SectionEdge>;
     let sections: &[SectionEdge] = if !is_plane
         && super::pcurve_compute::surface_periods(&surface).0.is_some()
-        && (matches!(surface, FaceSurface::Cone(_))
+        && (matches!(surface, FaceSurface::Cone(_) | FaceSurface::Cylinder(_))
             || sections_form_winding_chain(sections, &surface, tol.linear))
         && let Some(seam_u) = boundary_seam_u(&boundary_edges, &surface, tol.linear)
     {
         seam_anchored_sections =
-            split_sections_at_seam_meridian(sections, &surface, seam_u, tol.linear);
+            split_sections_at_seam_meridian(sections, &surface, seam_u, &wire_pts, tol.linear);
         &seam_anchored_sections
     } else {
         sections
