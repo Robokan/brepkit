@@ -197,19 +197,20 @@ files). Follow the `pr-workflow` skill. Upstream bans the reference kernel's
 name in code, commit messages and PR text, so word around it ("some STEP
 writers", "a reference kernel"); leave BuzzCAD and corpus names out too.
 
-**In flight (2026-10-13).** Seven PR branches are pushed to `origin`
-(Robokan/brepkit), each `upstream/main` plus one fix. Their PR descriptions
-are in `buzzcad-prs/`. No PR is open yet.
+**In flight.** Seven PR branches are pushed to `origin` (Robokan/brepkit),
+each `upstream/main` plus one fix, and all seven PRs were opened on
+2026-10-22 (#2045-#2051), without auto-merge. Their descriptions are in
+`buzzcad-prs/`.
 
 | branch | body | status |
 |---|---|---|
-| fix/shell-orientation-holes | shell.md | tested, sweep and audit unchanged; open first |
-| fix/step-outer-loop-by-area | outer.md | tested (2026-10-20) |
-| fix/step-vertex-loop-sphere | sphere.md | tested (2026-10-20) |
-| fix/step-planes-facing-out | planes.md | tested (2026-10-20); stacked on shell-orientation-holes |
-| fix/cylinder-wall-rim-notches | notch.md | tested, sweep and audit unchanged |
-| fix/plane-cylinder-line-outside-face | line.md | tested, sweep and audit unchanged |
-| fix/ring-face-sample | ring.md | tested, sweep and audit unchanged |
+| fix/shell-orientation-holes | shell.md | [#2045](https://github.com/andymai/brepkit/pull/2045) open; tested, sweep and audit unchanged |
+| fix/step-outer-loop-by-area | outer.md | [#2046](https://github.com/andymai/brepkit/pull/2046) open; tested (2026-10-20) |
+| fix/step-vertex-loop-sphere | sphere.md | [#2047](https://github.com/andymai/brepkit/pull/2047) open; tested (2026-10-20) |
+| fix/step-planes-facing-out | planes.md | [#2051](https://github.com/andymai/brepkit/pull/2051) open; tested (2026-10-20); stacked on shell-orientation-holes |
+| fix/cylinder-wall-rim-notches | notch.md | [#2048](https://github.com/andymai/brepkit/pull/2048) open; tested, sweep and audit unchanged |
+| fix/plane-cylinder-line-outside-face | line.md | [#2049](https://github.com/andymai/brepkit/pull/2049) open; tested, sweep and audit unchanged |
+| fix/ring-face-sample | ring.md | [#2050](https://github.com/andymai/brepkit/pull/2050) open; tested, sweep and audit unchanged |
 
 "Tested" means clippy clean and `cargo test -p brepkit-algo -p
 brepkit-operations --lib` passing (1197 tests) on that branch alone; for
@@ -223,25 +224,20 @@ operations suites (2084 tests).
 
 Next:
 
-1. Set up (once per machine):
-
-   ```bash
-   git remote add upstream https://github.com/andymai/brepkit.git
-   git fetch upstream origin
-   git worktree add .worktrees/upstream-prs fix/shell-orientation-holes
-   ```
-
-2. In `.worktrees/upstream-prs`, for each untested io branch:
-   `git switch <branch>`, `cargo clippy -p brepkit-io --all-targets -- -D warnings`,
-   `cargo test -p brepkit-io`.
-3. For the four algo branches, run the pose sweep and truth audit (see the
-   `pr-workflow` skill) on `upstream/main` and on the branch, and account for
-   any line that changes.
-4. Open each PR, shell-orientation-holes first, from this checkout's root
-   (the PR bodies live on the fork's `main`, not on the PR branches):
-   `gh pr create --repo andymai/brepkit --head Robokan:<branch> --title "<commit subject>" --body-file buzzcad-prs/<body>`.
-   Do not set auto-merge; merging is the maintainer's call. Record the PR
-   numbers here.
+1. Watch the open PRs. An AI reviewer (cubic) and Copilot comment within
+   minutes: `gh api repos/andymai/brepkit/pulls/<N>/comments` and
+   `gh pr view <N> --repo andymai/brepkit --comments`. Fix real findings on the
+   PR branch (in `.worktrees/upstream-prs`), push to `origin`, and answer the
+   rest. Do not merge or set auto-merge: the PRs come from the fork, and
+   merging is the maintainer's call. `gh pr edit` fails on a GitHub
+   deprecation error; patch a body with
+   `gh api -X PATCH repos/andymai/brepkit/pulls/<N> -F body=@<file>`.
+2. Batch two, each its own branch off `upstream/main`, checked the same way
+   (tests, pose sweep and truth audit, banned-name grep), from the fork's
+   commits of 2026-10-20: the STEP writer's `same_sense` (`e3fd82db`), the
+   band mesh declining a rim that folds back (`11744679`), the coplanar merge
+   with round holes (`c3eb7b7c`), and the closed-NURBS span reading in
+   `domain_with_endpoints` (part of `9f9d08b1`, with its unit test).
 
 ### Continuing on another machine
 

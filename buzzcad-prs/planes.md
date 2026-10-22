@@ -1,4 +1,4 @@
-**Depends on the shell orientation holes PR** (its commit is included here; review only the second commit).
+**Depends on #2045**: its commit is included here; review only the second commit.
 
 A STEP face may sit turned against its plane: its surface normal facing into the solid, the face's sense false. The reader kept that plane, set the face's reversed flag and wound its loops about the inward normal. brepkit builds a plane facing out and unreversed, its loops wound about that normal, and the boolean assembler reads a planar face's orientation from its loop. On a part read with many such planes, the assembler judged the shell inward and failed with "no outer shell found". A face turned against its plane now takes the plane flipped instead (normal and offset negated, loops wound the other way). Surfaces that cannot flip, such as a bore's cylinder, keep the reversed flag.
 
