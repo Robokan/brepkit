@@ -203,16 +203,21 @@ are in `buzzcad-prs/`. No PR is open yet.
 
 | branch | body | status |
 |---|---|---|
-| fix/shell-orientation-holes | shell.md | tested; open first |
-| fix/step-outer-loop-by-area | outer.md | not tested yet |
-| fix/step-vertex-loop-sphere | sphere.md | not tested yet |
-| fix/step-planes-facing-out | planes.md | not tested yet; stacked on shell-orientation-holes |
-| fix/cylinder-wall-rim-notches | notch.md | tested |
-| fix/plane-cylinder-line-outside-face | line.md | tested |
-| fix/ring-face-sample | ring.md | tested |
+| fix/shell-orientation-holes | shell.md | tested, sweep and audit unchanged; open first |
+| fix/step-outer-loop-by-area | outer.md | tested (2026-10-20) |
+| fix/step-vertex-loop-sphere | sphere.md | tested (2026-10-20) |
+| fix/step-planes-facing-out | planes.md | tested (2026-10-20); stacked on shell-orientation-holes |
+| fix/cylinder-wall-rim-notches | notch.md | tested, sweep and audit unchanged |
+| fix/plane-cylinder-line-outside-face | line.md | tested, sweep and audit unchanged |
+| fix/ring-face-sample | ring.md | tested, sweep and audit unchanged |
 
 "Tested" means clippy clean and `cargo test -p brepkit-algo -p
-brepkit-operations --lib` passing (1197 tests) on that branch alone. The
+brepkit-operations --lib` passing (1197 tests) on that branch alone; for
+the io branches, `cargo test -p brepkit-io`. On 2026-10-20 all seven still
+merged cleanly onto `upstream/main` (4.2.2 + 11 commits), the banned-name
+grep was clean on every branch and body, and the pose sweep and truth
+audit matched `upstream/main` line for line on the four algo branches
+(the audit's two `!` lines, a rod through a ring, are upstream's own). The
 fork's `main`, with all seven fixes together, passed the full io, algo and
 operations suites (2084 tests).
 
