@@ -400,16 +400,20 @@ fn resolve_seam_endpoint_uv(edges: &mut [OrientedPCurveEdge], surface: &FaceSurf
             // It starts where the walk is, on the seam line it leaves from:
             // moved by whole periods onto the running u (reached by a seam
             // line a turn away from the copy it is stored at, it lay a turn
-            // off the rest of the wall).
-            let (from, to) = if e.forward {
-                (e.start_uv.x(), e.end_uv.x())
+            // off the rest of the wall). Its start_uv is where its turn
+            // starts, as the closed-rim split reads it, and its end_uv keeps
+            // the curve's own sense; the walk goes on a turn in the
+            // traversal's (walked against its curve, a bore's far rim had
+            // been laid a turn below the wall).
+            let native: f64 = if e.end_uv.x() < e.start_uv.x() {
+                -1.0
             } else {
-                (e.end_uv.x(), e.start_uv.x())
+                1.0
             };
-            let shift = nearest(from, cur) - from;
+            let shift = nearest(e.start_uv.x(), cur) - e.start_uv.x();
             e.start_uv = Point2::new(e.start_uv.x() + shift, e.start_uv.y());
             e.end_uv = Point2::new(e.end_uv.x() + shift, e.end_uv.y());
-            cur = to + shift;
+            cur = if e.forward { native } else { -native }.mul_add(TAU, e.start_uv.x());
             continue;
         }
         if is_closed && !matches!(surface, FaceSurface::Cone(_)) {

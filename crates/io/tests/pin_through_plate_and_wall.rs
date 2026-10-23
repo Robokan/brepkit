@@ -70,9 +70,6 @@ fn removed(behind: bool) -> f64 {
 fn a_pin_through_a_plate_and_a_wall_over_it_cuts_exactly() {
     for behind in [true, false] {
         for seam in [0.0_f64, 90.0, 180.0, 270.0] {
-            if !behind && (seam - 90.0).abs() < 1e-9 {
-                continue; // see the ignored test below
-            }
             let label = format!(
                 "block {}, seam {seam}",
                 if behind { "behind" } else { "in front" }
@@ -104,28 +101,4 @@ fn a_pin_through_a_plate_and_a_wall_over_it_cuts_exactly() {
             );
         }
     }
-}
-
-/// The block in front of the pin's axis with the pin's seam at u = 0 of the
-/// wall's own frame, inside the patch: still falls back.
-#[test]
-#[ignore = "falls back to the mesh boolean in this pose"]
-fn a_pin_through_a_plate_and_a_wall_in_front_with_the_seam_in_the_patch() {
-    let mut built = Topology::new();
-    let part = part(&mut built, false);
-    let pin = make_cylinder(&mut built, R, 444.0).unwrap();
-    transform_solid(
-        &mut built,
-        pin,
-        &(Mat4::translation(PIN.0, PIN.1, 706.2) * Mat4::rotation_z(90.0_f64.to_radians())),
-    )
-    .unwrap();
-    let mut topo = Topology::new();
-    let (part, pin) = (
-        through_step(&built, part, &mut topo),
-        through_step(&built, pin, &mut topo),
-    );
-    let before = mesh_fallback_count();
-    let _ = boolean(&mut topo, BooleanOp::Cut, part, pin).unwrap();
-    assert_eq!(mesh_fallback_count(), before, "mesh fallback");
 }

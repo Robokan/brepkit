@@ -1193,6 +1193,34 @@ fn is_periodic_face_outside(lp: &[OrientedPCurveEdge], surface: &FaceSurface) ->
     (closing - first.x()).abs() < PI && signed_area_2d(&pts) < 0.0
 }
 
+/// Whether every piece of `lp` is one of the face's own boundary pieces run
+/// backwards: a pocket of the outside that the face's wire encloses on the
+/// glued wall (a slot cut along a bore, across its seam), which the face
+/// trace returns as an orbit of its boundary's twins. It is no region of the
+/// face.
+fn runs_boundary_backwards(
+    lp: &[OrientedPCurveEdge],
+    boundary: &[OrientedPCurveEdge],
+    tol: f64,
+) -> bool {
+    let weld = tol * 100.0;
+    !lp.is_empty()
+        && lp.iter().all(|e| {
+            e.source_edge_idx.is_none()
+                && boundary.iter().any(|b| {
+                    std::mem::discriminant(&b.curve_3d) == std::mem::discriminant(&e.curve_3d)
+                        && (b.start_3d - e.end_3d).length() <= weld
+                        && (b.end_3d - e.start_3d).length() <= weld
+                        && (b.start_3d - b.end_3d).length() > weld
+                })
+                && !boundary.iter().any(|b| {
+                    std::mem::discriminant(&b.curve_3d) == std::mem::discriminant(&e.curve_3d)
+                        && (b.start_3d - e.start_3d).length() <= weld
+                        && (b.end_3d - e.end_3d).length() <= weld
+                })
+        })
+}
+
 /// True when any traced loop's sampled UV polygon is area-degenerate — the
 /// classifier's sliver guard would silently drop it, so the loops path
 /// under-represents the face even though the loop COUNT looks fine. The
@@ -6582,8 +6610,48 @@ fn split_face_2d_impl(
                 None
             }
         });
+        // On a cylinder laid out in one window (seam lines a period apart),
+        // a closed rim's turn, run from its start_uv the way it is
+        // traversed, belongs in that window: it moves there by whole
+        // periods, or stays where the boundary walk put it.
+        let window = if matches!(surface, FaceSurface::Cylinder(_)) {
+            let us: Vec<f64> = boundary_edges
+                .iter()
+                .filter(|e| {
+                    matches!(e.curve_3d, EdgeCurve::Line)
+                        && (e.start_uv.x() - e.end_uv.x()).abs() <= 1e-9
+                })
+                .map(|e| e.start_uv.x())
+                .collect();
+            let lo = us.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = us.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            (us.len() >= 2 && ((hi - lo) - std::f64::consts::TAU).abs() <= 1e-6).then_some(lo)
+        } else {
+            None
+        };
         if let Some(seam_u) = seam_u_opt {
             for edge in &mut boundary_edges {
+                if (edge.start_3d - edge.end_3d).length() < 1e-10
+                    && let Some(lo) = window
+                {
+                    let native = if edge.end_uv.x() < edge.start_uv.x() {
+                        -1.0_f64
+                    } else {
+                        1.0
+                    };
+                    let dir = if edge.forward { native } else { -native };
+                    let run_lo = edge
+                        .start_uv
+                        .x()
+                        .min(std::f64::consts::TAU.mul_add(dir, edge.start_uv.x()));
+                    let turns = (lo - run_lo) / std::f64::consts::TAU;
+                    if (turns - turns.round()).abs() <= 1e-6 {
+                        let by = turns.round() * std::f64::consts::TAU;
+                        edge.start_uv = Point2::new(edge.start_uv.x() + by, edge.start_uv.y());
+                        edge.end_uv = Point2::new(edge.end_uv.x() + by, edge.end_uv.y());
+                        continue;
+                    }
+                }
                 if (edge.start_3d - edge.end_3d).length() < 1e-10 {
                     // Closed edge: shift UV so start_uv.x() == seam_u. One
                     // already starting on a copy of the seam's u was placed
@@ -8879,7 +8947,10 @@ fn split_face_2d_impl(
         // subdivision; adopt it only when it strictly refines the greedy
         // partition and is clean by every loop-health signature.
         let mut dcel = build_wire_loops_dcel(&all_edges, tol.linear, u_periodic, v_periodic);
-        dcel.retain(|lp| !is_periodic_face_outside(lp, &surface));
+        dcel.retain(|lp| {
+            !is_periodic_face_outside(lp, &surface)
+                && !runs_boundary_backwards(lp, &all_edges[..n_boundary_edges], tol.linear)
+        });
         // This branch is u-periodic by its gate: the pinch splitter is
         // unsafe on the glued seam graph (see the DCEL consult above), so
         // the trace is used as-is. The broken-loop flags are RELATIVE to the
