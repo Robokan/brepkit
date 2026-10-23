@@ -438,7 +438,12 @@ fn main() {
                 ) {
                     Ok(r) => {
                         let fb = brepkit_operations::boolean::mesh_fallback_count() > before;
-                        println!("solid {ai} cutter {j}: fallback={fb} {}", census(&topo, r));
+                        let valid = brepkit_operations::validate::validate_solid(&topo, r)
+                            .is_ok_and(|v| v.is_valid());
+                        println!(
+                            "solid {ai} cutter {j}: fallback={fb} valid={valid} {}",
+                            census(&topo, r)
+                        );
                         s = r;
                     }
                     Err(e) => {
@@ -466,7 +471,19 @@ fn main() {
     let fell_back = brepkit_operations::boolean::mesh_fallback_count() > before;
     match r {
         Ok(s) => {
-            println!("brepkit (fallback={fell_back}): {}", census(&topo, s));
+            let valid = brepkit_operations::validate::validate_solid(&topo, s)
+                .map(|r| {
+                    if r.is_valid() {
+                        "valid".to_string()
+                    } else {
+                        format!("INVALID {:?}", r.issues)
+                    }
+                })
+                .unwrap_or_default();
+            println!(
+                "brepkit (fallback={fell_back}): {} {valid}",
+                census(&topo, s)
+            );
             if std::env::var("FACES").is_ok() {
                 face_table(&topo, s);
             }
