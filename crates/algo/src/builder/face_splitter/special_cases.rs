@@ -1536,7 +1536,7 @@ fn loop_plane(pts: &[Point3]) -> Option<(brepkit_math::vec::Vec3, Point3)> {
 
 /// Reverse a loop's orientation (a hole is traversed opposite to the containing
 /// region's outer wire).
-fn reverse_loop(loop_edges: &[OrientedPCurveEdge]) -> Vec<OrientedPCurveEdge> {
+pub(super) fn reverse_loop(loop_edges: &[OrientedPCurveEdge]) -> Vec<OrientedPCurveEdge> {
     loop_edges
         .iter()
         .rev()

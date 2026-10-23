@@ -7220,6 +7220,96 @@ fn split_face_2d_impl(
         Vec::new()
     };
 
+    // A whole circle across a cylinder's wall starts and ends at one point,
+    // on the seam line, where the wall's two seam copies are glued into one
+    // vertex of the trace graph. Two such circles (a pin through a plate) and
+    // the seam between them bound a band the face traces cannot tell from
+    // the bands beside it at that pinch, and it was dropped. Each circle is
+    // split in thirds from its start, so its pieces run between plain
+    // vertices, each under the half turn the traces' unwrapping allows.
+    let split_circles: Vec<SectionEdge>;
+    let mut circles_split = false;
+    let sections: &[SectionEdge] = if u_periodic
+        && matches!(surface, FaceSurface::Cylinder(_))
+        && sections.iter().any(|s| {
+            matches!(s.curve_3d, EdgeCurve::Circle(_)) && (s.start - s.end).length() < 1e-10
+        }) {
+        split_circles = sections
+            .iter()
+            .flat_map(|s| {
+                if !matches!(s.curve_3d, EdgeCurve::Circle(_))
+                    || (s.start - s.end).length() >= 1e-10
+                {
+                    return vec![s.clone()];
+                }
+                // The circle's own UV run, laid as the whole section would
+                // be (a turn along one v, in the face's window), is cut in
+                // thirds with it: a fresh projection would put the pieces at
+                // the surface's own u, off the window.
+                let pcurve = match rank {
+                    Rank::A => &s.pcurve_a,
+                    Rank::B => &s.pcurve_b,
+                };
+                let hints = match rank {
+                    Rank::A => s.start_uv_a.zip(s.end_uv_a),
+                    Rank::B => s.start_uv_b.zip(s.end_uv_b),
+                };
+                let (su, eu) = hints.unwrap_or_else(|| {
+                    uv_endpoints_from_pcurve(pcurve, s.start, s.end, &surface, &wire_pts)
+                });
+                if ((eu.x() - su.x()).abs() - std::f64::consts::TAU).abs() > 1e-6 {
+                    return vec![s.clone()];
+                }
+                // The circle lies at one v, so each third's point is the
+                // surface's at its UV.
+                let at = |k: f64| {
+                    let uv = Point2::new((eu.x() - su.x()).mul_add(k / 3.0, su.x()), su.y());
+                    (surface.evaluate(uv.x(), uv.y()).unwrap_or(s.start), uv)
+                };
+                let pts = [at(0.0), at(1.0), at(2.0), at(3.0)];
+                pts.windows(2)
+                    .map(|w| {
+                        let ((a, ua), (b, ub)) = (w[0], w[1]);
+                        let (a, b) = (
+                            if (a - s.start).length() < 1e-9 {
+                                s.start
+                            } else {
+                                a
+                            },
+                            if (b - s.start).length() < 1e-9 {
+                                s.start
+                            } else {
+                                b
+                            },
+                        );
+                        let mut piece = s.clone();
+                        piece.start = a;
+                        piece.end = b;
+                        piece.start_uv_a = Some(ua);
+                        piece.end_uv_a = Some(ub);
+                        piece.start_uv_b = Some(ua);
+                        piece.end_uv_b = Some(ub);
+                        piece.pave_block_id = None;
+                        let dir = brepkit_math::vec::Vec2::new(ub.x() - ua.x(), ub.y() - ua.y());
+                        let line = dir
+                            .normalize()
+                            .ok()
+                            .and_then(|d| brepkit_math::curves2d::Line2D::new(ua, d).ok());
+                        if let Some(l) = line {
+                            piece.pcurve_a = brepkit_math::curves2d::Curve2D::Line(l.clone());
+                            piece.pcurve_b = brepkit_math::curves2d::Curve2D::Line(l);
+                        }
+                        piece
+                    })
+                    .collect()
+            })
+            .collect();
+        circles_split = true;
+        &split_circles
+    } else {
+        sections
+    };
+
     for section in sections {
         if holes_integrated {
             break;
@@ -8516,9 +8606,148 @@ fn split_face_2d_impl(
             tol.linear,
         )
     {
+        if trace_split {
+            log::debug!("STRACE-SECTORS {} pieces", sectors.len());
+        }
         return sectors;
     }
-    if u_periodic
+    // Whole circles split in thirds (above) give the walker's glued seam
+    // vertex several equally good ways on, and its loops dead-end or tour
+    // the bands between the circles as one; the arrangement does not take
+    // circles either. The face trace's successor is a function of the graph:
+    // when the walker's loops are broken (or there are none), adopt the
+    // trace's partition if it encloses area in every loop (read
+    // period-aware: a band between two circles winds the whole period) and
+    // covers nothing twice.
+    // Only on a wall laid out in one window, its seam copies a period apart:
+    // elsewhere the pieces' u are mixed copies, and no loop's winding reads
+    // right (a region and its hole twin trade places).
+    let one_window = {
+        let seam_us: Vec<f64> = all_edges[..n_boundary_edges]
+            .iter()
+            .filter(|e| {
+                matches!(e.curve_3d, EdgeCurve::Line)
+                    && (e.start_uv.x() - e.end_uv.x()).abs() <= 1e-9
+            })
+            .map(|e| e.start_uv.x())
+            .collect();
+        let lo = seam_us.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = seam_us.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        seam_us.len() >= 2 && ((hi - lo) - std::f64::consts::TAU).abs() <= 1e-6
+    };
+    let circle_bands = if circles_split
+        && u_periodic
+        && !v_periodic
+        && one_window
+        && (greedy_broken || loops.is_empty())
+    {
+        let mut dcel = build_wire_loops_dcel(&all_edges, tol.linear, u_periodic, v_periodic);
+        dcel.retain(|lp| !is_periodic_face_outside(lp, &surface));
+        // A loop inside the face comes back twice, as its region and as the
+        // hole it leaves in the region around it: one pair, not a
+        // duplicated ring.
+        let unpaired: Vec<Vec<OrientedPCurveEdge>> = {
+            let q = |p: Point2| {
+                (
+                    (p.x() / tol.linear).round() as i64,
+                    (p.y() / tol.linear).round() as i64,
+                )
+            };
+            let mut seen: Vec<Vec<[i64; 4]>> = Vec::new();
+            let mut out = Vec::new();
+            for lp in &dcel {
+                let mut keys: Vec<_> = lp
+                    .iter()
+                    .map(|e| {
+                        let (a, b) = (q(e.start_uv), q(e.end_uv));
+                        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                        [a.0, a.1, b.0, b.1]
+                    })
+                    .collect();
+                keys.sort_unstable();
+                if !seen.contains(&keys) {
+                    seen.push(keys);
+                    out.push(lp.clone());
+                }
+            }
+            out
+        };
+        let duplicated = wire_loops_duplicate_cover(&unpaired, tol.linear);
+        let degenerate = wire_loops_have_degenerate_area_periodic(
+            &dcel,
+            tol.linear,
+            Some(std::f64::consts::TAU),
+            None,
+        );
+        if trace_split {
+            log::debug!(
+                "STRACE-CIRCLES dcel={} duplicated={duplicated} degenerate={degenerate}",
+                dcel.len()
+            );
+            for lp in &loops {
+                log::debug!(
+                    "STRACE-CIRCLES greedy loop {}",
+                    lp.iter()
+                        .map(|e| format!("({:.3},{:.3})", e.start_uv.x(), e.start_uv.y()))
+                        .collect::<Vec<_>>()
+                        .join(">")
+                );
+            }
+        }
+        (!dcel.is_empty() && !duplicated && !degenerate).then_some(dcel)
+    } else {
+        None
+    };
+    if trace_split {
+        log::debug!(
+            "STRACE-CIRCLES split={circles_split} greedy={} broken={greedy_broken} adopted={}",
+            loops.len(),
+            circle_bands.as_ref().map_or(0, Vec::len)
+        );
+    }
+    if let Some(bands) = circle_bands {
+        // The trace walks every region one way round, whichever way the
+        // face's boundary runs in its UV. A region runs the face's rims the
+        // way the face's boundary does, so where the trace's loops run the
+        // rim pieces against it, it went the other way: turn every loop
+        // round (a patch's region and its hole twin would otherwise trade
+        // places, and the patch face come out inside out).
+        let near = |a: Point2, b: Point2| (a - b).length() <= 1e-6;
+        let (mut with, mut against) = (0_usize, 0_usize);
+        for e in bands.iter().flatten() {
+            for b in all_edges[..n_boundary_edges]
+                .iter()
+                .filter(|b| !matches!(b.curve_3d, EdgeCurve::Line))
+            {
+                if near(b.start_uv, e.start_uv) && near(b.end_uv, e.end_uv) {
+                    with += 1;
+                } else if near(b.start_uv, e.end_uv) && near(b.end_uv, e.start_uv) {
+                    against += 1;
+                }
+            }
+        }
+        if trace_split {
+            log::debug!("STRACE-CIRCLES rims with={with} against={against}");
+            for lp in &bands {
+                log::debug!(
+                    "STRACE-CIRCLES band area={:.4} {}",
+                    signed_area_2d(&sample_wire_loop_uv(lp)),
+                    lp.iter()
+                        .map(|e| format!("({:.3},{:.3})", e.start_uv.x(), e.start_uv.y()))
+                        .collect::<Vec<_>>()
+                        .join(">")
+                );
+            }
+        }
+        loops = if against > 0 && with == 0 {
+            bands
+                .iter()
+                .map(|lp| special_cases::reverse_loop(lp))
+                .collect()
+        } else {
+            bands
+        };
+    } else if u_periodic
         && !v_periodic
         && !sections.is_empty()
         && (matches!(&surface, FaceSurface::Cylinder(_)) && (greedy_broken || ring_duplicated)
@@ -8662,6 +8891,15 @@ fn split_face_2d_impl(
             && !wire_loops_have_degenerate_area(&dcel, tol.linear)
             && (!greedy_outer_loops_nested(&dcel, cw_loops)
                 || greedy_outer_loops_nested(&loops, cw_loops));
+        if trace_split {
+            log::debug!(
+                "STRACE-DCEL greedy={} dcel={} refines={refines} self_cross={}/{}",
+                loops.len(),
+                dcel.len(),
+                wire_loops_self_cross(&dcel, tol.linear),
+                wire_loops_self_cross(&loops, tol.linear)
+            );
+        }
         if refines
             && (!wire_loops_self_cross(&dcel, tol.linear)
                 || wire_loops_self_cross(&loops, tol.linear))
@@ -8833,7 +9071,13 @@ fn split_face_2d_impl(
             // through the wall, its rulings and arcs closing a triangle) is
             // traced both ways: the island is one, the hole around it the
             // other, told apart by their winding.
-            let island = !u_periodic && wire_loop.iter().all(|e| e.source_edge_idx.is_some());
+            // So is a patch of a periodic wall bounded by sections alone, lines
+            // among them (a block's side face and its top and bottom edges
+            // cutting a pin's wall clear of the seam): read as a band by its
+            // lines, its hole twin became a second patch and the wall round
+            // it lost its hole.
+            let island = wire_loop.iter().all(|e| e.source_edge_idx.is_some())
+                && (!u_periodic || (has_line && has_nonline));
             if island {
                 if loop_eff_area(&wire_loop) > 0.0 {
                     outers.push((wire_loop, 1.0));

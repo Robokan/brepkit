@@ -361,7 +361,17 @@ fn resolve_seam_endpoint_uv(edges: &mut [OrientedPCurveEdge], surface: &FaceSurf
         .iter()
         .map(|e| (e.start_3d - e.end_3d).length() < 1e-10 && seam_line_at(e.start_uv.x()))
         .collect();
-    let Some(first) = leaves_apex.or_else(|| edges.iter().position(|e| !at_seam(e.start_uv.x())))
+    // A wall whose seam is at u = 0 itself has every piece starting on it:
+    // its seam lines are then the reference, or its rims stay as sampled and
+    // the far one lies a turn off the wall.
+    let Some(first) = leaves_apex
+        .or_else(|| edges.iter().position(|e| !at_seam(e.start_uv.x())))
+        .or_else(|| {
+            edges.iter().position(|e| {
+                matches!(e.curve_3d, brepkit_topology::edge::EdgeCurve::Line)
+                    && (e.start_uv.x() - e.end_uv.x()).abs() <= 1e-9
+            })
+        })
     else {
         return;
     };
