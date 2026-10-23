@@ -161,8 +161,10 @@ impl NurbsCurve {
         let p = self.degree;
         let n = self.control_points.len();
         let span = basis::find_span(n, p, u, &self.knots);
-        let mut bf = [0.0f64; basis::MAX_STACK_OUTPUT + 1];
-        basis::basis_funs_into(span, u, p, &self.knots, &mut bf[..=p]);
+        let mut bf_stack = [0.0f64; basis::MAX_STACK_OUTPUT + 1];
+        let mut bf_heap = Vec::new();
+        let bf = basis::scratch(&mut bf_stack, &mut bf_heap, p + 1);
+        basis::basis_funs_into(span, u, p, &self.knots, bf);
 
         // Weighted sum in homogeneous coordinates.
         let mut wx = 0.0;
@@ -201,16 +203,11 @@ impl NurbsCurve {
         let span = basis::find_span(n, p, u, &self.knots);
         let du = d.min(p);
         let stride = p + 1;
-        let mut ders_bf_buf =
+        let mut ders_stack =
             [0.0f64; (basis::MAX_STACK_OUTPUT + 1) * (basis::MAX_STACK_OUTPUT + 1)];
-        basis::ders_basis_funs_into(
-            span,
-            u,
-            p,
-            du,
-            &self.knots,
-            &mut ders_bf_buf[..(du + 1) * stride],
-        );
+        let mut ders_heap = Vec::new();
+        let ders_bf_buf = basis::scratch(&mut ders_stack, &mut ders_heap, (du + 1) * stride);
+        basis::ders_basis_funs_into(span, u, p, du, &self.knots, ders_bf_buf);
 
         // Compute homogeneous derivatives: Aw[k] = (Aw_x, Aw_y, Aw_z, w) for k-th deriv.
         // Those above the degree are zero, but a rational curve's are not (a

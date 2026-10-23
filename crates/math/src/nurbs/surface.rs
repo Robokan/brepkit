@@ -236,10 +236,14 @@ impl NurbsSurface {
 
         let span_u = basis::find_span(n_rows, pu, u, &self.knots_u);
         let span_v = basis::find_span(n_cols, pv, v, &self.knots_v);
-        let mut nu = [0.0f64; basis::MAX_STACK_OUTPUT + 1];
-        basis::basis_funs_into(span_u, u, pu, &self.knots_u, &mut nu[..=pu]);
-        let mut nv = [0.0f64; basis::MAX_STACK_OUTPUT + 1];
-        basis::basis_funs_into(span_v, v, pv, &self.knots_v, &mut nv[..=pv]);
+        let mut nu_stack = [0.0f64; basis::MAX_STACK_OUTPUT + 1];
+        let mut nu_heap = Vec::new();
+        let nu = basis::scratch(&mut nu_stack, &mut nu_heap, pu + 1);
+        basis::basis_funs_into(span_u, u, pu, &self.knots_u, nu);
+        let mut nv_stack = [0.0f64; basis::MAX_STACK_OUTPUT + 1];
+        let mut nv_heap = Vec::new();
+        let nv = basis::scratch(&mut nv_stack, &mut nv_heap, pv + 1);
+        basis::basis_funs_into(span_v, v, pv, &self.knots_v, nv);
 
         // Contract along v first for each relevant u-row, then along u.
         let mut wx = 0.0;
@@ -296,27 +300,17 @@ impl NurbsSurface {
         let du = d.min(pu);
         let dv = d.min(pv);
         let stride_u = pu + 1;
-        let mut ders_u_buf =
+        let mut ders_u_stack =
             [0.0f64; (basis::MAX_STACK_OUTPUT + 1) * (basis::MAX_STACK_OUTPUT + 1)];
-        basis::ders_basis_funs_into(
-            span_u,
-            u,
-            pu,
-            du,
-            &self.knots_u,
-            &mut ders_u_buf[..(du + 1) * stride_u],
-        );
+        let mut ders_u_heap = Vec::new();
+        let ders_u_buf = basis::scratch(&mut ders_u_stack, &mut ders_u_heap, (du + 1) * stride_u);
+        basis::ders_basis_funs_into(span_u, u, pu, du, &self.knots_u, ders_u_buf);
         let stride_v = pv + 1;
-        let mut ders_v_buf =
+        let mut ders_v_stack =
             [0.0f64; (basis::MAX_STACK_OUTPUT + 1) * (basis::MAX_STACK_OUTPUT + 1)];
-        basis::ders_basis_funs_into(
-            span_v,
-            v,
-            pv,
-            dv,
-            &self.knots_v,
-            &mut ders_v_buf[..(dv + 1) * stride_v],
-        );
+        let mut ders_v_heap = Vec::new();
+        let ders_v_buf = basis::scratch(&mut ders_v_stack, &mut ders_v_heap, (dv + 1) * stride_v);
+        basis::ders_basis_funs_into(span_v, v, pv, dv, &self.knots_v, ders_v_buf);
 
         // Compute homogeneous derivatives Aw[k][l] = (wx, wy, wz, w). Those
         // above the degrees are zero, but a rational surface's are not (a

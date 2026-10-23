@@ -91,6 +91,21 @@ pub fn uniform_knot_step(knots: &[f64], degree: usize) -> Option<f64> {
 /// Covers all practical CAD usage (cubic through septic).
 pub const MAX_STACK_OUTPUT: usize = 8;
 
+/// A zeroed scratch slice of `len`: in `stack` when it fits, else in `heap`.
+///
+/// Callers size `stack` for degrees up to [`MAX_STACK_OUTPUT`]; a curve or
+/// surface of higher degree (a fitted B-spline of degree 14 read from a
+/// file) takes the heap instead of indexing past the stack buffer.
+pub fn scratch<'a>(stack: &'a mut [f64], heap: &'a mut Vec<f64>, len: usize) -> &'a mut [f64] {
+    if len <= stack.len() {
+        &mut stack[..len]
+    } else {
+        heap.clear();
+        heap.resize(len, 0.0);
+        heap.as_mut_slice()
+    }
+}
+
 /// Write non-zero basis function values into `out` (A2.2, zero-allocation variant).
 ///
 /// `out` must have length >= `degree + 1`. Writes `N_{span-degree,degree}(u)`

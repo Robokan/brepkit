@@ -302,8 +302,10 @@ impl NurbsCurve2D {
         let n = self.control_points.len();
         let p = self.degree;
         let span = crate::nurbs::basis::find_span(n, p, u, &self.knots);
-        let mut basis = [0.0f64; crate::nurbs::basis::MAX_STACK_OUTPUT + 1];
-        crate::nurbs::basis::basis_funs_into(span, u, p, &self.knots, &mut basis[..=p]);
+        let mut basis_stack = [0.0f64; crate::nurbs::basis::MAX_STACK_OUTPUT + 1];
+        let mut basis_heap = Vec::new();
+        let basis = crate::nurbs::basis::scratch(&mut basis_stack, &mut basis_heap, p + 1);
+        crate::nurbs::basis::basis_funs_into(span, u, p, &self.knots, basis);
 
         let mut wx = 0.0;
         let mut wy = 0.0;
@@ -333,15 +335,10 @@ impl NurbsCurve2D {
         let deg = self.degree;
         let span = crate::nurbs::basis::find_span(num_pts, deg, param, &self.knots);
         let stride = deg + 1;
-        let mut ders_buf = [0.0f64; 2 * (crate::nurbs::basis::MAX_STACK_OUTPUT + 1)];
-        crate::nurbs::basis::ders_basis_funs_into(
-            span,
-            param,
-            deg,
-            1,
-            &self.knots,
-            &mut ders_buf[..2 * stride],
-        );
+        let mut ders_stack = [0.0f64; 2 * (crate::nurbs::basis::MAX_STACK_OUTPUT + 1)];
+        let mut ders_heap = Vec::new();
+        let ders_buf = crate::nurbs::basis::scratch(&mut ders_stack, &mut ders_heap, 2 * stride);
+        crate::nurbs::basis::ders_basis_funs_into(span, param, deg, 1, &self.knots, ders_buf);
 
         let mut curve_pt = Vec2::new(0.0, 0.0);
         let mut curve_deriv = Vec2::new(0.0, 0.0);
