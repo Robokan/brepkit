@@ -1230,9 +1230,25 @@ fn distance_to_surface_near(
 
 /// Compute distance from point to surface.
 fn distance_to_surface(pt: Point3, surface: &FaceSurface) -> f64 {
-    if let FaceSurface::Plane { normal, d } = surface {
-        (pt.x() * normal.x() + pt.y() * normal.y() + pt.z() * normal.z() - d).abs()
-    } else if let Some((u, v)) = surface.project_point(pt) {
+    // A cylinder's and a sphere's distances have closed forms: the point's
+    // distance from the axis or the centre less the radius. They equal the
+    // projection's foot distance without its trigonometry, and the scans
+    // here ask for them at every sample of every edge near the face.
+    match surface {
+        FaceSurface::Plane { normal, d } => {
+            return (pt.x() * normal.x() + pt.y() * normal.y() + pt.z() * normal.z() - d).abs();
+        }
+        FaceSurface::Cylinder(c) => {
+            let w = pt - c.origin();
+            let radial = w - c.axis() * w.dot(c.axis());
+            return (radial.length() - c.radius()).abs();
+        }
+        FaceSurface::Sphere(sp) => {
+            return ((pt - sp.center()).length() - sp.radius()).abs();
+        }
+        _ => {}
+    }
+    if let Some((u, v)) = surface.project_point(pt) {
         if let Some(surf_pt) = surface.evaluate(u, v) {
             (pt - surf_pt).length()
         } else {
