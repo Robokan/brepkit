@@ -88,21 +88,40 @@ pub fn solid_vertices(topo: &Topology, solid: SolidId) -> Result<Vec<VertexId>, 
 /// Returns an error if any topology lookup fails.
 pub fn face_edges(topo: &Topology, face: FaceId) -> Result<Vec<EdgeId>, TopologyError> {
     let face_data = topo.face(face)?;
-    let mut seen = HashSet::new();
-    let mut edges = Vec::new();
-
+    let mut edges: Vec<EdgeId> = Vec::new();
     for wire_id in
         std::iter::once(face_data.outer_wire()).chain(face_data.inner_wires().iter().copied())
     {
-        let wire = topo.wire(wire_id)?;
-        for oe in wire.edges() {
-            if seen.insert(oe.edge().index()) {
-                edges.push(oe.edge());
+        edges.extend(
+            topo.wire(wire_id)?
+                .edges()
+                .iter()
+                .map(crate::wire::OrientedEdge::edge),
+        );
+    }
+    Ok(first_of_each(edges, EdgeId::index))
+}
+
+/// The items in their first-seen order, each once. A face's edges or
+/// vertices are few, so a scan of those kept beats building a hash set (the
+/// boolean pipeline asks for them hundreds of times per operation).
+fn first_of_each<T: Copy>(items: Vec<T>, index: impl Fn(T) -> usize) -> Vec<T> {
+    const SCAN: usize = 32;
+    if items.len() <= SCAN {
+        let mut kept: Vec<T> = Vec::with_capacity(items.len());
+        for item in items {
+            if !kept.iter().any(|&k| index(k) == index(item)) {
+                kept.push(item);
             }
         }
+        kept
+    } else {
+        let mut seen = HashSet::with_capacity(items.len());
+        items
+            .into_iter()
+            .filter(|&i| seen.insert(index(i)))
+            .collect()
     }
-
-    Ok(edges)
 }
 
 /// Get all unique vertex IDs from a face.
@@ -111,20 +130,13 @@ pub fn face_edges(topo: &Topology, face: FaceId) -> Result<Vec<EdgeId>, Topology
 ///
 /// Returns an error if any topology lookup fails.
 pub fn face_vertices(topo: &Topology, face: FaceId) -> Result<Vec<VertexId>, TopologyError> {
-    let mut seen = HashSet::new();
     let mut vertices = Vec::new();
-
     for eid in face_edges(topo, face)? {
         let edge = topo.edge(eid)?;
-        if seen.insert(edge.start().index()) {
-            vertices.push(edge.start());
-        }
-        if seen.insert(edge.end().index()) {
-            vertices.push(edge.end());
-        }
+        vertices.push(edge.start());
+        vertices.push(edge.end());
     }
-
-    Ok(vertices)
+    Ok(first_of_each(vertices, VertexId::index))
 }
 
 // ── Edge queries ───────────────────────────────────────────────────
