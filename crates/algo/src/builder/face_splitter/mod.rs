@@ -3382,11 +3382,17 @@ fn arrangement_regions_from_inputs(
     // When present, section-input interior break points are recorded per pave
     // block (exact UV → 3D via the frame) so curved faces sharing the same
     // section curve pre-split at identical points.
-    mut split_registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
+    split_registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
 ) -> Option<Vec<SplitSubFace>> {
     use brepkit_math::curves2d::{Curve2D, Line2D};
     use brepkit_math::vec::Vec2;
 
+    // Section break points for the registry, recorded only once the
+    // arrangement succeeds: one that gives up (an arc broken at its chord)
+    // has also broken lines at chords, which no other face shares (a section
+    // line crossing the chord of a cap's major rim arc split the wall beside
+    // it there).
+    let mut pending_breaks: Vec<(usize, Point3)> = Vec::new();
     // Drop degenerate (zero-length) inputs.
     inputs.retain(|i| (i.a - i.b).length() > tol);
     if inputs.len() < 3 {
@@ -3830,14 +3836,11 @@ fn arrangement_regions_from_inputs(
         let n_breaks = ts.len();
         if n_breaks > 2
             && inputs[i].is_section
-            && let Some(reg) = split_registry.as_deref_mut()
             && let Some(pb_id) = inputs[i].edge.pave_block_id
         {
             for brk in &ts[1..n_breaks - 1] {
                 let uv = brk.1.unwrap_or(a0 + d * brk.0);
-                reg.entry(pb_id)
-                    .or_default()
-                    .push(frame.evaluate(uv.x(), uv.y()));
+                pending_breaks.push((pb_id, frame.evaluate(uv.x(), uv.y())));
             }
         }
         for (wi, w) in ts.windows(2).enumerate() {
@@ -4316,7 +4319,15 @@ fn arrangement_regions_from_inputs(
                 precomputed_interior: Some(frame.evaluate(seed_uv.x(), seed_uv.y())),
             });
         }
-        return (!result.is_empty()).then_some(result);
+        if result.is_empty() {
+            return None;
+        }
+        if let Some(reg) = split_registry {
+            for (pb_id, p) in pending_breaks {
+                reg.entry(pb_id).or_default().push(p);
+            }
+        }
+        return Some(result);
     }
 
     // A disconnected component of the arrangement — a closed section loop
@@ -4455,6 +4466,11 @@ fn arrangement_regions_from_inputs(
     }
     if result.is_empty() {
         return None;
+    }
+    if let Some(reg) = split_registry {
+        for (pb_id, p) in pending_breaks {
+            reg.entry(pb_id).or_default().push(p);
+        }
     }
     Some(result)
 }
@@ -8653,6 +8669,12 @@ fn split_face_2d_impl(
             return result;
         }
 
+        // The trial's section breaks reach the registry only if its pieces
+        // are kept: the walker's loops, kept instead, never split the
+        // sections there (a section line crossing the chord of a cap's major
+        // rim arc split the wall beside it at the crossing).
+        let mut trial_breaks: std::collections::HashMap<usize, Vec<Point3>> =
+            std::collections::HashMap::new();
         let arr = split_plane_face_by_arrangement(
             &surface,
             boundary,
@@ -8662,7 +8684,7 @@ fn split_face_2d_impl(
             face_id,
             frame,
             tol.linear,
-            split_registry,
+            Some(&mut trial_breaks),
         );
         // The arrangement traces chords: a section cluster that never meets
         // the rim (a keyhole cap inside a disc) leaves the ring around it no
@@ -8675,6 +8697,11 @@ fn split_face_2d_impl(
                 || wire_loops_have_degenerate_area(&loops, tol.linear))
             && subfaces_cover_boundary(&result, boundary, frame)
         {
+            if let Some(reg) = split_registry {
+                for (pb_id, pts) in trial_breaks {
+                    reg.entry(pb_id).or_default().extend(pts);
+                }
+            }
             return result;
         }
     }
