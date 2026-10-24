@@ -455,6 +455,28 @@ fn main() {
         }
         return;
     }
+    // REPEAT=<n>: run the boolean n more times on copies of the inputs and
+    // print the median time, for profiling
+    if let Some(n) = std::env::var("REPEAT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let mut times = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut copy = topo.clone();
+            let t = std::time::Instant::now();
+            let _ = brepkit_operations::boolean::boolean_with_options(
+                &mut copy,
+                op,
+                a[0],
+                b[0],
+                BooleanOptions::default(),
+            );
+            times.push(t.elapsed().as_secs_f64());
+        }
+        times.sort_by(f64::total_cmp);
+        println!("median of {n}: {:.6} s", times[n / 2]);
+    }
     let before = brepkit_operations::boolean::mesh_fallback_count();
     let r = brepkit_operations::boolean::boolean_with_options(
         &mut topo,
