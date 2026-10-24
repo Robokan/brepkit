@@ -5777,6 +5777,20 @@ fn distribute_cap_circles(
     };
 
     let points_uv: Vec<Point2> = cap_points.iter().map(|&c| frame.project(c)).collect();
+    // A sub-face's loops are read in this frame from their 3D points: a
+    // piece from the internal-loops path carries its UVs in a frame of its
+    // own (a coplanar footprint's square read degenerate here, the circles
+    // inside it went to the ring around it, and the ring kept them as holes).
+    let in_frame = |lp: &[OrientedPCurveEdge]| -> Vec<OrientedPCurveEdge> {
+        lp.iter()
+            .map(|e| {
+                let mut e = e.clone();
+                e.start_uv = frame.project(e.start_3d);
+                e.end_uv = frame.project(e.end_3d);
+                e
+            })
+            .collect()
+    };
 
     let mut assigned = vec![false; cap_sections.len()];
     let mut result: Vec<SplitSubFace> = Vec::with_capacity(base.len() + cap_sections.len());
@@ -5784,7 +5798,9 @@ fn distribute_cap_circles(
         // The frame-based sampler is orientation-unambiguous; the stored-pcurve
         // sampler can fold a loop carrying reversed arc sections into a
         // self-crossing polygon (see [`sample_wire_loop_uv_via_frame`]).
-        let poly = sample_wire_loop_uv_via_frame(&sf.outer_wire, frame);
+        let poly = sample_wire_loop_uv_via_frame(&in_frame(&sf.outer_wire), frame);
+        let holes: Vec<Vec<OrientedPCurveEdge>> =
+            sf.inner_wires.iter().map(|h| in_frame(h)).collect();
         let contained: Vec<SectionEdge> = if poly.len() < 3 {
             Vec::new()
         } else {
@@ -5794,7 +5810,7 @@ fn distribute_cap_circles(
                 .filter_map(|(i, cs)| {
                     if assigned[i]
                         || !super::classify_2d::point_in_polygon_2d(points_uv[i], &poly)
-                        || is_inside_any_hole(&points_uv[i], &sf.inner_wires)
+                        || is_inside_any_hole(&points_uv[i], &holes)
                     {
                         return None;
                     }
