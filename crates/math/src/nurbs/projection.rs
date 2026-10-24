@@ -124,21 +124,69 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
     // Each span's (start, end) and its (parameter, distance_sq) samples, in
     // order along the curve.
     let n_samples = (p + 1).max(5) * 2;
-    let mut spans: Vec<Span> = Vec::new();
-    for span in knots.windows(2) {
-        let (u_start, u_end) = (span[0], span[1]);
-        if u_end <= u_start || u_start < lo || u_end > hi {
-            continue;
+    // A span's piece lies in the box of its p + 1 control points (the convex
+    // hull property, weights being positive), so its distance from that box
+    // bounds every point of it from below. Spans are sampled nearest box
+    // first, and a span whose box lies beyond the closest sample so far
+    // cannot hold the closest point: on a fitted curve of many spans, a
+    // point on or near it samples a few spans, not all of them.
+    let cps = curve.control_points();
+    let box_dist_sq = |k: usize| -> f64 {
+        let Some(first) = k.checked_sub(p) else {
+            return 0.0;
+        };
+        let Some(pts) = cps.get(first..=k) else {
+            return 0.0;
+        };
+        let axis = |f: fn(Point3) -> f64, q: f64| {
+            let (mn, mx) = pts
+                .iter()
+                .map(|c| f(*c))
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                    (a.min(v), b.max(v))
+                });
+            (mn - q).max(0.0).max(q - mx)
+        };
+        let (dx, dy, dz) = (
+            axis(Point3::x, point.x()),
+            axis(Point3::y, point.y()),
+            axis(Point3::z, point.z()),
+        );
+        dx.mul_add(dx, dy.mul_add(dy, dz * dz))
+    };
+    let mut order: Vec<(usize, f64)> = knots
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| w[1] > w[0] && w[0] >= lo && w[1] <= hi)
+        .map(|(k, _)| (k, box_dist_sq(k)))
+        .collect();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut best = f64::INFINITY;
+    let mut sampled: Vec<(usize, Span)> = Vec::new();
+    for (k, lower) in order {
+        if lower > best {
+            break;
         }
+        let (u_start, u_end) = (knots[k], knots[k + 1]);
         let top = if u_end < hi { u_end.next_down() } else { u_end };
-        let samples = (0..=n_samples)
+        let samples: Vec<(f64, f64)> = (0..=n_samples)
             .map(|i| {
                 let t = i as f64 / n_samples as f64;
                 let u = t.mul_add(u_end - u_start, u_start).min(top);
                 (u, (curve.evaluate(u) - point).length_squared())
             })
             .collect();
-        spans.push((u_start, top, samples));
+        best = samples.iter().map(|s| s.1).fold(best, f64::min);
+        sampled.push((k, (u_start, top, samples)));
+    }
+    // Back in order along the curve, for the minima's neighbours below; a
+    // span whose neighbour was not sampled reads its end as a minimum there.
+    sampled.sort_by_key(|s| s.0);
+    let mut spans: Vec<Span> = Vec::with_capacity(sampled.len());
+    let mut adjacent: Vec<bool> = Vec::with_capacity(sampled.len());
+    for (i, (k, span)) in sampled.iter().enumerate() {
+        adjacent.push(i > 0 && sampled[i - 1].0 + 1 == *k);
+        spans.push(span.clone());
     }
 
     let closest = |samples: &[(f64, f64)]| {
@@ -169,7 +217,7 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
             let prev = if i > 0 {
                 Some(samples[i - 1].1)
             } else {
-                s.checked_sub(1).map(|r| {
+                s.checked_sub(1).filter(|_| adjacent[s]).map(|r| {
                     let before = &spans[r].2;
                     before[before.len() - 2].1
                 })
@@ -177,7 +225,10 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
             let next = if i < last {
                 Some(samples[i + 1].1)
             } else {
-                spans.get(s + 1).map(|after| after.2[1].1)
+                spans
+                    .get(s + 1)
+                    .filter(|_| adjacent.get(s + 1).copied().unwrap_or(false))
+                    .map(|after| after.2[1].1)
             };
             let minimum = prev.is_none_or(|q| d <= q) && next.is_none_or(|q| d <= q);
             if minimum && !in_run {
