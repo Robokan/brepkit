@@ -277,7 +277,9 @@ fn split_sections_at_t_junctions(
             // pave-split rim) runs one way only and may span more than half
             // a turn. The shorter-arc reading then covers its complement: it
             // puts the complement's points on the piece and none of the
-            // piece's own, so it can only mint false splits there.
+            // piece's own, so it can only mint false splits there. At exactly
+            // half a turn (a rim split by a line through its centre) the
+            // reading may take either half, which is no better.
             EdgeCurve::Circle(c)
                 if edge.source_edge_idx.is_none() && {
                     let (s, e) = if edge.forward {
@@ -286,7 +288,7 @@ fn split_sections_at_t_junctions(
                         (edge.end_3d, edge.start_3d)
                     };
                     (c.project(e) - c.project(s)).rem_euclid(std::f64::consts::TAU)
-                        > std::f64::consts::PI + 1e-9
+                        > std::f64::consts::PI - 1e-9
                 } =>
             {
                 Vec::new()
@@ -6070,10 +6072,14 @@ fn split_face_2d_impl(
                         if (s3 - e3).length() < tol.linear {
                             continue;
                         }
-                        let pcurve = super::pcurve_compute::compute_pcurve_on_surface(
+                        // The piece's own span: a rim split where a line
+                        // crosses through its centre is two half turns,
+                        // which the shorter-arc reading cannot tell apart.
+                        let pcurve = super::pcurve_compute::compute_boundary_pcurve_on_surface(
                             e.curve(),
-                            s3,
-                            e3,
+                            vs.point(),
+                            ve.point(),
+                            oe.is_forward(),
                             &surface,
                             &wire_pts,
                             Some(frame),
@@ -6521,11 +6527,19 @@ fn split_face_2d_impl(
         if single_closed {
             true
         } else {
+            // The holes' vertices where the pave splits put them.
+            let hole_points: Vec<Point3> = expanded_inner_wires
+                .iter()
+                .zip(&original_inner_wires)
+                .flat_map(|(split, whole)| split.as_ref().unwrap_or(whole).iter())
+                .map(|e| e.start_3d)
+                .collect();
             deduped_line_loops = plane_internal_line_loops(
                 sections,
                 frame,
                 &boundary_edges,
                 &original_inner_wires,
+                &hole_points,
                 tol.linear,
             );
             deduped_line_loops.is_some()
@@ -7213,7 +7227,10 @@ fn split_face_2d_impl(
             }
             woven_hole_indices.push(i);
             all_edges.extend(hole.iter().cloned());
-            let poly: Vec<Point2> = hole.iter().map(|e| frame.project(e.start_3d)).collect();
+            // Arc-true: a rim split in two has a two-point chord polygon, and
+            // a line through its centre leaves a diameter, on which the
+            // segment test below reads neither side.
+            let poly: Vec<Point2> = sample_wire_loop_uv_via_frame(hole, frame);
             let arcs: Vec<(Point2, f64, Point2, Point2)> = hole
                 .iter()
                 .filter_map(|e| {
@@ -7232,7 +7249,9 @@ fn split_face_2d_impl(
                 (b.x() - a.x()).mul_add(p.y() - a.y(), -((b.y() - a.y()) * (p.x() - a.x())))
             };
             let in_region = |p: Point2| -> bool {
-                super::classify_2d::point_in_polygon_2d(p, &poly)
+                (super::classify_2d::point_in_polygon_2d(p, &poly)
+                    && super::classify_2d::distance_to_polygon_boundary(p, &poly)
+                        > tol.linear * 10.0)
                     || arcs.iter().any(|&(c, r, u0, u1)| {
                         let d = ((p.x() - c.x()).powi(2) + (p.y() - c.y()).powi(2)).sqrt();
                         d < r && side(u0, u1, p) * side(u0, u1, c) < 0.0
@@ -8296,6 +8315,21 @@ fn split_face_2d_impl(
         rows.sort();
         for r in rows {
             log::debug!("{r}");
+        }
+        for e in &all_edges {
+            if let brepkit_math::curves2d::Curve2D::Nurbs(n) = &e.pcurve {
+                let k = n.knots();
+                log::debug!(
+                    "PCDBG {:?}->{:?} nurbs a={:?} b={:?} mid={:?}",
+                    e.start_uv,
+                    e.end_uv,
+                    n.evaluate(k[0]),
+                    n.evaluate(k[k.len() - 1]),
+                    n.evaluate(0.5 * (k[0] + k[k.len() - 1]))
+                );
+            } else if !matches!(e.curve_3d, EdgeCurve::Line) {
+                log::debug!("PCDBG {:?}->{:?} other pcurve", e.start_uv, e.end_uv);
+            }
         }
     }
     let all_edges = super::wire_builder::remove_pendant_sections(
@@ -10048,6 +10082,7 @@ fn plane_internal_line_loops(
     frame: &PlaneFrame,
     boundary_edges: &[OrientedPCurveEdge],
     inner_wires: &[Vec<OrientedPCurveEdge>],
+    hole_points: &[Point3],
     tol_linear: f64,
 ) -> Option<Vec<SectionEdge>> {
     use std::collections::{HashMap, HashSet};
@@ -10115,6 +10150,27 @@ fn plane_internal_line_loops(
     if deduped.len() < 3 {
         return None;
     }
+    // A loop that runs through a hole's vertex crosses the hole there (a box
+    // footprint over round openings: the rims are split where its sides cross
+    // them). The hole is then part of the arrangement, not a loop inside it.
+    let through_hole = hole_points.iter().any(|&p| {
+        deduped
+            .iter()
+            .filter(|s| matches!(s.curve_3d, EdgeCurve::Line))
+            .any(|s| {
+                let d = s.end - s.start;
+                let len2 = d.dot(d);
+                let t = (p - s.start).dot(d) / len2;
+                len2 > margin * margin
+                    && t > 1e-6
+                    && t < 1.0 - 1e-6
+                    && (s.start + d * t - p).length() <= margin
+            })
+    });
+    if through_hole {
+        return None;
+    }
+
     // The same footprint side can arrive both whole and as sub-segments
     // split at paves. Drop any segment that another section's endpoint
     // subdivides (collinear, strictly interior) — the sub-segments carry
@@ -10666,7 +10722,7 @@ mod tests {
             line_section(Point3::new(0.1, 0.4, 0.0), Point3::new(0.1, 0.6, 0.0)),
             line_section(Point3::new(0.1, 0.6, 0.0), Point3::new(0.45, 0.6, 0.0)),
         ];
-        let rescued = plane_internal_line_loops(&sections, &frame, &boundary, &[hole], 1e-7)
+        let rescued = plane_internal_line_loops(&sections, &frame, &boundary, &[hole], &[], 1e-7)
             .expect("chain must be rescued");
         assert_eq!(rescued.len(), 4, "3 trimmed sections + 1 rim connector");
         let connector = rescued

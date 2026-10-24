@@ -3059,6 +3059,9 @@ fn project_angle_on_curve(curve: &brepkit_topology::edge::EdgeCurve, p: Point3) 
     }
 }
 
+/// An edge's middle and size, as `merge_duplicate_edges` compares copies.
+type EdgeMiddle = Option<(Point3, f64)>;
+
 /// Merge duplicate edges across selected faces by quantized endpoint position.
 ///
 /// For each group of edges with the same quantized start/end positions,
@@ -3090,6 +3093,12 @@ fn merge_duplicate_edges(topo: &mut Topology, face_ids: &mut [FaceId]) -> Result
                 });
             }
         }
+    }
+
+    // How many wire uses each edge has.
+    let mut uses: HashMap<EdgeId, usize> = HashMap::new();
+    for entry in &entries {
+        *uses.entry(entry.edge_id).or_default() += 1;
     }
 
     // Find groups where multiple DIFFERENT EdgeIds share the same qpair.
@@ -3134,8 +3143,7 @@ fn merge_duplicate_edges(topo: &mut Topology, face_ids: &mut [FaceId]) -> Result
         // through the same middle: a hole's arc and the straight edge across
         // it (a box's top crossing the hole) join the same two points, and
         // merged they give the arc's wall and the box's strip one edge set,
-        // which then reads as a doubled face and drops both. Each edge joins
-        // the first lower-index edge it runs alongside, else it is canonical.
+        // which then reads as a doubled face and drops both.
         // The middle of a line, circle or ellipse edge, with the edge's size;
         // `None` where it cannot be trusted: a closed edge's middle hangs on
         // its own parameter origin, and a fitted curve's span may resolve to
@@ -3165,14 +3173,54 @@ fn merge_duplicate_edges(topo: &mut Topology, face_ids: &mut [FaceId]) -> Result
             }
             _ => true,
         };
-        let mut canonicals: Vec<(EdgeId, Option<(Point3, f64)>)> = Vec::new();
+        // Copies of one edge share their middle outright.
+        let same = |a: Option<(Point3, f64)>, b: Option<(Point3, f64)>| match (a, b) {
+            (Some((ma, sa)), Some((mb, sb))) => {
+                (ma - mb).length() <= 1e-4 * sa.max(sb) + 10.0 * tol
+            }
+            _ => true,
+        };
+        // Copies first; then a set of copies that still lacks a partner (an
+        // odd number of uses) joins one alongside it that lacks one too. Two
+        // sets each already paired are two edges: a hole's short rim arc and
+        // a box edge's chord across the opening, each shared by its own two
+        // faces, would otherwise weld into one edge of four faces.
+        let mut sets: Vec<(EdgeId, EdgeMiddle, Vec<EdgeId>, usize)> = Vec::new();
         for &e in &unique {
             let mid = middle(e)?;
-            let Some(&(canonical, _)) = canonicals.iter().find(|&&(_, cm)| alongside(mid, cm))
-            else {
-                canonicals.push((e, mid));
-                continue;
+            let n = uses.get(&e).copied().unwrap_or(0);
+            if let Some(set) = sets.iter_mut().find(|set| same(mid, set.1)) {
+                set.2.push(e);
+                set.3 += n;
+            } else {
+                sets.push((e, mid, vec![e], n));
+            }
+        }
+        let mut canonicals: Vec<(EdgeId, EdgeMiddle, usize)> = Vec::new();
+        let mut joins: Vec<(EdgeId, EdgeId)> = Vec::new();
+        for (head, mid, members, n) in sets {
+            let into = if n % 2 == 1 {
+                canonicals
+                    .iter_mut()
+                    .find(|(_, cm, cn)| *cn % 2 == 1 && alongside(mid, *cm))
+            } else {
+                None
             };
+            let canonical = if let Some(c) = into {
+                c.2 += n;
+                c.0
+            } else {
+                canonicals.push((head, mid, n));
+                head
+            };
+            joins.extend(
+                members
+                    .into_iter()
+                    .filter(|&m| m != canonical)
+                    .map(|m| (m, canonical)),
+            );
+        }
+        for (e, canonical) in joins {
             let dup = e;
             let canon_start = topo.edge(canonical)?.start();
             let canon_end = topo.edge(canonical)?.end();
