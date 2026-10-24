@@ -346,6 +346,26 @@ fn perform_loops(topo: &Topology, faces: &[FaceId]) -> Result<Vec<Vec<FaceId>>, 
         .iter()
         .filter_map(|&fid| Some((fid, face_edge_keys(topo, fid).ok()?)))
         .collect();
+    // The edges behind each face's keys: two edges can share a key (a hole's
+    // arc and the straight edge across its opening join the same two
+    // points), and a neighbour across the very edge comes before one that
+    // only shares its ends.
+    let mut key_edges: HashMap<(FaceId, VPair), Vec<brepkit_topology::edge::EdgeId>> =
+        HashMap::new();
+    let mut face_own_edges: HashMap<FaceId, Vec<brepkit_topology::edge::EdgeId>> = HashMap::new();
+    for &fid in faces {
+        let face = topo.face(fid)?;
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(wid)?.edges() {
+                let edge = topo.edge(oe.edge())?;
+                let qs = quantize_point(topo.vertex(edge.start())?.point(), MERGE_TOL);
+                let qe = quantize_point(topo.vertex(edge.end())?.point(), MERGE_TOL);
+                let key = if qs <= qe { (qs, qe) } else { (qe, qs) };
+                key_edges.entry((fid, key)).or_default().push(oe.edge());
+                face_own_edges.entry(fid).or_default().push(oe.edge());
+            }
+        }
+    }
 
     for &start_face in faces {
         if visited.contains(&start_face) {
@@ -357,6 +377,13 @@ fn perform_loops(topo: &Topology, faces: &[FaceId]) -> Result<Vec<Vec<FaceId>>, 
 
         // Track edges already filled (2 faces) in this shell
         let mut shell_edge_count: HashMap<VPair, u32> = HashMap::new();
+        // The same count per edge, for faces across the very edge.
+        let mut shell_own_count: HashMap<brepkit_topology::edge::EdgeId, u32> = HashMap::new();
+        let count_own = |fid: FaceId, counts: &mut HashMap<brepkit_topology::edge::EdgeId, u32>| {
+            for e in face_own_edges.get(&fid).into_iter().flatten() {
+                *counts.entry(*e).or_default() += 1;
+            }
+        };
 
         visited.insert(start_face);
         shell.push(start_face);
@@ -367,6 +394,7 @@ fn perform_loops(topo: &Topology, faces: &[FaceId]) -> Result<Vec<Vec<FaceId>>, 
                 *shell_edge_count.entry(*key).or_default() += 1;
             }
         }
+        count_own(start_face, &mut shell_own_count);
 
         while let Some(current) = queue.pop_front() {
             let Some(keys) = face_edges.get(&current) else {
@@ -374,11 +402,6 @@ fn perform_loops(topo: &Topology, faces: &[FaceId]) -> Result<Vec<Vec<FaceId>>, 
             };
 
             for key in keys {
-                // Skip edges already manifold in this shell
-                if shell_edge_count.get(key).copied().unwrap_or(0) >= 2 {
-                    continue;
-                }
-
                 let Some(candidates) = edge_map.get(key) else {
                     continue;
                 };
@@ -393,6 +416,30 @@ fn perform_loops(topo: &Topology, faces: &[FaceId]) -> Result<Vec<Vec<FaceId>>, 
                     continue;
                 }
 
+                // A face across the very edge joins whatever the key's count:
+                // the count is per pair of ends, and another edge on the same
+                // ends (the box floor's chord across a hole's opening beside
+                // the hole's arc) can fill it first.
+                let current_edges = key_edges.get(&(current, *key));
+                let across: Vec<FaceId> = unvisited
+                    .iter()
+                    .copied()
+                    .filter(|&f| {
+                        key_edges.get(&(f, *key)).is_some_and(|es| {
+                            current_edges.is_some_and(|cs| {
+                                es.iter().any(|e| {
+                                    cs.contains(e)
+                                        && shell_own_count.get(e).copied().unwrap_or(0) < 2
+                                })
+                            })
+                        })
+                    })
+                    .collect();
+                // Skip edges already manifold in this shell
+                if across.is_empty() && shell_edge_count.get(key).copied().unwrap_or(0) >= 2 {
+                    continue;
+                }
+                let unvisited = if across.is_empty() { unvisited } else { across };
                 let selected = if unvisited.len() == 1 {
                     unvisited[0]
                 } else if let Some((start, end)) = edge_positions.get(key) {
@@ -411,6 +458,7 @@ fn perform_loops(topo: &Topology, faces: &[FaceId]) -> Result<Vec<Vec<FaceId>>, 
                         *shell_edge_count.entry(*k).or_default() += 1;
                     }
                 }
+                count_own(selected, &mut shell_own_count);
             }
         }
 
