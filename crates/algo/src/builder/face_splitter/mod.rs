@@ -9022,13 +9022,16 @@ fn split_face_2d_impl(
     // on its own reverse left the region it bounds unsplit. The DCEL face
     // trace partitions the arrangement itself; adopt it when it strictly
     // refines the greedy partition and is clean by every loop-health
-    // signature.
+    // signature. A holed face takes the trace only for a section closed on
+    // its own reverse (an arc ending where the face's boundary turns away
+    // from it, a wall's notch over a bore: the walker follows the notch),
+    // its holes attached to the pieces afterwards as to the walker's.
     if is_plane
         && !sections.is_empty()
-        && original_inner_wires.is_empty()
-        && (loops
-            .iter()
-            .any(|lp| split_loop_at_pinch_vertices(lp, tol.linear).len() != 1)
+        && ((original_inner_wires.is_empty()
+            && loops
+                .iter()
+                .any(|lp| split_loop_at_pinch_vertices(lp, tol.linear).len() != 1))
             || loops
                 .iter()
                 .any(|lp| loop_has_degenerate_area(lp, tol.linear, Some(frame))))

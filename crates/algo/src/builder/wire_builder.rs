@@ -313,25 +313,29 @@ pub fn build_wire_loops_dcel_measured(
             .or_default()
             .push(i);
     }
-    for (i, e) in edges.iter().enumerate() {
-        if twin[i].is_some() {
-            continue;
-        }
-        let rev_key = (key_of(e.end_uv), key_of(e.start_uv));
-        if let Some(cands) = by_pair.get(&rev_key) {
-            let pick = cands
-                .iter()
-                .copied()
-                .filter(|&j| j != i && twin[j].is_none())
-                .max_by_key(|&j| {
-                    usize::from(
-                        edges[j].source_edge_idx.is_some()
-                            && edges[j].source_edge_idx == e.source_edge_idx,
-                    )
-                });
-            if let Some(j) = pick {
-                twin[i] = Some(j);
-                twin[j] = Some(i);
+    // Same-source pairs first: a boundary arc sharing both ends with a
+    // section (a wall's notch over a bore, the bore's arc below it) must not
+    // take the section's forward half before its reverse half pairs with it.
+    for same_source_only in [true, false] {
+        for (i, e) in edges.iter().enumerate() {
+            if twin[i].is_some() {
+                continue;
+            }
+            let rev_key = (key_of(e.end_uv), key_of(e.start_uv));
+            if let Some(cands) = by_pair.get(&rev_key) {
+                let same = |j: usize| {
+                    edges[j].source_edge_idx.is_some()
+                        && edges[j].source_edge_idx == e.source_edge_idx
+                };
+                let pick = cands
+                    .iter()
+                    .copied()
+                    .filter(|&j| j != i && twin[j].is_none() && (!same_source_only || same(j)))
+                    .max_by_key(|&j| usize::from(same(j)));
+                if let Some(j) = pick {
+                    twin[i] = Some(j);
+                    twin[j] = Some(i);
+                }
             }
         }
     }

@@ -5,7 +5,8 @@ use brepkit_topology::Topology;
 use brepkit_topology::face::FaceSurface;
 
 use super::super::pcurve_compute::{
-    compute_pcurve_on_surface, project_point_on_surface, sample_edge_to_uv,
+    compute_boundary_pcurve_on_surface, compute_pcurve_on_surface, project_point_on_surface,
+    sample_edge_to_uv,
 };
 use super::super::plane_frame::PlaneFrame;
 use super::super::split_types::OrientedPCurveEdge;
@@ -253,8 +254,29 @@ pub(super) fn boundary_edges_to_pcurve_with_images<S: std::hash::BuildHasher>(
         let start_3d = start_v.point();
         let end_3d = end_v.point();
 
-        let pcurve =
-            compute_pcurve_on_surface(edge.curve(), start_3d, end_3d, surface, wire_pts, frame);
+        // A plane's boundary arc traces its own span: the shorter way round
+        // between its ends is its complement when it is the major arc (a
+        // wall's notch where a bore crosses its rim above the bore's centre),
+        // and the walker read the notch as leaving the way the bore's lower
+        // arc does.
+        let pcurve = if matches!(surface, FaceSurface::Plane { .. }) {
+            let (stored_start, stored_end) = if forward {
+                (start_3d, end_3d)
+            } else {
+                (end_3d, start_3d)
+            };
+            compute_boundary_pcurve_on_surface(
+                edge.curve(),
+                stored_start,
+                stored_end,
+                forward,
+                surface,
+                wire_pts,
+                frame,
+            )
+        } else {
+            compute_pcurve_on_surface(edge.curve(), start_3d, end_3d, surface, wire_pts, frame)
+        };
 
         // For closed edges (start_3d approx end_3d, e.g. full circle), projecting
         // start and end to UV gives the same point. Use pcurve sampling to
