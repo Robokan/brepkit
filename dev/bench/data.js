@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792949785175,
+  "lastUpdate": 1792950268599,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -431,6 +431,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 39309808,
             "range": "± 95073",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "95150b631a47d1b7c31e21c4ad14df1950bd5b65",
+          "message": "docs: judge corpus cases against their stored reference answer\n\nA case is judged against the reference answer stored with it where there\nis one, else Open CASCADE's result; the reference is not the truth, and\nthe independent judge still breaks ties.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T10:11:05-07:00",
+          "tree_id": "d10a84d8d915d91d5ca923df24b5f5391415ae81",
+          "url": "https://github.com/Robokan/brepkit/commit/95150b631a47d1b7c31e21c4ad14df1950bd5b65"
+        },
+        "date": 1792950268198,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1066015,
+            "range": "± 31681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1153718,
+            "range": "± 23378",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13440,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 668523,
+            "range": "± 2334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 48089951,
+            "range": "± 148489",
             "unit": "ns/iter"
           }
         ]
