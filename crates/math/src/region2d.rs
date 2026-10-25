@@ -130,6 +130,12 @@ const ELLIPSE_DEPTH: u32 = 60;
 /// bounding `|F''|`. An interval whose bound cannot undercut the least `F`
 /// seen, less a millionth of it, is dropped; the rest are halved.
 fn ellipse_arc_distance(x0: f64, y0: f64, a: f64, b: f64, t0: f64, t1: f64) -> f64 {
+    // Bounds that cannot be compared prune nothing, and the halving would
+    // run to its full depth everywhere: such an arc reads as touching.
+    const MAX_INTERVALS: usize = 1 << 20;
+    if ![x0, y0, a, b, t0, t1].iter().all(|v| v.is_finite()) {
+        return 0.0;
+    }
     let squared = |t: f64| {
         let (s, c) = t.sin_cos();
         a.mul_add(c, -x0).powi(2) + b.mul_add(s, -y0).powi(2)
@@ -144,11 +150,16 @@ fn ellipse_arc_distance(x0: f64, y0: f64, a: f64, b: f64, t0: f64, t1: f64) -> f
     let mut best = squared(t0).min(squared(t1));
     let mut unsettled = f64::INFINITY;
     let mut pending = vec![(t0, t1, 0_u32)];
+    let mut visited = 0_usize;
     while let Some((lo, hi, depth)) = pending.pop() {
+        visited += 1;
         let (m, r) = (0.5 * (lo + hi), 0.5 * (hi - lo));
         let at_m = squared(m);
         best = best.min(at_m);
         let low = at_m - slope(m).abs() * r - 0.5 * k * r * r;
+        if low.is_nan() || visited > MAX_INTERVALS {
+            return 0.0;
+        }
         if low >= best - slack(best) {
             continue;
         }
@@ -277,6 +288,17 @@ mod tests {
     use std::f64::consts::PI;
 
     use super::*;
+
+    /// An arc given a non-finite value reads as touching the point at once
+    /// rather than halving without end.
+    #[test]
+    fn a_non_finite_ellipse_arc_reads_as_touching() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            let off_centre = super::ellipse_arc_distance(bad, 0.0, 2.0, 1.0, 0.0, 1.0);
+            let off_range = super::ellipse_arc_distance(0.5, 0.0, 2.0, 1.0, 0.0, bad);
+            assert!(off_centre.abs() < f64::EPSILON && off_range.abs() < f64::EPSILON);
+        }
+    }
 
     fn circle(center: (f64, f64), r: f64, t0: f64, t1: f64) -> Boundary2 {
         Boundary2::Arc {
