@@ -1316,7 +1316,7 @@ fn sample_face_interior(
     face_id: FaceId,
     tol: Tolerance,
 ) -> Result<Point3, AlgoError> {
-    use brepkit_math::vec::Vec3;
+    use brepkit_math::vec::{Point2, Vec3};
 
     let face = topo.face(face_id)?;
     let wire = topo.wire(face.outer_wire())?;
@@ -1509,42 +1509,63 @@ fn sample_face_interior(
             let frame = plane_frame::PlaneFrame::from_plane_face(*normal, &poly);
             let poly2d: Vec<_> = boundary.iter().map(|p| frame.project(*p)).collect();
             let eps = classify_2d::boundary_eps(&poly2d);
-            // The face's holes, sampled as its boundary is: a sample in one
-            // is off the face (a ring's centre).
-            let mut holes2d: Vec<Vec<brepkit_math::vec::Point2>> = Vec::new();
-            for &w in face.inner_wires() {
-                let mut hole = Vec::new();
-                for oe in topo.wire(w)?.edges() {
-                    let e = topo.edge(oe.edge())?;
-                    let (sp, ep) = (
-                        topo.vertex(oe.oriented_start(e))?.point(),
-                        topo.vertex(oe.oriented_end(e))?.point(),
-                    );
-                    hole.push(frame.project(sp));
-                    if matches!(e.curve(), brepkit_topology::edge::EdgeCurve::Line) {
-                        continue;
+            // The face's loops as the curves they are, holes included. A
+            // sample in a hole is off the face (a ring's centre), and a
+            // hole's sampled polygon misses the sliver between each chord
+            // and its arc, 1.9 deep on a radius-25 bore.
+            let region = brepkit_topology::planar::face_boundary_2d(
+                topo,
+                face_id,
+                frame.origin(),
+                frame.u_axis(),
+                frame.v_axis(),
+            )?;
+            // A NURBS edge has no exact piece: the holes are then sampled as
+            // the outer boundary is, and a sample must clear them too.
+            let mut holes2d: Vec<Vec<Point2>> = Vec::new();
+            if region.is_none() {
+                for &w in face.inner_wires() {
+                    let mut hole = Vec::new();
+                    for oe in topo.wire(w)?.edges() {
+                        let e = topo.edge(oe.edge())?;
+                        let (sp, ep) = (
+                            topo.vertex(oe.oriented_start(e))?.point(),
+                            topo.vertex(oe.oriented_end(e))?.point(),
+                        );
+                        hole.push(frame.project(sp));
+                        if matches!(e.curve(), brepkit_topology::edge::EdgeCurve::Line) {
+                            continue;
+                        }
+                        let (ns, ne) = if oe.is_forward() { (sp, ep) } else { (ep, sp) };
+                        let (d0, d1) = e.curve().domain_with_endpoints(ns, ne);
+                        let mut samples: Vec<_> = (1..8)
+                            .map(|k| {
+                                let t = (d1 - d0).mul_add(f64::from(k) / 8.0, d0);
+                                frame.project(e.curve().evaluate_with_endpoints(t, ns, ne))
+                            })
+                            .collect();
+                        if !oe.is_forward() {
+                            samples.reverse();
+                        }
+                        hole.extend(samples);
                     }
-                    let (ns, ne) = if oe.is_forward() { (sp, ep) } else { (ep, sp) };
-                    let (d0, d1) = e.curve().domain_with_endpoints(ns, ne);
-                    let mut samples: Vec<_> = (1..8)
-                        .map(|k| {
-                            let t = (d1 - d0).mul_add(f64::from(k) / 8.0, d0);
-                            frame.project(e.curve().evaluate_with_endpoints(t, ns, ne))
-                        })
-                        .collect();
-                    if !oe.is_forward() {
-                        samples.reverse();
+                    if hole.len() >= 3 {
+                        holes2d.push(hole);
                     }
-                    hole.extend(samples);
-                }
-                if hole.len() >= 3 {
-                    holes2d.push(hole);
                 }
             }
-            let in_hole = |c2| {
-                holes2d
-                    .iter()
-                    .any(|h| classify_2d::point_in_polygon_2d(c2, h))
+            let clears = |c2: Point2, margin: f64| match &region {
+                Some(pieces) => {
+                    brepkit_math::region2d::point_in_region(pieces, c2, margin) == Some(true)
+                }
+                None => {
+                    classify_2d::point_in_polygon_2d(c2, &poly2d)
+                        && classify_2d::distance_to_polygon_boundary(c2, &poly2d) > margin
+                        && holes2d.iter().all(|h| {
+                            !classify_2d::point_in_polygon_2d(c2, h)
+                                && classify_2d::distance_to_polygon_boundary(c2, h) > margin
+                        })
+                }
             };
             // Try LARGE offsets first, then shrink. The base offset is
             // diag·1e-4 — a sample that close to the boundary edge can hug a
@@ -1552,33 +1573,46 @@ fn sample_face_interior(
             // wall's longest edge lies ON the coincident bottom cap), where
             // the ray-cast classifier turns unstable and mirror-image walls
             // classify differently. A deeper sample is strictly better
-            // whenever the polygon containment check admits it; thin slivers
-            // reject the large candidates and fall through to the fine
-            // scales. 28 halvings from 64 reach scale ~2.4e-7 (min offset
-            // ~diag·2.4e-11), below any physically meaningful strip width,
-            // so the loop only exits to the fallback for a near-zero-area
-            // (degenerate) face.
+            // whenever the containment check admits it; thin slivers reject
+            // the large candidates and fall through to the fine scales. 28
+            // halvings from 64 reach scale ~2.4e-7 (min offset
+            // ~diag·2.4e-11), below any physically meaningful strip width.
+            let mut candidates = Vec::with_capacity(56);
             let mut scale = 64.0_f64;
             for _ in 0..28 {
                 for sign in [1.0_f64, -1.0] {
-                    let cand = mid_pt + base_offset * (sign * scale);
-                    let c2 = frame.project(cand);
-                    if classify_2d::point_in_polygon_2d(c2, &poly2d)
-                        && classify_2d::distance_to_polygon_boundary(c2, &poly2d) > eps
-                        && !in_hole(c2)
-                    {
-                        return Ok(cand);
-                    }
+                    candidates.push(mid_pt + base_offset * (sign * scale));
                 }
                 scale *= 0.5;
             }
-            // Near-zero-area face: try a robust interior point of the projected
-            // boundary. Verify it before use — its last-resort path returns the
-            // vertex centroid, which can fall outside a concave boundary. If
-            // even that is exterior, fall back to the edge midpoint (on the
-            // boundary, never exterior) rather than a known-bad sample.
+            if let Some(&cand) = candidates.iter().find(|&&c| clears(frame.project(c), eps)) {
+                return Ok(cand);
+            }
+            // A band narrower than twice eps (a ring a hundred-thousandth
+            // wide) leaves no candidate that clears it by eps: halve the
+            // margin until one does, down to about a millionth of eps, so
+            // the sample sits near the middle of the band.
+            let floor = eps * 0.5_f64.powi(20);
+            let near: Vec<Point3> = candidates
+                .into_iter()
+                .filter(|&c| clears(frame.project(c), floor))
+                .collect();
+            let mut margin = eps;
+            for _ in 0..20 {
+                margin *= 0.5;
+                if let Some(&cand) = near.iter().find(|&&c| clears(frame.project(c), margin)) {
+                    return Ok(cand);
+                }
+            }
+            // Near-zero-area face: try a robust interior point of the
+            // projected outer boundary. It knows nothing of the holes, and
+            // its last-resort path returns the vertex centroid, which can
+            // fall outside a concave boundary, so check it as the offsets
+            // are. If it fails, fall back to the edge midpoint (on the
+            // boundary, never in a hole or exterior) rather than a
+            // known-bad sample.
             let ip = classify_2d::sample_interior_point(&poly2d);
-            if classify_2d::point_in_polygon_2d(ip, &poly2d) {
+            if clears(ip, floor) {
                 return Ok(frame.evaluate(ip.x(), ip.y()));
             }
             return Ok(mid_pt);
@@ -1723,42 +1757,72 @@ mod tests {
         );
     }
 
+    /// A ring in `z = 0` about the origin between radii `outer` and `hole`,
+    /// the hole's circle starting `hole_turn` radians round from the outer's.
+    fn ring_face(topo: &mut Topology, outer: f64, hole: f64, hole_turn: f64) -> FaceId {
+        use brepkit_topology::builder::make_circle_edge_with_ref;
+        use brepkit_topology::face::{Face, FaceSurface};
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let circle = |topo: &mut Topology, r: f64, turn: f64, forward: bool| {
+            let edge = make_circle_edge_with_ref(
+                topo,
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                r,
+                Vec3::new(turn.cos(), turn.sin(), 0.0),
+                1e-7,
+            )
+            .unwrap();
+            topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, forward)], true).unwrap())
+        };
+        let outer = circle(topo, outer, 0.0, true);
+        let hole = circle(topo, hole, hole_turn, false);
+        topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ))
+    }
+
+    /// The radius of a ring's sample, which must lie in the ring's plane.
+    fn ring_sample_radius(outer: f64, hole: f64, hole_turn: f64) -> f64 {
+        let mut topo = Topology::new();
+        let face = ring_face(&mut topo, outer, hole, hole_turn);
+        let pt = sample_face_interior(&topo, face, Tolerance::default()).unwrap();
+        assert!(pt.z().abs() < 1e-9, "ring sample {pt:?} off its plane");
+        pt.x().hypot(pt.y())
+    }
+
     /// A ring, a planar face bounded by two concentric circles: its sample
     /// lies on the ring, not at the centre in its hole, where the solid it
     /// is classified against may have material (a disc fused into the ring:
     /// the ring read Inside there and was dropped).
     #[test]
     fn sample_face_interior_planar_ring_lands_on_the_ring() {
-        use brepkit_topology::builder::make_circle_edge;
-        use brepkit_topology::face::Face;
-        use brepkit_topology::wire::{OrientedEdge, Wire};
-
-        let mut topo = Topology::new();
-        let circle = |topo: &mut Topology, r: f64, forward: bool| {
-            let edge = make_circle_edge(
-                topo,
-                Point3::new(0.0, 0.0, 0.0),
-                Vec3::new(0.0, 0.0, 1.0),
-                r,
-                1e-7,
-            )
-            .unwrap();
-            topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, forward)], true).unwrap())
-        };
-        let outer = circle(&mut topo, 25.0, true);
-        let hole = circle(&mut topo, 14.0, false);
-        let face = topo.add_face(Face::new(
-            outer,
-            vec![hole],
-            brepkit_topology::face::FaceSurface::Plane {
-                normal: Vec3::new(0.0, 0.0, 1.0),
-                d: 0.0,
-            },
-        ));
-
-        let pt = sample_face_interior(&topo, face, Tolerance::default()).unwrap();
-        let r = pt.x().hypot(pt.y());
+        let r = ring_sample_radius(25.0, 14.0, 0.0);
         assert!(r > 14.0 && r < 25.0, "ring sample at r={r}");
-        assert!(pt.z().abs() < 1e-9);
+    }
+
+    /// A thin ring whose hole's circle starts half a sampling step round
+    /// from the outer's: the sample ray runs between two of the hole's
+    /// sampled points, where its chord sits 1.9 inside the curve, so only
+    /// the curve itself keeps the sample out of the hole.
+    #[test]
+    fn sample_face_interior_thin_ring_stays_off_the_hole_between_its_samples() {
+        let r = ring_sample_radius(25.0, 24.9, std::f64::consts::PI / 8.0);
+        assert!(r > 24.9 && r < 25.0, "ring sample at r={r}");
+    }
+
+    /// A ring a hundred-thousandth wide, thinner than the boundary margin
+    /// every offset must clear: the sample still lands on the band, not at
+    /// the centre of the outer boundary, which is in the hole.
+    #[test]
+    fn sample_face_interior_ring_thinner_than_the_margin_lands_on_the_band() {
+        let r = ring_sample_radius(25.0, 24.999_99, 0.0);
+        assert!(r > 24.999_99 && r < 25.0, "ring sample at r={r}");
     }
 }
