@@ -1304,7 +1304,7 @@ pub fn whole_ring(
 
 /// Sample a point in the interior of a face.
 ///
-/// Uses the midpoint of the first boundary edge, then offsets slightly
+/// Uses the midpoint of the longest boundary edge, then offsets slightly
 /// inward along (edge_tangent x face_normal) to get a point that is
 /// reliably inside the face — unlike a vertex centroid, which can fall
 /// outside non-convex faces.
@@ -1316,7 +1316,7 @@ fn sample_face_interior(
     face_id: FaceId,
     tol: Tolerance,
 ) -> Result<Point3, AlgoError> {
-    use brepkit_math::vec::{Point2, Vec3};
+    use brepkit_math::vec::Vec3;
 
     let face = topo.face(face_id)?;
     let wire = topo.wire(face.outer_wire())?;
@@ -1501,72 +1501,28 @@ fn sample_face_interior(
             }
             boundary.extend(samples);
         }
-        // A sampled boundary with >= 3 points forms a real polygon to test
-        // against (two arcs bound a crescent). A planar face bounded by a
-        // single closed curve has no polygon; its centroid is the disc
-        // center (interior), so it falls through to the centroid heuristic.
+        // Every curved edge adds seven samples, so only a loop of one or two
+        // straight edges, which bounds no area, has fewer than three points
+        // and falls through to the centroid heuristic below.
         if inward_len > 1e-12 && boundary.len() >= 3 {
             let frame = plane_frame::PlaneFrame::from_plane_face(*normal, &poly);
             let poly2d: Vec<_> = boundary.iter().map(|p| frame.project(*p)).collect();
             let eps = classify_2d::boundary_eps(&poly2d);
-            // The face's loops as the curves they are, holes included. A
-            // sample in a hole is off the face (a ring's centre), and a
-            // hole's sampled polygon misses the sliver between each chord
-            // and its arc, 1.9 deep on a radius-25 bore.
-            let region = brepkit_topology::planar::face_boundary_2d(
+            // The face's loops as the curves they are, holes included, each
+            // NURBS edge as chords within ten margins of it. A sample in a
+            // hole is off the face (a ring's centre), and a sampled polygon
+            // of a hole misses the sliver between each chord and its arc,
+            // 1.9 deep on a radius-25 bore. The chords' deviation widens the
+            // clearance a sample needs from them, so a sample clear of the
+            // chords is clear of their curves too.
+            let region = brepkit_topology::planar::face_boundary_2d_chorded(
                 topo,
                 face_id,
                 frame.origin(),
                 frame.u_axis(),
                 frame.v_axis(),
+                10.0 * eps,
             )?;
-            // A NURBS edge has no exact piece: the holes are then sampled as
-            // the outer boundary is, and a sample must clear them too.
-            let mut holes2d: Vec<Vec<Point2>> = Vec::new();
-            if region.is_none() {
-                for &w in face.inner_wires() {
-                    let mut hole = Vec::new();
-                    for oe in topo.wire(w)?.edges() {
-                        let e = topo.edge(oe.edge())?;
-                        let (sp, ep) = (
-                            topo.vertex(oe.oriented_start(e))?.point(),
-                            topo.vertex(oe.oriented_end(e))?.point(),
-                        );
-                        hole.push(frame.project(sp));
-                        if matches!(e.curve(), brepkit_topology::edge::EdgeCurve::Line) {
-                            continue;
-                        }
-                        let (ns, ne) = if oe.is_forward() { (sp, ep) } else { (ep, sp) };
-                        let (d0, d1) = e.curve().domain_with_endpoints(ns, ne);
-                        let mut samples: Vec<_> = (1..8)
-                            .map(|k| {
-                                let t = (d1 - d0).mul_add(f64::from(k) / 8.0, d0);
-                                frame.project(e.curve().evaluate_with_endpoints(t, ns, ne))
-                            })
-                            .collect();
-                        if !oe.is_forward() {
-                            samples.reverse();
-                        }
-                        hole.extend(samples);
-                    }
-                    if hole.len() >= 3 {
-                        holes2d.push(hole);
-                    }
-                }
-            }
-            let clears = |c2: Point2, margin: f64| match &region {
-                Some(pieces) => {
-                    brepkit_math::region2d::point_in_region(pieces, c2, margin) == Some(true)
-                }
-                None => {
-                    classify_2d::point_in_polygon_2d(c2, &poly2d)
-                        && classify_2d::distance_to_polygon_boundary(c2, &poly2d) > margin
-                        && holes2d.iter().all(|h| {
-                            !classify_2d::point_in_polygon_2d(c2, h)
-                                && classify_2d::distance_to_polygon_boundary(c2, h) > margin
-                        })
-                }
-            };
             // Try LARGE offsets first, then shrink. The base offset is
             // diag·1e-4 — a sample that close to the boundary edge can hug a
             // coincident interface plane of the opposing solid (a frustum
@@ -1585,7 +1541,10 @@ fn sample_face_interior(
                 }
                 scale *= 0.5;
             }
-            if let Some(&cand) = candidates.iter().find(|&&c| clears(frame.project(c), eps)) {
+            if let Some(&cand) = candidates
+                .iter()
+                .find(|&&c| region.contains_clear(frame.project(c), eps))
+            {
                 return Ok(cand);
             }
             // A band narrower than twice eps (a ring a hundred-thousandth
@@ -1595,12 +1554,15 @@ fn sample_face_interior(
             let floor = eps * 0.5_f64.powi(20);
             let near: Vec<Point3> = candidates
                 .into_iter()
-                .filter(|&c| clears(frame.project(c), floor))
+                .filter(|&c| region.contains_clear(frame.project(c), floor))
                 .collect();
             let mut margin = eps;
             for _ in 0..20 {
                 margin *= 0.5;
-                if let Some(&cand) = near.iter().find(|&&c| clears(frame.project(c), margin)) {
+                if let Some(&cand) = near
+                    .iter()
+                    .find(|&&c| region.contains_clear(frame.project(c), margin))
+                {
                     return Ok(cand);
                 }
             }
@@ -1612,7 +1574,7 @@ fn sample_face_interior(
             // boundary, never in a hole or exterior) rather than a
             // known-bad sample.
             let ip = classify_2d::sample_interior_point(&poly2d);
-            if clears(ip, floor) {
+            if region.contains_clear(ip, floor) {
                 return Ok(frame.evaluate(ip.x(), ip.y()));
             }
             return Ok(mid_pt);
@@ -1670,9 +1632,8 @@ fn sample_face_interior(
 
     // Planes have no UV projection, but the inward offset is already in-plane,
     // so the offset point itself is the on-surface sample. This reaches a
-    // planar face only when its boundary has < 3 vertices (a single closed
-    // circle/ellipse edge); the centroid above is the disc center, so the
-    // flipped offset points into the disc.
+    // planar face only when its sampled boundary has fewer than three points
+    // (a loop of one or two straight edges).
     if matches!(surface, brepkit_topology::face::FaceSurface::Plane { .. }) && inward_len > 1e-12 {
         return Ok(interior_pt);
     }
@@ -1727,9 +1688,9 @@ mod tests {
 
     #[test]
     fn sample_face_interior_planar_disc_lands_inside() {
-        // A planar disc bounded by a single closed circle edge has < 3 boundary
-        // vertices, so the point-in-polygon path can't apply. The sample must
-        // still land inside the disc, not on the bounding circle (the
+        // A planar disc bounded by a single closed circle edge has a single
+        // vertex, so a polygon of its vertices alone is degenerate. The sample
+        // must still land inside the disc, not on the bounding circle (the
         // degenerate-polygon failure mode).
         use brepkit_topology::builder::make_circle_edge;
         use brepkit_topology::wire::{OrientedEdge, Wire};
@@ -1788,13 +1749,137 @@ mod tests {
         ))
     }
 
+    /// The radius about the origin of a face's sample, which must lie in
+    /// `z = 0`.
+    fn sample_radius(topo: &Topology, face: FaceId) -> f64 {
+        let pt = sample_face_interior(topo, face, Tolerance::default()).unwrap();
+        assert!(pt.z().abs() < 1e-9, "sample {pt:?} off its plane");
+        pt.x().hypot(pt.y())
+    }
+
     /// The radius of a ring's sample, which must lie in the ring's plane.
     fn ring_sample_radius(outer: f64, hole: f64, hole_turn: f64) -> f64 {
         let mut topo = Topology::new();
         let face = ring_face(&mut topo, outer, hole, hole_turn);
-        let pt = sample_face_interior(&topo, face, Tolerance::default()).unwrap();
-        assert!(pt.z().abs() < 1e-9, "ring sample {pt:?} off its plane");
-        pt.x().hypot(pt.y())
+        sample_radius(&topo, face)
+    }
+
+    /// `quarters` quarter turns of the circle of radius `r` about the origin
+    /// in `z = 0`, from `from` radians, as a rational quadratic NURBS.
+    fn nurbs_arc(r: f64, from: f64, quarters: u32) -> brepkit_math::nurbs::curve::NurbsCurve {
+        use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_4, SQRT_2};
+        let mut knots = vec![0.0; 3];
+        for k in 1..quarters {
+            let t = f64::from(k) / f64::from(quarters);
+            knots.extend([t, t]);
+        }
+        knots.extend([1.0; 3]);
+        let (points, weights) = (0..=2 * quarters)
+            .map(|k| {
+                let angle = FRAC_PI_4.mul_add(f64::from(k), from);
+                let (radius, weight) = if k % 2 == 0 {
+                    (r, 1.0)
+                } else {
+                    (r * SQRT_2, FRAC_1_SQRT_2)
+                };
+                (
+                    Point3::new(radius * angle.cos(), radius * angle.sin(), 0.0),
+                    weight,
+                )
+            })
+            .unzip();
+        brepkit_math::nurbs::curve::NurbsCurve::new(2, knots, points, weights).unwrap()
+    }
+
+    /// A planar face in `z = 0` bounded by `outer` with the one hole `hole`.
+    fn plane_face(
+        topo: &mut Topology,
+        outer: brepkit_topology::wire::WireId,
+        hole: brepkit_topology::wire::WireId,
+    ) -> FaceId {
+        topo.add_face(brepkit_topology::face::Face::new(
+            outer,
+            vec![hole],
+            brepkit_topology::face::FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ))
+    }
+
+    /// A ring whose outer loop is a NURBS upper half and a circular lower
+    /// half, its circular hole of radius 24.6 starting a sixteenth of a turn
+    /// round. The NURBS edge leaves the hole's circle exact, so the first
+    /// offset (r 24.547), in the hole between two of its eighth-turn
+    /// samples, is refused.
+    #[test]
+    fn sample_face_interior_nurbs_outer_edge_keeps_the_hole_exact() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_topology::builder::make_circle_edge_with_ref;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut topo = Topology::new();
+        let (origin, z) = (Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        let va = topo.add_vertex(Vertex::new(Point3::new(25.0, 0.0, 0.0), 1e-7));
+        let vb = topo.add_vertex(Vertex::new(Point3::new(-25.0, 0.0, 0.0), 1e-7));
+        let upper = EdgeCurve::NurbsCurve(nurbs_arc(25.0, 0.0, 2));
+        let upper = topo.add_edge(Edge::new(va, vb, upper));
+        let circle = Circle3D::new_with_ref(origin, z, 25.0, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+        let lower = topo.add_edge(Edge::new(vb, va, EdgeCurve::Circle(circle)));
+        let outer = Wire::new(
+            vec![
+                OrientedEdge::new(upper, true),
+                OrientedEdge::new(lower, true),
+            ],
+            true,
+        )
+        .unwrap();
+        let outer = topo.add_wire(outer);
+        let turn = std::f64::consts::PI / 8.0;
+        let hole = make_circle_edge_with_ref(
+            &mut topo,
+            origin,
+            z,
+            24.6,
+            Vec3::new(turn.cos(), turn.sin(), 0.0),
+            1e-7,
+        )
+        .unwrap();
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(hole, false)], true).unwrap());
+        let face = plane_face(&mut topo, outer, hole);
+
+        let r = sample_radius(&topo, face);
+        assert!(r > 24.6 && r < 25.0, "ring sample at r={r}");
+    }
+
+    /// A ring whose hole is a closed NURBS circle of radius 24.75, near the
+    /// outer circle, starting a sixteenth of a turn round: the sample must
+    /// clear the curve itself, where a polygon of its eighth-turn samples
+    /// lets the first offset (r 24.68) through.
+    #[test]
+    fn sample_face_interior_nurbs_hole_is_read_along_its_curve() {
+        use brepkit_topology::builder::make_circle_edge_with_ref;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut topo = Topology::new();
+        let (origin, z) = (Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        let outer =
+            make_circle_edge_with_ref(&mut topo, origin, z, 25.0, Vec3::new(1.0, 0.0, 0.0), 1e-7)
+                .unwrap();
+        let outer = topo.add_wire(Wire::new(vec![OrientedEdge::new(outer, true)], true).unwrap());
+        let turn = std::f64::consts::PI / 8.0;
+        let curve = nurbs_arc(24.75, turn, 4);
+        let seam = topo.add_vertex(Vertex::new(curve.evaluate(0.0), 1e-7));
+        let hole = topo.add_edge(Edge::new(seam, seam, EdgeCurve::NurbsCurve(curve)));
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(hole, false)], true).unwrap());
+        let face = plane_face(&mut topo, outer, hole);
+
+        let r = sample_radius(&topo, face);
+        assert!(r > 24.75 && r < 25.0, "ring sample at r={r}");
     }
 
     /// A ring, a planar face bounded by two concentric circles: its sample
