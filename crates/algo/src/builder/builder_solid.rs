@@ -599,8 +599,7 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
     // Positions are taken from the shell's own centre: a curved face
     // integrates over its boundary's whole parameter box, not its trimmed
     // patch, and that error scales with the distance to the origin used.
-    let corner_box = shell_corner_box(topo, faces);
-    let origin = corner_box.center();
+    let origin = shell_corner_box(topo, faces).center();
     for &fid in faces {
         // Only meaningful under BK_FLUX; skip the bookkeeping otherwise.
         let flux_before = if trace { flux } else { 0.0 };
@@ -857,9 +856,10 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
             }
         }
     }
-    // A flux this small next to the shell's own size is rounding: it says
-    // nothing about which way the shell faces.
-    let tiny = 1e-12 * (corner_box.max - corner_box.min).length().powi(3);
+    // A flux this small next to the faces' own contributions is rounding:
+    // it says nothing about which way the shell faces, however large or
+    // slender the shell.
+    let tiny = 1e-12 * tot_mass;
     if !any || (flux.abs() <= tiny && flux_wire.abs() <= tiny) {
         return None;
     }
@@ -4254,11 +4254,17 @@ mod tests {
         }
     }
 
-    /// A tube `size` tall standing at `z0`, its rim of radius `size` cut
+    /// A tube `height` tall standing at `z0`, its rim of radius `size` cut
     /// into three arcs and its hole of radius `0.9 size` into four, facing
     /// out or in (every face's flag turned, as a cut turns a cavity's).
-    fn split_tube(topo: &mut Topology, z0: f64, size: f64, outward: bool) -> Vec<FaceId> {
-        let (top, hole) = (z0 + size, 0.9 * size);
+    fn split_tube(
+        topo: &mut Topology,
+        z0: f64,
+        size: f64,
+        height: f64,
+        outward: bool,
+    ) -> Vec<FaceId> {
+        let (top, hole) = (z0 + height, 0.9 * size);
         let (_, rim_b) = arc_ring(topo, size, z0, 3);
         let (_, rim_t) = arc_ring(topo, size, top, 3);
         let (_, hole_b) = arc_ring(topo, hole, z0, 4);
@@ -4332,19 +4338,24 @@ mod tests {
     /// holes outmeasure them on their corners: the corner fan has no
     /// polyhedron to read there, and the surface flux decides, the tube
     /// facing out read as growth and facing in as a hole, wherever it stands
-    /// and however small it is.
+    /// and however small or slender it is.
     #[test]
     fn a_tube_whose_hole_outmeasures_its_rim_on_their_corners_reads_by_its_flux() {
-        for (z0, size) in [(0.0, 1.0), (1000.0, 1.0), (0.0, 5e-4)] {
+        for (z0, size, height) in [
+            (0.0, 1.0, 1.0),
+            (1000.0, 1.0, 1.0),
+            (0.0, 5e-4, 5e-4),
+            (0.0, 1e-4, 1000.0),
+        ] {
             for outward in [true, false] {
                 let mut topo = Topology::new();
-                let faces = split_tube(&mut topo, z0, size, outward);
+                let faces = split_tube(&mut topo, z0, size, height, outward);
                 assert!(!corner_fan_holds_holes(&topo, &faces));
                 let (growth, holes) = perform_areas(&topo, &[faces]);
                 assert_eq!(
                     (growth.len(), holes.len()),
                     if outward { (1, 0) } else { (0, 1) },
-                    "size {size} at z {z0}, facing {}",
+                    "size {size} by {height} at z {z0}, facing {}",
                     if outward { "out" } else { "in" }
                 );
             }
