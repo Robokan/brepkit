@@ -1230,9 +1230,25 @@ fn distance_to_surface_near(
 
 /// Compute distance from point to surface.
 fn distance_to_surface(pt: Point3, surface: &FaceSurface) -> f64 {
-    if let FaceSurface::Plane { normal, d } = surface {
-        (pt.x() * normal.x() + pt.y() * normal.y() + pt.z() * normal.z() - d).abs()
-    } else if let Some((u, v)) = surface.project_point(pt) {
+    // A cylinder's and a sphere's distances have closed forms: the point's
+    // distance from the axis or the centre less the radius. They equal the
+    // projection's foot distance without its trigonometry, and the scans
+    // here ask for them at every sample of every edge near the face.
+    match surface {
+        FaceSurface::Plane { normal, d } => {
+            return (pt.x() * normal.x() + pt.y() * normal.y() + pt.z() * normal.z() - d).abs();
+        }
+        FaceSurface::Cylinder(c) => {
+            let w = pt - c.origin();
+            let radial = w - c.axis() * w.dot(c.axis());
+            return (radial.length() - c.radius()).abs();
+        }
+        FaceSurface::Sphere(sp) => {
+            return ((pt - sp.center()).length() - sp.radius()).abs();
+        }
+        _ => {}
+    }
+    if let Some((u, v)) = surface.project_point(pt) {
         if let Some(surf_pt) = surface.evaluate(u, v) {
             (pt - surf_pt).length()
         } else {
@@ -1304,6 +1320,42 @@ mod tests {
     use super::*;
     use brepkit_math::vec::Point3;
     use brepkit_topology::edge::EdgeCurve;
+
+    /// The closed-form distances to a cylinder and a sphere equal the
+    /// projection's foot distance they replace, for surfaces placed off the
+    /// axes and points inside, outside and on them.
+    #[test]
+    fn closed_form_distances_match_the_projection() {
+        use brepkit_math::surfaces::{CylindricalSurface, SphericalSurface};
+        use brepkit_math::vec::Vec3;
+        let foot = |p: Point3, s: &FaceSurface| {
+            let (u, v) = s.project_point(p).unwrap();
+            (p - s.evaluate(u, v).unwrap()).length()
+        };
+        let surfaces = [
+            FaceSurface::Cylinder(
+                CylindricalSurface::new(Point3::new(1.0, -2.0, 3.0), Vec3::new(1.0, 2.0, 2.0), 1.5)
+                    .unwrap(),
+            ),
+            FaceSurface::Sphere(SphericalSurface::new(Point3::new(-4.0, 0.5, 2.0), 2.25).unwrap()),
+        ];
+        for s in &surfaces {
+            for k in 0..30 {
+                let t = f64::from(k);
+                let p = Point3::new(
+                    3.0 * (0.7 * t).cos(),
+                    2.0 * (1.3 * t).sin() - 1.0,
+                    0.4 * t - 4.0,
+                );
+                let (closed, projected) = (distance_to_surface(p, s), foot(p, s));
+                assert!(
+                    (closed - projected).abs() < 1e-9,
+                    "{}: {closed} vs {projected}",
+                    s.type_tag()
+                );
+            }
+        }
+    }
 
     /// A cylindrical band `z` in `[0, 6]` around the `z` axis at radius 2,
     /// seamed at angle 0, with a window between 60 and 120 degrees and `z` 2
