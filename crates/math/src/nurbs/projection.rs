@@ -124,22 +124,75 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
     // Each span's (start, end) and its (parameter, distance_sq) samples, in
     // order along the curve.
     let n_samples = (p + 1).max(5) * 2;
-    let mut spans: Vec<Span> = Vec::new();
-    for span in knots.windows(2) {
-        let (u_start, u_end) = (span[0], span[1]);
-        if u_end <= u_start || u_start < lo || u_end > hi {
-            continue;
+    // A span's piece lies in the box of its p + 1 control points (the convex
+    // hull property, which holds while their weights are positive), so its
+    // distance from that box bounds every point of it from below; a span
+    // with a weight of zero or less can leave its box, and is never pruned.
+    // Spans are sampled nearest box first, and a span whose box lies beyond
+    // the closest sample so far cannot hold the closest point: on a fitted
+    // curve of many spans, a point on or near it samples a few spans, not
+    // all of them.
+    let cps = curve.control_points();
+    let box_dist_sq = |k: usize| -> f64 {
+        let Some(first) = k.checked_sub(p) else {
+            return 0.0;
+        };
+        let Some(pts) = cps.get(first..=k) else {
+            return 0.0;
+        };
+        if curve
+            .weights()
+            .get(first..=k)
+            .is_none_or(|ws| ws.iter().any(|&w| w <= 0.0))
+        {
+            return 0.0;
         }
+        let axis = |f: fn(Point3) -> f64, q: f64| {
+            let (mn, mx) = pts
+                .iter()
+                .map(|c| f(*c))
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                    (a.min(v), b.max(v))
+                });
+            (mn - q).max(0.0).max(q - mx)
+        };
+        let (dx, dy, dz) = (
+            axis(Point3::x, point.x()),
+            axis(Point3::y, point.y()),
+            axis(Point3::z, point.z()),
+        );
+        dx.mul_add(dx, dy.mul_add(dy, dz * dz))
+    };
+    let mut order: Vec<(usize, f64)> = knots
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| w[1] > w[0] && w[0] >= lo && w[1] <= hi)
+        .map(|(k, _)| (k, box_dist_sq(k)))
+        .collect();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut best = f64::INFINITY;
+    let mut sampled: Vec<(usize, Span)> = Vec::new();
+    for (k, lower) in order {
+        if lower > best {
+            break;
+        }
+        let (u_start, u_end) = (knots[k], knots[k + 1]);
         let top = if u_end < hi { u_end.next_down() } else { u_end };
-        let samples = (0..=n_samples)
+        let samples: Vec<(f64, f64)> = (0..=n_samples)
             .map(|i| {
                 let t = i as f64 / n_samples as f64;
                 let u = t.mul_add(u_end - u_start, u_start).min(top);
                 (u, (curve.evaluate(u) - point).length_squared())
             })
             .collect();
-        spans.push((u_start, top, samples));
+        best = samples.iter().map(|s| s.1).fold(best, f64::min);
+        sampled.push((k, (u_start, top, samples)));
     }
+    // Back in order along the curve, for the minima's neighbours below; a
+    // span whose neighbour was not sampled reads its end as a minimum there.
+    sampled.sort_by_key(|s| s.0);
+    let adjacent = touching(knots, &sampled.iter().map(|s| s.0).collect::<Vec<_>>());
+    let spans: Vec<Span> = sampled.into_iter().map(|s| s.1).collect();
 
     let closest = |samples: &[(f64, f64)]| {
         samples
@@ -169,7 +222,7 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
             let prev = if i > 0 {
                 Some(samples[i - 1].1)
             } else {
-                s.checked_sub(1).map(|r| {
+                s.checked_sub(1).filter(|_| adjacent[s]).map(|r| {
                     let before = &spans[r].2;
                     before[before.len() - 2].1
                 })
@@ -177,7 +230,10 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
             let next = if i < last {
                 Some(samples[i + 1].1)
             } else {
-                spans.get(s + 1).map(|after| after.2[1].1)
+                spans
+                    .get(s + 1)
+                    .filter(|_| adjacent.get(s + 1).copied().unwrap_or(false))
+                    .map(|after| after.2[1].1)
             };
             let minimum = prev.is_none_or(|q| d <= q) && next.is_none_or(|q| d <= q);
             if minimum && !in_run {
@@ -199,6 +255,18 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
         }
     }
     seeds
+}
+
+/// Whether each of the knot windows `spans` (indices, in order along the
+/// curve) starts where the one before it ends. A window of repeated knots
+/// between two spans is empty and the two still touch; a span left out
+/// between them parts them.
+fn touching(knots: &[f64], spans: &[usize]) -> Vec<bool> {
+    spans
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| i > 0 && knots[spans[i - 1] + 1].total_cmp(&knots[k]).is_eq())
+        .collect()
 }
 
 /// Newton–Raphson refinement for curve point projection.
@@ -742,6 +810,128 @@ mod tests {
     use crate::vec::Vec3;
 
     const TOL: f64 = 1e-8;
+
+    /// A span with a negative weight leaves its control points' box, so it
+    /// is never pruned: here the exact hit at u = 0.75 lies outside the box
+    /// of the span holding it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn projection_keeps_a_span_with_a_negative_weight() {
+        let x = [0.5, 0.5, 0.0, -1.0, 0.0];
+        let curve = NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
+            x.iter().map(|&x| Point3::new(x, 0.0, 0.0)).collect(),
+            vec![1.0, 1.0, 1.0, -0.5, 1.0],
+        )
+        .unwrap();
+        let q = Point3::new(1.0, 0.0, 0.0);
+        let on = curve.evaluate(0.75);
+        assert!(
+            (on - q).length() < 1e-9,
+            "the curve passes through q: {on:?}"
+        );
+        let proj = project_point_to_curve(&curve, q, 1e-10).unwrap();
+        assert!(proj.distance < 1e-6, "projected {} away", proj.distance);
+    }
+
+    /// Spans either side of a window of repeated knots touch; spans either
+    /// side of a span left out do not.
+    #[test]
+    fn spans_touch_across_repeated_knots_only() {
+        let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0];
+        assert_eq!(super::touching(&knots, &[2, 4, 6]), [false, true, true]);
+        assert_eq!(super::touching(&knots, &[2, 6]), [false, false]);
+    }
+
+    /// A quadratic zigzag of eight spans joined at corners (every interior
+    /// knot doubled): points on, near and far from it project no farther
+    /// than the closest of 20 000 samples along it.
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::unwrap_used)]
+    fn projection_on_a_cornered_curve_finds_the_closest_point() {
+        let corners: Vec<Point3> = (0..=8)
+            .map(|i| Point3::new(f64::from(i), if i % 2 == 0 { 0.0 } else { 1.5 }, 0.0))
+            .collect();
+        let mut cps = vec![corners[0]];
+        for w in corners.windows(2) {
+            let mid = Point3::new(
+                0.5 * (w[0].x() + w[1].x()),
+                0.5 * (w[0].y() + w[1].y()) + 0.4,
+                0.0,
+            );
+            cps.push(mid);
+            cps.push(w[1]);
+        }
+        let mut knots = vec![0.0, 0.0, 0.0];
+        for i in 1..8 {
+            knots.extend([f64::from(i), f64::from(i)]);
+        }
+        knots.extend([8.0, 8.0, 8.0]);
+        let weights = vec![1.0; cps.len()];
+        let curve = NurbsCurve::new(2, knots, cps, weights).unwrap();
+        let n = 20_000;
+        let dense: Vec<Point3> = (0..=n)
+            .map(|i| curve.evaluate(8.0 * (i as f64 / n as f64)))
+            .collect();
+        for k in 0..60 {
+            let s = f64::from(k) * 0.137;
+            let q = Point3::new(s, 0.75 + 0.6 * (3.1 * s).sin(), 0.05 * f64::from(k % 3));
+            let best = dense
+                .iter()
+                .map(|p| (*p - q).length())
+                .fold(f64::INFINITY, f64::min);
+            let proj = project_point_to_curve(&curve, q, 1e-10).unwrap();
+            assert!(
+                proj.distance <= best + 1e-6,
+                "point {k}: projected {} but a sample is {best} away",
+                proj.distance
+            );
+        }
+    }
+
+    /// On a fitted curve of many spans (a helix through 60 points), the
+    /// pruned coarse search still finds the closest point: for points on,
+    /// near and far from the curve, the projection is never farther than
+    /// the closest of 20 000 samples along it.
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::unwrap_used)]
+    fn projection_on_a_many_span_curve_finds_the_closest_point() {
+        let pts: Vec<Point3> = (0..60)
+            .map(|i| {
+                let t = f64::from(i) * 0.3;
+                Point3::new(5.0 * t.cos(), 5.0 * t.sin(), 0.4 * t)
+            })
+            .collect();
+        let curve = crate::nurbs::fitting::interpolate(&pts, 3).unwrap();
+        let (lo, hi) = (
+            curve.knots()[curve.degree()],
+            curve.knots()[curve.knots().len() - curve.degree() - 1],
+        );
+        let n = 20_000;
+        let dense: Vec<Point3> = (0..=n)
+            .map(|i| curve.evaluate(lo + (hi - lo) * (i as f64 / n as f64)))
+            .collect();
+        for k in 0..40 {
+            let s = f64::from(k) * 0.43;
+            let off = [0.0, 0.3, 4.0, 12.0][k as usize % 4];
+            let q = Point3::new(
+                (5.0 + off) * s.cos(),
+                (5.0 + off) * s.sin(),
+                0.4 * s + off * 0.5,
+            );
+            let best = dense
+                .iter()
+                .map(|p| (*p - q).length())
+                .fold(f64::INFINITY, f64::min);
+            let proj = project_point_to_curve(&curve, q, 1e-10).unwrap();
+            assert!(
+                proj.distance <= best + 1e-6,
+                "point {k}: projected {} but a sample is {best} away",
+                proj.distance
+            );
+        }
+    }
 
     /// A simple line from (0,0,0) to (10,0,0) as a degree-1 NURBS.
     fn line_curve() -> NurbsCurve {

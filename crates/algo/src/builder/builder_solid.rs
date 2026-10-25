@@ -599,8 +599,7 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
     // Positions are taken from the shell's own centre: a curved face
     // integrates over its boundary's whole parameter box, not its trimmed
     // patch, and that error scales with the distance to the origin used.
-    let corner_box = shell_corner_box(topo, faces);
-    let origin = corner_box.center();
+    let origin = shell_corner_box(topo, faces).center();
     for &fid in faces {
         // Only meaningful under BK_FLUX; skip the bookkeeping otherwise.
         let flux_before = if trace { flux } else { 0.0 };
@@ -672,10 +671,10 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
                 };
                 let (sp, ep) = (sv.point(), ev.point());
                 let (d0, d1) = edge.curve().domain_with_endpoints(sp, ep);
-                // Traversal order (is_forward-aware, endpoint sample left to
-                // the next edge) so the uv polygon's signed area below reads
-                // the wire's true winding.
-                for k in 0..8 {
+                // Traversal order (is_forward-aware), each edge's end taken
+                // too: a loop running a whole turn then spans the whole
+                // period, not all of it but its last step.
+                for k in 0..=8 {
                     let f = f64::from(k) / 8.0;
                     let f = if oe.is_forward() { f } else { 1.0 - f };
                     let p = edge
@@ -857,9 +856,10 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
             }
         }
     }
-    // A flux this small next to the shell's own size is rounding: it says
-    // nothing about which way the shell faces.
-    let tiny = 1e-12 * (corner_box.max - corner_box.min).length().powi(3);
+    // A flux this small next to the faces' own contributions is rounding:
+    // it says nothing about which way the shell faces, however large or
+    // slender the shell.
+    let tiny = 1e-12 * tot_mass;
     if !any || (flux.abs() <= tiny && flux_wire.abs() <= tiny) {
         return None;
     }
@@ -4254,11 +4254,17 @@ mod tests {
         }
     }
 
-    /// A tube `size` tall standing at `z0`, its rim of radius `size` cut
+    /// A tube `height` tall standing at `z0`, its rim of radius `size` cut
     /// into three arcs and its hole of radius `0.9 size` into four, facing
     /// out or in (every face's flag turned, as a cut turns a cavity's).
-    fn split_tube(topo: &mut Topology, z0: f64, size: f64, outward: bool) -> Vec<FaceId> {
-        let (top, hole) = (z0 + size, 0.9 * size);
+    fn split_tube(
+        topo: &mut Topology,
+        z0: f64,
+        size: f64,
+        height: f64,
+        outward: bool,
+    ) -> Vec<FaceId> {
+        let (top, hole) = (z0 + height, 0.9 * size);
         let (_, rim_b) = arc_ring(topo, size, z0, 3);
         let (_, rim_t) = arc_ring(topo, size, top, 3);
         let (_, hole_b) = arc_ring(topo, hole, z0, 4);
@@ -4309,6 +4315,43 @@ mod tests {
         faces
     }
 
+    /// An upper hemispherical bowl between radii 1 and 0.999, its rim an
+    /// annulus whose outer ring is cut into three arcs and its inner into
+    /// four, facing out or in. The rim's holes outmeasure it on their
+    /// corners, so the flux decides, and each hemisphere is integrated over
+    /// its whole turn of longitude.
+    #[test]
+    fn a_bowl_split_unevenly_reads_by_its_whole_hemispheres() {
+        use brepkit_math::surfaces::SphericalSurface;
+
+        for outward in [true, false] {
+            let mut topo = Topology::new();
+            let (_, outer) = arc_ring(&mut topo, 1.0, 0.0, 3);
+            let (_, inner) = arc_ring(&mut topo, 0.999, 0.0, 4);
+            let mut faces = Vec::new();
+            let loops = (edge_run(&outer, false), vec![edge_run(&inner, true)]);
+            push_face(&mut topo, &mut faces, loops, z_plane(0.0, false), !outward);
+            for (r, ring, flipped) in [(1.0, &outer, false), (0.999, &inner, true)] {
+                let sphere = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), r).unwrap();
+                let loops = (edge_run(ring, true), vec![]);
+                push_face(
+                    &mut topo,
+                    &mut faces,
+                    loops,
+                    FaceSurface::Sphere(sphere),
+                    flipped == outward,
+                );
+            }
+            let (growth, holes) = perform_areas(&topo, &[faces]);
+            assert_eq!(
+                (growth.len(), holes.len()),
+                if outward { (1, 0) } else { (0, 1) },
+                "facing {}",
+                if outward { "out" } else { "in" }
+            );
+        }
+    }
+
     /// A cup whose walls and floor are a ten-thousandth thick, its rings cut
     /// unevenly, reads by its planar faces' exact areas: facing out, growth;
     /// facing in, a hole. Taken on outlines sampled per edge, the flux of
@@ -4332,19 +4375,24 @@ mod tests {
     /// holes outmeasure them on their corners: the corner fan has no
     /// polyhedron to read there, and the surface flux decides, the tube
     /// facing out read as growth and facing in as a hole, wherever it stands
-    /// and however small it is.
+    /// and however small or slender it is.
     #[test]
     fn a_tube_whose_hole_outmeasures_its_rim_on_their_corners_reads_by_its_flux() {
-        for (z0, size) in [(0.0, 1.0), (1000.0, 1.0), (0.0, 5e-4)] {
+        for (z0, size, height) in [
+            (0.0, 1.0, 1.0),
+            (1000.0, 1.0, 1.0),
+            (0.0, 5e-4, 5e-4),
+            (0.0, 1e-4, 1000.0),
+        ] {
             for outward in [true, false] {
                 let mut topo = Topology::new();
-                let faces = split_tube(&mut topo, z0, size, outward);
+                let faces = split_tube(&mut topo, z0, size, height, outward);
                 assert!(!corner_fan_holds_holes(&topo, &faces));
                 let (growth, holes) = perform_areas(&topo, &[faces]);
                 assert_eq!(
                     (growth.len(), holes.len()),
                     if outward { (1, 0) } else { (0, 1) },
-                    "size {size} at z {z0}, facing {}",
+                    "size {size} by {height} at z {z0}, facing {}",
                     if outward { "out" } else { "in" }
                 );
             }
