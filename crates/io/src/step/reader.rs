@@ -2369,6 +2369,10 @@ mod tests {
         .unwrap();
         let report = brepkit_operations::validate::validate_solid(&topo, fused).unwrap();
         assert!(report.is_valid(), "{report:?}");
+        // The box and the two caps of the ball either side of its slab.
+        let union = 48.0 + 10.0 / 3.0 * std::f64::consts::PI;
+        let volume = brepkit_operations::measure::solid_volume(&topo, fused, 0.001).unwrap();
+        assert!((volume - union).abs() < 1e-3 * union, "{volume} vs {union}");
     }
 
     #[test]
