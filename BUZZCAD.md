@@ -197,20 +197,25 @@ files). Follow the `pr-workflow` skill. Upstream bans the reference kernel's
 name in code, commit messages and PR text, so word around it ("some STEP
 writers", "a reference kernel"); leave BuzzCAD and corpus names out too.
 
-**In flight.** Seven PR branches are pushed to `origin` (Robokan/brepkit),
+**In flight.** As of 2026-10-25, 10 of the 12 PRs below are merged upstream (released in 4.2.3-4.2.5); #2046 and #2053 are still open. Seven PR branches are pushed to `origin` (Robokan/brepkit),
 each `upstream/main` plus one fix, and all seven PRs were opened on
 2026-10-22 (#2045-#2051), without auto-merge. Their descriptions are in
 `buzzcad-prs/`.
 
 | branch | body | status |
 |---|---|---|
-| fix/shell-orientation-holes | shell.md | [#2045](https://github.com/andymai/brepkit/pull/2045) open; tested, sweep and audit unchanged |
+| fix/shell-orientation-holes | shell.md | [#2045](https://github.com/andymai/brepkit/pull/2045) merged; tested, sweep and audit unchanged |
 | fix/step-outer-loop-by-area | outer.md | [#2046](https://github.com/andymai/brepkit/pull/2046) open; tested (2026-10-20) |
-| fix/step-vertex-loop-sphere | sphere.md | [#2047](https://github.com/andymai/brepkit/pull/2047) open; tested (2026-10-20) |
-| fix/step-planes-facing-out | planes.md | [#2051](https://github.com/andymai/brepkit/pull/2051) open; tested (2026-10-20); stacked on shell-orientation-holes |
-| fix/cylinder-wall-rim-notches | notch.md | [#2048](https://github.com/andymai/brepkit/pull/2048) open; tested, sweep and audit unchanged |
-| fix/plane-cylinder-line-outside-face | line.md | [#2049](https://github.com/andymai/brepkit/pull/2049) open; tested, sweep and audit unchanged |
-| fix/ring-face-sample | ring.md | [#2050](https://github.com/andymai/brepkit/pull/2050) open; tested, sweep and audit unchanged |
+| fix/step-vertex-loop-sphere | sphere.md | [#2047](https://github.com/andymai/brepkit/pull/2047) merged; tested (2026-10-20) |
+| fix/step-planes-facing-out | planes.md | [#2051](https://github.com/andymai/brepkit/pull/2051) merged; tested (2026-10-20); stacked on shell-orientation-holes |
+| fix/cylinder-wall-rim-notches | notch.md | [#2048](https://github.com/andymai/brepkit/pull/2048) merged; tested, sweep and audit unchanged |
+| fix/plane-cylinder-line-outside-face | line.md | [#2049](https://github.com/andymai/brepkit/pull/2049) merged; tested, sweep and audit unchanged |
+| fix/ring-face-sample | ring.md | [#2050](https://github.com/andymai/brepkit/pull/2050) merged; tested, sweep and audit unchanged |
+| fix/step-nurbs-edge-same-sense | same-sense.md | [#2052](https://github.com/andymai/brepkit/pull/2052) merged (2026-10-24); new writer unit test (the fork's round-trip test needs a fork-only cut) |
+| fix/heal-merge-round-holes | heal-round-holes.md | [#2053](https://github.com/andymai/brepkit/pull/2053) open (2026-10-24); sweep and audit unchanged |
+| perf/nurbs-projection-near-spans | projection.md | [#2054](https://github.com/andymai/brepkit/pull/2054) merged (2026-10-24); new many-span projection test; sweep and audit unchanged |
+| perf/surface-distance-closed-form | surface-distance.md | [#2055](https://github.com/andymai/brepkit/pull/2055) merged (2026-10-24); new equivalence test; sweep and audit unchanged |
+| fix/closed-nurbs-reversed-span | closed-nurbs.md | [#2056](https://github.com/andymai/brepkit/pull/2056) merged (2026-10-24); sweep and audit unchanged |
 
 "Tested" means clippy clean and `cargo test -p brepkit-algo -p
 brepkit-operations --lib` passing (1197 tests) on that branch alone; for
@@ -232,7 +237,7 @@ Next:
    merging is the maintainer's call. `gh pr edit` fails on a GitHub
    deprecation error; patch a body with
    `gh api -X PATCH repos/andymai/brepkit/pulls/<N> -F body=@<file>`.
-2. Batch two, each its own branch off `upstream/main`, checked the same way
+2. Batch two (opened 2026-10-24 as #2052, #2053, #2056, with two speed PRs #2054, #2055; all from Robokan, commits as eric.d.vaughan@gmail.com so the CLA credits Robokan). Still to send: the band mesh declining a folded rim (`11744679`), which needs a standalone test (its only test is a fork-only cut). Originally: batch two, each its own branch off `upstream/main`, checked the same way
    (tests, pose sweep and truth audit, banned-name grep), from the fork's
    commits of 2026-10-20: the STEP writer's `same_sense` (`e3fd82db`), the
    band mesh declining a rim that folds back (`11744679`), the coplanar merge
@@ -302,3 +307,4 @@ library files.
 | 2026-10-23 | 1704 | 39 | 0 | 196 | 0 | 0 | algo (face splitter), a rod with a crossbar fused on its top (`90e99aefddb9`, `ce074e9d40e2`: a short wide cylinder across the rod's end, its caps cutting down through the rod's wall): on each cap the cap's rim, split at the feet of the rod's two lines, keeps a major arc whose chord crosses one line. The cap's trial planar arrangement broke that line at the chord and registered the break for the curved faces before its pieces were dropped for the walker's, so the rod's wall split the line alone there and its pieces met nothing. Breaks now reach the registry only from an arrangement whose pieces are kept. Both pass; replay `20261023-233817`, no regressions against `20261023-184144`. Test `crates/operations/tests/rod_under_a_crossbar.rs` (the rod turned 90 or 270, every crossbar turn; with the rod at 0 or 180 it still falls back in memory, the rim-layout fault noted above) |
 | 2026-10-24 | 1704 | 41 | 0 | 194 | 0 | 0 | algo (builder_solid), a box sunk 1 into a drilled plate, its floor and roof crossing holes (`bafee87b8dbe`, `1997f6ee6e6c`): below the floor a crossed hole keeps a short strip of its wall and the floor's chord strip across it, a pair that meets the rest through edges sharing their ends with the hole's arc and the box edge's chord. The shell grouping counts edges by their ends, so the arc and the chord filled the count first and each pair became a cavity shell of its own (the exact result, at Open CASCADE's volume, was refused). A face across the very same edge now joins while that edge has fewer than two faces in the shell. Both now "faces" (27 vs 25: each strip stays apart from the hole wall below it); replay `20261024-004141`, no regressions against `20261023-233817`. Test `crates/io/tests/box_sunk_into_drilled_plate.rs` (the case's operands from STEP; built from primitives, in memory or through STEP, the fuse never hit it) |
 | 2026-10-24 | 1977 | 42 | 0 | 276 | 0 | 0 | 2401 cases (397 new); BuzzCAD's replay now takes reference answers stored in the corpus as a further opinion, and a new status, "empty" (19: the inputs only touch). Speed, measured with `crates/io/examples/corpus_bench.rs` on the 147 single-solid cases the engines all got right on the Mac (one core, inputs loaded): 0.429 s total, 1.18 ms median before; math: a NURBS projection samples only spans whose control box can hold the closest point (fitted section curves have many spans; the slowest cases 27 ms -> 6 ms); algo phase_ef: a cylinder's and a sphere's distance in closed form, not by projecting (median -13%); topology: a face's edges and vertices deduped by a short scan, not a hash set (~1%); BuzzCAD bridge: built for x86-64-v3 on Linux (`source/brepkit_py/.cargo/config.toml`, not committed; brepkit's `mul_add` was a software call without FMA; -22%). Now 0.241 s total, 0.915 ms median (1.8x and 1.3x; on the M1, where FMA is native, about 1.35x and 1.15x). Measured: the intersection curves themselves are 2% of the time (plane x cylinder already exact; only cylinder x cylinder fits curves), so exact intersections would help accuracy more than speed; a typical boolean's time is spread over edge-face crossings (23%), building the result (20%), face-face (12%), result checks (~10%), same-domain (5%), copies (3%). Replays `20261024-115457`, `-124435`: no regressions, 4 former timeouts pass; near-limit mesh fallbacks (45-57 s) flip between failed and timeout with load |
+| 2026-10-24 | 1987 | 42 | 0 | 267 | 0 | 0 | algo (phase_ff), a bore cut through a plate into the boss fused to its back, tilted 2.3 degrees off the boss's axis and running just inside its wall (10 fallbacks, `e729142fd1bd` and kin, all `atlas_real`): where the bore crosses the plate's back face (and a flange's shoulder) its ellipse lies wholly inside the boss's round hole in that face. The exact plane x cylinder trim found no edge crossings and handed the closed section to the sampled restriction, which reads no holes, so it was kept; it split the bore's wall along a curve no face shared, the wall was dropped and the cut fell back. A closed section that crosses none of a plane face's edges, holes included, and whose point lies outside the face's exact outline is now dropped. All 10 pass; replay `20261024-215642`, no regressions against `20261024-181317` (55 timeouts, no column here). Test `crates/operations/tests/bore_just_inside_a_boss.rs` (4 bore seam turns, closed-form volume) |

@@ -3855,6 +3855,24 @@ fn trim_ellipse_to_boundary_crossings(
     }
     // Need at least two crossings to bound an arc.
     if crossings.len() < 2 {
+        // A closed section that meets none of the face's edges, its holes'
+        // included, lies wholly on the face or wholly off it. One wholly
+        // inside a round hole (a bore just inside a boss the face is fused
+        // to) is off it, though the face's outline and boxes hold it; left
+        // to the sampled restriction, it was kept and split the analytic
+        // face along a curve no face shares.
+        if crossings.iter().all(|(_, src)| src.is_empty())
+            && section_lies_off_face(
+                topo,
+                plane_face,
+                *plane_n,
+                sec.evaluate(0.0),
+                analytic_surf,
+                tol,
+            )
+        {
+            return Some(Vec::new());
+        }
         return None;
     }
 
@@ -3951,6 +3969,58 @@ fn trim_ellipse_to_boundary_crossings(
     }
 
     if arcs.is_empty() { None } else { Some(arcs) }
+}
+
+/// Whether a closed plane section through `point`, crossing none of the
+/// plane face's outer edges, lies wholly off the face (in one of its holes,
+/// or beyond its outline): no hole edge meets the analytic surface, and
+/// `point` is outside the face's exact outline, its lines and arcs.
+fn section_lies_off_face(
+    topo: &Topology,
+    plane_face: FaceId,
+    plane_n: Vec3,
+    point: Point3,
+    analytic_surf: &FaceSurface,
+    tol: Tolerance,
+) -> bool {
+    let Ok(face) = topo.face(plane_face) else {
+        return false;
+    };
+    for &wid in face.inner_wires() {
+        let Ok(wire) = topo.wire(wid) else {
+            return false;
+        };
+        for oe in wire.edges() {
+            let Ok(edge) = topo.edge(oe.edge()) else {
+                return false;
+            };
+            let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+                return false;
+            };
+            let (sp, ep) = (sv.point(), ev.point());
+            let hits = if matches!(edge.curve(), EdgeCurve::Line) {
+                line_segment_surface_crossings(sp, ep, analytic_surf)
+            } else {
+                edge_surface_crossings(edge.curve(), sp, ep, analytic_surf, tol.linear)
+            };
+            if !hits.is_empty() {
+                return false;
+            }
+        }
+    }
+    let Ok(frame) = brepkit_math::frame::Frame3::from_normal(point, plane_n) else {
+        return false;
+    };
+    let Ok(Some(pieces)) =
+        brepkit_topology::planar::face_boundary_2d(topo, plane_face, point, frame.x, frame.y)
+    else {
+        return false;
+    };
+    brepkit_math::region2d::point_in_region(
+        &pieces,
+        brepkit_math::vec::Point2::new(0.0, 0.0),
+        tol.linear,
+    ) == Some(false)
 }
 
 /// Crossings of a circular boundary ARC with the plane `normal·p = d`.
