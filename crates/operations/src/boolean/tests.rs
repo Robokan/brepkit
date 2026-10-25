@@ -8664,6 +8664,10 @@ fn cylinder_cut_wall_bands_split_by_full_circles_beside_a_window() {
         brepkit_algo::gfa::boolean(&mut topo, brepkit_algo::bop::BooleanOp::Cut, body, cutter)
             .unwrap();
     check_result(&topo, result);
+    assert!(
+        is_closed_manifold(&topo, result).unwrap(),
+        "the cut body must be closed-manifold"
+    );
 
     // body: plate 40000, post above it 750, block 1800, less the post's
     // 100 inside the block = 42450; the plate loses a disc, the block the circular segment
