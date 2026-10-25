@@ -268,9 +268,10 @@ impl<'a> StepBuilder<'a> {
         }
 
         // FACE_OUTER_BOUND is optional (ISO 10303-42), and some writers
-        // often writes every loop as a plain FACE_BOUND, the hole first. A
-        // planar face's outer loop encloses the others, so it is the one of
-        // largest area; other faces fall back to the first bound.
+        // write every loop as a plain FACE_BOUND, the hole first. A planar
+        // face's outer loop encloses the others, so it is the one of largest
+        // area, read exactly: a sampled outline can rank a thin washer's hole
+        // above its rim. Other faces fall back to the first bound.
         let outer = outer_wire.or_else(|| {
             if inner_wires.is_empty() {
                 return None;
@@ -282,8 +283,11 @@ impl<'a> StepBuilder<'a> {
             {
                 let mut best = f64::NEG_INFINITY;
                 for (i, &wire) in inner_wires.iter().enumerate() {
-                    let area = planar_loop_area(self.topo, wire, frame.x, frame.y)
-                        .unwrap_or(f64::NEG_INFINITY);
+                    let area =
+                        brepkit_topology::planar::wire_area_2d(self.topo, wire, frame.x, frame.y)
+                            .ok()
+                            .flatten()
+                            .map_or(f64::NEG_INFINITY, f64::abs);
                     if area > best {
                         best = area;
                         first = i;
@@ -924,50 +928,6 @@ fn refs_after_name(attrs: &str) -> Vec<u64> {
 enum Extrusion {
     Surface(FaceSurface),
     Spline(brepkit_math::nurbs::NurbsCurve, Vec3),
-}
-
-/// The area a loop encloses, flattened into the plane spanned by unit `x`
-/// and `y`: the shoelace area of its edges sampled along their curves.
-/// Approximate, but enough to tell a face's outer loop from its holes.
-fn planar_loop_area(
-    topo: &Topology,
-    wire: brepkit_topology::wire::WireId,
-    x: Vec3,
-    y: Vec3,
-) -> Result<f64, IoError> {
-    const SAMPLES: usize = 16;
-    let mut pts = Vec::new();
-    for oe in topo.wire(wire)?.edges() {
-        let edge = topo.edge(oe.edge())?;
-        let (a, b) = (
-            topo.vertex(edge.start())?.point(),
-            topo.vertex(edge.end())?.point(),
-        );
-        let curve = edge.curve();
-        let (t0, t1) = curve.domain_with_endpoints(a, b);
-        let n = if matches!(curve, EdgeCurve::Line) {
-            1
-        } else {
-            SAMPLES
-        };
-        for k in 0..n {
-            #[allow(clippy::cast_precision_loss)]
-            let f = k as f64 / n as f64;
-            let f = if oe.is_forward() { f } else { 1.0 - f };
-            let p = curve.evaluate_with_endpoints(t0 + (t1 - t0) * f, a, b);
-            let v = Vec3::new(p.x(), p.y(), p.z());
-            pts.push((v.dot(x), v.dot(y)));
-        }
-    }
-    let Some(&(qx, qy)) = pts.first() else {
-        return Ok(0.0);
-    };
-    let mut area2 = 0.0;
-    for (i, &(ax, ay)) in pts.iter().enumerate() {
-        let (bx, by) = pts[(i + 1) % pts.len()];
-        area2 += (ax - qx) * (by - qy) - (bx - qx) * (ay - qy);
-    }
-    Ok(area2.abs() / 2.0)
 }
 
 /// The lowest and highest heights along unit `along` that an edge from
@@ -1964,6 +1924,52 @@ mod tests {
             (volume - expected).abs() < 1e-3 * expected,
             "{volume} vs {expected}"
         );
+    }
+
+    /// A thin washer's face written hole first, the hole (radius 9.95) as two
+    /// half circles and the rim (radius 10) as one: the rim is its outer
+    /// loop. Sampled the same number of times per edge, the hole's outline
+    /// outmeasures the rim's.
+    #[test]
+    fn a_thin_washer_split_unevenly_reads_its_rim_as_outer() {
+        let step = "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n\
+            #1 = MANIFOLD_SOLID_BREP('',#2);\n\
+            #2 = CLOSED_SHELL('',(#3));\n\
+            #3 = ADVANCED_FACE('',(#4,#5),#20,.T.);\n\
+            #4 = FACE_BOUND('',#6,.T.);\n\
+            #5 = FACE_BOUND('',#7,.T.);\n\
+            #6 = EDGE_LOOP('',(#8,#9));\n\
+            #7 = EDGE_LOOP('',(#10));\n\
+            #8 = ORIENTED_EDGE('',*,*,#11,.F.);\n\
+            #9 = ORIENTED_EDGE('',*,*,#12,.F.);\n\
+            #10 = ORIENTED_EDGE('',*,*,#13,.T.);\n\
+            #11 = EDGE_CURVE('',#14,#15,#30,.T.);\n\
+            #12 = EDGE_CURVE('',#15,#14,#30,.T.);\n\
+            #13 = EDGE_CURVE('',#16,#16,#31,.T.);\n\
+            #14 = VERTEX_POINT('',#40);\n\
+            #15 = VERTEX_POINT('',#41);\n\
+            #16 = VERTEX_POINT('',#42);\n\
+            #20 = PLANE('',#21);\n\
+            #21 = AXIS2_PLACEMENT_3D('',#43,#44,#45);\n\
+            #30 = CIRCLE('',#21,9.95);\n\
+            #31 = CIRCLE('',#21,10.);\n\
+            #40 = CARTESIAN_POINT('',(9.95,0.,0.));\n\
+            #41 = CARTESIAN_POINT('',(-9.95,0.,0.));\n\
+            #42 = CARTESIAN_POINT('',(10.,0.,0.));\n\
+            #43 = CARTESIAN_POINT('',(0.,0.,0.));\n\
+            #44 = DIRECTION('',(0.,0.,1.));\n\
+            #45 = DIRECTION('',(1.,0.,0.));\n\
+            ENDSEC;\nEND-ISO-10303-21;\n";
+        let mut topo = Topology::new();
+        let solids = read_step(step, &mut topo).unwrap();
+        let faces = brepkit_topology::explorer::solid_faces(&topo, solids[0]).unwrap();
+        assert_eq!(faces.len(), 1);
+        let face = topo.face(faces[0]).unwrap();
+        let outer = topo.wire(face.outer_wire()).unwrap();
+        assert_eq!(outer.edges().len(), 1, "the rim, one circle");
+        assert_eq!(face.inner_wires().len(), 1);
+        let hole = topo.wire(face.inner_wires()[0]).unwrap();
+        assert_eq!(hole.edges().len(), 2, "the hole, two half circles");
     }
 
     /// The span along a sweep that a face's edge reaches covers the whole
