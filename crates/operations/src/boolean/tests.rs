@@ -8839,3 +8839,76 @@ fn cylinder_generator_in_an_l_walls_notch_is_no_section() {
     let bore = std::f64::consts::PI * 400.0 * 6.0;
     assert_volume_near(&topo, result, body_volume - bore, 1e-3);
 }
+
+/// A truncated cone, radius 39 at z = 0 narrowing to 30 at z = 6, cut
+/// through a plate and into a wedge over its narrow rim (its wide rim, with
+/// the body mirrored through z = 3) whose sides lie in planes through the
+/// cone's axis. The cone's wall is sectioned by the plate's two full circles
+/// and notched at the rim by two generators and an arc of the wedge's face.
+#[test]
+fn cone_cut_wall_keeps_a_rim_notch_beside_full_circles() {
+    use crate::transform::transform_solid;
+    use brepkit_math::mat::Mat4;
+
+    let (r_in, r_out) = (10.0_f64, 60.0_f64);
+    let (a0, a1) = (150.0_f64.to_radians(), 210.0_f64.to_radians());
+    let spread = a1 - a0;
+    let radius = |z: f64| 1.5f64.mul_add(-z, 39.0);
+    // plate 40000, the wedge's 60-degree ring section 3 deep, and the
+    // post's 88 less its 8 in the plate and 32 in the wedge
+    let wedge = 1.5 * spread.sin() * r_out.mul_add(r_out, -r_in * r_in);
+    let body = 40_000.0 + wedge + 48.0;
+    // the cone's volume from z0 to z1 over a whole turn
+    let slab = |z0: f64, z1: f64| {
+        let (p, q) = (radius(z0), radius(z1));
+        std::f64::consts::PI * (z1 - z0) * p.mul_add(p, q.mul_add(q, p * q)) / 3.0
+    };
+
+    for wide in [false, true] {
+        let mut topo = Topology::new();
+        let at = |lo: f64, hi: f64| if wide { 6.0 - hi } else { lo };
+        let mut boxed = |lo: [f64; 3], hi: [f64; 3]| {
+            let (x, y, z) = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+            let b = crate::primitives::make_box(&mut topo, x, y, z).unwrap();
+            let shift = Mat4::translation(lo[0], lo[1], at(lo[2], hi[2]));
+            transform_solid(&mut topo, b, &shift).unwrap();
+            b
+        };
+        let plate = boxed([-100.0, -100.0, 1.0], [100.0, 100.0, 2.0]);
+        let post = boxed([-47.0, -2.0, 1.5], [-43.0, 2.0, 7.0]);
+        let z0 = at(5.0, 8.0);
+        let profile: Vec<Point3> = [(r_in, a0), (r_out, a0), (r_out, a1), (r_in, a1)]
+            .iter()
+            .map(|&(r, a)| Point3::new(r * a.cos(), r * a.sin(), z0))
+            .collect();
+        let outline =
+            brepkit_topology::builder::make_polygon_wire(&mut topo, &profile, 1e-7).unwrap();
+        let floor = brepkit_topology::builder::make_face_from_wire(&mut topo, outline).unwrap();
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let wedge_id = crate::extrude::extrude(&mut topo, floor, up, 3.0).unwrap();
+        let body_id = boolean(&mut topo, BooleanOp::Fuse, plate, post).unwrap();
+        let body_id = boolean(&mut topo, BooleanOp::Fuse, body_id, wedge_id).unwrap();
+        assert!(is_closed_manifold(&topo, body_id).unwrap(), "wide = {wide}");
+        assert_volume_near(&topo, body_id, body, 1e-6);
+
+        let cone = crate::primitives::make_cone(&mut topo, 39.0, 30.0, 6.0).unwrap();
+        let cut = brepkit_algo::bop::BooleanOp::Cut;
+        let result = brepkit_algo::gfa::boolean(&mut topo, cut, body_id, cone).unwrap();
+        check_result(&topo, result);
+        assert!(
+            is_closed_manifold(&topo, result).unwrap(),
+            "the cut body must be closed-manifold (wide = {wide})"
+        );
+        // the plate loses the cone's slab through it, the wedge the cone's
+        // sector through it less the triangle inside the wedge's inner side
+        let (plate_z, notch_z) = if wide {
+            ((4.0, 5.0), (0.0, 1.0))
+        } else {
+            ((1.0, 2.0), (5.0, 6.0))
+        };
+        let disc = slab(plate_z.0, plate_z.1);
+        let sector = spread / std::f64::consts::TAU * slab(notch_z.0, notch_z.1);
+        let notch = (0.5 * r_in * r_in).mul_add(-spread.sin(), sector);
+        assert_volume_near(&topo, result, body - disc - notch, 1e-6);
+    }
+}
