@@ -8682,3 +8682,100 @@ fn cylinder_cut_wall_bands_split_by_full_circles_beside_a_window() {
         .sum();
     assert_volume_near(&topo, result, 42450.0 - disc - segment, 1e-3);
 }
+
+/// Fuses boxes, each given by its low and high corners, into one body, then
+/// cuts it by a cylinder of radius 39 on the z axis from z = 0 to 6, through
+/// the GFA alone. The boxes that reach past z = 6 notch the cutter's top
+/// rim; `flip` mirrors them through z = 3, to notch the bottom rim instead.
+/// Returns the cut, checked closed.
+fn cut_by_a_rim_notched_cylinder(
+    topo: &mut Topology,
+    boxes: &[([f64; 3], [f64; 3])],
+    flip: bool,
+) -> SolidId {
+    use crate::transform::transform_solid;
+    use brepkit_math::mat::Mat4;
+
+    let mut body: Option<SolidId> = None;
+    for &(lo, hi) in boxes {
+        let (z0, z1) = if flip {
+            (6.0 - hi[2], 6.0 - lo[2])
+        } else {
+            (lo[2], hi[2])
+        };
+        let b = crate::primitives::make_box(topo, hi[0] - lo[0], hi[1] - lo[1], z1 - z0).unwrap();
+        transform_solid(topo, b, &Mat4::translation(lo[0], lo[1], z0)).unwrap();
+        body = Some(match body {
+            None => b,
+            Some(s) => boolean(topo, BooleanOp::Fuse, s, b).unwrap(),
+        });
+    }
+    let body = body.unwrap();
+    assert!(is_closed_manifold(topo, body).unwrap(), "flip = {flip}");
+    let cutter = crate::primitives::make_cylinder(topo, 39.0, 6.0).unwrap();
+    let result =
+        brepkit_algo::gfa::boolean(topo, brepkit_algo::bop::BooleanOp::Cut, body, cutter).unwrap();
+    check_result(topo, result);
+    assert!(
+        is_closed_manifold(topo, result).unwrap(),
+        "the cut body must be closed-manifold (flip = {flip})"
+    );
+    result
+}
+
+/// The area under the circle `y = sqrt(r^2 - x^2)` from 0 to `x`.
+fn area_under_circle(r: f64, x: f64) -> f64 {
+    0.5 * x.mul_add(r.mul_add(r, -x * x).sqrt(), r * r * (x / r).asin())
+}
+
+/// A cylinder cut through a plate, one rim inside a block that takes all of
+/// the cutter's wall where x < 10: the notch runs more than half a turn
+/// round the wall, and the rim's arc across it is one edge that long.
+#[test]
+fn cylinder_cut_wall_keeps_a_rim_notch_wider_than_half_a_turn() {
+    let r: f64 = 39.0;
+    let boxes = [
+        ([-100.0, -100.0, 1.0], [100.0, 100.0, 2.0]),
+        ([-49.0, -2.0, 1.5], [-45.0, 2.0, 7.0]),
+        ([-50.0, -50.0, 5.0], [10.0, 50.0, 8.0]),
+    ];
+    // plate 40000, block 18000, and the post's 88 less its 8 in the plate
+    // and 32 in the block
+    let body = 40_000.0 + 18_000.0 + 48.0;
+    // the plate loses a disc, the block the disc's part where x < 10, 1 deep
+    let disc = std::f64::consts::PI * r * r;
+    let notch = 0.5f64.mul_add(disc, 2.0 * area_under_circle(r, 10.0));
+    for flip in [false, true] {
+        let mut topo = Topology::new();
+        let result = cut_by_a_rim_notched_cylinder(&mut topo, &boxes, flip);
+        assert_volume_near(&topo, result, body - disc - notch, 1e-6);
+    }
+}
+
+/// A cylinder cut through a plate, one rim inside a shallow block, 0.1 deep,
+/// and a narrow block off its middle reaching 1 deeper: the notch they cut
+/// is stepped, not convex.
+#[test]
+fn cylinder_cut_wall_keeps_a_stepped_rim_notch() {
+    let r: f64 = 39.0;
+    let boxes = [
+        ([-100.0, -100.0, 1.0], [100.0, 100.0, 2.0]),
+        ([-5.0, -70.0, 1.5], [5.0, -55.0, 7.0]),
+        ([-25.0, -60.0, 5.9], [25.0, -20.0, 8.0]),
+        ([8.0, -65.0, 4.9], [12.0, -32.0, 7.0]),
+    ];
+    // plate 40000, post 825, shallow block 4200, narrow block 277.2, less
+    // the post's 75 in the plate and 55 in the shallow block, and the narrow
+    // block's 123.2 in the shallow one
+    let body = 40_000.0 + 825.0 + 4200.0 + 277.2 - 75.0 - 55.0 - 123.2;
+    let disc = std::f64::consts::PI * r * r;
+    // the disc's segments beyond y = -20 for |x| < 25, 0.1 deep, and beyond
+    // y = -32 for 8 < x < 12, 1 deeper
+    let shallow = 0.1 * 2.0f64.mul_add(area_under_circle(r, 25.0), -20.0 * 50.0);
+    let deep = area_under_circle(r, 12.0) - area_under_circle(r, 8.0) - 32.0 * 4.0;
+    for flip in [false, true] {
+        let mut topo = Topology::new();
+        let result = cut_by_a_rim_notched_cylinder(&mut topo, &boxes, flip);
+        assert_volume_near(&topo, result, body - disc - shallow - deep, 1e-6);
+    }
+}
