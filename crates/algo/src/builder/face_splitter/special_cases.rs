@@ -2978,9 +2978,9 @@ struct RimNotches {
 }
 
 /// Cut `chains`, each running from a closed circular `rim` (the stack's top
-/// when `from_top`) back to it, into the rim. `None` unless every chain
-/// stays clear of the seam (its every point strictly inside one turn from
-/// it), the chains' spans along the rim do not overlap, and a point is found
+/// when `from_top`) back to it, into the rim. `None` unless every chain is
+/// lines and conic arcs clear of the seam, its notch stays `close_tol` along
+/// the rim from the seam and from every other notch, and a point is found
 /// inside each notch.
 fn notch_rim(
     surface: &FaceSurface,
@@ -3017,6 +3017,14 @@ fn notch_rim(
     };
     let uv_of =
         |p: Point3| -> Option<Point2> { Some(Point2::new(u_of(p)?, surface.project_point(p)?.1)) };
+    // How far round from the seam, in the rim's sense, a point lies.
+    let off_seam = |p: Point3| -> Option<f64> {
+        let (u, _) = surface.project_point(p)?;
+        Some((sense * (u - seam_u)).rem_euclid(period))
+    };
+    // The angle `close_tol` spans on the rim: what keeps two notches, or a
+    // notch and the seam, apart.
+    let clear = close_tol / circle.radius();
 
     // Each chain runs the rim's way round, clear of the seam; its reach.
     let mut spans: Vec<(f64, f64, Vec<OrientedPCurveEdge>)> = Vec::new();
@@ -3031,20 +3039,24 @@ fn notch_rim(
             chain = reverse_loop(&chain);
             std::mem::swap(&mut t0, &mut t1);
         }
-        // In traversal order: the step from one edge's last sample to the
-        // next one's first must be short wherever the chain is connected.
-        let mut prev: Option<f64> = None;
+        // A line or conic arc on the lateral never turns back round the axis
+        // along its length, and turns less than a full turn, so it keeps
+        // clear of the seam just when its ends do and its middle lies between
+        // them.
+        // A NURBS section can swing across the seam and back between any
+        // samples along it, so a chain with one is left to the generic path.
         for e in &chain {
-            for p in edge_samples(e, SAMPLES) {
-                let (u, _) = surface.project_point(p)?;
-                let d = (sense * (u - seam_u)).rem_euclid(period);
-                if d < 1e-9
-                    || d > period - 1e-9
-                    || prev.is_some_and(|q: f64| (d - q).abs() > 0.5 * period)
-                {
-                    return None;
-                }
-                prev = Some(d);
+            if matches!(e.curve_3d, EdgeCurve::NurbsCurve(_)) {
+                return None;
+            }
+            let &[first, middle, last] = edge_samples(e, 2).as_slice() else {
+                return None;
+            };
+            let (d0, d1) = (off_seam(first)?, off_seam(last)?);
+            let (near, far) = (d0.min(d1), d0.max(d1));
+            let dm = off_seam(middle)?;
+            if near < clear || far > period - clear || dm < near - 1e-12 || dm > far + 1e-12 {
+                return None;
             }
             let (lo, hi) = edge_v_span(surface, e)?;
             reach = if from_top {
@@ -3060,11 +3072,9 @@ fn notch_rim(
         spans.push((t0, t1, chain));
     }
     spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-    if spans.first()?.0 < 1e-9
-        || spans.last()?.1 > TAU - 1e-9
-        || spans
-            .windows(2)
-            .any(|w| w[1].0 < w[0].1 + close_tol / circle.radius())
+    if spans.first()?.0 < clear
+        || spans.last()?.1 > TAU - clear
+        || spans.windows(2).any(|w| w[1].0 < w[0].1 + clear)
     {
         return None;
     }
@@ -7223,5 +7233,80 @@ mod tests {
                 "only the notch's own sample lies in the notch: {samples:?}"
             );
         }
+    }
+
+    /// A notch in the top rim of a cylinder of radius `r` on the z axis, its
+    /// seam at +x: down at `from` degrees to height 0.5, round to `to`
+    /// degrees on `floor`, and back up. `None` when the rim declines it.
+    fn notch_a_rim(
+        r: f64,
+        from: f64,
+        to: f64,
+        floor: OrientedPCurveEdge,
+    ) -> Option<super::RimNotches> {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), up, r).unwrap(),
+        );
+        let at = |deg: f64, z: f64| {
+            let a = deg.to_radians();
+            Point3::new(r * a.cos(), r * a.sin(), z)
+        };
+        let top = Circle3D::new(Point3::new(0.0, 0.0, 1.0), up, r).unwrap();
+        let rim = OrientedPCurveEdge {
+            start_3d: at(0.0, 1.0),
+            end_3d: at(0.0, 1.0),
+            ..arc_edge(&top, 0.0, TAU, true)
+        };
+        let chain = vec![
+            line_chord(at(from, 1.0), at(from, 0.5)),
+            floor,
+            line_chord(at(to, 0.5), at(to, 1.0)),
+        ];
+        let (seam_u, _) = surface.project_point(at(0.0, 1.0)).unwrap();
+        super::notch_rim(&surface, &rim, vec![chain], true, seam_u, TAU, 1e-5)
+    }
+
+    /// A notch whose floor is a NURBS curve from 60 to 120 degrees that
+    /// swings across the seam to 330 degrees and back within a fiftieth of
+    /// its parameter span, between any samples along it: the rim declines a
+    /// chain it cannot show stays clear of the seam.
+    #[test]
+    fn a_rim_notch_on_a_nurbs_floor_is_declined() {
+        let at = |deg: f64, z: f64| {
+            let a = f64::to_radians(deg);
+            Point3::new(a.cos(), a.sin(), z)
+        };
+        let swing = brepkit_math::nurbs::curve::NurbsCurve::new(
+            1,
+            vec![0.0, 0.0, 0.01, 0.02, 1.0, 1.0],
+            vec![at(60.0, 0.5), at(330.0, 0.5), at(60.0, 0.5), at(120.0, 0.5)],
+            vec![1.0; 4],
+        )
+        .unwrap();
+        let floor = OrientedPCurveEdge {
+            curve_3d: EdgeCurve::NurbsCurve(swing),
+            ..line_chord(at(60.0, 0.5), at(120.0, 0.5))
+        };
+        assert!(notch_a_rim(1.0, 60.0, 120.0, floor).is_none());
+    }
+
+    /// A notch in the rim of a cylinder of radius 0.01 that starts 1e-8
+    /// radians past the seam: the rim's arc from the seam to it would be
+    /// 1e-10 long, short enough to read as a whole circle, so the rim
+    /// declines it as it does notches that close on each other.
+    #[test]
+    fn a_rim_notch_hard_by_the_seam_is_declined() {
+        let r = 0.01;
+        let from = 1e-8_f64.to_degrees();
+        let circle = Circle3D::new_with_ref(
+            Point3::new(0.0, 0.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            r,
+            Vec3::new(1.0, 0.0, 0.0),
+        )
+        .unwrap();
+        let floor = arc_edge(&circle, 1e-8, 1.0, true);
+        assert!(notch_a_rim(r, from, 1.0_f64.to_degrees(), floor).is_none());
     }
 }
