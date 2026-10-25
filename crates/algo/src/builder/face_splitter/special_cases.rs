@@ -3021,8 +3021,9 @@ fn notch_rim(
     // Each chain runs the rim's way round, clear of the seam; its reach.
     let mut spans: Vec<(f64, f64, Vec<OrientedPCurveEdge>)> = Vec::new();
     // A notch in the top rim reaches down the lateral, one in the bottom up.
+    // The reach bounds every point of the chain, not just its samples: the
+    // end band's own sample sits just past it.
     let mut reach = v_rim;
-    let ahead = |v: f64, r: f64| if from_top { v.min(r) } else { v.max(r) };
     for chain in chains {
         let (mut t0, mut t1) = (along(chain.first()?.start_3d), along(chain.last()?.end_3d));
         let mut chain = chain;
@@ -3035,7 +3036,7 @@ fn notch_rim(
         let mut prev: Option<f64> = None;
         for e in &chain {
             for p in edge_samples(e, SAMPLES) {
-                let (u, v) = surface.project_point(p)?;
+                let (u, _) = surface.project_point(p)?;
                 let d = (sense * (u - seam_u)).rem_euclid(period);
                 if d < 1e-9
                     || d > period - 1e-9
@@ -3044,8 +3045,13 @@ fn notch_rim(
                     return None;
                 }
                 prev = Some(d);
-                reach = ahead(v, reach);
             }
+            let (lo, hi) = edge_v_span(surface, e)?;
+            reach = if from_top {
+                reach.min(lo)
+            } else {
+                reach.max(hi)
+            };
         }
         for e in &mut chain {
             e.start_uv = uv_of(e.start_3d)?;
@@ -3129,6 +3135,62 @@ fn notch_rim(
         pieces,
         reach,
     })
+}
+
+/// The lowest and highest `v` an edge reaches on a cylinder or cone. There
+/// `v` grows with height along the axis at any point, on the surface or off
+/// it, so they lie among the edge's ends, a conic arc's highest and lowest
+/// points wherever those fall inside it, and a NURBS curve's control points,
+/// whose hull holds the curve. `None` on any other surface, or for a NURBS
+/// curve with a weight that is not positive.
+fn edge_v_span(surface: &FaceSurface, e: &OrientedPCurveEdge) -> Option<(f64, f64)> {
+    use brepkit_math::vec::Vec3;
+    use std::f64::consts::{PI, TAU};
+    let axis = match surface {
+        FaceSurface::Cylinder(c) => c.axis(),
+        FaceSurface::Cone(c) => c.axis(),
+        FaceSurface::Plane { .. }
+        | FaceSurface::Nurbs(_)
+        | FaceSurface::Sphere(_)
+        | FaceSurface::Torus(_) => return None,
+    };
+    let (from, to) = natural_endpoints(e);
+    // The height of `c + a cos t x + b sin t y` is a sinusoid in `t`: its
+    // highest at `atan2(b (axis . y), a (axis . x))`, its lowest half a turn on.
+    let turning = |a: f64, b: f64, x: Vec3, y: Vec3| -> Vec<f64> {
+        let (t0, t1) = e.curve_3d.domain_with_endpoints(from, to);
+        let top = (b * axis.dot(y)).atan2(a * axis.dot(x));
+        [top, top + PI]
+            .into_iter()
+            .map(|t| t0 + (t - t0).rem_euclid(TAU))
+            .filter(|&t| t <= t1)
+            .collect()
+    };
+    let mut points = vec![from, to];
+    match &e.curve_3d {
+        EdgeCurve::Line => {}
+        EdgeCurve::Circle(c) => {
+            let r = c.radius();
+            let ts = turning(r, r, c.u_axis(), c.v_axis());
+            points.extend(ts.into_iter().map(|t| c.evaluate(t)));
+        }
+        EdgeCurve::Ellipse(el) => {
+            let ts = turning(el.semi_major(), el.semi_minor(), el.u_axis(), el.v_axis());
+            points.extend(ts.into_iter().map(|t| el.evaluate(t)));
+        }
+        EdgeCurve::NurbsCurve(n) => {
+            if n.weights().iter().any(|&w| w <= 0.0) {
+                return None;
+            }
+            points.extend_from_slice(n.control_points());
+        }
+    }
+    points
+        .into_iter()
+        .try_fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            let (_, v) = surface.project_point(p)?;
+            Some((lo.min(v), hi.max(v)))
+        })
 }
 
 /// Split a u-periodic face (cylinder lateral) into angular SECTORS at its
@@ -7076,5 +7138,90 @@ mod tests {
             (60.0..300.0).contains(&deg) && (0.5..1.0).contains(&inside.z()),
             "{inside:?} is outside the notch"
         );
+    }
+
+    /// A unit cylinder's lateral cut by a full circle just under 0.2 and
+    /// notched at its top rim down to a tilted plane, z = 0.5 + 0.3x, from 120
+    /// to 250 degrees. The notch's floor is lowest, 0.2, at 180 degrees,
+    /// between any fixed samples along it, and the band under the notch is
+    /// sampled there: below that lowest point, not inside the notch. A circle
+    /// closer to the floor than the split's tolerance leaves no room to
+    /// sample the band, and the split declines.
+    #[test]
+    fn a_band_under_a_tilted_rim_notch_is_sampled_below_its_floor() {
+        use crate::ds::Rank;
+        use brepkit_math::curves::Ellipse3D;
+
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), up, 1.0).unwrap(),
+        );
+        let ring = |z: f64| {
+            Circle3D::new_with_ref(Point3::new(0.0, 0.0, z), up, 1.0, Vec3::new(1.0, 0.0, 0.0))
+                .unwrap()
+        };
+        let seam = |z: f64| Point3::new(1.0, 0.0, z);
+        let boundary = vec![
+            arc_edge(&ring(0.0), 0.0, TAU, true),
+            line_chord(seam(0.0), seam(1.0)),
+            arc_edge(&ring(1.0), TAU, 0.0, false),
+            line_chord(seam(1.0), seam(0.0)),
+        ];
+        let floor = Ellipse3D::new_with_ref(
+            Point3::new(0.0, 0.0, 0.5),
+            Vec3::new(-0.3, 0.0, 1.0),
+            1.09_f64.sqrt(),
+            1.0,
+            Vec3::new(1.0, 0.0, 0.3),
+        )
+        .unwrap();
+        assert!((floor.v_axis() - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-12);
+        let (a, b) = (
+            floor.evaluate(120.0_f64.to_radians()),
+            floor.evaluate(250.0_f64.to_radians()),
+        );
+        let rim = |p: Point3| Point3::new(p.x(), p.y(), 1.0);
+        let in_notch = |p: Point3| {
+            let deg = p.y().atan2(p.x()).to_degrees().rem_euclid(360.0);
+            (120.0..250.0).contains(&deg) && p.z() > 0.3_f64.mul_add(p.x(), 0.5)
+        };
+        for (z, splits) in [(0.19998, true), (0.199_995, false)] {
+            let sections = vec![
+                SectionEdge {
+                    curve_3d: EdgeCurve::Circle(ring(z)),
+                    ..section_chord(seam(z), seam(z))
+                },
+                section_chord(rim(a), a),
+                SectionEdge {
+                    curve_3d: EdgeCurve::Ellipse(floor.clone()),
+                    ..section_chord(a, b)
+                },
+                section_chord(b, rim(b)),
+            ];
+            let pieces = super::split_periodic_face_into_bands(
+                &surface,
+                &boundary,
+                &sections,
+                Rank::A,
+                false,
+                dummy_face_id(),
+                1e-7,
+            );
+            if !splits {
+                assert!(pieces.is_none(), "circle at {z}: {pieces:?}");
+                continue;
+            }
+            let samples: Vec<Point3> = pieces
+                .expect("split")
+                .iter()
+                .map(|s| s.precomputed_interior.expect("a sample"))
+                .collect();
+            assert_eq!(samples.len(), 3, "two bands and the notch");
+            assert_eq!(
+                samples.iter().filter(|&&p| in_notch(p)).count(),
+                1,
+                "only the notch's own sample lies in the notch: {samples:?}"
+            );
+        }
     }
 }
