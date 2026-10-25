@@ -824,7 +824,7 @@ fn signed_turn(a: (f64, f64), b: (f64, f64)) -> f64 {
     let cross = a.0 * b.1 - a.1 * b.0;
     let dot = a.0 * b.0 + a.1 * b.1;
     let angle = cross.atan2(dot);
-    if angle < 1e-9 - std::f64::consts::PI {
+    if angle < 1e-6 - std::f64::consts::PI {
         std::f64::consts::PI
     } else {
         angle
@@ -833,9 +833,9 @@ fn signed_turn(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 /// An edge's 2D directions of travel as it leaves its start and arrives at
 /// its end, traversed forward or not, in the plane of `x` and `y`: the
-/// curve's own tangents taken just inside its ends, so an edge trimmed at a
-/// corner of its curve (a knot it is only C0 across) reads the side it runs
-/// on.
+/// curve's own tangents at its ends, a NURBS curve's taken just inside them,
+/// so an edge trimmed at a corner of its curve (a knot it is only C0 across)
+/// reads the side it runs on.
 fn travel_directions(
     curve: &EdgeCurve,
     es: brepkit_math::vec::Point3,
@@ -846,7 +846,11 @@ fn travel_directions(
 ) -> ((f64, f64), (f64, f64)) {
     let (t0, t1) = curve.domain_with_endpoints(es, ee);
     let sense = if t1 < t0 { -1.0 } else { 1.0 };
-    let inward = 1e-9 * (t1 - t0);
+    let inward = if matches!(curve, EdgeCurve::NurbsCurve(_)) {
+        1e-9 * (t1 - t0)
+    } else {
+        0.0
+    };
     let along = |t: f64, flip: f64| {
         let d = curve.tangent_with_endpoints(t, es, ee) * (sense * flip);
         let (u, v) = (d.dot(x), d.dot(y));
@@ -1524,9 +1528,19 @@ mod hole_merge_tests {
     /// about (-1, 0) split at (-2, 0) and (0, 0), by the triangle on (0, 0),
     /// `p` and `q` (clockwise), and by a whole circle about (-2, 2): the
     /// first two holes touch at (0, 0); all of it turned `turn` about the
-    /// origin. The sizes of the merged face's holes.
-    fn merged_hole_sizes(p: (f64, f64), q: (f64, f64), turn: f64) -> Vec<usize> {
+    /// origin, every loop wound the other way round when `flipped`. The
+    /// sizes of the merged face's holes.
+    fn merged_hole_sizes(p: (f64, f64), q: (f64, f64), turn: f64, flipped: bool) -> Vec<usize> {
         let mut topo = Topology::default();
+        // Every loop wound the other way round when `flipped`.
+        let loop_of = |topo: &mut Topology, edges: &[(EdgeId, bool)]| {
+            if flipped {
+                let back: Vec<(EdgeId, bool)> = edges.iter().rev().map(|&(e, f)| (e, !f)).collect();
+                loop_of(topo, &back)
+            } else {
+                loop_of(topo, edges)
+            }
+        };
         let (sin, cos) = turn.sin_cos();
         let at = |x: f64, y: f64| (cos * x - sin * y, sin * x + cos * y);
         let add_vertex = |topo: &mut Topology, x: f64, y: f64| {
@@ -1637,11 +1651,15 @@ mod hole_merge_tests {
         };
         for (p, q) in [((1.0, 1.0), (1.0, -1.0)), (at(-85.0), at(-89.0))] {
             for turn in [0.0, 0.3, 1.1, 2.0, 3.7, 5.5] {
-                assert_eq!(
-                    merged_hole_sizes(p, q, turn),
-                    [1, 2, 3],
-                    "the circles and the triangle on {p:?}, {q:?}, turned {turn}, stay three holes"
-                );
+                for flipped in [false, true] {
+                    assert_eq!(
+                        merged_hole_sizes(p, q, turn, flipped),
+                        [1, 2, 3],
+                        "the circles and the triangle on {p:?}, {q:?}, turned {turn}, \
+                         wound {}, stay three holes",
+                        if flipped { "back" } else { "forward" }
+                    );
+                }
             }
         }
     }
