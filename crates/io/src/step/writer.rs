@@ -344,7 +344,9 @@ impl StepWriteContext {
                 let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
                 t0 <= t1
             }
-            _ => true,
+            // A line runs from its start vertex, and an arc counter-clockwise
+            // from its start vertex, so their vertex order is their sense.
+            EdgeCurve::Line | EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => true,
         };
         let edge_curve = self.next_id();
         self.write_entity(
