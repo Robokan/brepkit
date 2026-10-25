@@ -568,9 +568,8 @@ fn merge_group_with_holes(
         // chord, which a chord test cannot tell apart from a point; its
         // samples can. Such a loop is a real boundary, typically a bore
         // opening: it is kept as a loop of its own, outlined by its samples.
-        let uv_run = edge_uv_run(topo, oe, &to_uv)?;
         let closed = start == end
-            && uv_run.iter().any(|&q| {
+            && edge_uv_run(topo, oe, &to_uv)?.iter().any(|&q| {
                 let p = to_uv(sp);
                 (q.0 - p.0).hypot(q.1 - p.1) > lin
             });
