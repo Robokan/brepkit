@@ -199,7 +199,18 @@ Fixes go to `andymai/brepkit` as one PR per fix, from branches off
 `upstream/main` (never from this fork's `main`, which carries fork-only
 files). Follow the `pr-workflow` skill. Upstream bans the reference kernel's
 name in code, commit messages and PR text, so word around it ("some STEP
-writers", "a reference kernel"); leave BuzzCAD and corpus names out too.
+writers", "a reference kernel"); leave BuzzCAD and corpus names out too, and
+never name another CAD product or say a result was checked against another
+engine's answers. Before every push of a PR branch, and before opening or
+editing a PR, run the fork-only check as well as the skill's banned-name
+grep, with the PR text in a file; it must print "clean":
+
+```bash
+scripts/check-pr-text.sh <branch> <pr-body.md>
+```
+
+Its word list is private (in the corpus submodule); a missing list fails the
+check rather than passing it.
 
 **In flight.** As of 2026-10-25, 10 of the 12 PRs below are merged upstream (released in 4.2.3-4.2.5); #2046 and #2053 are still open. Seven PR branches are pushed to `origin` (Robokan/brepkit),
 each `upstream/main` plus one fix, and all seven PRs were opened on
