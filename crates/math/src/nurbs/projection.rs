@@ -125,8 +125,9 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
     // order along the curve.
     let n_samples = (p + 1).max(5) * 2;
     // A span's piece lies in the box of its p + 1 control points (the convex
-    // hull property, weights being positive), so its distance from that box
-    // bounds every point of it from below. Spans are sampled nearest box
+    // hull property, which holds while their weights are positive), so its
+    // distance from that box bounds every point of it from below. A span
+    // with a weight of zero or less can leave its box, and is never pruned. Spans are sampled nearest box
     // first, and a span whose box lies beyond the closest sample so far
     // cannot hold the closest point: on a fitted curve of many spans, a
     // point on or near it samples a few spans, not all of them.
@@ -138,6 +139,13 @@ fn curve_coarse_search(curve: &NurbsCurve, point: Point3) -> Vec<(f64, f64, f64)
         let Some(pts) = cps.get(first..=k) else {
             return 0.0;
         };
+        if curve
+            .weights()
+            .get(first..=k)
+            .is_none_or(|ws| ws.iter().any(|&w| w <= 0.0))
+        {
+            return 0.0;
+        }
         let axis = |f: fn(Point3) -> f64, q: f64| {
             let (mn, mx) = pts
                 .iter()
@@ -882,6 +890,73 @@ mod tests {
     use crate::vec::Vec3;
 
     const TOL: f64 = 1e-8;
+
+    /// A span with a negative weight leaves its control points' box, so it
+    /// is never pruned: here the exact hit at u = 0.75 lies outside the box
+    /// of the span holding it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn projection_keeps_a_span_with_a_negative_weight() {
+        let x = [0.5, 0.5, 0.0, -1.0, 0.0];
+        let curve = NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
+            x.iter().map(|&x| Point3::new(x, 0.0, 0.0)).collect(),
+            vec![1.0, 1.0, 1.0, -0.5, 1.0],
+        )
+        .unwrap();
+        let q = Point3::new(1.0, 0.0, 0.0);
+        let on = curve.evaluate(0.75);
+        assert!(
+            (on - q).length() < 1e-9,
+            "the curve passes through q: {on:?}"
+        );
+        let proj = project_point_to_curve(&curve, q, 1e-10).unwrap();
+        assert!(proj.distance < 1e-6, "projected {} away", proj.distance);
+    }
+
+    /// On a fitted curve of many spans (a helix through 60 points), the
+    /// pruned coarse search still finds the closest point: for points on,
+    /// near and far from the curve, the projection is never farther than
+    /// the closest of 20 000 samples along it.
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::unwrap_used)]
+    fn projection_on_a_many_span_curve_finds_the_closest_point() {
+        let pts: Vec<Point3> = (0..60)
+            .map(|i| {
+                let t = f64::from(i) * 0.3;
+                Point3::new(5.0 * t.cos(), 5.0 * t.sin(), 0.4 * t)
+            })
+            .collect();
+        let curve = crate::nurbs::fitting::interpolate(&pts, 3).unwrap();
+        let (lo, hi) = (
+            curve.knots()[curve.degree()],
+            curve.knots()[curve.knots().len() - curve.degree() - 1],
+        );
+        let n = 20_000;
+        let dense: Vec<Point3> = (0..=n)
+            .map(|i| curve.evaluate(lo + (hi - lo) * (i as f64 / n as f64)))
+            .collect();
+        for k in 0..40 {
+            let s = f64::from(k) * 0.43;
+            let off = [0.0, 0.3, 4.0, 12.0][k as usize % 4];
+            let q = Point3::new(
+                (5.0 + off) * s.cos(),
+                (5.0 + off) * s.sin(),
+                0.4 * s + off * 0.5,
+            );
+            let best = dense
+                .iter()
+                .map(|p| (*p - q).length())
+                .fold(f64::INFINITY, f64::min);
+            let proj = project_point_to_curve(&curve, q, 1e-10).unwrap();
+            assert!(
+                proj.distance <= best + 1e-6,
+                "point {k}: projected {} but a sample is {best} away",
+                proj.distance
+            );
+        }
+    }
 
     /// A simple line from (0,0,0) to (10,0,0) as a degree-1 NURBS.
     fn line_curve() -> NurbsCurve {
