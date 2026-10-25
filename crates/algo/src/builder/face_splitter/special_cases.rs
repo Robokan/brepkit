@@ -2634,7 +2634,10 @@ fn split_torus_by_tube_loops(
 ///   and a cone's apex, plus seam Line edges at one u
 /// - every section is a full closed circle whose start point sits on the
 ///   seam (guaranteed by the seam-anchor pre-pass) at a v strictly between
-///   the stack's ends, with no two circles at the same v
+///   the stack's ends, with no two circles at the same v; or, on a cylinder
+///   or cone with at least one such circle, part of a notch: an open chain
+///   from a rim back to the same rim, clear of the seam and inside the end
+///   band beside that rim (see [`notch_rim`])
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,
@@ -2708,9 +2711,11 @@ pub(super) fn split_periodic_face_into_bands(
             .map(|(_, q)| q)
     };
     let mut mids: Vec<BandCircle> = Vec::with_capacity(sections.len());
+    let mut open: Vec<&SectionEdge> = Vec::new();
     for s in sections {
         if (s.start - s.end).length() > close_tol {
-            return None;
+            open.push(s);
+            continue;
         }
         // On a NURBS tube a section winding it once is a marched or fitted
         // loop rather than a circle, and runs its own sense from its start.
@@ -2772,6 +2777,57 @@ pub(super) fn split_periodic_face_into_bands(
         return None;
     }
 
+    // Open sections must notch a rim within its end band; the rims they
+    // reach take them in place of the arcs they span.
+    let mut bot_edges = bot.edges();
+    let mut top_edges = top.edges();
+    let mut notch_pieces: Vec<(Vec<OrientedPCurveEdge>, Point3)> = Vec::new();
+    let (mut bot_reach, mut top_reach) = (None, None);
+    if !open.is_empty() {
+        if !matches!(surface, FaceSurface::Cylinder(_) | FaceSurface::Cone(_)) {
+            return None;
+        }
+        let (v_low, v_high) = (mids.first()?.v, mids.last()?.v);
+        let chains = chain_open_sections(&open, surface, rank, close_tol)?;
+        let (mut on_bot, mut on_top) = (Vec::new(), Vec::new());
+        for chain in chains {
+            let (_, v0) = surface.project_point(chain.first()?.start_3d)?;
+            let (_, v1) = surface.project_point(chain.last()?.end_3d)?;
+            let near = |a: f64, b: f64| (a - b).abs() < close_tol;
+            if near(v0, v_top) && near(v1, v_top) {
+                on_top.push(chain);
+            } else if near(v0, v_bot) && near(v1, v_bot) {
+                on_bot.push(chain);
+            } else {
+                return None;
+            }
+        }
+        if !on_bot.is_empty() {
+            let BandEnd::Rim(rim) = bot else {
+                return None;
+            };
+            let n = notch_rim(surface, rim, on_bot, false, seam_u, period, close_tol)?;
+            if n.reach >= v_low - close_tol {
+                return None;
+            }
+            bot_edges = n.edges;
+            notch_pieces.extend(n.pieces);
+            bot_reach = Some(n.reach);
+        }
+        if !on_top.is_empty() {
+            let BandEnd::Rim(rim) = top else {
+                return None;
+            };
+            let n = notch_rim(surface, rim, on_top, true, seam_u, period, close_tol)?;
+            if n.reach <= v_high + close_tol {
+                return None;
+            }
+            top_edges = n.edges;
+            notch_pieces.extend(n.pieces);
+            top_reach = Some(n.reach);
+        }
+    }
+
     let mk_seam = |va: f64, vb: f64| -> Option<OrientedPCurveEdge> {
         let pa = surface.evaluate(seam_u, va)?;
         let pb = surface.evaluate(seam_u, vb)?;
@@ -2796,14 +2852,15 @@ pub(super) fn split_periodic_face_into_bands(
     // edge: the band against it closes on the seam.
     type Level = (f64, f64, Vec<OrientedPCurveEdge>, Vec<OrientedPCurveEdge>);
     let mut levels: Vec<Level> = Vec::new();
-    levels.push((v_bot, q_bot, bot.edges(), bot.edges()));
+    levels.push((v_bot, q_bot, bot_edges.clone(), bot_edges));
     for m in mids {
         levels.push((m.v, m.q, vec![m.lower], vec![m.upper]));
     }
-    levels.push((v_top, q_top, top.edges(), top.edges()));
+    levels.push((v_top, q_top, top_edges.clone(), top_edges));
 
-    let mut bands = Vec::with_capacity(levels.len() - 1);
-    for w in levels.windows(2) {
+    let last = levels.len() - 2;
+    let mut bands = Vec::with_capacity(levels.len() - 1 + notch_pieces.len());
+    for (i, w) in levels.windows(2).enumerate() {
         let (va, qa, lower, _) = &w[0];
         let (vb, qb, _, upper) = &w[1];
         let (va, vb) = (*va, *vb);
@@ -2811,7 +2868,19 @@ pub(super) fn split_periodic_face_into_bands(
         wire.push(mk_seam(va, vb)?);
         wire.extend(upper.iter().cloned());
         wire.push(mk_seam(vb, va)?);
-        let interior = surface.evaluate(u_opposite, f64::midpoint(*qa, *qb))?;
+        // An end band's sample stays below (above) the notches in its rim:
+        // they bite into it from the rim, anywhere round it.
+        let qa = if i == 0 {
+            bot_reach.unwrap_or(*qa)
+        } else {
+            *qa
+        };
+        let qb = if i == last {
+            top_reach.unwrap_or(*qb)
+        } else {
+            *qb
+        };
+        let interior = surface.evaluate(u_opposite, f64::midpoint(qa, qb))?;
         bands.push(SplitSubFace {
             surface: surface.clone(),
             outer_wire: wire,
@@ -2822,7 +2891,316 @@ pub(super) fn split_periodic_face_into_bands(
             precomputed_interior: Some(interior),
         });
     }
+    for (piece, inside) in notch_pieces {
+        bands.push(SplitSubFace {
+            surface: surface.clone(),
+            outer_wire: piece,
+            inner_wires: Vec::new(),
+            reversed,
+            parent: face_id,
+            rank,
+            precomputed_interior: Some(inside),
+        });
+    }
     Some(bands)
+}
+
+/// Open sections chained end to end, each chain open: `None` when a chain
+/// closes on itself or three sections meet at a point.
+fn chain_open_sections(
+    sections: &[&SectionEdge],
+    surface: &FaceSurface,
+    rank: Rank,
+    close_tol: f64,
+) -> Option<Vec<Vec<OrientedPCurveEdge>>> {
+    let near = |a: Point3, b: Point3| (a - b).length() < close_tol;
+    let ends: Vec<Point3> = sections.iter().flat_map(|s| [s.start, s.end]).collect();
+    if ends
+        .iter()
+        .any(|&p| ends.iter().filter(|&&q| near(p, q)).count() > 2)
+    {
+        return None;
+    }
+    let mut pool: Vec<OrientedPCurveEdge> = sections
+        .iter()
+        .map(|s| torus_section_to_edge(s, surface, rank))
+        .collect();
+    let mut chains = Vec::new();
+    while let Some(first) = pool.pop() {
+        let mut chain = std::collections::VecDeque::from([first]);
+        loop {
+            let tail = chain.back()?.end_3d;
+            if let Some(i) = pool
+                .iter()
+                .position(|e| near(e.start_3d, tail) || near(e.end_3d, tail))
+            {
+                let e = pool.swap_remove(i);
+                chain.push_back(if near(e.start_3d, tail) {
+                    e
+                } else {
+                    reverse_loop(std::slice::from_ref(&e)).pop()?
+                });
+                continue;
+            }
+            let head = chain.front()?.start_3d;
+            if let Some(i) = pool
+                .iter()
+                .position(|e| near(e.start_3d, head) || near(e.end_3d, head))
+            {
+                let e = pool.swap_remove(i);
+                chain.push_front(if near(e.end_3d, head) {
+                    e
+                } else {
+                    reverse_loop(std::slice::from_ref(&e)).pop()?
+                });
+                continue;
+            }
+            break;
+        }
+        if near(chain.front()?.start_3d, chain.back()?.end_3d) {
+            return None;
+        }
+        chains.push(Vec::from(chain));
+    }
+    Some(chains)
+}
+
+/// A rim with notches cut into it by section chains from the rim back to it.
+struct RimNotches {
+    /// The rim from the seam round to the seam, each chain in place of the
+    /// arc between its ends.
+    edges: Vec<OrientedPCurveEdge>,
+    /// Each notch: the rim's arc between the chain's ends, then the chain
+    /// back, with a point inside it.
+    pieces: Vec<(Vec<OrientedPCurveEdge>, Point3)>,
+    /// The `v` the chains reach farthest from the rim.
+    reach: f64,
+}
+
+/// Cut `chains`, each running from a closed circular `rim` (the stack's top
+/// when `from_top`) back to it, into the rim. `None` unless every chain is
+/// lines and conic arcs clear of the seam, its notch stays `close_tol` along
+/// the rim from the seam and from every other notch, and a point is found
+/// inside each notch.
+fn notch_rim(
+    surface: &FaceSurface,
+    rim: &OrientedPCurveEdge,
+    chains: Vec<Vec<OrientedPCurveEdge>>,
+    from_top: bool,
+    seam_u: f64,
+    period: f64,
+    close_tol: f64,
+) -> Option<RimNotches> {
+    use std::f64::consts::TAU;
+    const SAMPLES: usize = 16;
+    let EdgeCurve::Circle(circle) = &rim.curve_3d else {
+        return None;
+    };
+    let (_, v_rim) = surface.project_point(rim.start_3d)?;
+    // How far round the rim, in its own sense, from the seam.
+    let theta0 = circle.project(rim.start_3d);
+    let along = |p: Point3| -> f64 {
+        let d = circle.project(p) - theta0;
+        if rim.forward { d } else { -d }.rem_euclid(TAU)
+    };
+    let at = |t: f64| circle.evaluate(if rim.forward { theta0 + t } else { theta0 - t });
+    // u grows or shrinks along the rim's sense; u is laid out from the seam.
+    let (u_step, _) = surface.project_point(at(1e-3))?;
+    let sense: f64 = if (u_step - seam_u + 0.5 * period).rem_euclid(period) - 0.5 * period > 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let u_of = |p: Point3| -> Option<f64> {
+        let (u, _) = surface.project_point(p)?;
+        Some(sense.mul_add((sense * (u - seam_u)).rem_euclid(period), seam_u))
+    };
+    let uv_of =
+        |p: Point3| -> Option<Point2> { Some(Point2::new(u_of(p)?, surface.project_point(p)?.1)) };
+    // How far round from the seam, in the rim's sense, a point lies.
+    let off_seam = |p: Point3| -> Option<f64> {
+        let (u, _) = surface.project_point(p)?;
+        Some((sense * (u - seam_u)).rem_euclid(period))
+    };
+    // The angle `close_tol` spans on the rim: what keeps two notches, or a
+    // notch and the seam, apart.
+    let clear = close_tol / circle.radius();
+
+    // Each chain runs the rim's way round, clear of the seam; its reach.
+    let mut spans: Vec<(f64, f64, Vec<OrientedPCurveEdge>)> = Vec::new();
+    // A notch in the top rim reaches down the lateral, one in the bottom up.
+    // The reach bounds every point of the chain, not just its samples: the
+    // end band's own sample sits just past it.
+    let mut reach = v_rim;
+    for chain in chains {
+        let (mut t0, mut t1) = (along(chain.first()?.start_3d), along(chain.last()?.end_3d));
+        let mut chain = chain;
+        if t0 > t1 {
+            chain = reverse_loop(&chain);
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        // A line or conic arc on the lateral never turns back round the axis
+        // along its length, and turns less than a full turn, so it keeps
+        // clear of the seam just when its ends do and its middle lies between
+        // them.
+        // A NURBS section can swing across the seam and back between any
+        // samples along it, so a chain with one is left to the generic path.
+        for e in &chain {
+            if matches!(e.curve_3d, EdgeCurve::NurbsCurve(_)) {
+                return None;
+            }
+            let &[first, middle, last] = edge_samples(e, 2).as_slice() else {
+                return None;
+            };
+            let (d0, d1) = (off_seam(first)?, off_seam(last)?);
+            let (near, far) = (d0.min(d1), d0.max(d1));
+            let dm = off_seam(middle)?;
+            if near < clear || far > period - clear || dm < near - 1e-12 || dm > far + 1e-12 {
+                return None;
+            }
+            let (lo, hi) = edge_v_span(surface, e)?;
+            reach = if from_top {
+                reach.min(lo)
+            } else {
+                reach.max(hi)
+            };
+        }
+        for e in &mut chain {
+            e.start_uv = uv_of(e.start_3d)?;
+            e.end_uv = uv_of(e.end_3d)?;
+        }
+        spans.push((t0, t1, chain));
+    }
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if spans.first()?.0 < clear
+        || spans.last()?.1 > TAU - clear
+        || spans.windows(2).any(|w| w[1].0 < w[0].1 + clear)
+    {
+        return None;
+    }
+
+    let arc = |from: Point3, to: Point3| -> Option<OrientedPCurveEdge> {
+        let curve = EdgeCurve::Circle(circle.clone());
+        let (stored_start, stored_end) = if rim.forward { (from, to) } else { (to, from) };
+        let pcurve = super::super::pcurve_compute::compute_boundary_pcurve_on_surface(
+            &curve,
+            stored_start,
+            stored_end,
+            rim.forward,
+            surface,
+            &[],
+            None,
+        );
+        let end_uv = uv_of(to)?;
+        Some(OrientedPCurveEdge {
+            curve_3d: curve,
+            pcurve,
+            start_uv: uv_of(from)?,
+            // the arc back to the seam ends a whole turn on
+            end_uv: if (to - rim.start_3d).length() < close_tol {
+                Point2::new(sense.mul_add(period, seam_u), end_uv.y())
+            } else {
+                end_uv
+            },
+            start_3d: from,
+            end_3d: to,
+            forward: rim.forward,
+            source_edge_idx: None,
+            pave_block_id: None,
+        })
+    };
+    let mut edges = Vec::new();
+    let mut pieces = Vec::new();
+    let mut from = rim.start_3d;
+    for (t0, t1, chain) in spans {
+        let (p, q) = (at(t0), at(t1));
+        edges.push(arc(from, p)?);
+        let mut piece = vec![arc(p, q)?];
+        piece.extend(reverse_loop(&chain));
+        // Each notch is read on its own outline, all of it clear of the
+        // seam, so `u` laid out from the seam runs straight across it. The
+        // generic sampler can fold an arc over half a turn onto the rest of
+        // the turn, and can drop its point to mid-height, below the shallow
+        // side of a stepped notch.
+        let outline = piece
+            .iter()
+            .flat_map(|e| {
+                let mut run = edge_samples(e, SAMPLES);
+                run.pop();
+                run
+            })
+            .map(&uv_of)
+            .collect::<Option<Vec<_>>>()?;
+        let mid = super::super::classify_2d::sample_interior_point(&outline);
+        if !super::super::classify_2d::point_in_polygon_2d(mid, &outline) {
+            return None;
+        }
+        pieces.push((piece, surface.evaluate(mid.x(), mid.y())?));
+        edges.extend(chain);
+        from = q;
+    }
+    edges.push(arc(from, rim.start_3d)?);
+    Some(RimNotches {
+        edges,
+        pieces,
+        reach,
+    })
+}
+
+/// The lowest and highest `v` an edge reaches on a cylinder or cone. There
+/// `v` grows with height along the axis at any point, on the surface or off
+/// it, so they lie among the edge's ends, a conic arc's highest and lowest
+/// points wherever those fall inside it, and a NURBS curve's control points,
+/// whose hull holds the curve. `None` on any other surface, or for a NURBS
+/// curve with a weight that is not positive.
+fn edge_v_span(surface: &FaceSurface, e: &OrientedPCurveEdge) -> Option<(f64, f64)> {
+    use brepkit_math::vec::Vec3;
+    use std::f64::consts::{PI, TAU};
+    let axis = match surface {
+        FaceSurface::Cylinder(c) => c.axis(),
+        FaceSurface::Cone(c) => c.axis(),
+        FaceSurface::Plane { .. }
+        | FaceSurface::Nurbs(_)
+        | FaceSurface::Sphere(_)
+        | FaceSurface::Torus(_) => return None,
+    };
+    let (from, to) = natural_endpoints(e);
+    // The height of `c + a cos t x + b sin t y` is a sinusoid in `t`: its
+    // highest at `atan2(b (axis . y), a (axis . x))`, its lowest half a turn on.
+    let turning = |a: f64, b: f64, x: Vec3, y: Vec3| -> Vec<f64> {
+        let (t0, t1) = e.curve_3d.domain_with_endpoints(from, to);
+        let top = (b * axis.dot(y)).atan2(a * axis.dot(x));
+        [top, top + PI]
+            .into_iter()
+            .map(|t| t0 + (t - t0).rem_euclid(TAU))
+            .filter(|&t| t <= t1)
+            .collect()
+    };
+    let mut points = vec![from, to];
+    match &e.curve_3d {
+        EdgeCurve::Line => {}
+        EdgeCurve::Circle(c) => {
+            let r = c.radius();
+            let ts = turning(r, r, c.u_axis(), c.v_axis());
+            points.extend(ts.into_iter().map(|t| c.evaluate(t)));
+        }
+        EdgeCurve::Ellipse(el) => {
+            let ts = turning(el.semi_major(), el.semi_minor(), el.u_axis(), el.v_axis());
+            points.extend(ts.into_iter().map(|t| el.evaluate(t)));
+        }
+        EdgeCurve::NurbsCurve(n) => {
+            if n.weights().iter().any(|&w| w <= 0.0) {
+                return None;
+            }
+            points.extend_from_slice(n.control_points());
+        }
+    }
+    points
+        .into_iter()
+        .try_fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            let (_, v) = surface.project_point(p)?;
+            Some((lo.min(v), hi.max(v)))
+        })
 }
 
 /// Split a u-periodic face (cylinder lateral) into angular SECTORS at its
@@ -6723,5 +7101,212 @@ mod tests {
         walk.splice(at..at, [(1.26, 0.0), (1.265, 1.2), (1.27, 0.0)]);
         let spiked = tube_loop(walk);
         assert!(!super::seam_inside(&spiked, &next, (0.0, 1.0), 2.0, 0.5));
+    }
+
+    /// A notch in a unit cylinder's top rim, clear of the seam at +x: down
+    /// at 60 degrees, round two thirds of a turn at height 0.5, and back up
+    /// at 300 degrees. Its long arc is traversed against its circle's own
+    /// sense; the chain still reads as connected and clear of the seam, and
+    /// the notch's point lies in the notch, not in the third of the turn
+    /// beside it.
+    #[test]
+    fn a_rim_notch_over_half_a_turn_on_a_reversed_arc_is_cut() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), up, 1.0).unwrap(),
+        );
+        let at = |deg: f64, z: f64| {
+            let a = deg.to_radians();
+            Point3::new(a.cos(), a.sin(), z)
+        };
+        let top = Circle3D::new(Point3::new(0.0, 0.0, 1.0), up, 1.0).unwrap();
+        let rim = OrientedPCurveEdge {
+            start_3d: at(0.0, 1.0),
+            end_3d: at(0.0, 1.0),
+            ..arc_edge(&top, 0.0, TAU, true)
+        };
+        let clockwise = Circle3D::new(Point3::new(0.0, 0.0, 0.5), -up, 1.0).unwrap();
+        let arc = OrientedPCurveEdge {
+            start_3d: at(60.0, 0.5),
+            end_3d: at(300.0, 0.5),
+            ..arc_edge(&clockwise, 0.0, 0.0, false)
+        };
+        let chain = vec![
+            line_chord(at(60.0, 1.0), at(60.0, 0.5)),
+            arc,
+            line_chord(at(300.0, 0.5), at(300.0, 1.0)),
+        ];
+        let (seam_u, _) = surface.project_point(at(0.0, 1.0)).unwrap();
+        let notches =
+            super::notch_rim(&surface, &rim, vec![chain], true, seam_u, TAU, 1e-5).expect("cut");
+        assert!((notches.reach - 0.5).abs() < 1e-9, "{}", notches.reach);
+        assert_eq!(notches.pieces.len(), 1);
+        let (piece, inside) = &notches.pieces[0];
+        assert_eq!(piece.len(), 4);
+        let deg = inside.y().atan2(inside.x()).to_degrees().rem_euclid(360.0);
+        assert!(
+            (60.0..300.0).contains(&deg) && (0.5..1.0).contains(&inside.z()),
+            "{inside:?} is outside the notch"
+        );
+    }
+
+    /// A unit cylinder's lateral cut by a full circle just under 0.2 and
+    /// notched at its top rim down to a tilted plane, z = 0.5 + 0.3x, from 120
+    /// to 250 degrees. The notch's floor is lowest, 0.2, at 180 degrees,
+    /// between any fixed samples along it, and the band under the notch is
+    /// sampled there: below that lowest point, not inside the notch. A circle
+    /// closer to the floor than the split's tolerance leaves no room to
+    /// sample the band, and the split declines.
+    #[test]
+    fn a_band_under_a_tilted_rim_notch_is_sampled_below_its_floor() {
+        use crate::ds::Rank;
+        use brepkit_math::curves::Ellipse3D;
+
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), up, 1.0).unwrap(),
+        );
+        let ring = |z: f64| {
+            Circle3D::new_with_ref(Point3::new(0.0, 0.0, z), up, 1.0, Vec3::new(1.0, 0.0, 0.0))
+                .unwrap()
+        };
+        let seam = |z: f64| Point3::new(1.0, 0.0, z);
+        let boundary = vec![
+            arc_edge(&ring(0.0), 0.0, TAU, true),
+            line_chord(seam(0.0), seam(1.0)),
+            arc_edge(&ring(1.0), TAU, 0.0, false),
+            line_chord(seam(1.0), seam(0.0)),
+        ];
+        let floor = Ellipse3D::new_with_ref(
+            Point3::new(0.0, 0.0, 0.5),
+            Vec3::new(-0.3, 0.0, 1.0),
+            1.09_f64.sqrt(),
+            1.0,
+            Vec3::new(1.0, 0.0, 0.3),
+        )
+        .unwrap();
+        assert!((floor.v_axis() - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-12);
+        let (a, b) = (
+            floor.evaluate(120.0_f64.to_radians()),
+            floor.evaluate(250.0_f64.to_radians()),
+        );
+        let rim = |p: Point3| Point3::new(p.x(), p.y(), 1.0);
+        let in_notch = |p: Point3| {
+            let deg = p.y().atan2(p.x()).to_degrees().rem_euclid(360.0);
+            (120.0..250.0).contains(&deg) && p.z() > 0.3_f64.mul_add(p.x(), 0.5)
+        };
+        for (z, splits) in [(0.19998, true), (0.199_995, false)] {
+            let sections = vec![
+                SectionEdge {
+                    curve_3d: EdgeCurve::Circle(ring(z)),
+                    ..section_chord(seam(z), seam(z))
+                },
+                section_chord(rim(a), a),
+                SectionEdge {
+                    curve_3d: EdgeCurve::Ellipse(floor.clone()),
+                    ..section_chord(a, b)
+                },
+                section_chord(b, rim(b)),
+            ];
+            let pieces = super::split_periodic_face_into_bands(
+                &surface,
+                &boundary,
+                &sections,
+                Rank::A,
+                false,
+                dummy_face_id(),
+                1e-7,
+            );
+            if !splits {
+                assert!(pieces.is_none(), "circle at {z}: {pieces:?}");
+                continue;
+            }
+            let samples: Vec<Point3> = pieces
+                .expect("split")
+                .iter()
+                .map(|s| s.precomputed_interior.expect("a sample"))
+                .collect();
+            assert_eq!(samples.len(), 3, "two bands and the notch");
+            assert_eq!(
+                samples.iter().filter(|&&p| in_notch(p)).count(),
+                1,
+                "only the notch's own sample lies in the notch: {samples:?}"
+            );
+        }
+    }
+
+    /// A notch in the top rim of a cylinder of radius `r` on the z axis, its
+    /// seam at +x: down at `from` degrees to height 0.5, round to `to`
+    /// degrees on `floor`, and back up. `None` when the rim declines it.
+    fn notch_a_rim(
+        r: f64,
+        from: f64,
+        to: f64,
+        floor: OrientedPCurveEdge,
+    ) -> Option<super::RimNotches> {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), up, r).unwrap(),
+        );
+        let at = |deg: f64, z: f64| {
+            let a = deg.to_radians();
+            Point3::new(r * a.cos(), r * a.sin(), z)
+        };
+        let top = Circle3D::new(Point3::new(0.0, 0.0, 1.0), up, r).unwrap();
+        let rim = OrientedPCurveEdge {
+            start_3d: at(0.0, 1.0),
+            end_3d: at(0.0, 1.0),
+            ..arc_edge(&top, 0.0, TAU, true)
+        };
+        let chain = vec![
+            line_chord(at(from, 1.0), at(from, 0.5)),
+            floor,
+            line_chord(at(to, 0.5), at(to, 1.0)),
+        ];
+        let (seam_u, _) = surface.project_point(at(0.0, 1.0)).unwrap();
+        super::notch_rim(&surface, &rim, vec![chain], true, seam_u, TAU, 1e-5)
+    }
+
+    /// A notch whose floor is a NURBS curve from 60 to 120 degrees that
+    /// swings across the seam to 330 degrees and back within a fiftieth of
+    /// its parameter span, between any samples along it: the rim declines a
+    /// chain it cannot show stays clear of the seam.
+    #[test]
+    fn a_rim_notch_on_a_nurbs_floor_is_declined() {
+        let at = |deg: f64, z: f64| {
+            let a = f64::to_radians(deg);
+            Point3::new(a.cos(), a.sin(), z)
+        };
+        let swing = brepkit_math::nurbs::curve::NurbsCurve::new(
+            1,
+            vec![0.0, 0.0, 0.01, 0.02, 1.0, 1.0],
+            vec![at(60.0, 0.5), at(330.0, 0.5), at(60.0, 0.5), at(120.0, 0.5)],
+            vec![1.0; 4],
+        )
+        .unwrap();
+        let floor = OrientedPCurveEdge {
+            curve_3d: EdgeCurve::NurbsCurve(swing),
+            ..line_chord(at(60.0, 0.5), at(120.0, 0.5))
+        };
+        assert!(notch_a_rim(1.0, 60.0, 120.0, floor).is_none());
+    }
+
+    /// A notch in the rim of a cylinder of radius 0.01 that starts 1e-8
+    /// radians past the seam: the rim's arc from the seam to it would be
+    /// 1e-10 long, short enough to read as a whole circle, so the rim
+    /// declines it as it does notches that close on each other.
+    #[test]
+    fn a_rim_notch_hard_by_the_seam_is_declined() {
+        let r = 0.01;
+        let from = 1e-8_f64.to_degrees();
+        let circle = Circle3D::new_with_ref(
+            Point3::new(0.0, 0.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            r,
+            Vec3::new(1.0, 0.0, 0.0),
+        )
+        .unwrap();
+        let floor = arc_edge(&circle, 1e-8, 1.0, true);
+        assert!(notch_a_rim(r, from, 1.0_f64.to_degrees(), floor).is_none());
     }
 }
