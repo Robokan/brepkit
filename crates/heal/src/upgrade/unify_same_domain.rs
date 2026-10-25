@@ -436,12 +436,15 @@ fn chain_into_loop(
     Ok((at == start).then_some(chained))
 }
 
-/// A surviving edge with its traversal endpoints and 2D outgoing tangent.
+/// A surviving edge with its traversal endpoints and its 2D directions of
+/// travel as it leaves its start and as it arrives at its end, which differ
+/// on a curve.
 struct SurvEdge {
     oe: OrientedEdge,
     start: brepkit_topology::vertex::VertexId,
     end: brepkit_topology::vertex::VertexId,
     tangent_uv: (f64, f64),
+    arrival_uv: (f64, f64),
 }
 
 /// An edge's outline in UV as it is traversed, its end left out: its start
@@ -574,22 +577,26 @@ fn merge_group_with_holes(
         if (ep - sp).length() < lin && start == end && !closed {
             continue;
         }
-        let start_uv = to_uv(sp);
-        // A curve leaves its start toward its first sample, not its chord.
-        let end_uv = uv_run.get(1).copied().unwrap_or_else(|| to_uv(ep));
-        let dx = end_uv.0 - start_uv.0;
-        let dy = end_uv.1 - start_uv.1;
-        let len = dx.hypot(dy);
-        let tangent_uv = if len < f64::EPSILON {
-            (1.0, 0.0)
-        } else {
-            (dx / len, dy / len)
+        let unit = |from: (f64, f64), to: (f64, f64)| {
+            let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+            let len = dx.hypot(dy);
+            if len < f64::EPSILON {
+                (1.0, 0.0)
+            } else {
+                (dx / len, dy / len)
+            }
         };
+        let (start_uv, end_uv) = (to_uv(sp), to_uv(ep));
+        // A curve leaves its start toward its first sample and arrives at its
+        // end from its last, not along its chord either way.
+        let tangent_uv = unit(start_uv, uv_run.get(1).copied().unwrap_or(end_uv));
+        let arrival_uv = unit(uv_run.last().copied().unwrap_or(start_uv), end_uv);
         edges.push(SurvEdge {
             oe: *oe,
             start,
             end,
             tangent_uv,
+            arrival_uv,
         });
     }
 
@@ -632,7 +639,7 @@ fn merge_group_with_holes(
 
             // Incoming direction reversed so the turn angle is measured between
             // the edges meeting at `next_vertex`.
-            let in_dir = (-edges[current].tangent_uv.0, -edges[current].tangent_uv.1);
+            let in_dir = (-edges[current].arrival_uv.0, -edges[current].arrival_uv.1);
             let candidates = outgoing.get(&next_vertex);
             let mut best: Option<usize> = None;
             let mut best_angle = f64::NEG_INFINITY;
@@ -1479,6 +1486,100 @@ mod hole_merge_tests {
         assert_eq!(merged.inner_wires().len(), 1, "the small hole stays a hole");
         let inner = topo.wire(merged.inner_wires()[0]).unwrap();
         assert_eq!(inner.edges()[0].edge(), hole_rim);
+    }
+
+    #[test]
+    fn unify_keeps_two_holes_touching_at_a_vertex_apart() {
+        // A plate in two faces sharing x = 2, the left one holed by a circle
+        // about (-1, 0) split at (-2, 0) and (0, 0) and by a triangle on
+        // (0, 0), (1, 1), (1, -1): the holes touch at (0, 0). Arriving there
+        // along its upper half, the circle's walk must turn onto its lower
+        // half, not onto the triangle, so each hole stays a loop of its own.
+        let mut topo = Topology::default();
+        let corners = |topo: &mut Topology, x0: f64, x1: f64| {
+            [(x0, -3.0), (x1, -3.0), (x1, 3.0), (x0, 3.0)].map(|(x, y)| add_vertex(topo, x, y))
+        };
+        let a = corners(&mut topo, -3.0, 2.0);
+        let b0 = add_vertex(&mut topo, 4.0, -3.0);
+        let b1 = add_vertex(&mut topo, 4.0, 3.0);
+        let seam = line(&mut topo, a[1], a[2]);
+        let a_edges = [
+            line(&mut topo, a[0], a[1]),
+            line(&mut topo, a[2], a[3]),
+            line(&mut topo, a[3], a[0]),
+        ];
+        let left_outer = loop_of(
+            &mut topo,
+            &[
+                (a_edges[0], true),
+                (seam, true),
+                (a_edges[1], true),
+                (a_edges[2], true),
+            ],
+        );
+        let (b_bottom, b_right, b_top) = (
+            line(&mut topo, a[1], b0),
+            line(&mut topo, b0, b1),
+            line(&mut topo, b1, a[2]),
+        );
+        let right_outer = loop_of(
+            &mut topo,
+            &[
+                (b_bottom, true),
+                (b_right, true),
+                (b_top, true),
+                (seam, false),
+            ],
+        );
+
+        let circle = brepkit_math::curves::Circle3D::new(
+            Point3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            1.0,
+        )
+        .unwrap();
+        let (touch, west) = (
+            add_vertex(&mut topo, 0.0, 0.0),
+            add_vertex(&mut topo, -2.0, 0.0),
+        );
+        let upper = topo.add_edge(Edge::new(touch, west, EdgeCurve::Circle(circle.clone())));
+        let lower = topo.add_edge(Edge::new(west, touch, EdgeCurve::Circle(circle)));
+        // Walked from (-2, 0), so the choice at (0, 0) comes mid-walk.
+        let round = loop_of(&mut topo, &[(upper, false), (lower, false)]);
+        let (ne, se) = (
+            add_vertex(&mut topo, 1.0, 1.0),
+            add_vertex(&mut topo, 1.0, -1.0),
+        );
+        let sides = [
+            line(&mut topo, touch, ne),
+            line(&mut topo, ne, se),
+            line(&mut topo, se, touch),
+        ];
+        let tri = loop_of(
+            &mut topo,
+            &[(sides[0], true), (sides[1], true), (sides[2], true)],
+        );
+
+        let left = topo.add_face(Face::new(left_outer, vec![round, tri], plane_z0()));
+        let right = topo.add_face(Face::new(right_outer, vec![], plane_z0()));
+        let shell_id = topo.add_shell(Shell::new(vec![left, right]).unwrap());
+        let solid_id = topo.add_solid(Solid::new(shell_id, vec![]));
+
+        let opts = UnifyOptions {
+            unify_edges: false,
+            ..UnifyOptions::default()
+        };
+        unify_same_domain(&mut topo, solid_id, &opts).unwrap();
+        let shell = topo.shell(shell_id).unwrap();
+        assert_eq!(shell.faces().len(), 1, "the two faces become one");
+        let merged = topo.face(shell.faces()[0]).unwrap();
+        let mut sizes: Vec<usize> = merged
+            .inner_wires()
+            .iter()
+            .map(|&w| topo.wire(w).unwrap().edges().len())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [2, 3], "the circle and the triangle stay two holes");
     }
 
     #[test]
