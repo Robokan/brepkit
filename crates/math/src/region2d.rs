@@ -67,6 +67,112 @@ pub fn on_boundary(pieces: &[Boundary2], p: Point2, tol: f64) -> bool {
         .any(|piece| matches!(crossings(piece, p, along, tol), Crossing::OnBoundary))
 }
 
+/// The distance from `p` to the nearest of `pieces`; infinite with none.
+#[must_use]
+pub fn distance_to_boundary(pieces: &[Boundary2], p: Point2) -> f64 {
+    pieces
+        .iter()
+        .map(|piece| distance_to_piece(piece, p))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The distance from `p` to `piece`.
+///
+/// Exact for a segment and a circular arc. For an elliptical arc, a branch
+/// and bound over its angles that never reads more than the true distance
+/// and falls short of it by a millionth or so.
+#[must_use]
+pub fn distance_to_piece(piece: &Boundary2, p: Point2) -> f64 {
+    match *piece {
+        Boundary2::Segment(a, b) => {
+            let (ab, ap) = (b - a, p - a);
+            let len2 = ab.dot(ab);
+            let along = if len2 > 0.0 {
+                (ap.dot(ab) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (ap - ab * along).length()
+        }
+        Boundary2::Arc {
+            center,
+            u,
+            v,
+            a,
+            b,
+            t0,
+            t1,
+        } => {
+            let q = p - center;
+            let (x0, y0) = (q.dot(u), q.dot(v));
+            #[allow(clippy::float_cmp)]
+            let circle = a == b;
+            if !circle {
+                return ellipse_arc_distance(x0, y0, a, b, t0, t1);
+            }
+            if t0 + (y0.atan2(x0) - t0).rem_euclid(TAU) <= t1 {
+                return (x0.hypot(y0) - a).abs();
+            }
+            let end = |t: f64| (a.mul_add(-t.cos(), x0)).hypot(b.mul_add(-t.sin(), y0));
+            end(t0).min(end(t1))
+        }
+    }
+}
+
+/// The most halvings of an elliptical arc's angles a distance reads.
+const ELLIPSE_DEPTH: u32 = 60;
+
+/// The distance from `(x0, y0)` to the arc `(a cos t, b sin t)` for `t` from
+/// `t0` to `t1`, by branch and bound on the squared distance `F`.
+///
+/// On an angle interval of half-width `r` about `m`, `F` is at least
+/// `F(m) - |F'(m)| r - K r^2 / 2`, with `K = 2 (|a^2 - b^2| + a |x0| + b |y0|)`
+/// bounding `|F''|`. An interval whose bound cannot undercut the least `F`
+/// seen, less a millionth of it, is dropped; the rest are halved.
+fn ellipse_arc_distance(x0: f64, y0: f64, a: f64, b: f64, t0: f64, t1: f64) -> f64 {
+    // Bounds that cannot be compared prune nothing, and the halving would
+    // run to its full depth everywhere: such an arc reads as touching.
+    const MAX_INTERVALS: usize = 1 << 20;
+    if ![x0, y0, a, b, t0, t1].iter().all(|v| v.is_finite()) {
+        return 0.0;
+    }
+    let squared = |t: f64| {
+        let (s, c) = t.sin_cos();
+        a.mul_add(c, -x0).powi(2) + b.mul_add(s, -y0).powi(2)
+    };
+    let slope = |t: f64| {
+        let (s, c) = t.sin_cos();
+        2.0 * (a.mul_add(c, -x0) * (-a * s) + b.mul_add(s, -y0) * (b * c))
+    };
+    let k = 2.0 * (a.mul_add(a, -b * b).abs() + a * x0.abs() + b * y0.abs());
+    let noise = (1e-15 * a.max(b).max(x0.hypot(y0))).powi(2);
+    let slack = |best: f64| 1e-6_f64.mul_add(best, noise);
+    let mut best = squared(t0).min(squared(t1));
+    let mut unsettled = f64::INFINITY;
+    let mut pending = vec![(t0, t1, 0_u32)];
+    let mut visited = 0_usize;
+    while let Some((lo, hi, depth)) = pending.pop() {
+        visited += 1;
+        let (m, r) = (0.5 * (lo + hi), 0.5 * (hi - lo));
+        let at_m = squared(m);
+        best = best.min(at_m);
+        let low = at_m - slope(m).abs() * r - 0.5 * k * r * r;
+        if low.is_nan() || visited > MAX_INTERVALS {
+            return 0.0;
+        }
+        if low >= best - slack(best) {
+            continue;
+        }
+        if depth == ELLIPSE_DEPTH {
+            unsettled = unsettled.min(low);
+            continue;
+        }
+        pending.push((lo, m, depth + 1));
+        pending.push((m, hi, depth + 1));
+    }
+    (best - slack(best)).min(unsettled).max(0.0).sqrt()
+}
+
 /// How a ray from a point meets one boundary piece.
 enum Crossing {
     /// The point itself lies on the piece.
@@ -182,6 +288,17 @@ mod tests {
     use std::f64::consts::PI;
 
     use super::*;
+
+    /// An arc given a non-finite value reads as touching the point at once
+    /// rather than halving without end.
+    #[test]
+    fn a_non_finite_ellipse_arc_reads_as_touching() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            let off_centre = super::ellipse_arc_distance(bad, 0.0, 2.0, 1.0, 0.0, 1.0);
+            let off_range = super::ellipse_arc_distance(0.5, 0.0, 2.0, 1.0, 0.0, bad);
+            assert!(off_centre.abs() < f64::EPSILON && off_range.abs() < f64::EPSILON);
+        }
+    }
 
     fn circle(center: (f64, f64), r: f64, t0: f64, t1: f64) -> Boundary2 {
         Boundary2::Arc {
@@ -455,5 +572,123 @@ mod tests {
         }];
         let past = Point2::new(100.000_000_5, 0.0);
         assert_eq!(point_in_region(&ellipse, past, 1e-7), Some(false));
+    }
+
+    /// A segment's distance runs to its nearest point, its ends included,
+    /// and a zero-length one is a point.
+    #[test]
+    fn distance_to_a_segment() {
+        let seg = Boundary2::Segment(Point2::new(0.0, 0.0), Point2::new(2.0, 0.0));
+        let at = |x: f64, y: f64| distance_to_piece(&seg, Point2::new(x, y));
+        assert!((at(1.0, 0.5) - 0.5).abs() < 1e-15);
+        assert!((at(3.0, 0.0) - 1.0).abs() < 1e-15);
+        assert!((at(-3.0, 4.0) - 5.0).abs() < 1e-15);
+        let dot = Boundary2::Segment(Point2::new(1.0, 1.0), Point2::new(1.0, 1.0));
+        assert!((distance_to_piece(&dot, Point2::new(4.0, 5.0)) - 5.0).abs() < 1e-15);
+    }
+
+    /// A circular arc's distance is radial where the point's angle lies on
+    /// the arc, and to the nearer end where it does not.
+    #[test]
+    fn distance_to_a_circular_arc() {
+        let arc = circle((1.0, 1.0), 2.0, 0.0, PI / 2.0);
+        let at = |x: f64, y: f64| distance_to_piece(&arc, Point2::new(x, y));
+        assert!((at(1.0 + 3.0 * 0.6, 1.0 + 3.0 * 0.8) - 1.0).abs() < 1e-14);
+        assert!((at(1.0 + 0.6, 1.0 + 0.8) - 1.0).abs() < 1e-14);
+        assert!((at(1.0, 1.0) - 2.0).abs() < 1e-14);
+        assert!((at(1.0, -1.0) - 2.0_f64.hypot(2.0)).abs() < 1e-14);
+        assert!((at(-2.0, 1.0) - 3.0_f64.hypot(2.0)).abs() < 1e-14);
+    }
+
+    /// The least distance from `p` to the ellipse arc, by dense sampling
+    /// refined by golden section: a value the curve reaches.
+    fn sampled_ellipse_distance(arc: &Boundary2, p: Point2) -> f64 {
+        let Boundary2::Arc {
+            center,
+            u,
+            v,
+            a,
+            b,
+            t0,
+            t1,
+        } = *arc
+        else {
+            return f64::NAN;
+        };
+        let at = |t: f64| (center + u * (a * t.cos()) + v * (b * t.sin()) - p).length();
+        let n = 20_000;
+        let step = (t1 - t0) / f64::from(n);
+        let mut best = (at(t0), t0);
+        for k in 1..=n {
+            let t = step.mul_add(f64::from(k), t0);
+            if at(t) < best.0 {
+                best = (at(t), t);
+            }
+        }
+        let (mut lo, mut hi) = ((best.1 - step).max(t0), (best.1 + step).min(t1));
+        for _ in 0..100 {
+            let (m1, m2) = (lo + 0.382 * (hi - lo), lo + 0.618 * (hi - lo));
+            if at(m1) < at(m2) {
+                hi = m2;
+            } else {
+                lo = m1;
+            }
+        }
+        best.0.min(at(0.5 * (lo + hi)))
+    }
+
+    /// An ellipse's distance never exceeds what the curve reaches and falls
+    /// short of it by no more than a millionth: from outside, from near the
+    /// centre where two angles are nearest, from on and beside the curve,
+    /// and from past an arc's end.
+    #[test]
+    fn distance_to_an_elliptical_arc() {
+        let (c, s) = (0.5_f64.cos(), 0.5_f64.sin());
+        let turned = |t0: f64, t1: f64| Boundary2::Arc {
+            center: Point2::new(1.0, 2.0),
+            u: Vec2::new(c, s),
+            v: Vec2::new(-s, c),
+            a: 3.0,
+            b: 1.0,
+            t0,
+            t1,
+        };
+        let local = |x: f64, y: f64| Point2::new(1.0 + x * c - y * s, 2.0 + x * s + y * c);
+        let whole = turned(0.3, 0.3 + TAU);
+        let half = turned(0.0, PI);
+        let cases = [
+            (&whole, local(5.0, 4.0)),
+            (&whole, local(0.1, 0.05)),
+            (&whole, local(2.0, 0.0)),
+            (&whole, local(3.0 * 0.8_f64.cos(), 0.8_f64.sin())),
+            (
+                &whole,
+                local(3.0 * 0.8_f64.cos(), 1.000_001 * 0.8_f64.sin()),
+            ),
+            (&half, local(0.5, -2.0)),
+            (&half, local(-3.5, -0.5)),
+        ];
+        for (arc, p) in cases {
+            let read = distance_to_piece(arc, p);
+            let reached = sampled_ellipse_distance(arc, p);
+            assert!(read <= reached + 1e-12, "{p:?}: {read} above {reached}");
+            assert!(
+                read >= reached * (1.0 - 1e-6) - 1e-12,
+                "{p:?}: {read} below {reached}"
+            );
+        }
+    }
+
+    /// The boundary's distance is its nearest piece's, and infinite with
+    /// none.
+    #[test]
+    fn distance_to_the_nearest_piece() {
+        let pieces = [
+            Boundary2::Segment(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0)),
+            circle((2.0, 0.0), 1.0, 0.0, PI),
+        ];
+        let p = Point2::new(2.0, 0.5);
+        assert!((distance_to_boundary(&pieces, p) - 0.5).abs() < 1e-15);
+        assert!(distance_to_boundary(&[], p).is_infinite());
     }
 }

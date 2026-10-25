@@ -183,10 +183,18 @@ impl EdgeCurve {
                     // full-domain behaviour.
                     let dt = pb.parameter - pa.parameter;
                     let curve_open = (p0 - p1).length() >= WELD_EPS;
+                    // On a closed curve a reversed pair is either that
+                    // forward sub-arc across the seam or the sub-arc between
+                    // the two run backward. Only the backward one has a
+                    // `(t0, t1)` form; take it when it is the shorter way
+                    // round (a piece of a closed intersection loop stored
+                    // against the loop: read as the whole loop, every other
+                    // point of the loop lay "on" it).
+                    let backward_shorter = -dt <= 0.5 * (d1 - d0);
                     if pa.distance < WELD_EPS
                         && pb.distance < WELD_EPS
                         && dt.abs() > 1e-6 * (d1 - d0)
-                        && (dt > 0.0 || curve_open)
+                        && (dt > 0.0 || curve_open || backward_shorter)
                     {
                         return (pa.parameter, pb.parameter);
                     }
@@ -472,9 +480,12 @@ mod tests {
     }
 
     #[test]
-    fn nurbs_domain_reversed_pair_on_closed_curve_falls_back_to_full_domain() {
-        // A closed fitted loop: a reversed projection pair here is ambiguous
-        // (usually a seam-crossing forward sub-arc), so the full domain wins.
+    fn nurbs_domain_reversed_pair_on_closed_curve_reads_the_shorter_way() {
+        // A closed fitted loop: a reversed projection pair is the backward
+        // sub-arc between them or the forward one across the seam. The
+        // backward one, when it is the shorter way round, is the edge's span
+        // (a piece of a closed intersection loop stored against the loop);
+        // the forward one has no (t0, t1) form, so the full domain stands.
         let pts: Vec<Point3> = (0..=12)
             .map(|k| {
                 let a = std::f64::consts::TAU * f64::from(k) / 12.0;
@@ -487,8 +498,16 @@ mod tests {
         let tb = d0 + 0.2 * (d1 - d0);
         let pa = brepkit_math::traits::ParametricCurve::evaluate(&n, ta);
         let pb = brepkit_math::traits::ParametricCurve::evaluate(&n, tb);
-        let curve = EdgeCurve::NurbsCurve(n);
-        assert_full_domain(curve.domain_with_endpoints(pa, pb), d0, d1);
+        let curve = EdgeCurve::NurbsCurve(n.clone());
+        let (t0, t1) = curve.domain_with_endpoints(pa, pb);
+        assert!(
+            (t0 - ta).abs() < 1e-6 && (t1 - tb).abs() < 1e-6,
+            "got ({t0}, {t1})"
+        );
+        // Across the seam the forward way is the shorter one.
+        let tc = d0 + 0.9 * (d1 - d0);
+        let pc = brepkit_math::traits::ParametricCurve::evaluate(&n, tc);
+        assert_full_domain(curve.domain_with_endpoints(pc, pb), d0, d1);
     }
 
     #[test]
