@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792950268599,
+  "lastUpdate": 1792951252154,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -485,6 +485,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 48089951,
             "range": "± 148489",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "91e5f56a750870277265eb8e835d8aed78039f2e",
+          "message": "chore: check PR branches and text against a private word list\n\nscripts/check-pr-text.sh (fork-only) checks a branch's added lines, file\nnames, commit messages and PR text against the word list kept in the\nprivate corpus submodule, and fails when the list is missing. BUZZCAD.md\nasks for it before every push of a PR branch and every PR edit.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T10:57:57-07:00",
+          "tree_id": "35de7072d269897ff1c779ab631ec5d8c7481542",
+          "url": "https://github.com/Robokan/brepkit/commit/91e5f56a750870277265eb8e835d8aed78039f2e"
+        },
+        "date": 1792951251621,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1061926,
+            "range": "± 2913",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1154073,
+            "range": "± 2393",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13440,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 665015,
+            "range": "± 2568",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 47800501,
+            "range": "± 177621",
             "unit": "ns/iter"
           }
         ]
