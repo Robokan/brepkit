@@ -1,5 +1,19 @@
 # Changelog
 
+## [4.2.8](https://github.com/andymai/brepkit/compare/v4.2.7...v4.2.8) (2026-10-25)
+
+
+### Bug Fixes
+
+* **io:** take a planar face's largest loop as its outer bound ([#2046](https://github.com/andymai/brepkit/issues/2046)) ([ccffd1b](https://github.com/andymai/brepkit/commit/ccffd1ba9510150ab16f620c2ef3de9a8fc3c27a))
+
+## [4.2.7](https://github.com/andymai/brepkit/compare/v4.2.6...v4.2.7) (2026-10-25)
+
+
+### Bug Fixes
+
+* **io:** read a plane written facing in as brepkit builds one ([#2051](https://github.com/andymai/brepkit/issues/2051)) ([1dbe22b](https://github.com/andymai/brepkit/commit/1dbe22bcfb2268f7ff3b0cb91a253664ed9d3ad9))
+
 ## [4.2.6](https://github.com/andymai/brepkit/compare/v4.2.5...v4.2.6) (2026-10-25)
 
 
