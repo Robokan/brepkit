@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792941075110,
+  "lastUpdate": 1792948419564,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -323,6 +323,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 48252314,
             "range": "± 763053",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "602ab705a07be8ea202527d93139beb6e860d03c",
+          "message": "docs: Fusion 360 is the main reference for the corpus replay\n\nA case is judged against Fusion 360's answer where it has one, and\nagainst Open CASCADE's only as the fallback; neither is the truth, and\nthe independent judge (sample points, volume formulas, validity) still\nbreaks ties. The first replay after the switch shifts statuses for that\nreason alone.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T10:11:05-07:00",
+          "tree_id": "fa7b2a2509d12fc08215a9bbb8f0cd6caf291d7d",
+          "url": "https://github.com/Robokan/brepkit/commit/602ab705a07be8ea202527d93139beb6e860d03c"
+        },
+        "date": 1792948418975,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 896674,
+            "range": "± 1257",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 934593,
+            "range": "± 909",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11564,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 529358,
+            "range": "± 1558",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 39888073,
+            "range": "± 219261",
             "unit": "ns/iter"
           }
         ]
