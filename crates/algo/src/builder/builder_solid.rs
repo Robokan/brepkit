@@ -671,10 +671,10 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
                 };
                 let (sp, ep) = (sv.point(), ev.point());
                 let (d0, d1) = edge.curve().domain_with_endpoints(sp, ep);
-                // Traversal order (is_forward-aware, endpoint sample left to
-                // the next edge) so the uv polygon's signed area below reads
-                // the wire's true winding.
-                for k in 0..8 {
+                // Traversal order (is_forward-aware), each edge's end taken
+                // too: a loop running a whole turn then spans the whole
+                // period, not all of it but its last step.
+                for k in 0..=8 {
                     let f = f64::from(k) / 8.0;
                     let f = if oe.is_forward() { f } else { 1.0 - f };
                     let p = edge
@@ -4313,6 +4313,43 @@ mod tests {
         let (outer, surface) = wall(topo, bore, floor, (bore_f0, &bore_f), (bore_t0, &bore_t));
         push_face(topo, &mut faces, (outer, vec![]), surface, outward);
         faces
+    }
+
+    /// An upper hemispherical bowl between radii 1 and 0.999, its rim an
+    /// annulus whose outer ring is cut into three arcs and its inner into
+    /// four, facing out or in. The rim's holes outmeasure it on their
+    /// corners, so the flux decides, and each hemisphere is integrated over
+    /// its whole turn of longitude.
+    #[test]
+    fn a_bowl_split_unevenly_reads_by_its_whole_hemispheres() {
+        use brepkit_math::surfaces::SphericalSurface;
+
+        for outward in [true, false] {
+            let mut topo = Topology::new();
+            let (_, outer) = arc_ring(&mut topo, 1.0, 0.0, 3);
+            let (_, inner) = arc_ring(&mut topo, 0.999, 0.0, 4);
+            let mut faces = Vec::new();
+            let loops = (edge_run(&outer, false), vec![edge_run(&inner, true)]);
+            push_face(&mut topo, &mut faces, loops, z_plane(0.0, false), !outward);
+            for (r, ring, flipped) in [(1.0, &outer, false), (0.999, &inner, true)] {
+                let sphere = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), r).unwrap();
+                let loops = (edge_run(ring, true), vec![]);
+                push_face(
+                    &mut topo,
+                    &mut faces,
+                    loops,
+                    FaceSurface::Sphere(sphere),
+                    flipped == outward,
+                );
+            }
+            let (growth, holes) = perform_areas(&topo, &[faces]);
+            assert_eq!(
+                (growth.len(), holes.len()),
+                if outward { (1, 0) } else { (0, 1) },
+                "facing {}",
+                if outward { "out" } else { "in" }
+            );
+        }
     }
 
     /// A cup whose walls and floor are a ten-thousandth thick, its rings cut
