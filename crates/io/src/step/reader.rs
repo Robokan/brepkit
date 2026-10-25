@@ -470,16 +470,24 @@ impl<'a> StepBuilder<'a> {
                 && inner_wires.len() > 1
                 && let Ok(frame) = Frame3::from_normal(Point3::new(0.0, 0.0, 0.0), *normal)
             {
-                let mut best = f64::NEG_INFINITY;
-                for (i, &wire) in inner_wires.iter().enumerate() {
-                    let area =
+                // Ranked only when every loop's area reads: a loop that cannot
+                // be measured may be the rim.
+                let areas: Option<Vec<f64>> = inner_wires
+                    .iter()
+                    .map(|&wire| {
                         brepkit_topology::planar::wire_area_2d(self.topo, wire, frame.x, frame.y)
                             .ok()
                             .flatten()
-                            .map_or(f64::NEG_INFINITY, f64::abs);
-                    if area > best {
-                        best = area;
-                        first = i;
+                            .map(f64::abs)
+                    })
+                    .collect();
+                if let Some(areas) = areas {
+                    let mut best = f64::NEG_INFINITY;
+                    for (i, &area) in areas.iter().enumerate() {
+                        if area > best {
+                            best = area;
+                            first = i;
+                        }
                     }
                 }
             }
