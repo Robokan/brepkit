@@ -74,6 +74,67 @@ pub fn curve_to_bezier_segments(curve: &NurbsCurve) -> Result<Vec<NurbsCurve>, M
     Ok(segments)
 }
 
+/// The rational Bezier form of `curve` from parameter `a` to parameter `b`.
+///
+/// `a` and `b` lie in one knot span of the domain. The result is `degree + 1`
+/// control points in homogeneous form `[w x, w y, w z, w]`, the first at `a`
+/// and the last at `b`, so in reverse when `a > b`.
+///
+/// Control point `j` is the curve's blossom at `a` taken `degree - j` times
+/// and `b` taken `j` times, read off the span's de Boor points. No knot is
+/// inserted, so a piece of a span and an unclamped knot vector need no
+/// special case. When every returned weight is positive the piece lies in
+/// the convex hull of the points.
+///
+/// # Errors
+///
+/// Returns [`MathError::ParameterOutOfRange`] if `a` and `b` do not lie in
+/// one knot span of the curve's domain.
+pub fn curve_bezier_between(
+    curve: &NurbsCurve,
+    a: f64,
+    b: f64,
+) -> Result<Vec<[f64; 4]>, MathError> {
+    let p = curve.degree();
+    let knots = curve.knots();
+    let n = curve.control_points().len();
+    let (lo, hi) = (a.min(b), a.max(b));
+    let (d0, d1) = curve.domain();
+    let out_of_range = MathError::ParameterOutOfRange {
+        value: if lo < d0 { lo } else { hi },
+        min: d0,
+        max: d1,
+    };
+    if n <= p {
+        return Err(out_of_range);
+    }
+    let i = p + knots[p..n].partition_point(|&k| k <= lo).saturating_sub(1);
+    if !(knots[i] <= lo && hi <= knots[i + 1] && knots[i] < knots[i + 1]) {
+        return Err(out_of_range);
+    }
+    let homogeneous: Vec<[f64; 4]> = curve.control_points()[i - p..=i]
+        .iter()
+        .zip(&curve.weights()[i - p..=i])
+        .map(|(pt, &w)| [pt.x() * w, pt.y() * w, pt.z() * w, w])
+        .collect();
+    let blossom = |at_b: usize| {
+        let mut d = homogeneous.clone();
+        for level in 1..=p {
+            let u = if level <= at_b { b } else { a };
+            for j in (level..=p).rev() {
+                let (left, right) = (knots[i - p + j], knots[i + 1 + j - level]);
+                let alpha = (u - left) / (right - left);
+                let prev = d[j - 1];
+                for (c, q) in d[j].iter_mut().zip(prev) {
+                    *c = (1.0 - alpha).mul_add(q, alpha * *c);
+                }
+            }
+        }
+        d[p]
+    };
+    Ok((0..=p).map(blossom).collect())
+}
+
 /// A single Bezier patch extracted from a NURBS surface decomposition.
 ///
 /// Each patch has `(degree_u + 1) × (degree_v + 1)` control points and
@@ -604,5 +665,71 @@ mod tests {
             (diag - std::f64::consts::SQRT_2).abs() < 0.1,
             "expected diagonal ≈ √2, got {diag}"
         );
+    }
+
+    /// The point at `s` along homogeneous Bezier control points `q`.
+    fn bezier_at(q: &[[f64; 4]], s: f64) -> Point3 {
+        let mut d = q.to_vec();
+        for r in 1..d.len() {
+            for j in 0..d.len() - r {
+                for c in 0..4 {
+                    d[j][c] = (1.0 - s) * d[j][c] + s * d[j + 1][c];
+                }
+            }
+        }
+        let [x, y, z, w] = d[0];
+        Point3::new(x / w, y / w, z / w)
+    }
+
+    /// A rational cubic with an unclamped knot vector: domain `[0.2, 1.0]`,
+    /// spans `[0.2, 0.5]`, `[0.5, 0.7]`, `[0.7, 1.0]`.
+    fn unclamped_rational_cubic() -> NurbsCurve {
+        NurbsCurve::new(
+            3,
+            vec![-0.3, -0.1, 0.0, 0.2, 0.5, 0.7, 1.0, 1.2, 1.4, 1.5],
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 2.0, 0.5),
+                Point3::new(2.0, -1.0, 1.0),
+                Point3::new(3.0, 2.0, 0.0),
+                Point3::new(4.0, 0.5, -1.0),
+                Point3::new(5.0, 1.0, 0.0),
+            ],
+            vec![1.0, 0.7, 1.3, 0.9, 1.1, 0.8],
+        )
+        .expect("valid")
+    }
+
+    /// The Bezier form between two parameters traces the curve between them,
+    /// in either direction, on part of a span, a whole span, and the span
+    /// ending the domain.
+    #[test]
+    fn bezier_between_traces_the_curve_between_its_parameters() {
+        let curve = unclamped_rational_cubic();
+        for (a, b) in [
+            (0.25, 0.45),
+            (0.45, 0.25),
+            (0.5, 0.7),
+            (0.7, 1.0),
+            (1.0, 0.7),
+        ] {
+            let q = curve_bezier_between(&curve, a, b).expect("one span");
+            assert_eq!(q.len(), 4);
+            for k in 0..=8 {
+                let s = f64::from(k) / 8.0;
+                let on_curve = curve.evaluate(a + s * (b - a));
+                let gap = (bezier_at(&q, s) - on_curve).length();
+                assert!(gap < 1e-12, "({a}, {b}) at {s}: {gap}");
+            }
+        }
+    }
+
+    /// Parameters across a knot or outside the domain have no single span.
+    #[test]
+    fn bezier_between_refuses_more_than_one_span() {
+        let curve = unclamped_rational_cubic();
+        assert!(curve_bezier_between(&curve, 0.4, 0.6).is_err());
+        assert!(curve_bezier_between(&curve, 0.1, 0.3).is_err());
+        assert!(curve_bezier_between(&curve, 0.9, 1.1).is_err());
     }
 }
