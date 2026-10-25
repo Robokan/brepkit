@@ -5,6 +5,7 @@ use brepkit_blend::chamfer_builder::ChamferBuilder;
 use brepkit_blend::fillet_builder::FilletBuilder;
 use brepkit_topology::Topology;
 use brepkit_topology::edge::EdgeId;
+use brepkit_topology::face::FaceId;
 use brepkit_topology::solid::SolidId;
 
 use crate::OperationsError;
@@ -65,6 +66,35 @@ pub fn chamfer_v2(
     }
     let mut builder = ChamferBuilder::new(topo, solid);
     builder.add_edges_asymmetric(edges, d1, d2);
+    Ok(builder.build()?)
+}
+
+/// Chamfer edges with two distances (v2 engine), `d1` on each edge's
+/// reference face and `d2` on its other face.
+///
+/// # Errors
+/// Returns `OperationsError` if distances are non-positive, edges are empty,
+/// a reference face does not border its edge, or the blend computation
+/// fails.
+pub fn chamfer_v2_on(
+    topo: &mut Topology,
+    solid: SolidId,
+    edges: &[(EdgeId, FaceId)],
+    d1: f64,
+    d2: f64,
+) -> Result<BlendResult, OperationsError> {
+    if d1 <= 0.0 || d2 <= 0.0 {
+        return Err(OperationsError::InvalidInput {
+            reason: "distances must be positive".into(),
+        });
+    }
+    if edges.is_empty() {
+        return Err(OperationsError::InvalidInput {
+            reason: "no edges specified".into(),
+        });
+    }
+    let mut builder = ChamferBuilder::new(topo, solid);
+    builder.add_edges_asymmetric_on(edges, d1, d2);
     Ok(builder.build()?)
 }
 
