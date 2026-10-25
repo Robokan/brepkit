@@ -657,12 +657,9 @@ pub fn perform(
                         // the pair. Read against the plane's true outline, a
                         // line it misses entirely is dropped; one it meets is
                         // kept whole, so the band splitting is unchanged.
-                        let misses = |f: FaceId, surf: &FaceSurface| {
-                            matches!(surf, FaceSurface::Plane { .. })
-                                && line_face_intervals(topo, f, raw.p_start, raw.p_end, tol.linear)
-                                    .is_some_and(|runs| runs.iter().all(|r| r.1 - r.0 <= 1e-9))
-                        };
-                        return !(misses(fa, surf_a) || misses(fb, surf_b));
+                        let misses =
+                            |f| line_misses_plane_face(topo, f, raw.p_start, raw.p_end, tol.linear);
+                        return !(misses(fa) || misses(fb));
                     }
                     // A disc or ellipse face (one closed conic bounding it) has
                     // an exact extent: a line missing that region misses the
@@ -8461,6 +8458,22 @@ fn line_face_intervals(
     Some(runs)
 }
 
+/// Whether the segment `p0` to `p1`, lying in a planar face's plane, misses
+/// that face entirely, read on the face's own lines and arcs. `false` when
+/// the face is not a plane or cannot be read.
+///
+/// Every run [`line_face_intervals`] returns is already longer than `tol`,
+/// so any run is a meeting, however small a fraction of a long segment it is.
+fn line_misses_plane_face(
+    topo: &Topology,
+    face_id: FaceId,
+    p0: Point3,
+    p1: Point3,
+    tol: f64,
+) -> bool {
+    line_face_intervals(topo, face_id, p0, p1, tol).is_some_and(|runs| runs.is_empty())
+}
+
 /// Whether two plane faces, both read on their own lines and arcs, run along
 /// a line section at no common point: a face across a knuckle's end, say,
 /// whose plane passes through the hinge axis but whose material stops short
@@ -9699,6 +9712,29 @@ mod tests {
                 exact_runs_disjoint(&topo, a, b, &raw, 1e-7),
                 apart,
                 "z = {z}"
+            );
+        }
+    }
+
+    /// A strip 0.0005 wide crossed by a line a million long: the run is a
+    /// 5e-10 sliver of the line but 5,000 times the tolerance, so the line
+    /// meets the face. The same line beside the strip misses it.
+    #[test]
+    fn a_long_line_crossing_a_narrow_face_meets_it() {
+        use brepkit_topology::builder::{make_face_from_wire, make_polygon_wire};
+
+        let mut topo = Topology::new();
+        let corners = [(0.0, -1.0), (5e-4, -1.0), (5e-4, 1.0), (0.0, 1.0)]
+            .map(|(x, y)| Point3::new(x, y, 0.0));
+        let wire = make_polygon_wire(&mut topo, &corners, 1e-7).unwrap();
+        let strip = make_face_from_wire(&mut topo, wire).unwrap();
+        let along = |y: f64, half: f64| (Point3::new(-half, y, 0.0), Point3::new(half, y, 0.0));
+        for (y, half, misses) in [(0.0, 5e5, false), (0.0, 1.0, false), (2.0, 5e5, true)] {
+            let (p0, p1) = along(y, half);
+            assert_eq!(
+                line_misses_plane_face(&topo, strip, p0, p1, 1e-7),
+                misses,
+                "y = {y}, half length {half}"
             );
         }
     }
