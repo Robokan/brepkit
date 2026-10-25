@@ -92,12 +92,18 @@ pub fn face_boundary_2d(
 ///
 /// Exact for lines and conic arcs, so it does not depend on how a loop's
 /// curves are split into edges. A NURBS edge is integrated knot span by
-/// knot span.
+/// knot span; `None` when a rational span's weights are so steep that its
+/// halving budget runs out before the area settles.
 ///
 /// # Errors
 ///
 /// Returns [`TopologyError`] if an entity lookup fails.
-pub fn wire_area_2d(topo: &Topology, wire: WireId, x: Vec3, y: Vec3) -> Result<f64, TopologyError> {
+pub fn wire_area_2d(
+    topo: &Topology,
+    wire: WireId,
+    x: Vec3,
+    y: Vec3,
+) -> Result<Option<f64>, TopologyError> {
     loop_area_2d(topo, topo.wire(wire)?.edges(), x, y)
 }
 
@@ -111,9 +117,9 @@ pub fn loop_area_2d(
     edges: &[OrientedEdge],
     x: Vec3,
     y: Vec3,
-) -> Result<f64, TopologyError> {
+) -> Result<Option<f64>, TopologyError> {
     let Some(first) = edges.first() else {
-        return Ok(0.0);
+        return Ok(Some(0.0));
     };
     // Read about a point of the loop, not the world origin: far from it the
     // swept areas below are large and cancel to the loop's small one.
@@ -154,23 +160,49 @@ pub fn loop_area_2d(
             ),
             EdgeCurve::NurbsCurve(n) => {
                 let (t0, t1) = curve.domain_with_endpoints(a, b);
-                nurbs_swept(n, t0, t1, origin, x, y)
+                let Some(swept) = nurbs_swept(n, t0, t1, origin, x, y) else {
+                    return Ok(None);
+                };
+                swept
             }
         };
         twice += if oe.is_forward() { swept } else { -swept };
     }
-    Ok(0.5 * twice)
+    Ok(Some(0.5 * twice))
 }
 
 /// Twice the area a NURBS curve sweeps about `origin` from `t0` to `t1`
 /// (either way round) in the plane of `x` and `y`: `∫ q × q' dt` by Gauss
-/// quadrature on each knot span. A polynomial span's integrand is a
-/// polynomial the rule integrates exactly; a rational span's is not, and
-/// steep weights crowd it into a corner of the span, so its halves are
-/// integrated in turn until they agree with the whole.
-fn nurbs_swept(curve: &NurbsCurve, t0: f64, t1: f64, origin: Point3, x: Vec3, y: Vec3) -> f64 {
-    const MAX_HALVINGS: u32 = 24;
+/// quadrature on each knot span, on the curve moved to `origin` so a
+/// rational curve's derivatives do not cancel far from the world's.
+///
+/// A polynomial span's integrand is a polynomial the rule integrates
+/// exactly. A rational span's is not, and steep weights crowd the curve
+/// into a sliver of its span where no node may fall, so a piece is taken
+/// only when its two halves agree with it and its points keep near the
+/// chord's at the same fractions (its speed spread over it); otherwise it is
+/// halved. `None` if a piece still fails after `MAX_HALVINGS` halvings.
+fn nurbs_swept(
+    curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    origin: Point3,
+    x: Vec3,
+    y: Vec3,
+) -> Option<f64> {
+    const MAX_HALVINGS: u32 = 48;
     let o = Vec3::new(origin.x(), origin.y(), origin.z());
+    let curve = NurbsCurve::new(
+        curve.degree(),
+        curve.knots().to_vec(),
+        curve
+            .control_points()
+            .iter()
+            .map(|&c| Point3::new(c.x() - o.x(), c.y() - o.y(), c.z() - o.z()))
+            .collect(),
+        curve.weights().to_vec(),
+    )
+    .ok()?;
     let (lo, hi) = (t0.min(t1), t0.max(t1));
     let rational = curve.is_rational();
     let points = quadrature::gauss_legendre_points(if rational {
@@ -184,13 +216,22 @@ fn nurbs_swept(curve: &NurbsCurve, t0: f64, t1: f64, origin: Point3, x: Vec3, y:
             .iter()
             .map(|g| {
                 let d = curve.derivatives(half.mul_add(g.x, mid), 1);
-                let (Some(&p), Some(&dp)) = (d.first(), d.get(1)) else {
+                let (Some(&q), Some(&dq)) = (d.first(), d.get(1)) else {
                     return 0.0;
                 };
-                let q = p - o;
-                g.w * half * (q.dot(x) * dp.dot(y) - q.dot(y) * dp.dot(x))
+                g.w * half * (q.dot(x) * dq.dot(y) - q.dot(y) * dq.dot(x))
             })
             .sum::<f64>()
+    };
+    // Whether the curve keeps within half the chord's length of the chord's
+    // own point at a quarter, a half and three quarters along.
+    let even = |a: f64, b: f64| {
+        let (pa, pb) = (curve.evaluate(a), curve.evaluate(b));
+        let chord = (pb - pa).length();
+        [0.25_f64, 0.5, 0.75].iter().all(|&f| {
+            let on = curve.evaluate(f.mul_add(b - a, a));
+            (on - (pa + (pb - pa) * f)).length() <= 0.5 * chord
+        })
     };
     // The swept area's scale, for the agreement test: the control points'
     // reach from `origin` times their spread.
@@ -198,7 +239,7 @@ fn nurbs_swept(curve: &NurbsCurve, t0: f64, t1: f64, origin: Point3, x: Vec3, y:
         let cps = curve.control_points();
         let reach = cps
             .iter()
-            .map(|c| (*c - origin).length())
+            .map(|c| Vec3::new(c.x(), c.y(), c.z()).length())
             .fold(0.0, f64::max);
         let lo_hi = cps.iter().fold(None, |acc: Option<(Point3, Point3)>, c| {
             Some(acc.map_or((*c, *c), |(a, b)| {
@@ -225,15 +266,17 @@ fn nurbs_swept(curve: &NurbsCurve, t0: f64, t1: f64, origin: Point3, x: Vec3, y:
         while let Some((a, b, whole, depth)) = pending.pop() {
             let m = 0.5 * (a + b);
             let (left, right) = (gauss(a, m), gauss(m, b));
-            if depth >= MAX_HALVINGS || (left + right - whole).abs() <= tolerance {
+            if (left + right - whole).abs() <= tolerance && even(a, b) {
                 total += left + right;
+            } else if depth >= MAX_HALVINGS {
+                return None;
             } else {
                 pending.push((a, m, left, depth + 1));
                 pending.push((m, b, right, depth + 1));
             }
         }
     }
-    if t1 < t0 { -total } else { total }
+    Some(if t1 < t0 { -total } else { total })
 }
 
 #[cfg(test)]
@@ -333,7 +376,7 @@ mod tests {
         let disc = 16.0 * std::f64::consts::PI;
         let (x, y) = XY;
         for (w, want) in [(one, disc), (two, disc), (back, -disc)] {
-            let area = wire_area_2d(&topo, w, x, y).unwrap();
+            let area = wire_area_2d(&topo, w, x, y).unwrap().unwrap();
             assert!((area - want).abs() < 1e-9, "{area} vs {want}");
         }
     }
@@ -361,7 +404,7 @@ mod tests {
         let axis = topo.add_edge(Edge::new(vb, va, EdgeCurve::Line));
         let w = wire_of(&mut topo, &[(arc, true), (axis, true)]);
         let (x, y) = XY;
-        let area = wire_area_2d(&topo, w, x, y).unwrap();
+        let area = wire_area_2d(&topo, w, x, y).unwrap().unwrap();
         assert!((area - 3.0 * std::f64::consts::PI).abs() < 1e-9, "{area}");
     }
 
@@ -393,38 +436,63 @@ mod tests {
             let arc = topo.add_edge(Edge::new(from, to, EdgeCurve::NurbsCurve(curve.clone())));
             let chord = topo.add_edge(Edge::new(to, from, EdgeCurve::Line));
             let w = wire_of(&mut topo, &[(arc, true), (chord, true)]);
-            let area = wire_area_2d(&topo, w, x, y).unwrap();
+            let area = wire_area_2d(&topo, w, x, y).unwrap().unwrap();
             assert!((area - want).abs() < 1e-9, "{area} vs {want}");
         }
     }
 
-    /// A quarter circle whose weights are steep (the same arc reparametrized
-    /// so most of it runs in a sliver of its domain), closed by two radii,
-    /// reads the quarter disc's area.
-    #[test]
-    fn a_steeply_weighted_quarter_circle_reads_its_exact_area() {
+    /// The quarter disc at `at`, its arc a rational quadratic with the middle
+    /// and last weights `w1` and `w2` (the standard ones, `1/√2` and 1,
+    /// times `c` and `c²` give the same arc reparametrized), closed by two
+    /// radii; its area as read.
+    fn quarter_disc_area(at: (f64, f64), w1: f64, w2: f64) -> Option<f64> {
+        let p = |x: f64, y: f64| Point3::new(at.0 + x, at.1 + y, 0.0);
         let curve = NurbsCurve::new(
             2,
             vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-            vec![
-                Point3::new(1.0, 0.0, 0.0),
-                Point3::new(1.0, 1.0, 0.0),
-                Point3::new(0.0, 1.0, 0.0),
-            ],
-            vec![1.0, 300.0 * std::f64::consts::FRAC_1_SQRT_2, 90_000.0],
+            vec![p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            vec![1.0, w1, w2],
         )
         .unwrap();
         let mut topo = Topology::new();
-        let o = topo.add_vertex(Vertex::new(Point3::new(0.0, 0.0, 0.0), 1e-7));
-        let east = topo.add_vertex(Vertex::new(Point3::new(1.0, 0.0, 0.0), 1e-7));
-        let north = topo.add_vertex(Vertex::new(Point3::new(0.0, 1.0, 0.0), 1e-7));
+        let o = topo.add_vertex(Vertex::new(p(0.0, 0.0), 1e-7));
+        let east = topo.add_vertex(Vertex::new(p(1.0, 0.0), 1e-7));
+        let north = topo.add_vertex(Vertex::new(p(0.0, 1.0), 1e-7));
         let to_east = topo.add_edge(Edge::new(o, east, EdgeCurve::Line));
         let arc = topo.add_edge(Edge::new(east, north, EdgeCurve::NurbsCurve(curve)));
         let back = topo.add_edge(Edge::new(north, o, EdgeCurve::Line));
         let w = wire_of(&mut topo, &[(to_east, true), (arc, true), (back, true)]);
         let (x, y) = XY;
-        let area = wire_area_2d(&topo, w, x, y).unwrap();
-        assert!((area - std::f64::consts::FRAC_PI_4).abs() < 1e-9, "{area}");
+        wire_area_2d(&topo, w, x, y).unwrap()
+    }
+
+    /// A quarter circle read the same far from the origin and with steep
+    /// weights, which crowd most of the arc into a sliver of its domain.
+    #[test]
+    fn a_steeply_weighted_quarter_circle_reads_its_exact_area() {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let quarter = std::f64::consts::FRAC_PI_4;
+        for (at, c) in [
+            ((0.0, 0.0), 1.0),
+            ((1e6, 1e6), 1.0),
+            ((0.0, 0.0), 300.0),
+            ((1e6, -1e6), 300.0),
+        ] {
+            let area = quarter_disc_area(at, c * s, c * c).unwrap();
+            assert!((area - quarter).abs() < 1e-9, "at {at:?}, c {c}: {area}");
+        }
+    }
+
+    /// Weights so steep that the arc runs within 1e-20 of its domain's end:
+    /// the area reads exactly or not at all, never as the near-zero the
+    /// quadrature nodes see.
+    #[test]
+    fn a_quarter_circle_too_steep_to_settle_reads_nothing_rather_than_wrong() {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let area = quarter_disc_area((0.0, 0.0), 1e20 * s, 1e40);
+        if let Some(area) = area {
+            assert!((area - std::f64::consts::FRAC_PI_4).abs() < 1e-9, "{area}");
+        }
     }
 
     /// A NURBS edge declines the flattening.

@@ -646,7 +646,8 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
                 Point3::new(c.x() / n, c.y() / n, c.z() / n)
             };
             let n2 = newell_normal(&pts);
-            let c_wire = 0.5 * (centroid - origin).dot(n2) * planar_net_share(topo, face);
+            let c_wire = planar_flux(topo, face, origin)
+                .unwrap_or_else(|| 0.5 * (centroid - origin).dot(n2));
             let c_comp = if face.is_reversed() { -c_wire } else { c_wire };
             flux += c_comp;
             flux_wire += c_wire;
@@ -1127,39 +1128,30 @@ fn newell_normal(verts: &[Point3]) -> Vec3 {
     Vec3::new(nx, ny, nz)
 }
 
-/// The share of a planar face's outer loop that is face rather than hole,
-/// with each loop's area read by `area`: the loop's area less its holes',
-/// over its own; 1 without holes or when the outer loop has none. The shell
-/// orientation readings integrate a planar face over its outer loop alone;
-/// scaled by this they count its holes, which on a holed part far from the
-/// origin can outweigh whole walls and turn an outward shell's reading
-/// inward.
-fn planar_share(face: &Face, area: impl Fn(WireId) -> Option<f64>) -> f64 {
-    if face.inner_wires().is_empty() || !matches!(face.surface(), FaceSurface::Plane { .. }) {
-        return 1.0;
-    }
-    let Some(outer) = area(face.outer_wire()).filter(|&a| a > 0.0) else {
-        return 1.0;
+/// A planar face's share of the flux `∮ (p - origin) · n dA`, read on its
+/// wire's winding: its plane's offset from `origin` times its loops' exact
+/// signed area, holes taken out, so it does not depend on how the loops are
+/// split into edges. `None` when a loop's area cannot be read.
+fn planar_flux(topo: &Topology, face: &Face, origin: Point3) -> Option<f64> {
+    let FaceSurface::Plane { normal, d } = face.surface() else {
+        return None;
     };
-    let holes: f64 = face.inner_wires().iter().filter_map(|&w| area(w)).sum();
-    ((outer - holes) / outer).clamp(0.0, 1.0)
-}
-
-/// [`planar_share`] with every loop's exact area, for the flux, which
-/// integrates the shell's surfaces themselves.
-fn planar_net_share(topo: &Topology, face: &Face) -> f64 {
-    let FaceSurface::Plane { normal, .. } = face.surface() else {
-        return 1.0;
-    };
-    let Ok(frame) = brepkit_math::frame::Frame3::from_normal(Point3::new(0.0, 0.0, 0.0), *normal)
-    else {
-        return 1.0;
-    };
-    planar_share(face, |w| {
+    let frame =
+        brepkit_math::frame::Frame3::from_normal(Point3::new(0.0, 0.0, 0.0), *normal).ok()?;
+    let area = |w| {
         brepkit_topology::planar::wire_area_2d(topo, w, frame.x, frame.y)
             .ok()
-            .map(f64::abs)
-    })
+            .flatten()
+    };
+    let outer = area(face.outer_wire())?;
+    let holes = face
+        .inner_wires()
+        .iter()
+        .map(|&w| area(w).map(f64::abs))
+        .sum::<Option<f64>>()?;
+    let net = outer.signum() * (outer.abs() - holes).max(0.0);
+    let offset = d - normal.dot(Vec3::new(origin.x(), origin.y(), origin.z()));
+    Some(offset * net)
 }
 
 /// The area of the polygon on a loop's corners: 0 on fewer than three.
@@ -1176,14 +1168,29 @@ fn corner_area(topo: &Topology, wire: WireId) -> Option<f64> {
     })
 }
 
-/// [`planar_share`] with every loop's area that of the polygon on its
-/// corners, for the corner fan. The fan is the volume of the polyhedron on
-/// the shell's vertices, which closes, and so reads the same wherever the
-/// shell sits, only while a hole is cut from its face by those same
-/// corners: a round hole and the floor of its pocket, each on fewer than
-/// three corners, drop out together.
+/// The share of a planar face's corner polygon that is face rather than
+/// hole: the polygon's area less its holes' polygons', over its own; 1
+/// without holes or when the outer loop has no polygon. The corner fan
+/// integrates a planar face over its outer loop's corners alone; scaled by
+/// this it counts its holes, which on a holed part far from the origin can
+/// outweigh whole walls. The fan is the volume of the polyhedron on the
+/// shell's vertices, which closes, and so reads the same wherever the shell
+/// sits, only while a hole is cut by those same corners: a round hole and
+/// the floor of its pocket, each on fewer than three corners, drop out
+/// together.
 fn planar_corner_share(topo: &Topology, face: &Face) -> f64 {
-    planar_share(face, |w| corner_area(topo, w))
+    if face.inner_wires().is_empty() || !matches!(face.surface(), FaceSurface::Plane { .. }) {
+        return 1.0;
+    }
+    let Some(outer) = corner_area(topo, face.outer_wire()).filter(|&a| a > 0.0) else {
+        return 1.0;
+    };
+    let holes: f64 = face
+        .inner_wires()
+        .iter()
+        .filter_map(|&w| corner_area(topo, w))
+        .sum();
+    ((outer - holes) / outer).clamp(0.0, 1.0)
 }
 
 /// Whether every planar face's holes cut its corner polygon. A ring whose
@@ -3978,12 +3985,12 @@ mod tests {
 
     use super::*;
 
-    /// A planar face's share of its outer loop excluding its holes: a square
-    /// hole, and a round one whose loop is a single closed circle or two half
-    /// circles. The exact share counts the round hole however it is split;
-    /// the corner share, on fewer than three corners, leaves it out.
+    /// A planar face's flux and corner share with a square hole, and with a
+    /// round one whose loop is a single closed circle or two half circles.
+    /// The flux takes the round hole's exact area however it is split; the
+    /// corner share, on fewer than three corners, leaves it out.
     #[test]
-    fn planar_net_share_counts_square_and_round_holes() {
+    fn planar_readings_count_square_and_round_holes() {
         use brepkit_topology::edge::{Edge, EdgeCurve};
         use brepkit_topology::vertex::Vertex;
         use brepkit_topology::wire::Wire;
@@ -4017,7 +4024,8 @@ mod tests {
         let outer = square(&mut topo, 0.0, 10.0, true);
         let hole = square(&mut topo, 3.0, 7.0, false);
         let holed = Face::new(outer, vec![hole], plane.clone());
-        assert!((planar_net_share(&topo, &holed) - 0.84).abs() < 1e-12);
+        let at_origin = Point3::new(0.0, 0.0, 0.0);
+        assert!((planar_flux(&topo, &holed, at_origin).unwrap() - 8400.0).abs() < 1e-9);
         assert!((planar_corner_share(&topo, &holed) - 0.84).abs() < 1e-12);
 
         let circle = brepkit_math::curves::Circle3D::new(
@@ -4046,7 +4054,8 @@ mod tests {
         for round in [one, two] {
             let outer = square(&mut topo, 0.0, 10.0, true);
             let drilled = Face::new(outer, vec![round], plane.clone());
-            assert!((planar_net_share(&topo, &drilled) - (100.0 - disc) / 100.0).abs() < 1e-12);
+            let flux = planar_flux(&topo, &drilled, at_origin).unwrap();
+            assert!((flux - 100.0 * (100.0 - disc)).abs() < 1e-9, "{flux}");
             assert!((planar_corner_share(&topo, &drilled) - 1.0).abs() < 1e-12);
         }
     }
@@ -4099,103 +4108,170 @@ mod tests {
         ))
     }
 
+    /// A circle of radius `r` about the z axis at height `z`, cut into `n`
+    /// arcs from the +x side: its first vertex and its arcs in turn.
+    fn arc_ring(
+        topo: &mut Topology,
+        r: f64,
+        z: f64,
+        n: usize,
+    ) -> (brepkit_topology::vertex::VertexId, Vec<EdgeId>) {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::vertex::Vertex;
+
+        let circle = Circle3D::new(Point3::new(0.0, 0.0, z), Vec3::new(0.0, 0.0, 1.0), r).unwrap();
+        let v: Vec<_> = (0..n)
+            .map(|k| {
+                #[allow(clippy::cast_precision_loss)]
+                let a = std::f64::consts::TAU * k as f64 / n as f64;
+                topo.add_vertex(Vertex::new(Point3::new(r * a.cos(), r * a.sin(), z), 1e-7))
+            })
+            .collect();
+        let arcs = (0..n)
+            .map(|k| {
+                topo.add_edge(Edge::new(
+                    v[k],
+                    v[(k + 1) % n],
+                    EdgeCurve::Circle(circle.clone()),
+                ))
+            })
+            .collect();
+        (v[0], arcs)
+    }
+
+    /// `arcs` run forward, or backward with each reversed.
+    fn edge_run(arcs: &[EdgeId], forward: bool) -> Vec<OrientedEdge> {
+        if forward {
+            arcs.iter().map(|&e| OrientedEdge::new(e, true)).collect()
+        } else {
+            arcs.iter()
+                .rev()
+                .map(|&e| OrientedEdge::new(e, false))
+                .collect()
+        }
+    }
+
+    /// The wall of radius `r` about the z axis from the ring `lower` (first
+    /// vertex `b0`) at `z_lo` up to the ring `upper` (first vertex `t0`),
+    /// seamed at +x: its loop and surface.
+    fn wall(
+        topo: &mut Topology,
+        r: f64,
+        z_lo: f64,
+        (b0, lower): (brepkit_topology::vertex::VertexId, &[EdgeId]),
+        (t0, upper): (brepkit_topology::vertex::VertexId, &[EdgeId]),
+    ) -> (Vec<OrientedEdge>, FaceSurface) {
+        use brepkit_math::surfaces::CylindricalSurface;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+
+        let seam = topo.add_edge(Edge::new(b0, t0, EdgeCurve::Line));
+        let mut wire = edge_run(lower, true);
+        wire.push(OrientedEdge::new(seam, true));
+        wire.extend(edge_run(upper, false));
+        wire.push(OrientedEdge::new(seam, false));
+        let axis = Vec3::new(0.0, 0.0, 1.0);
+        let surface = CylindricalSurface::new(Point3::new(0.0, 0.0, z_lo), axis, r).unwrap();
+        (wire, FaceSurface::Cylinder(surface))
+    }
+
+    /// A face on `outer` with `holes`, its flag set when `reversed`.
+    fn push_face(
+        topo: &mut Topology,
+        faces: &mut Vec<FaceId>,
+        (outer, holes): (Vec<OrientedEdge>, Vec<Vec<OrientedEdge>>),
+        surface: FaceSurface,
+        reversed: bool,
+    ) {
+        use brepkit_topology::wire::Wire;
+
+        let outer = topo.add_wire(Wire::new(outer, true).unwrap());
+        let holes = holes
+            .into_iter()
+            .map(|h| topo.add_wire(Wire::new(h, true).unwrap()))
+            .collect();
+        faces.push(topo.add_face(if reversed {
+            Face::new_reversed(outer, holes, surface)
+        } else {
+            Face::new(outer, holes, surface)
+        }));
+    }
+
+    /// A z-facing plane at height `z`, up or down.
+    const fn z_plane(z: f64, up: bool) -> FaceSurface {
+        if up {
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: z,
+            }
+        } else {
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, -1.0),
+                d: -z,
+            }
+        }
+    }
+
     /// A tube of height 1 standing at `z0`, its rim of radius 1 cut into
     /// three arcs and its hole of radius 0.9 into four, facing out or in
     /// (every face's flag turned, as a cut turns a cavity's).
     fn split_tube(topo: &mut Topology, z0: f64, outward: bool) -> Vec<FaceId> {
-        use brepkit_math::curves::Circle3D;
-        use brepkit_math::surfaces::CylindricalSurface;
-        use brepkit_topology::edge::{Edge, EdgeCurve};
-        use brepkit_topology::vertex::Vertex;
-        use brepkit_topology::wire::Wire;
-
-        let axis = Vec3::new(0.0, 0.0, 1.0);
-        let ring = |topo: &mut Topology, r: f64, z: f64, n: usize| {
-            let circle = Circle3D::new(Point3::new(0.0, 0.0, z), axis, r).unwrap();
-            let v: Vec<_> = (0..n)
-                .map(|k| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let a = std::f64::consts::TAU * k as f64 / n as f64;
-                    topo.add_vertex(Vertex::new(Point3::new(r * a.cos(), r * a.sin(), z), 1e-7))
-                })
-                .collect();
-            let arcs: Vec<EdgeId> = (0..n)
-                .map(|k| {
-                    topo.add_edge(Edge::new(
-                        v[k],
-                        v[(k + 1) % n],
-                        EdgeCurve::Circle(circle.clone()),
-                    ))
-                })
-                .collect();
-            (v[0], arcs)
-        };
-        let run = |arcs: &[EdgeId], forward: bool| -> Vec<OrientedEdge> {
-            if forward {
-                arcs.iter().map(|&e| OrientedEdge::new(e, true)).collect()
-            } else {
-                arcs.iter()
-                    .rev()
-                    .map(|&e| OrientedEdge::new(e, false))
-                    .collect()
-            }
-        };
-        let (rim_b0, rim_b) = ring(topo, 1.0, z0, 3);
-        let (rim_t0, rim_t) = ring(topo, 1.0, z0 + 1.0, 3);
-        let (hole_b0, hole_b) = ring(topo, 0.9, z0, 4);
-        let (hole_t0, hole_t) = ring(topo, 0.9, z0 + 1.0, 4);
+        let (rim_b0, rim_b) = arc_ring(topo, 1.0, z0, 3);
+        let (rim_t0, rim_t) = arc_ring(topo, 1.0, z0 + 1.0, 3);
+        let (hole_b0, hole_b) = arc_ring(topo, 0.9, z0, 4);
+        let (hole_t0, hole_t) = arc_ring(topo, 0.9, z0 + 1.0, 4);
         let mut faces = Vec::new();
-        let mut add = |topo: &mut Topology,
-                       outer: Vec<OrientedEdge>,
-                       holes: Vec<Vec<OrientedEdge>>,
-                       surface,
-                       flipped: bool| {
-            let outer = topo.add_wire(Wire::new(outer, true).unwrap());
-            let holes = holes
-                .into_iter()
-                .map(|h| topo.add_wire(Wire::new(h, true).unwrap()))
-                .collect();
-            faces.push(topo.add_face(if flipped == outward {
-                Face::new_reversed(outer, holes, surface)
-            } else {
-                Face::new(outer, holes, surface)
-            }));
-        };
-        let bottom = FaceSurface::Plane {
-            normal: -axis,
-            d: -z0,
-        };
-        let top = FaceSurface::Plane {
-            normal: axis,
-            d: z0 + 1.0,
-        };
-        add(
-            topo,
-            run(&rim_b, false),
-            vec![run(&hole_b, true)],
-            bottom,
-            false,
-        );
-        add(
-            topo,
-            run(&rim_t, true),
-            vec![run(&hole_t, false)],
-            top,
-            false,
-        );
-        for (r, b0, t0, lower, upper, flipped) in [
-            (1.0, rim_b0, rim_t0, &rim_b, &rim_t, false),
-            (0.9, hole_b0, hole_t0, &hole_b, &hole_t, true),
-        ] {
-            let seam = topo.add_edge(Edge::new(b0, t0, EdgeCurve::Line));
-            let mut wire = run(lower, true);
-            wire.push(OrientedEdge::new(seam, true));
-            wire.extend(run(upper, false));
-            wire.push(OrientedEdge::new(seam, false));
-            let wall = CylindricalSurface::new(Point3::new(0.0, 0.0, z0), axis, r).unwrap();
-            add(topo, wire, vec![], FaceSurface::Cylinder(wall), flipped);
-        }
+        let loops = (edge_run(&rim_b, false), vec![edge_run(&hole_b, true)]);
+        push_face(topo, &mut faces, loops, z_plane(z0, false), !outward);
+        let loops = (edge_run(&rim_t, true), vec![edge_run(&hole_t, false)]);
+        push_face(topo, &mut faces, loops, z_plane(z0 + 1.0, true), !outward);
+        let (outer, surface) = wall(topo, 1.0, z0, (rim_b0, &rim_b), (rim_t0, &rim_t));
+        push_face(topo, &mut faces, (outer, vec![]), surface, !outward);
+        let (outer, surface) = wall(topo, 0.9, z0, (hole_b0, &hole_b), (hole_t0, &hole_t));
+        push_face(topo, &mut faces, (outer, vec![]), surface, outward);
         faces
+    }
+
+    /// A cup of radius and height 1, a bore of radius 0.9999 sunk from its
+    /// top to 0.0001 above its base, its outer rings cut into three arcs and
+    /// the bore's into four, facing out or in.
+    fn blind_cup(topo: &mut Topology, outward: bool) -> Vec<FaceId> {
+        let (floor, bore) = (1e-4, 0.9999);
+        let (rim_b0, rim_b) = arc_ring(topo, 1.0, 0.0, 3);
+        let (rim_t0, rim_t) = arc_ring(topo, 1.0, 1.0, 3);
+        let (bore_f0, bore_f) = arc_ring(topo, bore, floor, 4);
+        let (bore_t0, bore_t) = arc_ring(topo, bore, 1.0, 4);
+        let mut faces = Vec::new();
+        let loops = (edge_run(&rim_b, false), vec![]);
+        push_face(topo, &mut faces, loops, z_plane(0.0, false), !outward);
+        let loops = (edge_run(&rim_t, true), vec![edge_run(&bore_t, false)]);
+        push_face(topo, &mut faces, loops, z_plane(1.0, true), !outward);
+        let loops = (edge_run(&bore_f, true), vec![]);
+        push_face(topo, &mut faces, loops, z_plane(floor, true), !outward);
+        let (outer, surface) = wall(topo, 1.0, 0.0, (rim_b0, &rim_b), (rim_t0, &rim_t));
+        push_face(topo, &mut faces, (outer, vec![]), surface, !outward);
+        let (outer, surface) = wall(topo, bore, floor, (bore_f0, &bore_f), (bore_t0, &bore_t));
+        push_face(topo, &mut faces, (outer, vec![]), surface, outward);
+        faces
+    }
+
+    /// A cup whose walls and floor are a ten-thousandth thick, its rings cut
+    /// unevenly, reads by its planar faces' exact areas: facing out, growth;
+    /// facing in, a hole. Taken on outlines sampled per edge, the flux of
+    /// such thin walls reads the wrong way round.
+    #[test]
+    fn a_thin_cup_split_unevenly_reads_by_its_exact_areas() {
+        for outward in [true, false] {
+            let mut topo = Topology::new();
+            let faces = blind_cup(&mut topo, outward);
+            let (growth, holes) = perform_areas(&topo, &[faces]);
+            assert_eq!(
+                (growth.len(), holes.len()),
+                if outward { (1, 0) } else { (0, 1) },
+                "facing {}",
+                if outward { "out" } else { "in" }
+            );
+        }
     }
 
     /// A tube whose rim is cut into fewer arcs than its hole has caps whose
