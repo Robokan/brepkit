@@ -1523,6 +1523,7 @@ fn sample_face_interior(
                 frame.origin(),
                 frame.u_axis(),
                 frame.v_axis(),
+                tol.linear,
             )?
             else {
                 return Err(AlgoError::FaceSplitFailed(format!(
@@ -1958,5 +1959,82 @@ mod tests {
     fn sample_face_interior_ring_thinner_than_the_margin_lands_on_the_band() {
         let r = ring_sample_radius(25.0, 24.999_99, 0.0);
         assert!(r > 24.999_99 && r < 25.0, "ring sample at r={r}");
+    }
+
+    /// The corners of a square from `corner` with sides `side`, counter-
+    /// clockwise, each side cut into `cuts` equal pieces.
+    fn cut_square(corner: (f64, f64), side: f64, cuts: u32) -> Vec<Point3> {
+        let (x0, y0) = corner;
+        let along = |k: u32| side * f64::from(k) / f64::from(cuts);
+        let mut points = Vec::new();
+        for k in 0..cuts {
+            points.push(Point3::new(x0 + along(k), y0, 0.0));
+        }
+        for k in 0..cuts {
+            points.push(Point3::new(x0 + side, y0 + along(k), 0.0));
+        }
+        for k in 0..cuts {
+            points.push(Point3::new(x0 + side - along(k), y0 + side, 0.0));
+        }
+        for k in 0..cuts {
+            points.push(Point3::new(x0, y0 + side - along(k), 0.0));
+        }
+        points
+    }
+
+    /// The sample of a 1000 square face with a unit square hole whose
+    /// centre is the first offset candidate, 9.05 in from the middle of the
+    /// first edge. Each of the hole's sides is cut into 1024 pieces, shorter
+    /// than the face's boundary margin of 1.4e-3: line edges, or the knot
+    /// spans of one degree-1 NURBS when `nurbs`.
+    fn sample_beside_a_finely_cut_hole(nurbs: bool) -> Point3 {
+        use brepkit_topology::builder::make_polygon_wire;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut topo = Topology::new();
+        let outer = make_polygon_wire(&mut topo, &cut_square((0.0, 0.0), 1000.0, 1), 1e-7).unwrap();
+        let mut ring = cut_square((499.5, 8.55), 1.0, 1024);
+        ring.reverse();
+        let hole = if nurbs {
+            let n = ring.len();
+            ring.push(ring[0]);
+            let mut knots = vec![0.0, 0.0];
+            knots.extend((1..n).map(|k| k as f64 / n as f64));
+            knots.extend([1.0, 1.0]);
+            let weights = vec![1.0; ring.len()];
+            let seam = topo.add_vertex(Vertex::new(ring[0], 1e-7));
+            let curve =
+                brepkit_math::nurbs::curve::NurbsCurve::new(1, knots, ring, weights).unwrap();
+            let edge = topo.add_edge(Edge::new(seam, seam, EdgeCurve::NurbsCurve(curve)));
+            topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, true)], true).unwrap())
+        } else {
+            make_polygon_wire(&mut topo, &ring, 1e-7).unwrap()
+        };
+        let face = plane_face(&mut topo, outer, hole);
+        sample_face_interior(&topo, face, Tolerance::default()).unwrap()
+    }
+
+    /// Whether a sample lies in the finely cut hole, or off the face.
+    fn in_the_hole_or_off_the_face(pt: Point3) -> bool {
+        let in_hole = (499.5..=500.5).contains(&pt.x()) && (8.55..=9.55).contains(&pt.y());
+        let on_face = (0.0..1000.0).contains(&pt.x()) && (0.0..1000.0).contains(&pt.y());
+        in_hole || !on_face || pt.z().abs() > 1e-9
+    }
+
+    /// A hole of line edges each shorter than the margin is still a hole.
+    #[test]
+    fn sample_face_interior_skips_a_hole_of_short_line_edges() {
+        let pt = sample_beside_a_finely_cut_hole(false);
+        assert!(!in_the_hole_or_off_the_face(pt), "sample {pt:?}");
+    }
+
+    /// A NURBS hole of knot spans each shorter than the margin is still a
+    /// hole.
+    #[test]
+    fn sample_face_interior_skips_a_nurbs_hole_of_short_knot_spans() {
+        let pt = sample_beside_a_finely_cut_hole(true);
+        assert!(!in_the_hole_or_off_the_face(pt), "sample {pt:?}");
     }
 }

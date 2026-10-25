@@ -2,7 +2,7 @@
 
 use brepkit_math::nurbs::curve::NurbsCurve;
 use brepkit_math::nurbs::decompose::curve_bezier_between;
-use brepkit_math::region2d::{Boundary2, point_in_region};
+use brepkit_math::region2d::{Boundary2, distance_to_boundary, point_in_region};
 use brepkit_math::vec::{Point2, Point3, Vec2, Vec3};
 
 use crate::Topology;
@@ -214,20 +214,32 @@ const MAX_HALVINGS: usize = 4096;
 pub struct PlanarRegion {
     exact: Vec<Boundary2>,
     beziers: Vec<BezierPiece>,
+    /// The linear tolerance: a piece shorter than it is a point when
+    /// crossings are counted.
+    tol: f64,
 }
 
 impl PlanarRegion {
     /// Whether `p` lies inside the face and farther than `margin` from its
     /// boundary, a NURBS edge read along its curve.
     ///
-    /// A NURBS piece whose chord lies farther from `p` than `margin` plus
-    /// the piece's bound stands as that chord: `p` then lies outside the
-    /// sliver between the chord and the curve, so on the same side of both,
-    /// and farther than `margin` from the curve. A nearer piece is halved
-    /// until it stands so. A chord ending within `margin` of `p`, or a query
-    /// that runs out of halvings, reads `false`.
+    /// The clearance is each line's, circle's, and ellipse's own distance
+    /// from `p`. A NURBS piece whose chord lies farther from `p` than
+    /// `margin` plus the piece's bound stands as that chord: `p` then lies
+    /// outside the sliver between the chord and the curve, so on the same
+    /// side of both, and farther than `margin` from the curve. A nearer
+    /// piece is halved until it stands so. A chord ending within `margin` of
+    /// `p`, or a query that runs out of halvings, reads `false`.
+    ///
+    /// The side is read by counting crossings at the smaller of `margin`
+    /// and the linear tolerance, so a piece shorter than the margin still
+    /// counts, and a point already clear by `margin` never reads as on the
+    /// boundary there.
     #[must_use]
     pub fn contains_clear(&self, p: Point2, margin: f64) -> bool {
+        if distance_to_boundary(&self.exact, p) <= margin {
+            return false;
+        }
         let mut pieces = Vec::with_capacity(self.exact.len() + self.beziers.len());
         pieces.extend_from_slice(&self.exact);
         let mut pending: Vec<BezierPiece> = Vec::new();
@@ -257,7 +269,7 @@ impl PlanarRegion {
                 }
             }
         }
-        point_in_region(&pieces, p, margin) == Some(true)
+        point_in_region(&pieces, p, margin.min(self.tol)) == Some(true)
     }
 }
 
@@ -265,8 +277,9 @@ impl PlanarRegion {
 /// ellipses flattened as [`face_boundary_2d`] flattens them, and each NURBS
 /// edge as the rational Bezier pieces of its knot spans.
 ///
-/// `None` when a NURBS edge's piece of its curve has a weight of zero or
-/// less, where its control points no longer bound it, or spans no
+/// `tol` is the linear tolerance, below which a piece is too short to count
+/// a crossing. `None` when a NURBS edge's piece of its curve has a weight of
+/// zero or less, where its control points no longer bound it, or spans no
 /// parameters.
 ///
 /// # Errors
@@ -278,6 +291,7 @@ pub fn face_region_2d(
     origin: Point3,
     x: Vec3,
     y: Vec3,
+    tol: f64,
 ) -> Result<Option<PlanarRegion>, TopologyError> {
     let face = topo.face(face)?;
     let plane = Plane2 { origin, x, y };
@@ -301,7 +315,11 @@ pub fn face_region_2d(
             }
         }
     }
-    Ok(Some(PlanarRegion { exact, beziers }))
+    Ok(Some(PlanarRegion {
+        exact,
+        beziers,
+        tol,
+    }))
 }
 
 /// The rational Bezier pieces of `curve` from parameter `t0` (at `a`) to
@@ -439,7 +457,7 @@ mod tests {
     /// The region of a face in `z = 0`, read in the plane's own axes.
     fn region(topo: &Topology, face: FaceId) -> Option<PlanarRegion> {
         let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        face_region_2d(topo, face, Point3::new(0.0, 0.0, 0.0), x, y).unwrap()
+        face_region_2d(topo, face, Point3::new(0.0, 0.0, 0.0), x, y, 1e-9).unwrap()
     }
 
     /// A straight NURBS diameter is one piece, its chord, bounding it
@@ -591,5 +609,87 @@ mod tests {
         assert!(clear(0.125, 0.05));
         assert!(!clear(0.125, 0.2));
         assert!(clear(0.5, -0.5));
+    }
+
+    /// A square face 1000 across with a unit square hole at `(500, 500)`,
+    /// each of the hole's sides cut into 1024 pieces: line edges, or the
+    /// knot spans of one degree-1 NURBS when `nurbs`.
+    fn square_with_a_finely_cut_hole(topo: &mut Topology, nurbs: bool) -> FaceId {
+        let square = |corner: (f64, f64), side: f64, cuts: u32| {
+            let along = |k: u32| side * f64::from(k) / f64::from(cuts);
+            let mut points = Vec::new();
+            for k in 0..cuts {
+                points.push(Point3::new(corner.0 + along(k), corner.1, 0.0));
+            }
+            for k in 0..cuts {
+                points.push(Point3::new(corner.0 + side, corner.1 + along(k), 0.0));
+            }
+            for k in 0..cuts {
+                points.push(Point3::new(
+                    corner.0 + side - along(k),
+                    corner.1 + side,
+                    0.0,
+                ));
+            }
+            for k in 0..cuts {
+                points.push(Point3::new(corner.0, corner.1 + side - along(k), 0.0));
+            }
+            points
+        };
+        let polygon = |topo: &mut Topology, points: &[Point3]| {
+            let v: Vec<_> = points
+                .iter()
+                .map(|&p| topo.add_vertex(Vertex::new(p, 1e-7)))
+                .collect();
+            let edges = (0..v.len())
+                .map(|k| {
+                    let e = topo.add_edge(Edge::new(v[k], v[(k + 1) % v.len()], EdgeCurve::Line));
+                    OrientedEdge::new(e, true)
+                })
+                .collect();
+            topo.add_wire(Wire::new(edges, true).unwrap())
+        };
+        let outer = polygon(topo, &square((0.0, 0.0), 1000.0, 1));
+        let mut ring = square((499.5, 499.5), 1.0, 1024);
+        ring.reverse();
+        let hole = if nurbs {
+            let n = ring.len();
+            ring.push(ring[0]);
+            let mut knots = vec![0.0, 0.0];
+            knots.extend((1..n).map(|k| k as f64 / n as f64));
+            knots.extend([1.0, 1.0]);
+            let weights = vec![1.0; ring.len()];
+            let seam = topo.add_vertex(Vertex::new(ring[0], 1e-7));
+            let curve = NurbsCurve::new(1, knots, ring, weights).unwrap();
+            let edge = topo.add_edge(Edge::new(seam, seam, EdgeCurve::NurbsCurve(curve)));
+            topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, true)], true).unwrap())
+        } else {
+            polygon(topo, &ring)
+        };
+        topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ))
+    }
+
+    /// A hole whose pieces are each shorter than the clearance margin is
+    /// still a hole, whether line edges or NURBS knot spans.
+    #[test]
+    fn a_hole_of_pieces_shorter_than_the_margin_is_still_a_hole() {
+        for nurbs in [false, true] {
+            let mut topo = Topology::new();
+            let face = square_with_a_finely_cut_hole(&mut topo, nurbs);
+            let region = region(&topo, face).unwrap();
+            let clear = |px: f64, py: f64| region.contains_clear(Point2::new(px, py), 1.414e-3);
+            assert!(!clear(500.0, 500.0), "nurbs {nurbs}: the hole's centre");
+            assert!(!clear(500.0, 500.4999), "nurbs {nurbs}: inside its top");
+            assert!(!clear(500.0, 500.5005), "nurbs {nurbs}: within the margin");
+            assert!(clear(500.0, 500.51), "nurbs {nurbs}: just past it");
+            assert!(clear(250.0, 250.0), "nurbs {nurbs}: far from it");
+        }
     }
 }
