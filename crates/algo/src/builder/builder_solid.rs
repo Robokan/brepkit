@@ -961,6 +961,11 @@ fn perform_areas(topo: &Topology, shells: &[Vec<FaceId>]) -> (Vec<Vec<FaceId>>, 
             // each bounded by one circle), so the fan holds no volume and
             // its sign says nothing: the surface-normal flux decides.
             shell_is_outward_oriented(topo, shell).unwrap_or(true)
+        } else if !corner_fan_holds_holes(topo, shell) {
+            // A face whose holes outmeasure it on their corners leaves the
+            // fan no polyhedron to read: the surface-normal flux, which
+            // takes every loop's exact area, decides.
+            shell_is_outward_oriented(topo, shell).unwrap_or(signed_vol >= 0.0)
         } else if signed_vol >= 0.0 {
             // Positive corner-fan volume already reads outward — keep the
             // historical behaviour for every solid that integrates cleanly
@@ -1157,24 +1162,48 @@ fn planar_net_share(topo: &Topology, face: &Face) -> f64 {
     })
 }
 
+/// The area of the polygon on a loop's corners: 0 on fewer than three.
+fn corner_area(topo: &Topology, wire: WireId) -> Option<f64> {
+    let mut corners = Vec::new();
+    for oe in topo.wire(wire).ok()?.edges() {
+        let edge = topo.edge(oe.edge()).ok()?;
+        corners.push(topo.vertex(oe.oriented_start(edge)).ok()?.point());
+    }
+    Some(if corners.len() < 3 {
+        0.0
+    } else {
+        0.5 * newell_normal(&corners).length()
+    })
+}
+
 /// [`planar_share`] with every loop's area that of the polygon on its
-/// vertices, for the corner fan. The fan is the volume of the polyhedron on
+/// corners, for the corner fan. The fan is the volume of the polyhedron on
 /// the shell's vertices, which closes, and so reads the same wherever the
 /// shell sits, only while a hole is cut from its face by those same
 /// corners: a round hole and the floor of its pocket, each on fewer than
 /// three corners, drop out together.
 fn planar_corner_share(topo: &Topology, face: &Face) -> f64 {
-    planar_share(face, |w| {
-        let mut corners = Vec::new();
-        for oe in topo.wire(w).ok()?.edges() {
-            let edge = topo.edge(oe.edge()).ok()?;
-            corners.push(topo.vertex(oe.oriented_start(edge)).ok()?.point());
+    planar_share(face, |w| corner_area(topo, w))
+}
+
+/// Whether every planar face's holes cut its corner polygon. A ring whose
+/// rim is split into fewer pieces than its hole (a triangle on the rim, a
+/// square on the hole) has holes outmeasuring its outline on their corners:
+/// no polygon on those corners is the face, and the fan's sign says nothing.
+fn corner_fan_holds_holes(topo: &Topology, faces: &[FaceId]) -> bool {
+    faces.iter().all(|&fid| {
+        let Ok(face) = topo.face(fid) else {
+            return true;
+        };
+        if face.inner_wires().is_empty() || !matches!(face.surface(), FaceSurface::Plane { .. }) {
+            return true;
         }
-        Some(if corners.len() < 3 {
-            0.0
-        } else {
-            0.5 * newell_normal(&corners).length()
-        })
+        let holes: f64 = face
+            .inner_wires()
+            .iter()
+            .filter_map(|&w| corner_area(topo, w))
+            .sum();
+        holes <= 0.0 || corner_area(topo, face.outer_wire()).is_some_and(|outer| outer > holes)
     })
 }
 
@@ -4068,6 +4097,127 @@ mod tests {
             inner,
             FaceSurface::Plane { normal, d },
         ))
+    }
+
+    /// A tube of height 1 standing at `z0`, its rim of radius 1 cut into
+    /// three arcs and its hole of radius 0.9 into four, facing out or in
+    /// (every face's flag turned, as a cut turns a cavity's).
+    fn split_tube(topo: &mut Topology, z0: f64, outward: bool) -> Vec<FaceId> {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::CylindricalSurface;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::Wire;
+
+        let axis = Vec3::new(0.0, 0.0, 1.0);
+        let ring = |topo: &mut Topology, r: f64, z: f64, n: usize| {
+            let circle = Circle3D::new(Point3::new(0.0, 0.0, z), axis, r).unwrap();
+            let v: Vec<_> = (0..n)
+                .map(|k| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let a = std::f64::consts::TAU * k as f64 / n as f64;
+                    topo.add_vertex(Vertex::new(Point3::new(r * a.cos(), r * a.sin(), z), 1e-7))
+                })
+                .collect();
+            let arcs: Vec<EdgeId> = (0..n)
+                .map(|k| {
+                    topo.add_edge(Edge::new(
+                        v[k],
+                        v[(k + 1) % n],
+                        EdgeCurve::Circle(circle.clone()),
+                    ))
+                })
+                .collect();
+            (v[0], arcs)
+        };
+        let run = |arcs: &[EdgeId], forward: bool| -> Vec<OrientedEdge> {
+            if forward {
+                arcs.iter().map(|&e| OrientedEdge::new(e, true)).collect()
+            } else {
+                arcs.iter()
+                    .rev()
+                    .map(|&e| OrientedEdge::new(e, false))
+                    .collect()
+            }
+        };
+        let (rim_b0, rim_b) = ring(topo, 1.0, z0, 3);
+        let (rim_t0, rim_t) = ring(topo, 1.0, z0 + 1.0, 3);
+        let (hole_b0, hole_b) = ring(topo, 0.9, z0, 4);
+        let (hole_t0, hole_t) = ring(topo, 0.9, z0 + 1.0, 4);
+        let mut faces = Vec::new();
+        let mut add = |topo: &mut Topology,
+                       outer: Vec<OrientedEdge>,
+                       holes: Vec<Vec<OrientedEdge>>,
+                       surface,
+                       flipped: bool| {
+            let outer = topo.add_wire(Wire::new(outer, true).unwrap());
+            let holes = holes
+                .into_iter()
+                .map(|h| topo.add_wire(Wire::new(h, true).unwrap()))
+                .collect();
+            faces.push(topo.add_face(if flipped == outward {
+                Face::new_reversed(outer, holes, surface)
+            } else {
+                Face::new(outer, holes, surface)
+            }));
+        };
+        let bottom = FaceSurface::Plane {
+            normal: -axis,
+            d: -z0,
+        };
+        let top = FaceSurface::Plane {
+            normal: axis,
+            d: z0 + 1.0,
+        };
+        add(
+            topo,
+            run(&rim_b, false),
+            vec![run(&hole_b, true)],
+            bottom,
+            false,
+        );
+        add(
+            topo,
+            run(&rim_t, true),
+            vec![run(&hole_t, false)],
+            top,
+            false,
+        );
+        for (r, b0, t0, lower, upper, flipped) in [
+            (1.0, rim_b0, rim_t0, &rim_b, &rim_t, false),
+            (0.9, hole_b0, hole_t0, &hole_b, &hole_t, true),
+        ] {
+            let seam = topo.add_edge(Edge::new(b0, t0, EdgeCurve::Line));
+            let mut wire = run(lower, true);
+            wire.push(OrientedEdge::new(seam, true));
+            wire.extend(run(upper, false));
+            wire.push(OrientedEdge::new(seam, false));
+            let wall = CylindricalSurface::new(Point3::new(0.0, 0.0, z0), axis, r).unwrap();
+            add(topo, wire, vec![], FaceSurface::Cylinder(wall), flipped);
+        }
+        faces
+    }
+
+    /// A tube whose rim is cut into fewer arcs than its hole has caps whose
+    /// holes outmeasure them on their corners: the corner fan has no
+    /// polyhedron to read there, and the surface flux decides, the tube
+    /// facing out read as growth and facing in as a hole, wherever it stands.
+    #[test]
+    fn a_tube_whose_hole_outmeasures_its_rim_on_their_corners_reads_by_its_flux() {
+        for z0 in [0.0, 1000.0] {
+            for outward in [true, false] {
+                let mut topo = Topology::new();
+                let faces = split_tube(&mut topo, z0, outward);
+                assert!(!corner_fan_holds_holes(&topo, &faces));
+                let (growth, holes) = perform_areas(&topo, &[faces]);
+                assert_eq!(
+                    (growth.len(), holes.len()),
+                    if outward { (1, 0) } else { (0, 1) },
+                    "at z {z0}, facing {}",
+                    if outward { "out" } else { "in" }
+                );
+            }
+        }
     }
 
     /// A U channel standing at z 1000 to 1010, its walls 0.4 thick, a deep

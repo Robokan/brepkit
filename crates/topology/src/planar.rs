@@ -9,7 +9,7 @@ use crate::Topology;
 use crate::TopologyError;
 use crate::edge::EdgeCurve;
 use crate::face::FaceId;
-use crate::wire::WireId;
+use crate::wire::{OrientedEdge, WireId};
 
 /// A planar face's boundary flattened into its plane, holes included.
 ///
@@ -98,8 +98,21 @@ pub fn face_boundary_2d(
 ///
 /// Returns [`TopologyError`] if an entity lookup fails.
 pub fn wire_area_2d(topo: &Topology, wire: WireId, x: Vec3, y: Vec3) -> Result<f64, TopologyError> {
-    let wire = topo.wire(wire)?;
-    let Some(first) = wire.edges().first() else {
+    loop_area_2d(topo, topo.wire(wire)?.edges(), x, y)
+}
+
+/// [`wire_area_2d`] for a closed run of oriented edges not yet made a wire.
+///
+/// # Errors
+///
+/// Returns [`TopologyError`] if an entity lookup fails.
+pub fn loop_area_2d(
+    topo: &Topology,
+    edges: &[OrientedEdge],
+    x: Vec3,
+    y: Vec3,
+) -> Result<f64, TopologyError> {
+    let Some(first) = edges.first() else {
         return Ok(0.0);
     };
     // Read about a point of the loop, not the world origin: far from it the
@@ -111,7 +124,7 @@ pub fn wire_area_2d(topo: &Topology, wire: WireId, x: Vec3, y: Vec3) -> Result<f
     let flat = |p: Point3| along(p - origin);
     let cross = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
     let mut twice = 0.0;
-    for oe in wire.edges() {
+    for oe in edges {
         let edge = topo.edge(oe.edge())?;
         let (a, b) = (
             topo.vertex(edge.start())?.point(),
@@ -151,31 +164,73 @@ pub fn wire_area_2d(topo: &Topology, wire: WireId, x: Vec3, y: Vec3) -> Result<f
 
 /// Twice the area a NURBS curve sweeps about `origin` from `t0` to `t1`
 /// (either way round) in the plane of `x` and `y`: `∫ q × q' dt` by Gauss
-/// quadrature on each knot span, exact on a polynomial curve's spans.
+/// quadrature on each knot span. A polynomial span's integrand is a
+/// polynomial the rule integrates exactly; a rational span's is not, and
+/// steep weights crowd it into a corner of the span, so its halves are
+/// integrated in turn until they agree with the whole.
 fn nurbs_swept(curve: &NurbsCurve, t0: f64, t1: f64, origin: Point3, x: Vec3, y: Vec3) -> f64 {
+    const MAX_HALVINGS: u32 = 24;
     let o = Vec3::new(origin.x(), origin.y(), origin.z());
     let (lo, hi) = (t0.min(t1), t0.max(t1));
-    let order = if curve.is_rational() {
+    let rational = curve.is_rational();
+    let points = quadrature::gauss_legendre_points(if rational {
         quadrature::MAX_ORDER
     } else {
         curve.degree() + 1
+    });
+    let gauss = |a: f64, b: f64| {
+        let (mid, half) = (0.5 * (a + b), 0.5 * (b - a));
+        points
+            .iter()
+            .map(|g| {
+                let d = curve.derivatives(half.mul_add(g.x, mid), 1);
+                let (Some(&p), Some(&dp)) = (d.first(), d.get(1)) else {
+                    return 0.0;
+                };
+                let q = p - o;
+                g.w * half * (q.dot(x) * dp.dot(y) - q.dot(y) * dp.dot(x))
+            })
+            .sum::<f64>()
     };
-    let points = quadrature::gauss_legendre_points(order);
+    // The swept area's scale, for the agreement test: the control points'
+    // reach from `origin` times their spread.
+    let (reach, spread) = {
+        let cps = curve.control_points();
+        let reach = cps
+            .iter()
+            .map(|c| (*c - origin).length())
+            .fold(0.0, f64::max);
+        let lo_hi = cps.iter().fold(None, |acc: Option<(Point3, Point3)>, c| {
+            Some(acc.map_or((*c, *c), |(a, b)| {
+                (
+                    Point3::new(a.x().min(c.x()), a.y().min(c.y()), a.z().min(c.z())),
+                    Point3::new(b.x().max(c.x()), b.y().max(c.y()), b.z().max(c.z())),
+                )
+            }))
+        });
+        (reach, lo_hi.map_or(0.0, |(a, b)| (b - a).length()))
+    };
+    let tolerance = 1e-13 * reach.max(spread) * spread;
     let mut cuts = vec![lo];
     cuts.extend(curve.knots().iter().copied().filter(|&k| k > lo && k < hi));
     cuts.push(hi);
     cuts.dedup();
     let mut total = 0.0;
     for span in cuts.windows(2) {
-        let (mid, half) = (0.5 * (span[0] + span[1]), 0.5 * (span[1] - span[0]));
-        for g in points {
-            let d = curve.derivatives(half.mul_add(g.x, mid), 1);
-            let (Some(&p), Some(&dp)) = (d.first(), d.get(1)) else {
-                continue;
-            };
-            let q = p - o;
-            let cross = q.dot(x) * dp.dot(y) - q.dot(y) * dp.dot(x);
-            total += g.w * half * cross;
+        if !rational {
+            total += gauss(span[0], span[1]);
+            continue;
+        }
+        let mut pending = vec![(span[0], span[1], gauss(span[0], span[1]), 0)];
+        while let Some((a, b, whole, depth)) = pending.pop() {
+            let m = 0.5 * (a + b);
+            let (left, right) = (gauss(a, m), gauss(m, b));
+            if depth >= MAX_HALVINGS || (left + right - whole).abs() <= tolerance {
+                total += left + right;
+            } else {
+                pending.push((a, m, left, depth + 1));
+                pending.push((m, b, right, depth + 1));
+            }
         }
     }
     if t1 < t0 { -total } else { total }
@@ -341,6 +396,35 @@ mod tests {
             let area = wire_area_2d(&topo, w, x, y).unwrap();
             assert!((area - want).abs() < 1e-9, "{area} vs {want}");
         }
+    }
+
+    /// A quarter circle whose weights are steep (the same arc reparametrized
+    /// so most of it runs in a sliver of its domain), closed by two radii,
+    /// reads the quarter disc's area.
+    #[test]
+    fn a_steeply_weighted_quarter_circle_reads_its_exact_area() {
+        let curve = NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            vec![1.0, 300.0 * std::f64::consts::FRAC_1_SQRT_2, 90_000.0],
+        )
+        .unwrap();
+        let mut topo = Topology::new();
+        let o = topo.add_vertex(Vertex::new(Point3::new(0.0, 0.0, 0.0), 1e-7));
+        let east = topo.add_vertex(Vertex::new(Point3::new(1.0, 0.0, 0.0), 1e-7));
+        let north = topo.add_vertex(Vertex::new(Point3::new(0.0, 1.0, 0.0), 1e-7));
+        let to_east = topo.add_edge(Edge::new(o, east, EdgeCurve::Line));
+        let arc = topo.add_edge(Edge::new(east, north, EdgeCurve::NurbsCurve(curve)));
+        let back = topo.add_edge(Edge::new(north, o, EdgeCurve::Line));
+        let w = wire_of(&mut topo, &[(to_east, true), (arc, true), (back, true)]);
+        let (x, y) = XY;
+        let area = wire_area_2d(&topo, w, x, y).unwrap();
+        assert!((area - std::f64::consts::FRAC_PI_4).abs() < 1e-9, "{area}");
     }
 
     /// A NURBS edge declines the flattening.
