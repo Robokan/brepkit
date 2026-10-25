@@ -8634,6 +8634,152 @@ fn cut_a_plug_touching_a_cavity_with_split_corners_leaves_the_box() {
     );
 }
 
+/// A cylinder cut through a plate, ending inside a block above it: its wall
+/// is sectioned by two full circles (the plate's faces) and, apart from
+/// them, by a window (the block's sides and underside). The circles must
+/// split the wall into bands, so the band through the plate lines the hole;
+/// traced as one loop with the window, the band was lost and the plate's
+/// hole left open.
+#[test]
+fn cylinder_cut_wall_bands_split_by_full_circles_beside_a_window() {
+    use crate::transform::transform_solid;
+    use brepkit_math::mat::Mat4;
+
+    let mut topo = Topology::new();
+    let boxed = |topo: &mut Topology, size: [f64; 3], at: [f64; 3]| {
+        let b = crate::primitives::make_box(topo, size[0], size[1], size[2]).unwrap();
+        transform_solid(topo, b, &Mat4::translation(at[0], at[1], at[2])).unwrap();
+        b
+    };
+    let plate = boxed(&mut topo, [200.0, 200.0, 1.0], [-100.0, -100.0, 1.0]);
+    let post = boxed(&mut topo, [10.0, 15.0, 5.5], [-5.0, -70.0, 1.5]);
+    let block = boxed(&mut topo, [20.0, 30.0, 3.0], [-10.0, -60.0, 5.0]);
+    let body = boolean(&mut topo, BooleanOp::Fuse, plate, post).unwrap();
+    let body = boolean(&mut topo, BooleanOp::Fuse, body, block).unwrap();
+    check_result(&topo, body);
+    assert_volume_near(&topo, body, 42450.0, 1e-6);
+    let cutter = crate::primitives::make_cylinder(&mut topo, 39.0, 6.0).unwrap();
+
+    let result =
+        brepkit_algo::gfa::boolean(&mut topo, brepkit_algo::bop::BooleanOp::Cut, body, cutter)
+            .unwrap();
+    check_result(&topo, result);
+    assert!(
+        is_closed_manifold(&topo, result).unwrap(),
+        "the cut body must be closed-manifold"
+    );
+
+    // body: plate 40000, post above it 750, block 1800, less the post's
+    // 100 inside the block = 42450; the plate loses a disc, the block the circular segment
+    // of the cutter's top 1 between x = ±10 and y = -30
+    let disc = std::f64::consts::PI * 39.0 * 39.0;
+    let n = 20_000;
+    let segment: f64 = (0..n)
+        .map(|i| {
+            let x = -10.0 + 20.0 * (f64::from(i) + 0.5) / f64::from(n);
+            (39.0f64.mul_add(39.0, -x * x).sqrt() - 30.0) * 20.0 / f64::from(n)
+        })
+        .sum();
+    assert_volume_near(&topo, result, 42450.0 - disc - segment, 1e-3);
+}
+
+/// Fuses boxes, each given by its low and high corners, into one body, then
+/// cuts it by a cylinder of radius 39 on the z axis from z = 0 to 6, through
+/// the GFA alone. The boxes that reach past z = 6 notch the cutter's top
+/// rim; `flip` mirrors them through z = 3, to notch the bottom rim instead.
+/// Returns the cut, checked closed.
+fn cut_by_a_rim_notched_cylinder(
+    topo: &mut Topology,
+    boxes: &[([f64; 3], [f64; 3])],
+    flip: bool,
+) -> SolidId {
+    use crate::transform::transform_solid;
+    use brepkit_math::mat::Mat4;
+
+    let mut body: Option<SolidId> = None;
+    for &(lo, hi) in boxes {
+        let (z0, z1) = if flip {
+            (6.0 - hi[2], 6.0 - lo[2])
+        } else {
+            (lo[2], hi[2])
+        };
+        let b = crate::primitives::make_box(topo, hi[0] - lo[0], hi[1] - lo[1], z1 - z0).unwrap();
+        transform_solid(topo, b, &Mat4::translation(lo[0], lo[1], z0)).unwrap();
+        body = Some(match body {
+            None => b,
+            Some(s) => boolean(topo, BooleanOp::Fuse, s, b).unwrap(),
+        });
+    }
+    let body = body.unwrap();
+    assert!(is_closed_manifold(topo, body).unwrap(), "flip = {flip}");
+    let cutter = crate::primitives::make_cylinder(topo, 39.0, 6.0).unwrap();
+    let result =
+        brepkit_algo::gfa::boolean(topo, brepkit_algo::bop::BooleanOp::Cut, body, cutter).unwrap();
+    check_result(topo, result);
+    assert!(
+        is_closed_manifold(topo, result).unwrap(),
+        "the cut body must be closed-manifold (flip = {flip})"
+    );
+    result
+}
+
+/// The area under the circle `y = sqrt(r^2 - x^2)` from 0 to `x`.
+fn area_under_circle(r: f64, x: f64) -> f64 {
+    0.5 * x.mul_add(r.mul_add(r, -x * x).sqrt(), r * r * (x / r).asin())
+}
+
+/// A cylinder cut through a plate, one rim inside a block that takes all of
+/// the cutter's wall where x < 10: the notch runs more than half a turn
+/// round the wall, and the rim's arc across it is one edge that long.
+#[test]
+fn cylinder_cut_wall_keeps_a_rim_notch_wider_than_half_a_turn() {
+    let r: f64 = 39.0;
+    let boxes = [
+        ([-100.0, -100.0, 1.0], [100.0, 100.0, 2.0]),
+        ([-49.0, -2.0, 1.5], [-45.0, 2.0, 7.0]),
+        ([-50.0, -50.0, 5.0], [10.0, 50.0, 8.0]),
+    ];
+    // plate 40000, block 18000, and the post's 88 less its 8 in the plate
+    // and 32 in the block
+    let body = 40_000.0 + 18_000.0 + 48.0;
+    // the plate loses a disc, the block the disc's part where x < 10, 1 deep
+    let disc = std::f64::consts::PI * r * r;
+    let notch = 0.5f64.mul_add(disc, 2.0 * area_under_circle(r, 10.0));
+    for flip in [false, true] {
+        let mut topo = Topology::new();
+        let result = cut_by_a_rim_notched_cylinder(&mut topo, &boxes, flip);
+        assert_volume_near(&topo, result, body - disc - notch, 1e-6);
+    }
+}
+
+/// A cylinder cut through a plate, one rim inside a shallow block, 0.1 deep,
+/// and a narrow block off its middle reaching 1 deeper: the notch they cut
+/// is stepped, not convex.
+#[test]
+fn cylinder_cut_wall_keeps_a_stepped_rim_notch() {
+    let r: f64 = 39.0;
+    let boxes = [
+        ([-100.0, -100.0, 1.0], [100.0, 100.0, 2.0]),
+        ([-5.0, -70.0, 1.5], [5.0, -55.0, 7.0]),
+        ([-25.0, -60.0, 5.9], [25.0, -20.0, 8.0]),
+        ([8.0, -65.0, 4.9], [12.0, -32.0, 7.0]),
+    ];
+    // plate 40000, post 825, shallow block 4200, narrow block 277.2, less
+    // the post's 75 in the plate and 55 in the shallow block, and the narrow
+    // block's 123.2 in the shallow one
+    let body = 40_000.0 + 825.0 + 4200.0 + 277.2 - 75.0 - 55.0 - 123.2;
+    let disc = std::f64::consts::PI * r * r;
+    // the disc's segments beyond y = -20 for |x| < 25, 0.1 deep, and beyond
+    // y = -32 for 8 < x < 12, 1 deeper
+    let shallow = 0.1 * 2.0f64.mul_add(area_under_circle(r, 25.0), -20.0 * 50.0);
+    let deep = area_under_circle(r, 12.0) - area_under_circle(r, 8.0) - 32.0 * 4.0;
+    for flip in [false, true] {
+        let mut topo = Topology::new();
+        let result = cut_by_a_rim_notched_cylinder(&mut topo, &boxes, flip);
+        assert_volume_near(&topo, result, body - disc - shallow - deep, 1e-6);
+    }
+}
+
 /// A cylinder cut through a plate, beside an L-shaped wall whose plane
 /// holds one of the cutter's generators: the generator runs through the
 /// wall's bounding box but not the wall, so it is no section of the pair.
@@ -8692,4 +8838,77 @@ fn cylinder_generator_in_an_l_walls_notch_is_no_section() {
     );
     let bore = std::f64::consts::PI * 400.0 * 6.0;
     assert_volume_near(&topo, result, body_volume - bore, 1e-3);
+}
+
+/// A truncated cone, radius 39 at z = 0 narrowing to 30 at z = 6, cut
+/// through a plate and into a wedge over its narrow rim (its wide rim, with
+/// the body mirrored through z = 3) whose sides lie in planes through the
+/// cone's axis. The cone's wall is sectioned by the plate's two full circles
+/// and notched at the rim by two generators and an arc of the wedge's face.
+#[test]
+fn cone_cut_wall_keeps_a_rim_notch_beside_full_circles() {
+    use crate::transform::transform_solid;
+    use brepkit_math::mat::Mat4;
+
+    let (r_in, r_out) = (10.0_f64, 60.0_f64);
+    let (a0, a1) = (150.0_f64.to_radians(), 210.0_f64.to_radians());
+    let spread = a1 - a0;
+    let radius = |z: f64| 1.5f64.mul_add(-z, 39.0);
+    // plate 40000, the wedge's 60-degree ring section 3 deep, and the
+    // post's 88 less its 8 in the plate and 32 in the wedge
+    let wedge = 1.5 * spread.sin() * r_out.mul_add(r_out, -r_in * r_in);
+    let body = 40_000.0 + wedge + 48.0;
+    // the cone's volume from z0 to z1 over a whole turn
+    let slab = |z0: f64, z1: f64| {
+        let (p, q) = (radius(z0), radius(z1));
+        std::f64::consts::PI * (z1 - z0) * p.mul_add(p, q.mul_add(q, p * q)) / 3.0
+    };
+
+    for wide in [false, true] {
+        let mut topo = Topology::new();
+        let at = |lo: f64, hi: f64| if wide { 6.0 - hi } else { lo };
+        let mut boxed = |lo: [f64; 3], hi: [f64; 3]| {
+            let (x, y, z) = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+            let b = crate::primitives::make_box(&mut topo, x, y, z).unwrap();
+            let shift = Mat4::translation(lo[0], lo[1], at(lo[2], hi[2]));
+            transform_solid(&mut topo, b, &shift).unwrap();
+            b
+        };
+        let plate = boxed([-100.0, -100.0, 1.0], [100.0, 100.0, 2.0]);
+        let post = boxed([-47.0, -2.0, 1.5], [-43.0, 2.0, 7.0]);
+        let z0 = at(5.0, 8.0);
+        let profile: Vec<Point3> = [(r_in, a0), (r_out, a0), (r_out, a1), (r_in, a1)]
+            .iter()
+            .map(|&(r, a)| Point3::new(r * a.cos(), r * a.sin(), z0))
+            .collect();
+        let outline =
+            brepkit_topology::builder::make_polygon_wire(&mut topo, &profile, 1e-7).unwrap();
+        let floor = brepkit_topology::builder::make_face_from_wire(&mut topo, outline).unwrap();
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let wedge_id = crate::extrude::extrude(&mut topo, floor, up, 3.0).unwrap();
+        let body_id = boolean(&mut topo, BooleanOp::Fuse, plate, post).unwrap();
+        let body_id = boolean(&mut topo, BooleanOp::Fuse, body_id, wedge_id).unwrap();
+        assert!(is_closed_manifold(&topo, body_id).unwrap(), "wide = {wide}");
+        assert_volume_near(&topo, body_id, body, 1e-6);
+
+        let cone = crate::primitives::make_cone(&mut topo, 39.0, 30.0, 6.0).unwrap();
+        let cut = brepkit_algo::bop::BooleanOp::Cut;
+        let result = brepkit_algo::gfa::boolean(&mut topo, cut, body_id, cone).unwrap();
+        check_result(&topo, result);
+        assert!(
+            is_closed_manifold(&topo, result).unwrap(),
+            "the cut body must be closed-manifold (wide = {wide})"
+        );
+        // the plate loses the cone's slab through it, the wedge the cone's
+        // sector through it less the triangle inside the wedge's inner side
+        let (plate_z, notch_z) = if wide {
+            ((4.0, 5.0), (0.0, 1.0))
+        } else {
+            ((1.0, 2.0), (5.0, 6.0))
+        };
+        let disc = slab(plate_z.0, plate_z.1);
+        let sector = spread / std::f64::consts::TAU * slab(notch_z.0, notch_z.1);
+        let notch = (0.5 * r_in * r_in).mul_add(-spread.sin(), sector);
+        assert_volume_near(&topo, result, body - disc - notch, 1e-6);
+    }
 }
