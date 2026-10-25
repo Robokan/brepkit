@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792951404227,
+  "lastUpdate": 1792957196974,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -593,6 +593,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 39413234,
             "range": "± 129831",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "56285fdc4d88bc1035d05daa2516785d8d33734a",
+          "message": "fix(heal): join straight edges a fuse leaves in pieces across the whole solid\n\nunify_same_domain merged collinear edges one wire at a time, giving each\nmerged face its own copy of the joined edge; the face across the edge\nthen no longer shared it, the unpaired-edge check undid the merge, and\nthe pieces stayed (a block fused onto the end of a thinner one kept its\nlong side and bottom edges split where the blocks met). Picking such an\nedge picked one piece, and a chamfer along the pieces failed.\n\nA new solid-level pass joins two line edges that meet at a vertex, run\non in one direction and are used by the same two planar faces, replacing\nthe pair with one edge in every wire that uses it, so both faces keep\nsharing it. It is reverted if unpaired edges would rise.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T12:37:08-07:00",
+          "tree_id": "2e464a79f339b12a0bb16f6847b8e383917fb5bb",
+          "url": "https://github.com/Robokan/brepkit/commit/56285fdc4d88bc1035d05daa2516785d8d33734a"
+        },
+        "date": 1792957196584,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 856480,
+            "range": "± 1210",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 933927,
+            "range": "± 16953",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11470,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 527683,
+            "range": "± 851",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 39470400,
+            "range": "± 81545",
             "unit": "ns/iter"
           }
         ]
