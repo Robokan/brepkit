@@ -199,11 +199,10 @@ Fixes go to `andymai/brepkit` as one PR per fix, from branches off
 `upstream/main` (never from this fork's `main`, which carries fork-only
 files). Follow the `pr-workflow` skill. Upstream bans the reference kernel's
 name in code, commit messages and PR text, so word around it ("some STEP
-writers", "a reference kernel"); leave BuzzCAD and corpus names out too, and
-never name another CAD product or say a result was checked against another
-engine's answers. Before every push of a PR branch, and before opening or
-editing a PR, run the fork-only check as well as the skill's banned-name
-grep, with the PR text in a file; it must print "clean":
+writers", "a reference kernel"); leave BuzzCAD and corpus names out too.
+Before every push of a PR branch, and before opening or editing a PR, run
+the fork-only check as well as the skill's banned-name grep, with the PR
+text in a file; it must print "clean":
 
 ```bash
 scripts/check-pr-text.sh <branch> <pr-body.md>
