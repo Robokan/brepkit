@@ -128,12 +128,12 @@ Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`
 
 | status | meaning | what to do |
 |---|---|---|
-| pass | same solid as Open CASCADE (volume, area and bounding box within 0.1%, same face count) | nothing |
+| pass | same solid as the case's reference answer (volume, area and bounding box within 0.1%, same face count) | nothing |
 | faces | same solid, but a different face count. Usually brepkit leaves faces split that should be merged, or adds slivers. | fix it, lower priority |
 | mismatch | a different solid. The judge says brepkit is wrong, or nothing independent could decide. | fix it. With judge "unknown", work out by geometry which one is right first |
 | failed | brepkit errored, or BuzzCAD's checks rejected its result. The reason says which. | fix it |
 | crash / timeout | brepkit panicked, segfaulted or hung. `worker.log` has the output. | fix it, high priority |
-| occ_wrong | they differ, and Open CASCADE's result is the wrong one | **do not change brepkit to match it.** Note it for the user |
+| reference_wrong / occ_wrong | they differ, and the judge says the reference's result is the wrong one | **do not change brepkit to match it.** Note it for the user |
 | both_wrong | neither result looks right | look, then note it |
 | unsupported | brepkit or the bridge can't take this input yet | see "Bridge limits" below |
 | occ_failed | Open CASCADE failed on it | brepkit succeeding here is a bonus |
@@ -155,17 +155,21 @@ Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`
 
 ## Rules
 
-- **Open CASCADE is the reference, not the truth.** It has bugs too. Never
-  make brepkit match Open CASCADE just because it is Open CASCADE. When the
-  results differ, `replay.py` runs a judge that uses neither kernel's
-  result:
+- **The reference is not the truth.** A case is judged against its
+  reference answer: the one stored with the case where there is one, else
+  Open CASCADE's result. Every engine has bugs (Open CASCADE's measures are
+  off on some closed and periodic faces, for one). Never make brepkit match
+  the reference just because it is the reference. When the results differ,
+  `replay.py` runs a judge that uses neither engine's result:
   - booleans: sample points classified against the inputs;
   - extrude and revolve: their volume formulas;
   - all results: a validity check.
 
   The verdict is in `results.jsonl` under `"judge"`. If the judge can't
   decide, reason about the geometry (`occ.step` against your result) before
-  you "fix" anything.
+  you "fix" anything. A replay after the references change shifts statuses
+  for that reason alone: read its "Since..." with that in mind, not as
+  regressions or fixes.
 - **Don't make cases pass by weakening BuzzCAD's checks.** That means
   `_checked_native` and `_folded` in `engine.py`, and the bridge's refusal
   of mesh fallbacks. Those checks exist because brepkit's broken results
