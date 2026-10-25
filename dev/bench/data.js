@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792910048636,
+  "lastUpdate": 1792940891084,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -215,6 +215,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 30596328,
             "range": "± 500254",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "41344daef04a5f70af65c88cf6c32c00c7cd4996",
+          "message": "feat(operations): two-distance chamfers with a reference face per edge\n\n`chamfer::chamfer_two_on` measures `d1` on each edge's given face and `d2`\non its other face (a distance-and-angle chamfer is `d2 = d1 * tan(angle)`).\nRound rims between a cap and a coaxial wall are cut by the rim chamfer,\nwhich now takes a cap and a wall distance; other edges go to the blend\nengine's chamfer, which takes the reference face per edge\n(`ChamferBuilder::add_edges_asymmetric_on`, `blend_ops::chamfer_v2_on`).\n\nfix(blend): the trimmer keeps a trimmed planar face's holes on the kept\nside; it dropped them, leaving the hole's wall open.\n\nfix(operations): an asymmetric chamfer's ends set each side back by its\nown face's distance; both took the larger, leaving a wedge at each end\n(the volume test had locked that in).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T08:05:14-07:00",
+          "tree_id": "821d8d961fd1d9201acface9e9d97fc6cd9dc116",
+          "url": "https://github.com/Robokan/brepkit/commit/41344daef04a5f70af65c88cf6c32c00c7cd4996"
+        },
+        "date": 1792940890636,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1065550,
+            "range": "± 2279",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1155239,
+            "range": "± 21116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13417,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 665086,
+            "range": "± 6594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 47814413,
+            "range": "± 111198",
             "unit": "ns/iter"
           }
         ]
