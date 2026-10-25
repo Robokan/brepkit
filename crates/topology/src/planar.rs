@@ -1,7 +1,8 @@
 //! A planar face's boundary flattened into its plane.
 
 use brepkit_math::nurbs::curve::NurbsCurve;
-use brepkit_math::region2d::{Boundary2, on_boundary, point_in_region};
+use brepkit_math::nurbs::decompose::curve_bezier_between;
+use brepkit_math::region2d::{Boundary2, point_in_region};
 use brepkit_math::vec::{Point2, Point3, Vec2, Vec3};
 
 use crate::Topology;
@@ -106,69 +107,182 @@ pub fn face_boundary_2d(
     Ok(Some(pieces))
 }
 
-/// A planar face's boundary in its plane, a NURBS edge as a chain of chords.
+/// A rational Bezier piece of a NURBS edge in the plane, and the chord
+/// standing for it.
 #[derive(Debug, Clone)]
-pub struct ChordedBoundary {
-    /// Every loop's pieces, the NURBS edges' chords last.
-    pub pieces: Vec<Boundary2>,
-    /// Where in `pieces` the chords begin.
-    pub chords_from: usize,
-    /// The farthest a NURBS edge strays from its chords at the probes that
-    /// placed them; zero with no NURBS edge.
-    pub deviation: f64,
+struct BezierPiece {
+    /// Control points in homogeneous form `[w x, w y, w]`, every weight
+    /// positive.
+    hull: Vec<[f64; 3]>,
+    /// The chord's first end: the edge's vertex at its start, else the curve
+    /// where the piece begins.
+    start: Point2,
+    /// The chord's last end, likewise.
+    end: Point2,
 }
 
-impl ChordedBoundary {
-    /// The chords standing for NURBS edges.
-    #[must_use]
-    pub fn chords(&self) -> &[Boundary2] {
-        self.pieces.get(self.chords_from..).unwrap_or_default()
+/// How a NURBS piece stands to a point.
+enum Reading {
+    /// The point lies farther from the chord than the margin plus the
+    /// piece's bound, so the chord may stand for the piece.
+    Chord,
+    /// An end of the chord, a point of the boundary, lies within the margin.
+    Touches,
+    /// Neither: the piece must be halved.
+    Unsettled,
+}
+
+impl BezierPiece {
+    /// The farthest a control point lies from the chord. With positive
+    /// weights the piece, and the sliver between it and its chord, lie in
+    /// the hull of the control points and the chord's ends, so no point of
+    /// either lies farther.
+    fn bound(&self) -> f64 {
+        self.hull
+            .iter()
+            .map(|&[x, y, w]| distance_to_segment(Point2::new(x / w, y / w), self.start, self.end))
+            .fold(0.0, f64::max)
     }
 
+    fn read(&self, p: Point2, margin: f64) -> Reading {
+        if distance_to_segment(p, self.start, self.end) > margin + self.bound() {
+            Reading::Chord
+        } else if (p - self.start).length() <= margin || (p - self.end).length() <= margin {
+            Reading::Touches
+        } else {
+            Reading::Unsettled
+        }
+    }
+
+    /// The piece split at its middle parameter, by de Casteljau in
+    /// homogeneous form.
+    fn halves(&self) -> (Self, Self) {
+        let mut work = self.hull.clone();
+        let n = work.len();
+        let mut left = Vec::with_capacity(n);
+        let mut right = Vec::with_capacity(n);
+        for r in 0..n {
+            if r > 0 {
+                for j in 0..n - r {
+                    let (a, b) = (work[j], work[j + 1]);
+                    work[j] = [
+                        0.5 * (a[0] + b[0]),
+                        0.5 * (a[1] + b[1]),
+                        0.5 * (a[2] + b[2]),
+                    ];
+                }
+            }
+            left.push(work[0]);
+            right.push(work[n - 1 - r]);
+        }
+        right.reverse();
+        let [x, y, w] = work[0];
+        let mid = Point2::new(x / w, y / w);
+        (
+            Self {
+                hull: left,
+                start: self.start,
+                end: mid,
+            },
+            Self {
+                hull: right,
+                start: mid,
+                end: self.end,
+            },
+        )
+    }
+}
+
+/// The distance from `p` to the segment from `a` to `b`.
+fn distance_to_segment(p: Point2, a: Point2, b: Point2) -> f64 {
+    let (ab, ap) = (b - a, p - a);
+    let len2 = ab.dot(ab);
+    let t = if len2 > 0.0 {
+        (ap.dot(ab) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (ap - ab * t).length()
+}
+
+/// The most halvings of NURBS pieces one containment query makes.
+const MAX_HALVINGS: usize = 4096;
+
+/// A planar face's region in its plane, a NURBS edge as rational Bezier
+/// pieces whose control points bound it.
+#[derive(Debug, Clone)]
+pub struct PlanarRegion {
+    exact: Vec<Boundary2>,
+    beziers: Vec<BezierPiece>,
+}
+
+impl PlanarRegion {
     /// Whether `p` lies inside the face and farther than `margin` from its
-    /// boundary, the NURBS edges' own curves included.
+    /// boundary, a NURBS edge read along its curve.
     ///
-    /// The sliver between a chord and its curve lies within the curve's
-    /// farthest stray of the chord, which the deviation stands for as far
-    /// as the probes catch it. A point farther than `margin` plus the
-    /// deviation from every chord therefore lies on the same side of a
-    /// NURBS edge as of its chords, and farther than `margin` from it.
+    /// A NURBS piece whose chord lies farther from `p` than `margin` plus
+    /// the piece's bound stands as that chord: `p` then lies outside the
+    /// sliver between the chord and the curve, so on the same side of both,
+    /// and farther than `margin` from the curve. A nearer piece is halved
+    /// until it stands so. A chord ending within `margin` of `p`, or a query
+    /// that runs out of halvings, reads `false`.
     #[must_use]
     pub fn contains_clear(&self, p: Point2, margin: f64) -> bool {
-        point_in_region(&self.pieces, p, margin) == Some(true)
-            && !on_boundary(self.chords(), p, margin + self.deviation)
+        let mut pieces = Vec::with_capacity(self.exact.len() + self.beziers.len());
+        pieces.extend_from_slice(&self.exact);
+        let mut pending: Vec<BezierPiece> = Vec::new();
+        let mut halvings = 0_usize;
+        let mut whole = self.beziers.iter();
+        loop {
+            let owned;
+            let piece = if let Some(half) = pending.pop() {
+                owned = half;
+                &owned
+            } else if let Some(piece) = whole.next() {
+                piece
+            } else {
+                break;
+            };
+            match piece.read(p, margin) {
+                Reading::Chord => pieces.push(Boundary2::Segment(piece.start, piece.end)),
+                Reading::Touches => return false,
+                Reading::Unsettled => {
+                    if halvings == MAX_HALVINGS {
+                        return false;
+                    }
+                    halvings += 1;
+                    let (first, second) = piece.halves();
+                    pending.push(second);
+                    pending.push(first);
+                }
+            }
+        }
+        point_in_region(&pieces, p, margin) == Some(true)
     }
 }
 
-/// The most chords one knot span of a NURBS edge is cut into.
-const MAX_SPAN_CHORDS: u32 = 256;
-
-/// A planar face's boundary flattened into its plane, holes included, as
-/// [`face_boundary_2d`] flattens it, except that a NURBS edge becomes a chain
-/// of chords instead of declining the face.
+/// A planar face's region in its plane, holes included: lines, circles, and
+/// ellipses flattened as [`face_boundary_2d`] flattens them, and each NURBS
+/// edge as the rational Bezier pieces of its knot spans.
 ///
-/// Each knot span of a NURBS edge is cut into a number of chords, doubled
-/// until the curve, probed a quarter, a half, and three quarters along each
-/// chord, lies within `chord_tol` of the chord's point at the same fraction,
-/// or until 256 chords. [`ChordedBoundary::deviation`] reports the farthest
-/// probe.
+/// `None` when a NURBS edge's piece of its curve has a weight of zero or
+/// less, where its control points no longer bound it, or spans no
+/// parameters.
 ///
 /// # Errors
 ///
 /// Returns [`TopologyError`] if an entity lookup fails.
-pub fn face_boundary_2d_chorded(
+pub fn face_region_2d(
     topo: &Topology,
     face: FaceId,
     origin: Point3,
     x: Vec3,
     y: Vec3,
-    chord_tol: f64,
-) -> Result<ChordedBoundary, TopologyError> {
+) -> Result<Option<PlanarRegion>, TopologyError> {
     let face = topo.face(face)?;
     let plane = Plane2 { origin, x, y };
-    let mut pieces = Vec::new();
-    let mut chords = Vec::new();
-    let mut deviation = 0.0_f64;
+    let mut exact = Vec::new();
+    let mut beziers = Vec::new();
     for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
         for oe in topo.wire(wid)?.edges() {
             let edge = topo.edge(oe.edge())?;
@@ -178,84 +292,67 @@ pub fn face_boundary_2d_chorded(
             );
             let curve = edge.curve();
             if let Some(piece) = plane.exact_piece(curve, a, b) {
-                pieces.push(piece);
+                exact.push(piece);
             } else if let EdgeCurve::NurbsCurve(n) = curve {
                 let span = curve.domain_with_endpoints(a, b);
-                deviation =
-                    deviation.max(chord_nurbs(n, span, a, b, plane, chord_tol, &mut chords));
+                if !bezier_pieces(n, span, a, b, plane, &mut beziers) {
+                    return Ok(None);
+                }
             }
         }
     }
-    let chords_from = pieces.len();
-    pieces.extend(chords);
-    Ok(ChordedBoundary {
-        pieces,
-        chords_from,
-        deviation,
-    })
+    Ok(Some(PlanarRegion { exact, beziers }))
 }
 
-/// Chords along `curve` from parameter `t0` (at `a`) to `t1` (at `b`),
-/// appended to `out`; returns the farthest a probe strays from its chord.
-fn chord_nurbs(
+/// The rational Bezier pieces of `curve` from parameter `t0` (at `a`) to
+/// `t1` (at `b`), one per knot span, appended to `out`; `false` when a
+/// weight is zero or less or the range is empty.
+fn bezier_pieces(
     curve: &NurbsCurve,
     (t0, t1): (f64, f64),
     a: Point3,
     b: Point3,
     plane: Plane2,
-    chord_tol: f64,
-    out: &mut Vec<Boundary2>,
-) -> f64 {
-    let (lo, hi) = (t0.min(t1), t0.max(t1));
+    out: &mut Vec<BezierPiece>,
+) -> bool {
+    let (d0, d1) = curve.domain();
+    let (lo, hi) = (t0.min(t1).max(d0), t0.max(t1).min(d1));
     let mut breaks: Vec<f64> = std::iter::once(lo)
         .chain(curve.knots().iter().copied().filter(|&k| k > lo && k < hi))
         .chain(std::iter::once(hi))
         .collect();
     breaks.dedup();
+    if breaks.len() < 2 {
+        return false;
+    }
     if t0 > t1 {
         breaks.reverse();
     }
-    let at = |t: f64| plane.point(curve.evaluate(t));
-    let (first, last) = (plane.point(a), plane.point(b));
-    if breaks.len() < 2 {
-        out.push(Boundary2::Segment(first, last));
-        return 0.0;
-    }
     let spans = breaks.len() - 1;
-    let mut deviation = 0.0_f64;
-    let mut start = first;
+    let mut start = plane.point(a);
     for (i, w) in breaks.windows(2).enumerate() {
-        let (s0, s1) = (w[0], w[1]);
-        let end = if i + 1 == spans { last } else { at(s1) };
-        let mut n = 1_u32;
-        loop {
-            let param = |k: u32| (s1 - s0).mul_add(f64::from(k) / f64::from(n), s0);
-            let points: Vec<Point2> = (0..=n)
-                .map(|k| match k {
-                    0 => start,
-                    k if k == n => end,
-                    k => at(param(k)),
-                })
-                .collect();
-            let mut worst = 0.0_f64;
-            for (k, chord) in (0_u32..).zip(points.windows(2)) {
-                let (u0, u1) = (param(k), param(k + 1));
-                for f in [0.25, 0.5, 0.75] {
-                    let on_chord = chord[0] + (chord[1] - chord[0]) * f;
-                    let on_curve = at((u1 - u0).mul_add(f, u0));
-                    worst = worst.max((on_curve - on_chord).length());
-                }
+        let Ok(bezier) = curve_bezier_between(curve, w[0], w[1]) else {
+            return false;
+        };
+        let mut hull = Vec::with_capacity(bezier.len());
+        for [hx, hy, hz, hw] in bezier {
+            if hw <= 0.0 {
+                return false;
             }
-            if worst <= chord_tol || n >= MAX_SPAN_CHORDS {
-                deviation = deviation.max(worst);
-                out.extend(points.windows(2).map(|c| Boundary2::Segment(c[0], c[1])));
-                break;
-            }
-            n *= 2;
+            let flat = plane.point(Point3::new(hx / hw, hy / hw, hz / hw));
+            hull.push([flat.x() * hw, flat.y() * hw, hw]);
         }
+        let end = if i + 1 == spans {
+            plane.point(b)
+        } else if let Some(&[hx, hy, hw]) = hull.last() {
+            Point2::new(hx / hw, hy / hw)
+        } else {
+            return false;
+        };
+        out.push(BezierPiece { hull, start, end });
         start = end;
     }
-    deviation
+    true
 }
 
 #[cfg(test)]
@@ -339,24 +436,30 @@ mod tests {
         );
     }
 
-    /// A straight NURBS diameter is one chord, lying on its curve.
+    /// The region of a face in `z = 0`, read in the plane's own axes.
+    fn region(topo: &Topology, face: FaceId) -> Option<PlanarRegion> {
+        let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        face_region_2d(topo, face, Point3::new(0.0, 0.0, 0.0), x, y).unwrap()
+    }
+
+    /// A straight NURBS diameter is one piece, its chord, bounding it
+    /// exactly.
     #[test]
-    fn a_straight_nurbs_edge_is_one_chord() {
+    fn a_straight_nurbs_edge_reads_as_its_line() {
         let mut topo = Topology::new();
         let face = half_disc(&mut topo, true);
-        let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let region =
-            face_boundary_2d_chorded(&topo, face, Point3::new(0.0, 0.0, 0.0), x, y, 1e-6).unwrap();
-        assert_eq!(region.pieces.len(), 2);
-        assert_eq!(region.chords().len(), 1);
-        assert!(region.deviation < 1e-12, "deviation {}", region.deviation);
+        let region = region(&topo, face).unwrap();
+        assert_eq!(region.exact.len(), 1);
+        assert_eq!(region.beziers.len(), 1);
+        assert!(region.beziers[0].bound() < 1e-12);
         assert!(region.contains_clear(Point2::new(0.0, 0.5), 1e-9));
         assert!(!region.contains_clear(Point2::new(0.0, -0.01), 1e-9));
     }
 
     /// The upper half of the unit disc in `z = 0` with its arc a rational
-    /// quadratic NURBS, stored against the edge's direction when `reversed`.
-    fn nurbs_half_disc(topo: &mut Topology, reversed: bool) -> FaceId {
+    /// quadratic NURBS whose corner weights are `w`, stored against the
+    /// edge's direction when `reversed`.
+    fn nurbs_half_disc(topo: &mut Topology, reversed: bool, w: f64) -> FaceId {
         let (a, b) = (Point3::new(1.0, 0.0, 0.0), Point3::new(-1.0, 0.0, 0.0));
         let (va, vb) = (
             topo.add_vertex(Vertex::new(a, 1e-7)),
@@ -372,7 +475,6 @@ mod tests {
         if reversed {
             points.reverse();
         }
-        let w = std::f64::consts::FRAC_1_SQRT_2;
         let arc = NurbsCurve::new(
             2,
             vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
@@ -401,43 +503,93 @@ mod tests {
         ))
     }
 
-    /// A curved NURBS edge is chorded to within its tolerance from its start
-    /// vertex to its end, whichever way its curve runs, and a point clear of
-    /// the chords by the deviation reads as the curve places it.
+    /// A NURBS half circle is a piece per knot span chained from its start
+    /// vertex to its end, whichever way its curve runs, and it is read along
+    /// the curve to within the margin, however near.
     #[test]
-    fn a_curved_nurbs_edge_chords_within_its_tolerance() {
+    fn a_curved_nurbs_edge_reads_along_its_curve() {
         for reversed in [false, true] {
             let mut topo = Topology::new();
-            let face = nurbs_half_disc(&mut topo, reversed);
-            let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
-            let region =
-                face_boundary_2d_chorded(&topo, face, Point3::new(0.0, 0.0, 0.0), x, y, 1e-4)
-                    .unwrap();
-            let chords = region.chords();
-            assert!(chords.len() > 8, "{} chords", chords.len());
-            assert!(
-                region.deviation > 0.0 && region.deviation <= 1e-4,
-                "deviation {}",
-                region.deviation
-            );
-            let ends = |c: &Boundary2| match *c {
-                Boundary2::Segment(p, q) => Some((p, q)),
-                Boundary2::Arc { .. } => None,
-            };
-            let ends = |c: &Boundary2| ends(c).unwrap();
-            let (first, _) = ends(&chords[0]);
-            let (_, last) = ends(&chords[chords.len() - 1]);
-            assert!((first - Point2::new(1.0, 0.0)).length() < 1e-12);
-            assert!((last - Point2::new(-1.0, 0.0)).length() < 1e-12);
-            for w in chords.windows(2) {
-                assert!((ends(&w[0]).1 - ends(&w[1]).0).length() < 1e-12);
-            }
+            let face = nurbs_half_disc(&mut topo, reversed, std::f64::consts::FRAC_1_SQRT_2);
+            let region = region(&topo, face).unwrap();
+            let pieces = &region.beziers;
+            assert_eq!(pieces.len(), 2);
+            assert!((pieces[0].start - Point2::new(1.0, 0.0)).length() < 1e-12);
+            assert!((pieces[0].end - Point2::new(0.0, 1.0)).length() < 1e-12);
+            assert!((pieces[1].start - pieces[0].end).length() < 1e-15);
+            assert!((pieces[1].end - Point2::new(-1.0, 0.0)).length() < 1e-12);
             let clear = |px: f64, py: f64| region.contains_clear(Point2::new(px, py), 1e-9);
+            let (c, s) = (1.0_f64.cos(), 1.0_f64.sin());
             assert!(clear(0.0, 0.5));
-            assert!(clear(0.0, 0.999));
             assert!(clear(0.7, 0.7));
-            assert!(!clear(0.0, 1.001));
+            assert!(clear(c * (1.0 - 1e-6), s * (1.0 - 1e-6)));
+            assert!(!clear(c * (1.0 + 1e-6), s * (1.0 + 1e-6)));
+            assert!(!clear(c * (1.0 - 1e-10), s * (1.0 - 1e-10)));
             assert!(!clear(0.0, -0.01));
         }
+    }
+
+    /// A weight of zero or less leaves the control points no hull of the
+    /// curve, so the region is not read at all.
+    #[test]
+    fn a_nonpositive_weight_declines_the_region() {
+        for w in [0.0, -0.5] {
+            let mut topo = Topology::new();
+            let face = nurbs_half_disc(&mut topo, false, w);
+            assert!(region(&topo, face).is_none(), "weight {w}");
+        }
+    }
+
+    /// The face below the quintic `x = t`, `y = 32 t (t - 1/4) (t - 1/2)
+    /// (t - 3/4) (t - 1)` from `(0, 0)` to `(1, 0)`, closed by the unit
+    /// square beneath. The curve meets its chord at a quarter, a half, and
+    /// three quarters along, and dips to `y = -0.1025` at `t = 7/8`.
+    fn below_a_wavy_quintic(topo: &mut Topology) -> FaceId {
+        let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, -1.0), (0.0, -1.0)];
+        let v: Vec<_> = corners
+            .iter()
+            .map(|&(px, py)| topo.add_vertex(Vertex::new(Point3::new(px, py, 0.0), 1e-7)))
+            .collect();
+        let points = [0.0, 0.6, -1.3, 1.3, -0.6, 0.0]
+            .iter()
+            .zip(0_u8..)
+            .map(|(&py, j)| Point3::new(f64::from(j) / 5.0, py, 0.0))
+            .collect();
+        let mut knots = vec![0.0; 6];
+        knots.extend([1.0; 6]);
+        let wave = NurbsCurve::new(5, knots, points, vec![1.0; 6]).unwrap();
+        let mut edges = vec![topo.add_edge(Edge::new(v[0], v[1], EdgeCurve::NurbsCurve(wave)))];
+        for k in 1..4 {
+            edges.push(topo.add_edge(Edge::new(v[k], v[(k + 1) % 4], EdgeCurve::Line)));
+        }
+        let wire = Wire::new(
+            edges.iter().map(|&e| OrientedEdge::new(e, true)).collect(),
+            true,
+        )
+        .unwrap();
+        let wire = topo.add_wire(wire);
+        topo.add_face(Face::new(
+            wire,
+            vec![],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ))
+    }
+
+    /// Where the wavy quintic dips below its chord, a point between the two
+    /// is off the face, and where it rises above, one between is on it.
+    #[test]
+    fn a_wavy_nurbs_edge_is_read_where_it_leaves_its_chord() {
+        let mut topo = Topology::new();
+        let face = below_a_wavy_quintic(&mut topo);
+        let region = region(&topo, face).unwrap();
+        let clear = |px: f64, py: f64| region.contains_clear(Point2::new(px, py), 1e-9);
+        assert!(!clear(0.875, -0.05));
+        assert!(clear(0.875, -0.2));
+        assert!(clear(0.125, 0.05));
+        assert!(!clear(0.125, 0.2));
+        assert!(clear(0.5, -0.5));
     }
 }

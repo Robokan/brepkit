@@ -1508,21 +1508,28 @@ fn sample_face_interior(
             let frame = plane_frame::PlaneFrame::from_plane_face(*normal, &poly);
             let poly2d: Vec<_> = boundary.iter().map(|p| frame.project(*p)).collect();
             let eps = classify_2d::boundary_eps(&poly2d);
-            // The face's loops as the curves they are, holes included, each
-            // NURBS edge as chords within ten margins of it. A sample in a
-            // hole is off the face (a ring's centre), and a sampled polygon
-            // of a hole misses the sliver between each chord and its arc,
-            // 1.9 deep on a radius-25 bore. The chords' deviation widens the
-            // clearance a sample needs from them, so a sample clear of the
-            // chords is clear of their curves too.
-            let region = brepkit_topology::planar::face_boundary_2d_chorded(
+            // The face's loops as the curves they are, holes included. A
+            // sample in a hole is off the face (a ring's centre), and a
+            // sampled polygon of a hole misses the sliver between each chord
+            // and its arc, 1.9 deep on a radius-25 bore. A NURBS edge is
+            // read through its Bezier control points, halved near a sample
+            // until they settle its side, so a smaller margin reads the
+            // curve closer. A weight of zero or less leaves them no hull of
+            // the curve, and with no sample that can be vouched for, a
+            // guess off the face would misclassify it.
+            let Some(region) = brepkit_topology::planar::face_region_2d(
                 topo,
                 face_id,
                 frame.origin(),
                 frame.u_axis(),
                 frame.v_axis(),
-                10.0 * eps,
-            )?;
+            )?
+            else {
+                return Err(AlgoError::FaceSplitFailed(format!(
+                    "face {face_id:?}: a NURBS edge has a weight of zero or less or no \
+                     parameter span, so no sample can be bounded"
+                )));
+            };
             // Try LARGE offsets first, then shrink. The base offset is
             // diag·1e-4 — a sample that close to the boundary edge can hug a
             // coincident interface plane of the opposing solid (a frustum
@@ -1854,32 +1861,74 @@ mod tests {
         assert!(r > 24.6 && r < 25.0, "ring sample at r={r}");
     }
 
+    /// A ring in `z = 0` between a circle of radius `outer` about the origin
+    /// and the closed NURBS curve `hole`.
+    fn nurbs_ring_face(
+        topo: &mut Topology,
+        outer: f64,
+        hole: brepkit_math::nurbs::curve::NurbsCurve,
+    ) -> FaceId {
+        use brepkit_topology::builder::make_circle_edge_with_ref;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let (origin, z) = (Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        let outer =
+            make_circle_edge_with_ref(topo, origin, z, outer, Vec3::new(1.0, 0.0, 0.0), 1e-7)
+                .unwrap();
+        let outer = topo.add_wire(Wire::new(vec![OrientedEdge::new(outer, true)], true).unwrap());
+        let seam = topo.add_vertex(Vertex::new(hole.evaluate(0.0), 1e-7));
+        let hole = topo.add_edge(Edge::new(seam, seam, EdgeCurve::NurbsCurve(hole)));
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(hole, false)], true).unwrap());
+        plane_face(topo, outer, hole)
+    }
+
+    /// The sample radius of a ring between a circle of radius `outer` and a
+    /// closed NURBS circle of radius `hole` starting `turn` radians round.
+    fn nurbs_ring_sample_radius(outer: f64, hole: f64, turn: f64) -> f64 {
+        let mut topo = Topology::new();
+        let face = nurbs_ring_face(&mut topo, outer, nurbs_arc(hole, turn, 4));
+        sample_radius(&topo, face)
+    }
+
+    /// A NURBS hole with a zero weight has no control-point hull to bound
+    /// it, so the face has no sample that can be vouched for: an error, not
+    /// a guess.
+    #[test]
+    fn sample_face_interior_refuses_a_nurbs_hole_it_cannot_bound() {
+        let arc = nurbs_arc(24.0, 0.0, 4);
+        let mut weights = arc.weights().to_vec();
+        weights[1] = 0.0;
+        let hole = brepkit_math::nurbs::curve::NurbsCurve::new(
+            2,
+            arc.knots().to_vec(),
+            arc.control_points().to_vec(),
+            weights,
+        )
+        .unwrap();
+        let mut topo = Topology::new();
+        let face = nurbs_ring_face(&mut topo, 25.0, hole);
+        assert!(sample_face_interior(&topo, face, Tolerance::default()).is_err());
+    }
+
     /// A ring whose hole is a closed NURBS circle of radius 24.75, near the
     /// outer circle, starting a sixteenth of a turn round: the sample must
     /// clear the curve itself, where a polygon of its eighth-turn samples
     /// lets the first offset (r 24.68) through.
     #[test]
     fn sample_face_interior_nurbs_hole_is_read_along_its_curve() {
-        use brepkit_topology::builder::make_circle_edge_with_ref;
-        use brepkit_topology::edge::{Edge, EdgeCurve};
-        use brepkit_topology::vertex::Vertex;
-        use brepkit_topology::wire::{OrientedEdge, Wire};
-
-        let mut topo = Topology::new();
-        let (origin, z) = (Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
-        let outer =
-            make_circle_edge_with_ref(&mut topo, origin, z, 25.0, Vec3::new(1.0, 0.0, 0.0), 1e-7)
-                .unwrap();
-        let outer = topo.add_wire(Wire::new(vec![OrientedEdge::new(outer, true)], true).unwrap());
-        let turn = std::f64::consts::PI / 8.0;
-        let curve = nurbs_arc(24.75, turn, 4);
-        let seam = topo.add_vertex(Vertex::new(curve.evaluate(0.0), 1e-7));
-        let hole = topo.add_edge(Edge::new(seam, seam, EdgeCurve::NurbsCurve(curve)));
-        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(hole, false)], true).unwrap());
-        let face = plane_face(&mut topo, outer, hole);
-
-        let r = sample_radius(&topo, face);
+        let r = nurbs_ring_sample_radius(25.0, 24.75, std::f64::consts::PI / 8.0);
         assert!(r > 24.75 && r < 25.0, "ring sample at r={r}");
+    }
+
+    /// A ring a hundred-thousandth wide whose hole is a NURBS circle: the
+    /// curve must be read ever closer as the margin shrinks, or no offset
+    /// clears both loops and the sample falls back to the outer rim.
+    #[test]
+    fn sample_face_interior_thin_nurbs_ring_lands_on_the_band() {
+        let r = nurbs_ring_sample_radius(25.0, 24.999_99, 0.0);
+        assert!(r > 24.999_99 && r < 25.0, "ring sample at r={r}");
     }
 
     /// A ring, a planar face bounded by two concentric circles: its sample
