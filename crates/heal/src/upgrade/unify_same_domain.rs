@@ -442,9 +442,6 @@ struct SurvEdge {
     start: brepkit_topology::vertex::VertexId,
     end: brepkit_topology::vertex::VertexId,
     tangent_uv: (f64, f64),
-    /// The edge's outline in UV from its start, its end left out: the start
-    /// alone for a line, the start and interior samples for a curve.
-    uv_run: Vec<(f64, f64)>,
 }
 
 /// An edge's outline in UV as it is traversed, its end left out: its start
@@ -593,7 +590,6 @@ fn merge_group_with_holes(
             start,
             end,
             tangent_uv,
-            uv_run,
         });
     }
 
@@ -695,13 +691,16 @@ fn merge_group_with_holes(
             .find_map(|&(u, v)| point_in_region(&pieces[j], Point2::new(u, v), lin))
     };
 
+    // Each loop's winding from its exact area: a sampled outline can wind a
+    // thin curved loop (a sector a ten-thousandth wide) the wrong way round.
     let mut infos: Vec<LoopInfo> = Vec::with_capacity(loops.len());
     for loop_edges in loops {
-        let uv_points: Vec<(f64, f64)> = loop_edges
-            .iter()
-            .flat_map(|&i| edges[i].uv_run.iter().copied())
-            .collect();
-        let signed_area = polygon_signed_area(&uv_points);
+        let oes: Vec<OrientedEdge> = loop_edges.iter().map(|&i| edges[i].oe).collect();
+        let Some(signed_area) =
+            brepkit_topology::planar::loop_area_2d(topo, &oes, frame.x, frame.y)?
+        else {
+            return Ok(None);
+        };
         infos.push(LoopInfo {
             edge_indices: loop_edges,
             signed_area,
@@ -765,12 +764,11 @@ fn merge_group_with_holes(
     // Reverse a loop's edge run when its current sign disagrees.
     let mut widest = 0.0_f64;
     for &fid in group_face_ids {
-        let wire = topo.wire(topo.face(fid)?.outer_wire())?;
-        let mut pts = Vec::with_capacity(wire.edges().len());
-        for oe in wire.edges() {
-            pts.extend(edge_uv_run(topo, oe, &to_uv)?);
-        }
-        let area = polygon_signed_area(&pts);
+        let wire = topo.face(fid)?.outer_wire();
+        let Some(area) = brepkit_topology::planar::wire_area_2d(topo, wire, frame.x, frame.y)?
+        else {
+            return Ok(None);
+        };
         if area.abs() > widest.abs() {
             widest = area;
         }
@@ -829,6 +827,7 @@ fn signed_turn(a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 /// Shoelace signed area of a closed UV polygon.
+#[cfg(test)]
 fn polygon_signed_area(pts: &[(f64, f64)]) -> f64 {
     let n = pts.len();
     if n < 3 {
@@ -1480,6 +1479,104 @@ mod hole_merge_tests {
         assert_eq!(merged.inner_wires().len(), 1, "the small hole stays a hole");
         let inner = topo.wire(merged.inner_wires()[0]).unwrap();
         assert_eq!(inner.edges()[0].edge(), hole_rim);
+    }
+
+    #[test]
+    fn unify_winds_a_thin_curved_band_by_its_exact_area() {
+        // Two 60-degree sectors of the band between radii 1 and 0.9999, each
+        // bounded by one outer arc and two inner arcs, the first holed by a
+        // circle of radius 0.00002 midway across the band. Sampled per edge,
+        // a member's outline winds the wrong way round, so the merged hole
+        // was turned to wind with the outline.
+        let mut topo = Topology::default();
+        let circle = |r: f64| {
+            brepkit_math::curves::Circle3D::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                r,
+            )
+            .unwrap()
+        };
+        let (outer_r, inner_r) = (1.0, 0.9999);
+        let at = |r: f64, deg: f64| {
+            let a = deg.to_radians();
+            (r * a.cos(), r * a.sin())
+        };
+        let vertex = |topo: &mut Topology, (x, y): (f64, f64)| add_vertex(topo, x, y);
+        let outer: Vec<VertexId> = [0.0, 60.0, 120.0]
+            .iter()
+            .map(|&d| vertex(&mut topo, at(outer_r, d)))
+            .collect();
+        let inner: Vec<VertexId> = [0.0, 30.0, 60.0, 90.0, 120.0]
+            .iter()
+            .map(|&d| vertex(&mut topo, at(inner_r, d)))
+            .collect();
+        let arc = |topo: &mut Topology, a: VertexId, b: VertexId, r: f64| {
+            topo.add_edge(Edge::new(a, b, EdgeCurve::Circle(circle(r))))
+        };
+        let outer_arcs: Vec<EdgeId> = (0..2)
+            .map(|k| arc(&mut topo, outer[k], outer[k + 1], outer_r))
+            .collect();
+        let inner_arcs: Vec<EdgeId> = (0..4)
+            .map(|k| arc(&mut topo, inner[k], inner[k + 1], inner_r))
+            .collect();
+        let radii: Vec<EdgeId> = (0..3)
+            .map(|k| line(&mut topo, inner[2 * k], outer[k]))
+            .collect();
+        let mid = 0.5 * (outer_r + inner_r);
+        let small = brepkit_math::curves::Circle3D::new(
+            Point3::new(
+                mid * 30_f64.to_radians().cos(),
+                mid * 30_f64.to_radians().sin(),
+                0.0,
+            ),
+            Vec3::new(0.0, 0.0, 1.0),
+            0.00002,
+        )
+        .unwrap();
+        let hv = topo.add_vertex(Vertex::new(small.evaluate(0.0), 1e-7));
+        let hole_rim = topo.add_edge(Edge::new(hv, hv, EdgeCurve::Circle(small)));
+        let faces: Vec<FaceId> = (0..2)
+            .map(|k| {
+                let outline = loop_of(
+                    &mut topo,
+                    &[
+                        (radii[k], true),
+                        (outer_arcs[k], true),
+                        (radii[k + 1], false),
+                        (inner_arcs[2 * k + 1], false),
+                        (inner_arcs[2 * k], false),
+                    ],
+                );
+                let holes = if k == 0 {
+                    vec![loop_of(&mut topo, &[(hole_rim, false)])]
+                } else {
+                    vec![]
+                };
+                topo.add_face(Face::new(outline, holes, plane_z0()))
+            })
+            .collect();
+        let shell_id = topo.add_shell(Shell::new(faces).unwrap());
+        let solid_id = topo.add_solid(Solid::new(shell_id, vec![]));
+
+        let opts = UnifyOptions {
+            unify_edges: false,
+            ..UnifyOptions::default()
+        };
+        unify_same_domain(&mut topo, solid_id, &opts).unwrap();
+        let shell = topo.shell(shell_id).unwrap();
+        assert_eq!(shell.faces().len(), 1, "the two sectors become one face");
+        let merged = topo.face(shell.faces()[0]).unwrap();
+        assert_eq!(merged.inner_wires().len(), 1, "the small hole stays a hole");
+        let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        let area = |w| {
+            brepkit_topology::planar::wire_area_2d(&topo, w, x, y)
+                .unwrap()
+                .unwrap()
+        };
+        let (outline, hole) = (area(merged.outer_wire()), area(merged.inner_wires()[0]));
+        assert!(outline > 0.0, "the band winds as its members do: {outline}");
+        assert!(hole < 0.0, "the hole winds against it: {hole}");
     }
 }
 
