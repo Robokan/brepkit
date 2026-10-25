@@ -333,11 +333,27 @@ impl StepWriteContext {
             }
         };
 
+        // A fitted curve can run against its edge (a piece of a closed
+        // section loop, stored from its end back): its span then runs down,
+        // and the edge's sense must say so, or a reader takes the curve from
+        // the start vertex onward, the other way round the loop.
+        let same_sense = match edge.curve() {
+            EdgeCurve::NurbsCurve(_) => {
+                let sp = topo.vertex(edge.start()).map_err(topo_err)?.point();
+                let ep = topo.vertex(edge.end()).map_err(topo_err)?.point();
+                let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
+                t0 <= t1
+            }
+            _ => true,
+        };
         let edge_curve = self.next_id();
         self.write_entity(
             edge_curve,
             "EDGE_CURVE",
-            &format!("'', #{start_vp}, #{end_vp}, #{curve_id}, .T.)"),
+            &format!(
+                "'', #{start_vp}, #{end_vp}, #{curve_id}, {})",
+                if same_sense { ".T." } else { ".F." }
+            ),
         );
 
         self.edge_map.insert(key, edge_curve);
@@ -767,6 +783,39 @@ mod tests {
     use brepkit_topology::test_utils::make_unit_cube_non_manifold;
 
     use super::*;
+
+    /// An edge stored against its fitted curve (from the curve's end back
+    /// to its start) is written `same_sense = .F.`: written with the curve,
+    /// a reader starts the curve at the edge's start vertex.
+    #[test]
+    fn nurbs_edge_against_its_curve_is_written_against_it() {
+        use brepkit_math::nurbs::NurbsCurve;
+        use brepkit_topology::edge::EdgeCurve;
+        use brepkit_topology::explorer::solid_edges;
+
+        let mut topo = Topology::new();
+        let solid = make_unit_cube_non_manifold(&mut topo);
+        let eid = solid_edges(&topo, solid).unwrap()[0];
+        let (sp, ep) = {
+            let e = topo.edge(eid).unwrap();
+            (
+                topo.vertex(e.start()).unwrap().point(),
+                topo.vertex(e.end()).unwrap().point(),
+            )
+        };
+        let backward =
+            NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![ep, sp], vec![1.0, 1.0]).unwrap();
+        topo.edge_mut(eid)
+            .unwrap()
+            .set_curve(EdgeCurve::NurbsCurve(backward));
+
+        let step_str = write_step(&topo, &[solid]).unwrap();
+        let against = step_str
+            .lines()
+            .filter(|l| l.contains("EDGE_CURVE(") && l.contains(".F.)"))
+            .count();
+        assert_eq!(against, 1, "{step_str}");
+    }
 
     #[test]
     fn write_step_unit_cube() {
