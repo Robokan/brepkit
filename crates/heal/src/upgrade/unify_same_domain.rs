@@ -577,20 +577,31 @@ fn merge_group_with_holes(
         if (ep - sp).length() < lin && start == end && !closed {
             continue;
         }
-        let unit = |from: (f64, f64), to: (f64, f64)| {
-            let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-            let len = dx.hypot(dy);
+        // The directions of travel as the edge leaves its start and arrives
+        // at its end, from the curve's own tangents there: a sample a step
+        // along turns its chord off the tangent, enough to pick the wrong
+        // successor where a nearly tangent edge meets the curve at a vertex.
+        let (es, ee) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(es, ee);
+        let sense = if t1 < t0 { -1.0 } else { 1.0 };
+        let along = |t: f64, flip: f64| {
+            let d = edge.curve().tangent_with_endpoints(t, es, ee) * (sense * flip);
+            let (u, v) = (d.dot(frame.x), d.dot(frame.y));
+            let len = u.hypot(v);
             if len < f64::EPSILON {
                 (1.0, 0.0)
             } else {
-                (dx / len, dy / len)
+                (u / len, v / len)
             }
         };
-        let (start_uv, end_uv) = (to_uv(sp), to_uv(ep));
-        // A curve leaves its start toward its first sample and arrives at its
-        // end from its last, not along its chord either way.
-        let tangent_uv = unit(start_uv, uv_run.get(1).copied().unwrap_or(end_uv));
-        let arrival_uv = unit(uv_run.last().copied().unwrap_or(start_uv), end_uv);
+        let (tangent_uv, arrival_uv) = if oe.is_forward() {
+            (along(t0, 1.0), along(t1, 1.0))
+        } else {
+            (along(t1, -1.0), along(t0, -1.0))
+        };
         edges.push(SurvEdge {
             oe: *oe,
             start,
@@ -1488,13 +1499,11 @@ mod hole_merge_tests {
         assert_eq!(inner.edges()[0].edge(), hole_rim);
     }
 
-    #[test]
-    fn unify_keeps_two_holes_touching_at_a_vertex_apart() {
-        // A plate in two faces sharing x = 2, the left one holed by a circle
-        // about (-1, 0) split at (-2, 0) and (0, 0) and by a triangle on
-        // (0, 0), (1, 1), (1, -1): the holes touch at (0, 0). Arriving there
-        // along its upper half, the circle's walk must turn onto its lower
-        // half, not onto the triangle, so each hole stays a loop of its own.
+    /// A plate in two faces sharing x = 2, the left one holed by a circle
+    /// about (-1, 0) split at (-2, 0) and (0, 0), by the triangle on (0, 0),
+    /// `p` and `q` (clockwise), and by a whole circle about (-2, 2): the
+    /// first two holes touch at (0, 0). The sizes of the merged face's holes.
+    fn merged_hole_sizes(p: (f64, f64), q: (f64, f64)) -> Vec<usize> {
         let mut topo = Topology::default();
         let corners = |topo: &mut Topology, x0: f64, x1: f64| {
             [(x0, -3.0), (x1, -3.0), (x1, 3.0), (x0, 3.0)].map(|(x, y)| add_vertex(topo, x, y))
@@ -1532,12 +1541,9 @@ mod hole_merge_tests {
             ],
         );
 
-        let circle = brepkit_math::curves::Circle3D::new(
-            Point3::new(-1.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
-            1.0,
-        )
-        .unwrap();
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let circle =
+            brepkit_math::curves::Circle3D::new(Point3::new(-1.0, 0.0, 0.0), up, 1.0).unwrap();
         let (touch, west) = (
             add_vertex(&mut topo, 0.0, 0.0),
             add_vertex(&mut topo, -2.0, 0.0),
@@ -1546,21 +1552,26 @@ mod hole_merge_tests {
         let lower = topo.add_edge(Edge::new(west, touch, EdgeCurve::Circle(circle)));
         // Walked from (-2, 0), so the choice at (0, 0) comes mid-walk.
         let round = loop_of(&mut topo, &[(upper, false), (lower, false)]);
-        let (ne, se) = (
-            add_vertex(&mut topo, 1.0, 1.0),
-            add_vertex(&mut topo, 1.0, -1.0),
+        let (pv, qv) = (
+            add_vertex(&mut topo, p.0, p.1),
+            add_vertex(&mut topo, q.0, q.1),
         );
         let sides = [
-            line(&mut topo, touch, ne),
-            line(&mut topo, ne, se),
-            line(&mut topo, se, touch),
+            line(&mut topo, touch, pv),
+            line(&mut topo, pv, qv),
+            line(&mut topo, qv, touch),
         ];
         let tri = loop_of(
             &mut topo,
             &[(sides[0], true), (sides[1], true), (sides[2], true)],
         );
+        let whole =
+            brepkit_math::curves::Circle3D::new(Point3::new(-2.0, 2.0, 0.0), up, 0.3).unwrap();
+        let wv = topo.add_vertex(Vertex::new(whole.evaluate(0.0), 1e-7));
+        let rim = topo.add_edge(Edge::new(wv, wv, EdgeCurve::Circle(whole)));
+        let bore = loop_of(&mut topo, &[(rim, false)]);
 
-        let left = topo.add_face(Face::new(left_outer, vec![round, tri], plane_z0()));
+        let left = topo.add_face(Face::new(left_outer, vec![round, tri, bore], plane_z0()));
         let right = topo.add_face(Face::new(right_outer, vec![], plane_z0()));
         let shell_id = topo.add_shell(Shell::new(vec![left, right]).unwrap());
         let solid_id = topo.add_solid(Solid::new(shell_id, vec![]));
@@ -1579,7 +1590,26 @@ mod hole_merge_tests {
             .map(|&w| topo.wire(w).unwrap().edges().len())
             .collect();
         sizes.sort_unstable();
-        assert_eq!(sizes, [2, 3], "the circle and the triangle stay two holes");
+        sizes
+    }
+
+    #[test]
+    fn unify_keeps_two_holes_touching_at_a_vertex_apart() {
+        // Arriving at (0, 0) along its upper half, the circle's walk must
+        // turn onto its lower half, not onto the triangle, so each hole stays
+        // a loop of its own: a triangle opening wide from (0, 0), and one
+        // leaving it within a few degrees of the circle's tangent there.
+        let at = |deg: f64| {
+            let a = deg.to_radians();
+            (a.cos(), a.sin())
+        };
+        for (p, q) in [((1.0, 1.0), (1.0, -1.0)), (at(-85.0), at(-89.0))] {
+            assert_eq!(
+                merged_hole_sizes(p, q),
+                [1, 2, 3],
+                "the circles and the triangle on {p:?}, {q:?} stay three holes"
+            );
+        }
     }
 
     #[test]
