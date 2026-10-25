@@ -8686,6 +8686,10 @@ fn cylinder_generator_in_an_l_walls_notch_is_no_section() {
         brepkit_algo::gfa::boolean(&mut topo, brepkit_algo::bop::BooleanOp::Cut, body, cutter)
             .unwrap();
     check_result(&topo, result);
+    assert!(
+        is_closed_manifold(&topo, result).unwrap(),
+        "the bored body must be closed-manifold"
+    );
     let bore = std::f64::consts::PI * 400.0 * 6.0;
     assert_volume_near(&topo, result, body_volume - bore, 1e-3);
 }
