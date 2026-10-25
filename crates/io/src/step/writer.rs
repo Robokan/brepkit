@@ -786,6 +786,39 @@ mod tests {
 
     use super::*;
 
+    /// An edge stored against its fitted curve (from the curve's end back
+    /// to its start) is written `same_sense = .F.`: written with the curve,
+    /// a reader starts the curve at the edge's start vertex.
+    #[test]
+    fn nurbs_edge_against_its_curve_is_written_against_it() {
+        use brepkit_math::nurbs::NurbsCurve;
+        use brepkit_topology::edge::EdgeCurve;
+        use brepkit_topology::explorer::solid_edges;
+
+        let mut topo = Topology::new();
+        let solid = make_unit_cube_non_manifold(&mut topo);
+        let eid = solid_edges(&topo, solid).unwrap()[0];
+        let (sp, ep) = {
+            let e = topo.edge(eid).unwrap();
+            (
+                topo.vertex(e.start()).unwrap().point(),
+                topo.vertex(e.end()).unwrap().point(),
+            )
+        };
+        let backward =
+            NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![ep, sp], vec![1.0, 1.0]).unwrap();
+        topo.edge_mut(eid)
+            .unwrap()
+            .set_curve(EdgeCurve::NurbsCurve(backward));
+
+        let step_str = write_step(&topo, &[solid]).unwrap();
+        let against = step_str
+            .lines()
+            .filter(|l| l.contains("EDGE_CURVE(") && l.contains(".F.)"))
+            .count();
+        assert_eq!(against, 1, "{step_str}");
+    }
+
     #[test]
     fn write_step_unit_cube() {
         let mut topo = Topology::new();

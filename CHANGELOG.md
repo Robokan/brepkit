@@ -1,5 +1,60 @@
 # Changelog
 
+## [4.2.8](https://github.com/andymai/brepkit/compare/v4.2.7...v4.2.8) (2026-10-25)
+
+
+### Bug Fixes
+
+* **io:** take a planar face's largest loop as its outer bound ([#2046](https://github.com/andymai/brepkit/issues/2046)) ([ccffd1b](https://github.com/andymai/brepkit/commit/ccffd1ba9510150ab16f620c2ef3de9a8fc3c27a))
+
+## [4.2.7](https://github.com/andymai/brepkit/compare/v4.2.6...v4.2.7) (2026-10-25)
+
+
+### Bug Fixes
+
+* **io:** read a plane written facing in as brepkit builds one ([#2051](https://github.com/andymai/brepkit/issues/2051)) ([1dbe22b](https://github.com/andymai/brepkit/commit/1dbe22bcfb2268f7ff3b0cb91a253664ed9d3ad9))
+
+## [4.2.6](https://github.com/andymai/brepkit/compare/v4.2.5...v4.2.6) (2026-10-25)
+
+
+### Bug Fixes
+
+* **algo:** count a planar face's holes in the shell orientation readings ([#2045](https://github.com/andymai/brepkit/issues/2045)) ([b57c405](https://github.com/andymai/brepkit/commit/b57c4053c9215d489c51411718110f14f0dae225))
+
+## [4.2.5](https://github.com/andymai/brepkit/compare/v4.2.4...v4.2.5) (2026-10-25)
+
+
+### Bug Fixes
+
+* **algo:** sample a ring face on the ring, not in its hole ([#2050](https://github.com/andymai/brepkit/issues/2050)) ([4ba0251](https://github.com/andymai/brepkit/commit/4ba0251105b6bd51d726fcd604dbfa7c12a3eb67))
+* **algo:** split a cylinder wall notched at its rim into bands ([#2048](https://github.com/andymai/brepkit/issues/2048)) ([acd51b1](https://github.com/andymai/brepkit/commit/acd51b148d49364737e6e9324747cf68d7f6631d))
+
+## [4.2.4](https://github.com/andymai/brepkit/compare/v4.2.3...v4.2.4) (2026-10-25)
+
+
+### Bug Fixes
+
+* **algo:** drop a plane x cylinder line that misses the plane face ([#2049](https://github.com/andymai/brepkit/issues/2049)) ([f996fcf](https://github.com/andymai/brepkit/commit/f996fcfdabec35df944778f5b9e0e234046a8526))
+
+
+### Performance
+
+* **math:** project onto a NURBS curve's nearby spans only ([#2054](https://github.com/andymai/brepkit/issues/2054)) ([89195cc](https://github.com/andymai/brepkit/commit/89195ccd4057268b97e42f848ecd18e79a8c0af0))
+
+## [4.2.3](https://github.com/andymai/brepkit/compare/v4.2.2...v4.2.3) (2026-10-25)
+
+
+### Bug Fixes
+
+* **io:** read a VERTEX_LOOP-bounded sphere face as two hemispheres ([#2047](https://github.com/andymai/brepkit/issues/2047)) ([d3e0b88](https://github.com/andymai/brepkit/commit/d3e0b88621ee3af6d69a73bde7336346df1a17af))
+* **io:** write a NURBS edge running against its curve as same_sense .F. ([#2052](https://github.com/andymai/brepkit/issues/2052)) ([3e6bcca](https://github.com/andymai/brepkit/commit/3e6bccaf6418c8f08047ca68971516cbd825d0f9))
+* **topology:** read a reversed piece of a closed NURBS loop the shorter way ([#2056](https://github.com/andymai/brepkit/issues/2056)) ([330a3c0](https://github.com/andymai/brepkit/commit/330a3c08e2710e50e8b9bd573e7945fc954a1ac3))
+
+
+### Performance
+
+* **algo:** measure distance to a cylinder or sphere directly ([#2055](https://github.com/andymai/brepkit/issues/2055)) ([5f7f483](https://github.com/andymai/brepkit/commit/5f7f48367bcba416cbb419e6109c0ae94e800d57))
+
 ## [4.2.2](https://github.com/andymai/brepkit/compare/v4.2.1...v4.2.2) (2026-10-15)
 
 
