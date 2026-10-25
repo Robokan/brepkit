@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use brepkit_math::vec::{Point3, Vec3};
 use brepkit_topology::Topology;
-use brepkit_topology::edge::{EdgeCurve, EdgeId};
+use brepkit_topology::edge::EdgeId;
 use brepkit_topology::face::{Face, FaceId, FaceSurface};
 use brepkit_topology::shell::Shell;
 use brepkit_topology::solid::{Solid, SolidId};
@@ -1122,51 +1122,60 @@ fn newell_normal(verts: &[Point3]) -> Vec3 {
     Vec3::new(nx, ny, nz)
 }
 
-/// A loop's points in traversal order: each edge's start, and a conic or
-/// spline edge sampled along its length.
-fn sampled_loop(topo: &Topology, wire: WireId) -> Option<Vec<Point3>> {
-    const SAMPLES: u32 = 16;
-    let mut pts = Vec::new();
-    for oe in topo.wire(wire).ok()?.edges() {
-        let edge = topo.edge(oe.edge()).ok()?;
-        let (sp, ep) = (
-            topo.vertex(edge.start()).ok()?.point(),
-            topo.vertex(edge.end()).ok()?.point(),
-        );
-        let (d0, d1) = edge.curve().domain_with_endpoints(sp, ep);
-        let n = if matches!(edge.curve(), EdgeCurve::Line) {
-            1
-        } else {
-            SAMPLES
-        };
-        for k in 0..n {
-            let f = f64::from(k) / f64::from(n);
-            let f = if oe.is_forward() { f } else { 1.0 - f };
-            pts.push(
-                edge.curve()
-                    .evaluate_with_endpoints((d1 - d0).mul_add(f, d0), sp, ep),
-            );
-        }
-    }
-    Some(pts)
-}
-
-/// The share of a planar face's outer loop that is face rather than hole:
-/// the loop's area less its holes', over its own; 1 without holes or when a
-/// loop cannot be read. The shell orientation readings integrate a planar
-/// face over its outer loop alone; scaled by this they count its holes,
-/// which on a holed part far from the origin can outweigh whole walls and
-/// turn an outward shell's reading inward.
-fn planar_net_share(topo: &Topology, face: &Face) -> f64 {
+/// The share of a planar face's outer loop that is face rather than hole,
+/// with each loop's area read by `area`: the loop's area less its holes',
+/// over its own; 1 without holes or when the outer loop has none. The shell
+/// orientation readings integrate a planar face over its outer loop alone;
+/// scaled by this they count its holes, which on a holed part far from the
+/// origin can outweigh whole walls and turn an outward shell's reading
+/// inward.
+fn planar_share(face: &Face, area: impl Fn(WireId) -> Option<f64>) -> f64 {
     if face.inner_wires().is_empty() || !matches!(face.surface(), FaceSurface::Plane { .. }) {
         return 1.0;
     }
-    let area = |w| sampled_loop(topo, w).map(|pts| newell_normal(&pts).length());
     let Some(outer) = area(face.outer_wire()).filter(|&a| a > 0.0) else {
         return 1.0;
     };
     let holes: f64 = face.inner_wires().iter().filter_map(|&w| area(w)).sum();
     ((outer - holes) / outer).clamp(0.0, 1.0)
+}
+
+/// [`planar_share`] with every loop's exact area, for the flux, which
+/// integrates the shell's surfaces themselves.
+fn planar_net_share(topo: &Topology, face: &Face) -> f64 {
+    let FaceSurface::Plane { normal, .. } = face.surface() else {
+        return 1.0;
+    };
+    let Ok(frame) = brepkit_math::frame::Frame3::from_normal(Point3::new(0.0, 0.0, 0.0), *normal)
+    else {
+        return 1.0;
+    };
+    planar_share(face, |w| {
+        brepkit_topology::planar::wire_area_2d(topo, w, frame.x, frame.y)
+            .ok()
+            .map(f64::abs)
+    })
+}
+
+/// [`planar_share`] with every loop's area that of the polygon on its
+/// vertices, for the corner fan. The fan is the volume of the polyhedron on
+/// the shell's vertices, which closes, and so reads the same wherever the
+/// shell sits, only while a hole is cut from its face by those same
+/// corners: a round hole and the floor of its pocket, each on fewer than
+/// three corners, drop out together.
+fn planar_corner_share(topo: &Topology, face: &Face) -> f64 {
+    planar_share(face, |w| {
+        let mut corners = Vec::new();
+        for oe in topo.wire(w).ok()?.edges() {
+            let edge = topo.edge(oe.edge()).ok()?;
+            corners.push(topo.vertex(oe.oriented_start(edge)).ok()?.point());
+        }
+        Some(if corners.len() < 3 {
+            0.0
+        } else {
+            0.5 * newell_normal(&corners).length()
+        })
+    })
 }
 
 /// Compute a signed volume estimate for a shell using the divergence theorem.
@@ -1234,7 +1243,7 @@ fn signed_volume_of_shell(topo: &Topology, faces: &[FaceId]) -> f64 {
                 }
             }
         };
-        let sign = sign * planar_net_share(topo, face);
+        let sign = sign * planar_corner_share(topo, face);
         let v0 = verts[0];
         for i in 1..verts.len() - 1 {
             let v1 = verts[i];
@@ -3941,10 +3950,12 @@ mod tests {
     use super::*;
 
     /// A planar face's share of its outer loop excluding its holes: a square
-    /// hole, and a circular one whose loop is a single edge on one vertex.
+    /// hole, and a round one whose loop is a single closed circle or two half
+    /// circles. The exact share counts the round hole however it is split;
+    /// the corner share, on fewer than three corners, leaves it out.
     #[test]
     fn planar_net_share_counts_square_and_round_holes() {
-        use brepkit_topology::edge::Edge;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
         use brepkit_topology::vertex::Vertex;
         use brepkit_topology::wire::Wire;
 
@@ -3978,6 +3989,7 @@ mod tests {
         let hole = square(&mut topo, 3.0, 7.0, false);
         let holed = Face::new(outer, vec![hole], plane.clone());
         assert!((planar_net_share(&topo, &holed) - 0.84).abs() < 1e-12);
+        assert!((planar_corner_share(&topo, &holed) - 0.84).abs() < 1e-12);
 
         let circle = brepkit_math::curves::Circle3D::new(
             Point3::new(5.0, 5.0, 100.0),
@@ -3985,14 +3997,151 @@ mod tests {
             2.0,
         )
         .unwrap();
-        let v = topo.add_vertex(Vertex::new(Point3::new(7.0, 5.0, 100.0), 1e-7));
-        let e = topo.add_edge(Edge::new(v, v, EdgeCurve::Circle(circle)));
-        let round = topo.add_wire(Wire::new(vec![OrientedEdge::new(e, true)], true).unwrap());
-        let outer = square(&mut topo, 0.0, 10.0, true);
-        let drilled = Face::new(outer, vec![round], plane);
-        // the sampled circle is a 16-gon inscribed in it
-        let hole = 0.5 * 16.0 * 4.0 * (std::f64::consts::TAU / 16.0).sin();
-        assert!((planar_net_share(&topo, &drilled) - (100.0 - hole) / 100.0).abs() < 1e-9);
+        let east = topo.add_vertex(Vertex::new(Point3::new(7.0, 5.0, 100.0), 1e-7));
+        let west = topo.add_vertex(Vertex::new(Point3::new(3.0, 5.0, 100.0), 1e-7));
+        let whole = topo.add_edge(Edge::new(east, east, EdgeCurve::Circle(circle.clone())));
+        let half_a = topo.add_edge(Edge::new(east, west, EdgeCurve::Circle(circle.clone())));
+        let half_b = topo.add_edge(Edge::new(west, east, EdgeCurve::Circle(circle)));
+        let one = topo.add_wire(Wire::new(vec![OrientedEdge::new(whole, true)], true).unwrap());
+        let two = topo.add_wire(
+            Wire::new(
+                vec![
+                    OrientedEdge::new(half_a, true),
+                    OrientedEdge::new(half_b, true),
+                ],
+                true,
+            )
+            .unwrap(),
+        );
+        let disc = 4.0 * std::f64::consts::PI;
+        for round in [one, two] {
+            let outer = square(&mut topo, 0.0, 10.0, true);
+            let drilled = Face::new(outer, vec![round], plane.clone());
+            assert!((planar_net_share(&topo, &drilled) - (100.0 - disc) / 100.0).abs() < 1e-12);
+            assert!((planar_corner_share(&topo, &drilled) - 1.0).abs() < 1e-12);
+        }
+    }
+
+    /// A planar face on the loop `outer` with the holes `holes`, its normal
+    /// the side of its plane `facing` points to: each loop's points in any
+    /// order round it, wound here about the normal and against it for a
+    /// hole. Every face takes its own edges, which is all the orientation
+    /// readings look at.
+    fn planar_face(
+        topo: &mut Topology,
+        outer: &[Point3],
+        holes: &[&[Point3]],
+        facing: Vec3,
+    ) -> FaceId {
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::Wire;
+
+        let wire = |topo: &mut Topology, pts: &[Point3], ccw: bool| {
+            let mut pts = pts.to_vec();
+            if (newell_normal(&pts).dot(facing) > 0.0) != ccw {
+                pts.reverse();
+            }
+            let v: Vec<_> = pts
+                .iter()
+                .map(|&p| topo.add_vertex(Vertex::new(p, 1e-7)))
+                .collect();
+            let edges = (0..v.len())
+                .map(|i| {
+                    let e = topo.add_edge(Edge::new(v[i], v[(i + 1) % v.len()], EdgeCurve::Line));
+                    OrientedEdge::new(e, true)
+                })
+                .collect();
+            topo.add_wire(Wire::new(edges, true).unwrap())
+        };
+        let outer_wire = wire(topo, outer, true);
+        let inner: Vec<_> = holes.iter().map(|h| wire(topo, h, false)).collect();
+        let wound = newell_normal(outer).normalize().unwrap();
+        let normal = if wound.dot(facing) > 0.0 {
+            wound
+        } else {
+            -wound
+        };
+        let d = normal.dot(Vec3::new(outer[0].x(), outer[0].y(), outer[0].z()));
+        topo.add_face(Face::new(
+            outer_wire,
+            inner,
+            FaceSurface::Plane { normal, d },
+        ))
+    }
+
+    /// A U channel standing at z 1000 to 1010, its walls 0.4 thick, a deep
+    /// rectangular pocket in the inside of each wall. The pockets open toward
+    /// the channel's middle, so readings that count a holed face whole take
+    /// their openings' areas against the shell, more than its volume: the
+    /// outward shell read inward and was dropped. Built facing out, it is
+    /// growth; facing in, a hole.
+    #[test]
+    fn a_channel_pocketed_inside_reads_by_its_faces_less_their_holes() {
+        let at = |x: f64, y: f64, h: f64| Point3::new(x, y, 1000.0 + h);
+        let profile = [
+            (-5.0, -5.0),
+            (5.0, -5.0),
+            (5.0, 5.0),
+            (4.6, 5.0),
+            (4.6, -4.6),
+            (-4.6, -4.6),
+            (-4.6, 5.0),
+            (-5.0, 5.0),
+        ];
+        for out in [1.0, -1.0] {
+            let mut topo = Topology::new();
+            let mut faces = Vec::new();
+            let mut face = |topo: &mut Topology, outer: &[Point3], holes: &[&[Point3]], n: Vec3| {
+                faces.push(planar_face(topo, outer, holes, n * out));
+            };
+            let bottom: Vec<_> = profile.iter().map(|&(x, y)| at(x, y, 0.0)).collect();
+            let top: Vec<_> = profile.iter().map(|&(x, y)| at(x, y, 10.0)).collect();
+            face(&mut topo, &bottom, &[], Vec3::new(0.0, 0.0, -1.0));
+            face(&mut topo, &top, &[], Vec3::new(0.0, 0.0, 1.0));
+            // A pocket in the wall at `x = side * 4.6`, 0.2 deep, 8 by 8.
+            let opening = |side: f64, depth: f64| {
+                let x = side * (4.6 + depth);
+                [
+                    at(x, -3.5, 1.0),
+                    at(x, 4.5, 1.0),
+                    at(x, 4.5, 9.0),
+                    at(x, -3.5, 9.0),
+                ]
+            };
+            for i in 0..profile.len() {
+                let (a, b) = (profile[i], profile[(i + 1) % profile.len()]);
+                let n = Vec3::new(b.1 - a.1, a.0 - b.0, 0.0);
+                let quad = [
+                    at(a.0, a.1, 0.0),
+                    at(b.0, b.1, 0.0),
+                    at(b.0, b.1, 10.0),
+                    at(a.0, a.1, 10.0),
+                ];
+                let inside = (a.0 - b.0).abs() < 1e-12 && a.0.abs() < 4.7;
+                if inside {
+                    let side = a.0.signum();
+                    face(&mut topo, &quad, &[&opening(side, 0.0)], n);
+                    let (rim, floor) = (opening(side, 0.0), opening(side, 0.2));
+                    face(&mut topo, &floor, &[], Vec3::new(-side, 0.0, 0.0));
+                    for k in 0..4 {
+                        let wall = [rim[k], rim[(k + 1) % 4], floor[(k + 1) % 4], floor[k]];
+                        let mid = (rim[k] - rim[(k + 2) % 4]) * 0.5;
+                        let into = Vec3::new(0.0, mid.y(), mid.z());
+                        face(&mut topo, &wall, &[], into * -1.0);
+                    }
+                } else {
+                    face(&mut topo, &quad, &[], n);
+                }
+            }
+            let (growth, holes) = perform_areas(&topo, &[faces]);
+            assert_eq!(
+                (growth.len(), holes.len()),
+                if out > 0.0 { (1, 0) } else { (0, 1) },
+                "facing {}",
+                if out > 0.0 { "out" } else { "in" }
+            );
+        }
     }
 
     #[test]

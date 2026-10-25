@@ -1,5 +1,7 @@
 //! A planar face's boundary flattened into its plane.
 
+use brepkit_math::nurbs::curve::NurbsCurve;
+use brepkit_math::quadrature;
 use brepkit_math::region2d::Boundary2;
 use brepkit_math::vec::{Point2, Point3, Vec2, Vec3};
 
@@ -7,6 +9,7 @@ use crate::Topology;
 use crate::TopologyError;
 use crate::edge::EdgeCurve;
 use crate::face::FaceId;
+use crate::wire::WireId;
 
 /// A planar face's boundary flattened into its plane, holes included.
 ///
@@ -84,6 +87,100 @@ pub fn face_boundary_2d(
     Ok(Some(pieces))
 }
 
+/// The signed area a wire encloses in the plane spanned by the orthonormal
+/// `x` and `y`: positive when it winds counterclockwise about `x × y`.
+///
+/// Exact for lines and conic arcs, so it does not depend on how a loop's
+/// curves are split into edges. A NURBS edge is integrated knot span by
+/// knot span.
+///
+/// # Errors
+///
+/// Returns [`TopologyError`] if an entity lookup fails.
+pub fn wire_area_2d(topo: &Topology, wire: WireId, x: Vec3, y: Vec3) -> Result<f64, TopologyError> {
+    let wire = topo.wire(wire)?;
+    let Some(first) = wire.edges().first() else {
+        return Ok(0.0);
+    };
+    // Read about a point of the loop, not the world origin: far from it the
+    // swept areas below are large and cancel to the loop's small one.
+    let origin = topo
+        .vertex(first.oriented_start(topo.edge(first.edge())?))?
+        .point();
+    let along = |v: Vec3| (v.dot(x), v.dot(y));
+    let flat = |p: Point3| along(p - origin);
+    let cross = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
+    let mut twice = 0.0;
+    for oe in wire.edges() {
+        let edge = topo.edge(oe.edge())?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let curve = edge.curve();
+        // Twice the area swept about `origin` from the edge's start vertex
+        // to its end. On a conic `c + A cos t u + B sin t v` that is
+        // `c × (end - start) + A B (u × v) (t1 - t0)`.
+        let conic = |c: Point3, u: Vec3, v: Vec3, semi_a: f64, semi_b: f64| {
+            let (t0, t1) = curve.domain_with_endpoints(a, b);
+            let (fa, fb) = (flat(a), flat(b));
+            cross(flat(c), (fb.0 - fa.0, fb.1 - fa.1))
+                + semi_a * semi_b * cross(along(u), along(v)) * (t1 - t0)
+        };
+        let swept = match curve {
+            EdgeCurve::Line => cross(flat(a), flat(b)),
+            EdgeCurve::Circle(c) => {
+                conic(c.center(), c.u_axis(), c.v_axis(), c.radius(), c.radius())
+            }
+            EdgeCurve::Ellipse(e) => conic(
+                e.center(),
+                e.u_axis(),
+                e.v_axis(),
+                e.semi_major(),
+                e.semi_minor(),
+            ),
+            EdgeCurve::NurbsCurve(n) => {
+                let (t0, t1) = curve.domain_with_endpoints(a, b);
+                nurbs_swept(n, t0, t1, origin, x, y)
+            }
+        };
+        twice += if oe.is_forward() { swept } else { -swept };
+    }
+    Ok(0.5 * twice)
+}
+
+/// Twice the area a NURBS curve sweeps about `origin` from `t0` to `t1`
+/// (either way round) in the plane of `x` and `y`: `∫ q × q' dt` by Gauss
+/// quadrature on each knot span, exact on a polynomial curve's spans.
+fn nurbs_swept(curve: &NurbsCurve, t0: f64, t1: f64, origin: Point3, x: Vec3, y: Vec3) -> f64 {
+    let o = Vec3::new(origin.x(), origin.y(), origin.z());
+    let (lo, hi) = (t0.min(t1), t0.max(t1));
+    let order = if curve.is_rational() {
+        quadrature::MAX_ORDER
+    } else {
+        curve.degree() + 1
+    };
+    let points = quadrature::gauss_legendre_points(order);
+    let mut cuts = vec![lo];
+    cuts.extend(curve.knots().iter().copied().filter(|&k| k > lo && k < hi));
+    cuts.push(hi);
+    cuts.dedup();
+    let mut total = 0.0;
+    for span in cuts.windows(2) {
+        let (mid, half) = (0.5 * (span[0] + span[1]), 0.5 * (span[1] - span[0]));
+        for g in points {
+            let d = curve.derivatives(half.mul_add(g.x, mid), 1);
+            let (Some(&p), Some(&dp)) = (d.first(), d.get(1)) else {
+                continue;
+            };
+            let q = p - o;
+            let cross = q.dot(x) * dp.dot(y) - q.dot(y) * dp.dot(x);
+            total += g.w * half * cross;
+        }
+    }
+    if t1 < t0 { -total } else { total }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -150,6 +247,100 @@ mod tests {
         assert_eq!(inside(0.0, 0.999), Some(true));
         assert_eq!(inside(0.7, 0.7), Some(true));
         assert_eq!(inside(0.0, -0.01), Some(false));
+    }
+
+    /// A loop of `edges`, each `(edge, forward)`.
+    fn wire_of(topo: &mut Topology, edges: &[(crate::edge::EdgeId, bool)]) -> WireId {
+        let oes = edges
+            .iter()
+            .map(|&(e, forward)| OrientedEdge::new(e, forward))
+            .collect();
+        topo.add_wire(Wire::new(oes, true).unwrap())
+    }
+
+    const XY: (Vec3, Vec3) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+
+    /// A disc's area is the same whether its circle is one closed edge or two
+    /// half circles, far from the origin, and turns negative run backward.
+    #[test]
+    fn a_disc_reads_its_exact_area_however_its_circle_is_split() {
+        let mut topo = Topology::new();
+        let c = Point3::new(300.0, -200.0, 1000.0);
+        let circle = Circle3D::new(c, Vec3::new(0.0, 0.0, 1.0), 4.0).unwrap();
+        let east = topo.add_vertex(Vertex::new(Point3::new(304.0, -200.0, 1000.0), 1e-7));
+        let west = topo.add_vertex(Vertex::new(Point3::new(296.0, -200.0, 1000.0), 1e-7));
+        let whole = topo.add_edge(Edge::new(east, east, EdgeCurve::Circle(circle.clone())));
+        let upper = topo.add_edge(Edge::new(east, west, EdgeCurve::Circle(circle.clone())));
+        let lower = topo.add_edge(Edge::new(west, east, EdgeCurve::Circle(circle)));
+        let one = wire_of(&mut topo, &[(whole, true)]);
+        let two = wire_of(&mut topo, &[(upper, true), (lower, true)]);
+        let back = wire_of(&mut topo, &[(lower, false), (upper, false)]);
+        let disc = 16.0 * std::f64::consts::PI;
+        let (x, y) = XY;
+        for (w, want) in [(one, disc), (two, disc), (back, -disc)] {
+            let area = wire_area_2d(&topo, w, x, y).unwrap();
+            assert!((area - want).abs() < 1e-9, "{area} vs {want}");
+        }
+    }
+
+    /// A half ellipse closed by its major axis: half of `pi a b`.
+    #[test]
+    fn a_half_ellipse_reads_half_its_area() {
+        let mut topo = Topology::new();
+        let ellipse = brepkit_math::curves::Ellipse3D::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            3.0,
+            2.0,
+        )
+        .unwrap();
+        let (u, v) = (ellipse.u_axis(), ellipse.v_axis());
+        assert!(u.cross(v).z() > 0.0);
+        let a = Point3::new(3.0 * u.x(), 3.0 * u.y(), 0.0);
+        let b = Point3::new(-a.x(), -a.y(), 0.0);
+        let (va, vb) = (
+            topo.add_vertex(Vertex::new(a, 1e-7)),
+            topo.add_vertex(Vertex::new(b, 1e-7)),
+        );
+        let arc = topo.add_edge(Edge::new(va, vb, EdgeCurve::Ellipse(ellipse)));
+        let axis = topo.add_edge(Edge::new(vb, va, EdgeCurve::Line));
+        let w = wire_of(&mut topo, &[(arc, true), (axis, true)]);
+        let (x, y) = XY;
+        let area = wire_area_2d(&topo, w, x, y).unwrap();
+        assert!((area - 3.0 * std::f64::consts::PI).abs() < 1e-9, "{area}");
+    }
+
+    /// A rational half circle reads its exact area, run with its curve and,
+    /// as an edge stored against its curve, the other way round.
+    #[test]
+    fn a_rational_half_circle_reads_its_exact_area() {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let curve = NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
+            vec![
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(-1.0, 1.0, 0.0),
+                Point3::new(-1.0, 0.0, 0.0),
+            ],
+            vec![1.0, s, 1.0, s, 1.0],
+        )
+        .unwrap();
+        let half = std::f64::consts::FRAC_PI_2;
+        let (x, y) = XY;
+        for (against, want) in [(false, half), (true, -half)] {
+            let mut topo = Topology::new();
+            let east = topo.add_vertex(Vertex::new(Point3::new(1.0, 0.0, 0.0), 1e-7));
+            let west = topo.add_vertex(Vertex::new(Point3::new(-1.0, 0.0, 0.0), 1e-7));
+            let (from, to) = if against { (west, east) } else { (east, west) };
+            let arc = topo.add_edge(Edge::new(from, to, EdgeCurve::NurbsCurve(curve.clone())));
+            let chord = topo.add_edge(Edge::new(to, from, EdgeCurve::Line));
+            let w = wire_of(&mut topo, &[(arc, true), (chord, true)]);
+            let area = wire_area_2d(&topo, w, x, y).unwrap();
+            assert!((area - want).abs() < 1e-9, "{area} vs {want}");
+        }
     }
 
     /// A NURBS edge declines the flattening.
