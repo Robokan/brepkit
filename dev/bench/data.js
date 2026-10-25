@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792906880393,
+  "lastUpdate": 1792909909518,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -107,6 +107,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 45898379,
             "range": "± 95681",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "3e2d40694c6a7af6df678b1e565c74f4a69a9507",
+          "message": "Merge upstream/main (4.2.8): the fork's fixes as upstream merged them\n\nUpstream merged eleven of the fork's fixes (#2045-#2052, #2054-#2056)\nand released them in 4.2.3-4.2.8, with dependency bumps. Their reviewed\nversions replace the fork's originals: exact planar flux and corner\nshare in the shell orientation readings, the exact ring-face sample,\nthe rim-notch bands, the exact loop areas in the STEP reader and the\nprojection's touching spans. The fork's own work is kept. Workspace\ntests pass; a full corpus replay shows no regressions.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-24T23:29:27-07:00",
+          "tree_id": "294bcef2764001a8436bc89252b0fc71beb7fa90",
+          "url": "https://github.com/Robokan/brepkit/commit/3e2d40694c6a7af6df678b1e565c74f4a69a9507"
+        },
+        "date": 1792909908548,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 612814,
+            "range": "± 2531",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 683190,
+            "range": "± 8136",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8572,
+            "range": "± 126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 384496,
+            "range": "± 9596",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 31023116,
+            "range": "± 211915",
             "unit": "ns/iter"
           }
         ]
