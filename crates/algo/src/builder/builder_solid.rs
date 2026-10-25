@@ -599,7 +599,8 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
     // Positions are taken from the shell's own centre: a curved face
     // integrates over its boundary's whole parameter box, not its trimmed
     // patch, and that error scales with the distance to the origin used.
-    let origin = shell_corner_box(topo, faces).center();
+    let corner_box = shell_corner_box(topo, faces);
+    let origin = corner_box.center();
     for &fid in faces {
         // Only meaningful under BK_FLUX; skip the bookkeeping otherwise.
         let flux_before = if trace { flux } else { 0.0 };
@@ -856,7 +857,10 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
             }
         }
     }
-    if !any || (flux.abs() < 1e-9 && flux_wire.abs() < 1e-9) {
+    // A flux this small next to the shell's own size is rounding: it says
+    // nothing about which way the shell faces.
+    let tiny = 1e-12 * (corner_box.max - corner_box.min).length().powi(3);
+    if !any || (flux.abs() <= tiny && flux_wire.abs() <= tiny) {
         return None;
     }
     let outward = if (flux > 0.0) == (flux_wire > 0.0) {
@@ -4175,6 +4179,44 @@ mod tests {
         (wire, FaceSurface::Cylinder(surface))
     }
 
+    /// The wall of radius `r` about the z axis from `z_lo` between the rings
+    /// `lower` and `upper`, cut as they are (arc for arc) into sectors joined
+    /// by lines up the wall: each sector's loop, on the one surface.
+    fn sector_walls(
+        topo: &mut Topology,
+        r: f64,
+        z_lo: f64,
+        lower: &[EdgeId],
+        upper: &[EdgeId],
+    ) -> (Vec<Vec<OrientedEdge>>, FaceSurface) {
+        use brepkit_math::surfaces::CylindricalSurface;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+
+        let starts = |topo: &Topology, ring: &[EdgeId]| -> Vec<_> {
+            ring.iter()
+                .map(|&e| topo.edge(e).unwrap().start())
+                .collect()
+        };
+        let (b, t) = (starts(topo, lower), starts(topo, upper));
+        let ups: Vec<EdgeId> = (0..b.len())
+            .map(|k| topo.add_edge(Edge::new(b[k], t[k], EdgeCurve::Line)))
+            .collect();
+        let n = b.len();
+        let loops = (0..n)
+            .map(|k| {
+                vec![
+                    OrientedEdge::new(lower[k], true),
+                    OrientedEdge::new(ups[(k + 1) % n], true),
+                    OrientedEdge::new(upper[k], false),
+                    OrientedEdge::new(ups[k], false),
+                ]
+            })
+            .collect();
+        let axis = Vec3::new(0.0, 0.0, 1.0);
+        let surface = CylindricalSurface::new(Point3::new(0.0, 0.0, z_lo), axis, r).unwrap();
+        (loops, FaceSurface::Cylinder(surface))
+    }
+
     /// A face on `outer` with `holes`, its flag set when `reversed`.
     fn push_face(
         topo: &mut Topology,
@@ -4212,23 +4254,35 @@ mod tests {
         }
     }
 
-    /// A tube of height 1 standing at `z0`, its rim of radius 1 cut into
-    /// three arcs and its hole of radius 0.9 into four, facing out or in
-    /// (every face's flag turned, as a cut turns a cavity's).
-    fn split_tube(topo: &mut Topology, z0: f64, outward: bool) -> Vec<FaceId> {
-        let (rim_b0, rim_b) = arc_ring(topo, 1.0, z0, 3);
-        let (rim_t0, rim_t) = arc_ring(topo, 1.0, z0 + 1.0, 3);
-        let (hole_b0, hole_b) = arc_ring(topo, 0.9, z0, 4);
-        let (hole_t0, hole_t) = arc_ring(topo, 0.9, z0 + 1.0, 4);
+    /// A tube `size` tall standing at `z0`, its rim of radius `size` cut
+    /// into three arcs and its hole of radius `0.9 size` into four, facing
+    /// out or in (every face's flag turned, as a cut turns a cavity's).
+    fn split_tube(topo: &mut Topology, z0: f64, size: f64, outward: bool) -> Vec<FaceId> {
+        let (top, hole) = (z0 + size, 0.9 * size);
+        let (_, rim_b) = arc_ring(topo, size, z0, 3);
+        let (_, rim_t) = arc_ring(topo, size, top, 3);
+        let (_, hole_b) = arc_ring(topo, hole, z0, 4);
+        let (_, hole_t) = arc_ring(topo, hole, top, 4);
         let mut faces = Vec::new();
         let loops = (edge_run(&rim_b, false), vec![edge_run(&hole_b, true)]);
         push_face(topo, &mut faces, loops, z_plane(z0, false), !outward);
         let loops = (edge_run(&rim_t, true), vec![edge_run(&hole_t, false)]);
-        push_face(topo, &mut faces, loops, z_plane(z0 + 1.0, true), !outward);
-        let (outer, surface) = wall(topo, 1.0, z0, (rim_b0, &rim_b), (rim_t0, &rim_t));
-        push_face(topo, &mut faces, (outer, vec![]), surface, !outward);
-        let (outer, surface) = wall(topo, 0.9, z0, (hole_b0, &hole_b), (hole_t0, &hole_t));
-        push_face(topo, &mut faces, (outer, vec![]), surface, outward);
+        push_face(topo, &mut faces, loops, z_plane(top, true), !outward);
+        for (r, lower, upper, flipped) in [
+            (size, &rim_b, &rim_t, false),
+            (hole, &hole_b, &hole_t, true),
+        ] {
+            let (sectors, surface) = sector_walls(topo, r, z0, lower, upper);
+            for sector in sectors {
+                push_face(
+                    topo,
+                    &mut faces,
+                    (sector, vec![]),
+                    surface.clone(),
+                    flipped == outward,
+                );
+            }
+        }
         faces
     }
 
@@ -4277,19 +4331,20 @@ mod tests {
     /// A tube whose rim is cut into fewer arcs than its hole has caps whose
     /// holes outmeasure them on their corners: the corner fan has no
     /// polyhedron to read there, and the surface flux decides, the tube
-    /// facing out read as growth and facing in as a hole, wherever it stands.
+    /// facing out read as growth and facing in as a hole, wherever it stands
+    /// and however small it is.
     #[test]
     fn a_tube_whose_hole_outmeasures_its_rim_on_their_corners_reads_by_its_flux() {
-        for z0 in [0.0, 1000.0] {
+        for (z0, size) in [(0.0, 1.0), (1000.0, 1.0), (0.0, 5e-4)] {
             for outward in [true, false] {
                 let mut topo = Topology::new();
-                let faces = split_tube(&mut topo, z0, outward);
+                let faces = split_tube(&mut topo, z0, size, outward);
                 assert!(!corner_fan_holds_holes(&topo, &faces));
                 let (growth, holes) = perform_areas(&topo, &[faces]);
                 assert_eq!(
                     (growth.len(), holes.len()),
                     if outward { (1, 0) } else { (0, 1) },
-                    "at z {z0}, facing {}",
+                    "size {size} at z {z0}, facing {}",
                     if outward { "out" } else { "in" }
                 );
             }

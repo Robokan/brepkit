@@ -92,8 +92,8 @@ pub fn face_boundary_2d(
 ///
 /// Exact for lines and conic arcs, so it does not depend on how a loop's
 /// curves are split into edges. A NURBS edge is integrated knot span by
-/// knot span; `None` when a rational span's weights are so steep that its
-/// halving budget runs out before the area settles.
+/// knot span; `None` when a rational curve's weights spread so far that its
+/// area cannot be read reliably, or its halvings run out before it settles.
 ///
 /// # Errors
 ///
@@ -191,6 +191,10 @@ fn nurbs_swept(
     y: Vec3,
 ) -> Option<f64> {
     const MAX_HALVINGS: u32 = 48;
+    // Weights far apart crowd a span's curve into layers at its ends or
+    // middle that no node or probe may see; past this spread the area is
+    // not read at all rather than read wrong.
+    const WEIGHT_SPREAD: f64 = 1e3;
     let o = Vec3::new(origin.x(), origin.y(), origin.z());
     let curve = NurbsCurve::new(
         curve.degree(),
@@ -205,6 +209,15 @@ fn nurbs_swept(
     .ok()?;
     let (lo, hi) = (t0.min(t1), t0.max(t1));
     let rational = curve.is_rational();
+    if rational {
+        let (w_lo, w_hi) = curve
+            .weights()
+            .iter()
+            .fold((f64::INFINITY, 0.0_f64), |(a, b), &w| (a.min(w), b.max(w)));
+        if w_lo <= 0.0 || w_hi > WEIGHT_SPREAD * w_lo {
+            return None;
+        }
+    }
     let points = quadrature::gauss_legendre_points(if rational {
         quadrature::MAX_ORDER
     } else {
@@ -466,8 +479,9 @@ mod tests {
         wire_area_2d(&topo, w, x, y).unwrap()
     }
 
-    /// A quarter circle read the same far from the origin and with steep
-    /// weights, which crowd most of the arc into a sliver of its domain.
+    /// A quarter circle read the same far from the origin and with its
+    /// weights spread a hundredfold, which crowds the arc toward one end of
+    /// its domain.
     #[test]
     fn a_steeply_weighted_quarter_circle_reads_its_exact_area() {
         let s = std::f64::consts::FRAC_1_SQRT_2;
@@ -475,24 +489,43 @@ mod tests {
         for (at, c) in [
             ((0.0, 0.0), 1.0),
             ((1e6, 1e6), 1.0),
-            ((0.0, 0.0), 300.0),
-            ((1e6, -1e6), 300.0),
+            ((0.0, 0.0), 10.0),
+            ((1e6, -1e6), 10.0),
         ] {
             let area = quarter_disc_area(at, c * s, c * c).unwrap();
             assert!((area - quarter).abs() < 1e-9, "at {at:?}, c {c}: {area}");
         }
     }
 
-    /// Weights so steep that the arc runs within 1e-20 of its domain's end:
-    /// the area reads exactly or not at all, never as the near-zero the
+    /// Weights spread so far that the arc runs within a sliver of its
+    /// domain's end, or hugs its middle control point but at its two ends:
+    /// the area is not read rather than read as the near-zero the
     /// quadrature nodes see.
     #[test]
-    fn a_quarter_circle_too_steep_to_settle_reads_nothing_rather_than_wrong() {
+    fn a_curve_weighted_too_steeply_reads_nothing_rather_than_wrong() {
         let s = std::f64::consts::FRAC_1_SQRT_2;
-        let area = quarter_disc_area((0.0, 0.0), 1e20 * s, 1e40);
-        if let Some(area) = area {
-            assert!((area - std::f64::consts::FRAC_PI_4).abs() < 1e-9, "{area}");
-        }
+        assert_eq!(quarter_disc_area((0.0, 0.0), 300.0 * s, 9e4), None);
+        assert_eq!(quarter_disc_area((0.0, 0.0), 1e20 * s, 1e40), None);
+
+        let tent = NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.5, 0.25, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+            ],
+            vec![1.0, 1e20, 1.0],
+        )
+        .unwrap();
+        let mut topo = Topology::new();
+        let a = topo.add_vertex(Vertex::new(Point3::new(0.0, 0.0, 0.0), 1e-7));
+        let b = topo.add_vertex(Vertex::new(Point3::new(1.0, 0.0, 0.0), 1e-7));
+        let arc = topo.add_edge(Edge::new(a, b, EdgeCurve::NurbsCurve(tent)));
+        let chord = topo.add_edge(Edge::new(b, a, EdgeCurve::Line));
+        let w = wire_of(&mut topo, &[(arc, true), (chord, true)]);
+        let (x, y) = XY;
+        assert_eq!(wire_area_2d(&topo, w, x, y).unwrap(), None);
     }
 
     /// A NURBS edge declines the flattening.
