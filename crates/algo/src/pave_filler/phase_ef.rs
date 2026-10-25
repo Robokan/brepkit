@@ -1246,7 +1246,7 @@ fn distance_to_surface(pt: Point3, surface: &FaceSurface) -> f64 {
         FaceSurface::Sphere(sp) => {
             return ((pt - sp.center()).length() - sp.radius()).abs();
         }
-        _ => {}
+        FaceSurface::Cone(_) | FaceSurface::Torus(_) | FaceSurface::Nurbs(_) => {}
     }
     if let Some((u, v)) = surface.project_point(pt) {
         if let Some(surf_pt) = surface.evaluate(u, v) {
@@ -1323,7 +1323,7 @@ mod tests {
 
     /// The closed-form distances to a cylinder and a sphere equal the
     /// projection's foot distance they replace, for surfaces placed off the
-    /// axes and points inside, outside and on them.
+    /// axes and points on them and moved off them inward and outward.
     #[test]
     fn closed_form_distances_match_the_projection() {
         use brepkit_math::surfaces::{CylindricalSurface, SphericalSurface};
@@ -1340,13 +1340,15 @@ mod tests {
             FaceSurface::Sphere(SphericalSurface::new(Point3::new(-4.0, 0.5, 2.0), 2.25).unwrap()),
         ];
         for s in &surfaces {
-            for k in 0..30 {
+            // Points on each surface, then moved off it along its normal by
+            // amounts inside it, near it and out past it.
+            for k in 0..30_u32 {
                 let t = f64::from(k);
-                let p = Point3::new(
-                    3.0 * (0.7 * t).cos(),
-                    2.0 * (1.3 * t).sin() - 1.0,
-                    0.4 * t - 4.0,
-                );
+                let (u, v) = (0.7 * t, 0.4 * t - 4.0);
+                let on = s.evaluate(u, v.clamp(-1.4, 1.4)).unwrap();
+                let n = s.normal(u, v.clamp(-1.4, 1.4));
+                let offset = [0.0, 1e-9, -1e-6, -0.8, 0.5, 6.0][usize::try_from(k % 6).unwrap()];
+                let p = on + n * offset;
                 let (closed, projected) = (distance_to_surface(p, s), foot(p, s));
                 assert!(
                     (closed - projected).abs() < 1e-9,
