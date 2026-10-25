@@ -438,8 +438,42 @@ struct SurvEdge {
     oe: OrientedEdge,
     start: brepkit_topology::vertex::VertexId,
     end: brepkit_topology::vertex::VertexId,
-    start_uv: (f64, f64),
     tangent_uv: (f64, f64),
+    /// The edge's outline in UV from its start, its end left out: the start
+    /// alone for a line, the start and interior samples for a curve.
+    uv_run: Vec<(f64, f64)>,
+}
+
+/// An edge's outline in UV as it is traversed, its end left out: its start
+/// alone for a line, its start and interior samples for a curve.
+fn edge_uv_run(
+    topo: &Topology,
+    oe: &OrientedEdge,
+    to_uv: &impl Fn(brepkit_math::vec::Point3) -> (f64, f64),
+) -> Result<Vec<(f64, f64)>, HealError> {
+    const SAMPLES: usize = 16;
+    let edge = topo.edge(oe.edge())?;
+    // The curve runs from the edge's own start; the traversal may not.
+    let (es, ee) = (
+        topo.vertex(edge.start())?.point(),
+        topo.vertex(edge.end())?.point(),
+    );
+    if matches!(edge.curve(), EdgeCurve::Line) {
+        return Ok(vec![to_uv(if oe.is_forward() { es } else { ee })]);
+    }
+    let (t0, t1) = edge.curve().domain_with_endpoints(es, ee);
+    Ok((0..SAMPLES)
+        .map(|k| {
+            #[allow(clippy::cast_precision_loss)]
+            let f = k as f64 / SAMPLES as f64;
+            let t = if oe.is_forward() {
+                t0 + f * (t1 - t0)
+            } else {
+                t1 - f * (t1 - t0)
+            };
+            to_uv(edge.curve().evaluate_with_endpoints(t, es, ee))
+        })
+        .collect())
 }
 
 /// A reassembled closed loop with its UV polygon and signed area.
@@ -529,34 +563,21 @@ fn merge_group_with_holes(
         let sp = topo.vertex(start)?.point();
         let ep = topo.vertex(end)?.point();
         // A full circle is stored as a CLOSED edge: start == end with a zero
-        // chord, which the degenerate-sliver test below cannot tell it apart
-        // from. Sampling the curve interior separates them (the endpoints of a
-        // closed curve carry no extent — see the closed-edge rule in
-        // CLAUDE.md). Such a loop is a real boundary, typically a bore opening,
-        // but it reaches the loop walk as a SINGLE-VERTEX loop, and the
-        // containment classification below needs a UV polygon with area to
-        // decide outer-vs-hole. Dropping the edge instead would erase the hole
-        // and orphan its rim — a drilled pad annulus merged into its coplanar
-        // neighbour leaves the bore rim used once (free) — so defer the whole
-        // group rather than merge it wrongly.
-        if start == end {
-            let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
-            let mid = edge
-                .curve()
-                .evaluate_with_endpoints(0.5 * (t0 + t1), sp, ep);
-            if (mid - sp).length() > lin {
-                log::debug!(
-                    "unify_same_domain: deferring group of {} faces (closed-curve boundary loop)",
-                    group_face_ids.len()
-                );
-                return Ok(None);
-            }
-        }
-        if (ep - sp).length() < lin && start == end {
+        // chord, which a chord test cannot tell apart from a point; its
+        // samples can. Such a loop is a real boundary, typically a bore
+        // opening: it is kept as a loop of its own, outlined by its samples.
+        let uv_run = edge_uv_run(topo, oe, &to_uv)?;
+        let closed = start == end
+            && uv_run.iter().any(|&q| {
+                let p = to_uv(sp);
+                (q.0 - p.0).hypot(q.1 - p.1) > lin
+            });
+        if (ep - sp).length() < lin && start == end && !closed {
             continue;
         }
         let start_uv = to_uv(sp);
-        let end_uv = to_uv(ep);
+        // A curve leaves its start toward its first sample, not its chord.
+        let end_uv = uv_run.get(1).copied().unwrap_or_else(|| to_uv(ep));
         let dx = end_uv.0 - start_uv.0;
         let dy = end_uv.1 - start_uv.1;
         let len = dx.hypot(dy);
@@ -569,8 +590,8 @@ fn merge_group_with_holes(
             oe: *oe,
             start,
             end,
-            start_uv,
             tangent_uv,
+            uv_run,
         });
     }
 
@@ -587,6 +608,13 @@ fn merge_group_with_holes(
 
     let mut used = vec![false; edges.len()];
     let mut loops: Vec<Vec<usize>> = Vec::new();
+    // A closed edge is a loop of its own, kept out of the walk.
+    for (i, e) in edges.iter().enumerate() {
+        if e.start == e.end {
+            used[i] = true;
+            loops.push(vec![i]);
+        }
+    }
 
     for seed in 0..edges.len() {
         if used[seed] {
@@ -641,7 +669,10 @@ fn merge_group_with_holes(
     // Build per-loop UV polygons and signed areas for classification.
     let mut infos: Vec<LoopInfo> = Vec::with_capacity(loops.len());
     for loop_edges in loops {
-        let uv_points: Vec<(f64, f64)> = loop_edges.iter().map(|&i| edges[i].start_uv).collect();
+        let uv_points: Vec<(f64, f64)> = loop_edges
+            .iter()
+            .flat_map(|&i| edges[i].uv_run.iter().copied())
+            .collect();
         let signed_area = polygon_signed_area(&uv_points);
         infos.push(LoopInfo {
             edge_indices: loop_edges,
@@ -655,7 +686,7 @@ fn merge_group_with_holes(
     let n_loops = infos.len();
     let mut is_outer = vec![true; n_loops];
     for i in 0..n_loops {
-        let Some(sample) = loop_interior_point(&infos[i].uv_points) else {
+        let Some(sample) = loop_boundary_point(&infos[i].uv_points) else {
             return Ok(None);
         };
         for j in 0..n_loops {
@@ -679,7 +710,7 @@ fn merge_group_with_holes(
     // Route each hole to the outer region whose polygon contains its sample.
     let mut region_holes: HashMap<usize, Vec<usize>> = HashMap::new();
     for &h in &hole_indices {
-        let Some(sample) = loop_interior_point(&infos[h].uv_points) else {
+        let Some(sample) = loop_boundary_point(&infos[h].uv_points) else {
             return Ok(None);
         };
         let mut owner: Option<usize> = None;
@@ -708,8 +739,7 @@ fn merge_group_with_holes(
         let wire = topo.wire(topo.face(fid)?.outer_wire())?;
         let mut pts = Vec::with_capacity(wire.edges().len());
         for oe in wire.edges() {
-            let edge = topo.edge(oe.edge())?;
-            pts.push(to_uv(topo.vertex(oe.oriented_start(edge))?.point()));
+            pts.extend(edge_uv_run(topo, oe, &to_uv)?);
         }
         let area = polygon_signed_area(&pts);
         if area.abs() > widest.abs() {
@@ -784,19 +814,22 @@ fn polygon_signed_area(pts: &[(f64, f64)]) -> f64 {
     acc * 0.5
 }
 
-/// A representative interior point of a UV polygon (centroid; falls back to the
-/// midpoint of the first edge for non-convex shapes by nudging inward).
-fn loop_interior_point(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
+/// A point on a UV polygon's boundary, the middle of its longest side: inside
+/// another loop exactly when the polygon is (loops that do not cross meet at
+/// vertices at most). A centroid is no such probe: an outer loop's centroid
+/// can sit in one of its holes.
+fn loop_boundary_point(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
     if pts.len() < 3 {
         return None;
     }
-    // Midpoint of the first edge nudged toward the polygon centroid keeps the
-    // sample strictly inside even for non-convex loops.
-    let cx: f64 = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
-    let cy: f64 = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
-    let mid = ((pts[0].0 + pts[1].0) * 0.5, (pts[0].1 + pts[1].1) * 0.5);
-    let sample = (mid.0 * 0.001 + cx * 0.999, mid.1 * 0.001 + cy * 0.999);
-    Some(sample)
+    (0..pts.len())
+        .map(|i| (pts[i], pts[(i + 1) % pts.len()]))
+        .max_by(|(a, b), (c, d)| {
+            let l1 = (b.0 - a.0).hypot(b.1 - a.1);
+            let l2 = (d.0 - c.0).hypot(d.1 - c.1);
+            l1.total_cmp(&l2)
+        })
+        .map(|(a, b)| ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5))
 }
 
 /// Even-odd point-in-polygon test in UV.
@@ -1252,6 +1285,71 @@ mod hole_merge_tests {
             let f = topo.face(fid).unwrap();
             assert_eq!(f.inner_wires().len(), 1, "each region keeps its hole");
         }
+    }
+
+    #[test]
+    fn unify_keeps_a_round_hole_where_the_merged_outline_centres() {
+        // A 4 x 2 plate holed by a full circle at (3, 1), r = 0.5, and a
+        // 1 x 2 tab beside it, sharing the plate's edge x = 4. The merged
+        // outline's vertices average to (3, 1), the hole's centre.
+        let mut topo = Topology::default();
+        let v00 = add_vertex(&mut topo, 0.0, 0.0);
+        let v40 = add_vertex(&mut topo, 4.0, 0.0);
+        let v50 = add_vertex(&mut topo, 5.0, 0.0);
+        let v52 = add_vertex(&mut topo, 5.0, 2.0);
+        let v42 = add_vertex(&mut topo, 4.0, 2.0);
+        let v02 = add_vertex(&mut topo, 0.0, 2.0);
+        let e_mid = line(&mut topo, v40, v42);
+        let p_b = line(&mut topo, v00, v40);
+        let p_t = line(&mut topo, v42, v02);
+        let p_l = line(&mut topo, v02, v00);
+        let plate_outer = loop_of(
+            &mut topo,
+            &[(p_b, true), (e_mid, true), (p_t, true), (p_l, true)],
+        );
+        let circle = brepkit_math::curves::Circle3D::new(
+            Point3::new(3.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            0.5,
+        )
+        .unwrap();
+        let hv = topo.add_vertex(Vertex::new(circle.evaluate(0.0), 1e-7));
+        let rim = topo.add_edge(Edge::new(hv, hv, EdgeCurve::Circle(circle)));
+        let hole = loop_of(&mut topo, &[(rim, false)]);
+        let plate = topo.add_face(Face::new(plate_outer, vec![hole], plane_z0()));
+        let t_b = line(&mut topo, v40, v50);
+        let t_r = line(&mut topo, v50, v52);
+        let t_t = line(&mut topo, v52, v42);
+        let tab_outer = loop_of(
+            &mut topo,
+            &[(t_b, true), (t_r, true), (t_t, true), (e_mid, false)],
+        );
+        let tab = topo.add_face(Face::new(tab_outer, vec![], plane_z0()));
+        let shell_id = topo.add_shell(Shell::new(vec![plate, tab]).unwrap());
+        let solid_id = topo.add_solid(Solid::new(shell_id, vec![]));
+
+        let opts = UnifyOptions {
+            unify_edges: false,
+            ..UnifyOptions::default()
+        };
+        let (_, result) = unify_same_domain(&mut topo, solid_id, &opts).unwrap();
+        assert_eq!(
+            result.faces_merged, 1,
+            "the plate and the tab become one face"
+        );
+        let shell = topo.shell(shell_id).unwrap();
+        assert_eq!(shell.faces().len(), 1);
+        let merged = topo.face(shell.faces()[0]).unwrap();
+        assert_eq!(merged.inner_wires().len(), 1, "the round hole stays a hole");
+        let inner = topo.wire(merged.inner_wires()[0]).unwrap();
+        assert_eq!(inner.edges().len(), 1);
+        assert_eq!(inner.edges()[0].edge(), rim);
+        let outer = topo.wire(merged.outer_wire()).unwrap();
+        assert_eq!(
+            outer.edges().len(),
+            6,
+            "the outline is plate and tab, the seam gone"
+        );
     }
 }
 
