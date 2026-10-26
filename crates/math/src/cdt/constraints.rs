@@ -132,6 +132,7 @@ impl Cdt {
                 } else {
                     // Quad is not convex — try from the other side.
                     // Find a different intersecting edge.
+                    let mut flipped = false;
                     if let Some((ti2, local2)) = self.find_other_intersecting_edge(v0, v1, e0, e1) {
                         let adj2 = match self.triangles[ti2].adj[local2] {
                             Some(a) => a,
@@ -143,8 +144,17 @@ impl Cdt {
                             let opp2 = self.find_shared_edge_local(adj2, e2a, e2b).unwrap_or(0);
                             if self.is_convex_quad(ti2, local2, adj2, opp2) {
                                 self.flip_edge(ti2, local2, adj2, opp2);
+                                flipped = true;
                             }
                         }
+                    }
+                    // Neither end of the corridor flips (a long side passing
+                    // close by reflex corners): some crossing edge in it
+                    // always has a convex quad, so take the first that does
+                    // rather than spin until the bisection backstop splits a
+                    // valid outline.
+                    if !flipped {
+                        self.flip_any_crossing_edge(v0, v1);
                     }
                 }
             } else {
@@ -395,6 +405,40 @@ impl Cdt {
         }
 
         None
+    }
+
+    /// Flip the first unconstrained edge crossing the segment `v0`–`v1`
+    /// whose quad is convex, if there is one.
+    fn flip_any_crossing_edge(&mut self, v0: usize, v1: usize) {
+        let p0 = self.vertices[v0];
+        let p1 = self.vertices[v1];
+        for ti in 0..self.triangles.len() {
+            if self.triangles[ti].removed {
+                continue;
+            }
+            for local in 0..3 {
+                let ea = self.triangles[ti].v[(local + 1) % 3];
+                let eb = self.triangles[ti].v[(local + 2) % 3];
+                if ea == v0 || ea == v1 || eb == v0 || eb == v1 {
+                    continue;
+                }
+                if self.constraints.contains(&sorted_pair(ea, eb))
+                    || !segments_properly_intersect(p0, p1, self.vertices[ea], self.vertices[eb])
+                {
+                    continue;
+                }
+                let Some(adj) = self.triangles[ti].adj[local] else {
+                    continue;
+                };
+                let Some(opp) = self.find_shared_edge_local(adj, ea, eb) else {
+                    continue;
+                };
+                if self.is_convex_quad(ti, local, adj, opp) {
+                    self.flip_edge(ti, local, adj, opp);
+                    return;
+                }
+            }
+        }
     }
 
     /// Find an intersecting edge different from (skip_e0, skip_e1).
