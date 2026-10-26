@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793027735115,
+  "lastUpdate": 1793035165858,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1025,6 +1025,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 31936694,
             "range": "± 1183831",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "755f7ab36b7be38c361ab6502157a461b962fdb7",
+          "message": "fix(measure): keep the old anchor for solids with torus faces\n\nThe torus closed forms read wrong about a point off the torus's axis:\na torus cut by planes, measured about its pieces' centres, summed short\n(torus_plane_cut's three piece-sum tests). Solids with torus faces keep\nthe old anchor until those forms are fixed.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-26T08:37:29-07:00",
+          "tree_id": "cd782e4ebca2e2c809522d15896cb6be7e0e1b34",
+          "url": "https://github.com/Robokan/brepkit/commit/755f7ab36b7be38c361ab6502157a461b962fdb7"
+        },
+        "date": 1793035164132,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 613403,
+            "range": "± 11276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 663295,
+            "range": "± 8430",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8730,
+            "range": "± 1906",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 375989,
+            "range": "± 6746",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 30627500,
+            "range": "± 305840",
             "unit": "ns/iter"
           }
         ]
