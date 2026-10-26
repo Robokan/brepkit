@@ -2772,10 +2772,13 @@ fn cdt_in_surface_frame(
     // across the dip Delaunay joins the loop's two sides. And so does any
     // patch a section bounds in part: raw `(u, v)` mixes radians with
     // lengths, and Delaunay there joins rim samples to section samples far
-    // round the wall, a sheared strip longer than the surface it spans.
+    // round the wall, a sheared strip longer than the surface it spans. So
+    // does a wall stepped along its rim, whose reflex corner Delaunay fans to
+    // the far rim.
     let notched_wall = is_notched_wall(topo, face_data)?
         || is_wound_wall(topo, face_data)?
-        || is_section_bound(topo, face_data)?;
+        || is_section_bound(topo, face_data)?
+        || is_stepped_wall(topo, face_data)?;
     let holed_wall_radius = if holes.is_empty() && !notched_wall {
         None
     } else {
@@ -4968,6 +4971,32 @@ pub(super) fn is_section_bound(
         }
     }
     Ok(false)
+}
+
+/// Whether a cylinder or cone wall's outer loop has rim circles at more
+/// than two heights: a wall stepped along its rim (a C-shaped band whose
+/// floor drops partway round), which is not the (u, v) box between two rims
+/// that the grid fills.
+pub(super) fn is_stepped_wall(
+    topo: &Topology,
+    face_data: &brepkit_topology::face::Face,
+) -> Result<bool, crate::OperationsError> {
+    let (origin, axis, scale) = match face_data.surface() {
+        FaceSurface::Cylinder(c) => (c.origin(), c.axis(), c.radius()),
+        FaceSurface::Cone(c) => (c.apex(), c.axis(), 1.0),
+        _ => return Ok(false),
+    };
+    let tol = 1e-7 * scale.max(1.0);
+    let mut heights: Vec<f64> = Vec::new();
+    for oe in topo.wire(face_data.outer_wire())?.edges() {
+        if let EdgeCurve::Circle(circle) = topo.edge(oe.edge())?.curve() {
+            let h = axis.dot(circle.center() - origin);
+            if heights.iter().all(|&k| (k - h).abs() > tol) {
+                heights.push(h);
+            }
+        }
+    }
+    Ok(heights.len() > 2)
 }
 
 /// Evaluate a non-planar surface at `(u, v)` and return a 3D point.

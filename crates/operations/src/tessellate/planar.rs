@@ -703,7 +703,20 @@ fn find_interior_seed(polygon: &[brepkit_math::vec::Point2]) -> brepkit_math::ve
         return polygon[0];
     }
 
-    for i in 0..n {
+    // Step in from the vertex whose shorter edge is longest. The seed steps a
+    // fraction of that edge, so a vertex at a corner where two sampled curves
+    // meet a hair apart (the last edge ending just past the first, which makes
+    // a sliver lobe) gives a seed in the lobe, and the flood from it stops
+    // there; the middle of a smooth run is well clear of that.
+    let shorter_edge = |i: usize| {
+        let (p, c, q) = (polygon[(i + n - 1) % n], polygon[i], polygon[(i + 1) % n]);
+        (p.x() - c.x())
+            .hypot(p.y() - c.y())
+            .min((q.x() - c.x()).hypot(q.y() - c.y()))
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| shorter_edge(b).total_cmp(&shorter_edge(a)));
+    for i in order {
         let prev = polygon[(i + n - 1) % n];
         let curr = polygon[i];
         let next = polygon[(i + 1) % n];

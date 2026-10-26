@@ -3685,3 +3685,134 @@ fn only_a_face_left_genuinely_empty_is_reported_unmeshed() {
     }
     assert_eq!(core.unmeshed, vec![sliver]);
 }
+
+/// A hole sampled from several curves can close a hair past its own start:
+/// its last edge then crosses its first, leaving a sliver lobe at the first
+/// vertex. A seed stepped in from that vertex lands in the lobe, and the
+/// flood from it stops there, leaving the hole meshed over.
+#[test]
+fn hole_seed_clears_a_lobe_where_the_loop_overshoots_its_start() {
+    use brepkit_math::vec::Point2;
+
+    // A 2 x 1 rectangle walked from (0, 0), its last sample a hair past
+    // the start along the first side's line.
+    let hole = vec![
+        Point2::new(0.0, 0.0),
+        Point2::new(0.5, 0.0),
+        Point2::new(1.0, 0.0),
+        Point2::new(1.5, 0.0),
+        Point2::new(2.0, 0.0),
+        Point2::new(2.0, 1.0),
+        Point2::new(1.0, 1.0),
+        Point2::new(0.0, 1.0),
+        Point2::new(0.0, 0.5),
+        Point2::new(3e-5, -1e-6),
+    ];
+    let seeds = super::planar::hole_removal_seeds(&hole, &[(0, hole.len())]);
+    assert_eq!(seeds.len(), 1);
+    let seed = seeds[0];
+    // Inside the rectangle, and clear of its overshooting corner.
+    assert!(
+        seed.x() > 0.0 && seed.x() < 2.0 && seed.y() > 0.0 && seed.y() < 1.0,
+        "seed {seed:?} is outside the hole"
+    );
+    assert!(
+        seed.x().hypot(seed.y()) > 0.1,
+        "seed {seed:?} is in the lobe"
+    );
+}
+
+/// A cylinder wall stepped along its rim: its floor is one height for part
+/// of the turn and another for the rest, and its top runs nearly the whole
+/// turn (a C-shaped band with a slit). It is not the (u, v) box between two
+/// rims that the analytic grid fills, which meshed it as the whole band.
+#[test]
+fn stepped_cylinder_wall_meshes_its_own_outline() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_math::surfaces::CylindricalSurface;
+
+    let r = 3.5;
+    let z = Vec3::new(0.0, 0.0, 1.0);
+    let (a1, a2) = (185.0_f64.to_radians(), 354.6_f64.to_radians());
+    let at = |angle: f64, h: f64| Point3::new(r * angle.cos(), r * angle.sin(), h);
+    let mut topo = Topology::new();
+    let [a, b, c, d, e, f] = [
+        at(0.0, 0.0),
+        at(a1, 0.0),
+        at(a1, 2.5),
+        at(a2, 2.5),
+        at(a2, 4.0),
+        at(0.0, 4.0),
+    ]
+    .map(|p| topo.add_vertex(Vertex::new(p, 1e-7)));
+    let rim = |h: f64| EdgeCurve::Circle(Circle3D::new(Point3::new(0.0, 0.0, h), z, r).unwrap());
+    let low = topo.add_edge(Edge::new(a, b, rim(0.0)));
+    let up1 = topo.add_edge(Edge::new(b, c, EdgeCurve::Line));
+    let mid = topo.add_edge(Edge::new(c, d, rim(2.5)));
+    let up2 = topo.add_edge(Edge::new(d, e, EdgeCurve::Line));
+    let top = topo.add_edge(Edge::new(f, e, rim(4.0)));
+    let down = topo.add_edge(Edge::new(f, a, EdgeCurve::Line));
+    let wire = topo.add_wire(
+        Wire::new(
+            vec![
+                OrientedEdge::new(low, true),
+                OrientedEdge::new(up1, true),
+                OrientedEdge::new(mid, true),
+                OrientedEdge::new(up2, true),
+                OrientedEdge::new(top, false),
+                OrientedEdge::new(down, true),
+            ],
+            true,
+        )
+        .unwrap(),
+    );
+    let cylinder = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), z, r).unwrap();
+    let face = topo.add_face(Face::new(wire, vec![], FaceSurface::Cylinder(cylinder)));
+
+    let mesh = tessellate(&topo, face, 0.03).unwrap();
+    let area: f64 = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let [p, q, s] = [t[0], t[1], t[2]].map(|i| mesh.positions[i as usize]);
+            0.5 * (q - p).cross(s - p).length()
+        })
+        .sum();
+    let exact = r * (a1 * 4.0 + (a2 - a1) * 1.5);
+    assert!(
+        (area - exact).abs() < 1e-2 * exact,
+        "mesh area {area}, the wall's {exact}"
+    );
+}
+
+/// A NURBS edge read from a file can end off its vertices by the file's
+/// tolerance (6e-4 on one part). Its samples' ends are the vertices every
+/// edge meeting there shares at any deflection; left unsnapped below some
+/// deflection, they missed the neighbouring edges' ends and the face's
+/// outline came apart there.
+#[test]
+fn nurbs_edge_samples_end_on_vertices_off_its_curve() {
+    use brepkit_math::nurbs::curve::NurbsCurve;
+
+    let mut topo = Topology::new();
+    let start = Point3::new(0.0, 0.0, 0.0);
+    let end = Point3::new(10.0, 0.0, 0.0);
+    let off = Vec3::new(0.0, 5e-4, 0.0);
+    let curve = NurbsCurve::new(
+        1,
+        vec![0.0, 0.0, 1.0, 1.0],
+        vec![start + off, end + off],
+        vec![1.0, 1.0],
+    )
+    .unwrap();
+    let a = topo.add_vertex(Vertex::new(start, 1e-3));
+    let b = topo.add_vertex(Vertex::new(end, 1e-3));
+    let id = topo.add_edge(Edge::new(a, b, EdgeCurve::NurbsCurve(curve)));
+    let edge = topo.edge(id).unwrap();
+    for deflection in [0.001, 0.01, 0.05] {
+        let samples =
+            super::edge_sampling::sample_edge(&topo, edge, deflection, 0.5, false).unwrap();
+        assert_eq!(samples.first().copied(), Some(start), "at {deflection}");
+        assert_eq!(samples.last().copied(), Some(end), "at {deflection}");
+    }
+}
