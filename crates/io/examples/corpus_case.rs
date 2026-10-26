@@ -455,6 +455,74 @@ fn main() {
         }
         return;
     }
+    // A fuse of bodies of several solids runs as the bridge runs it: the
+    // solids whose boxes meet are fused in turn, group by group. STEP=<i>
+    // writes the pair of the group's i-th fuse to part.step and tool.step.
+    if op == BooleanOp::Fuse && (b.len() > 1 || a.len() > 1) {
+        let stop: Option<usize> = std::env::var("STEP").ok().and_then(|v| v.parse().ok());
+        let boxes_meet = |topo: &Topology, x: SolidId, y: SolidId| {
+            let (p, q) = (
+                brepkit_operations::measure::solid_bounding_box(topo, x).unwrap(),
+                brepkit_operations::measure::solid_bounding_box(topo, y).unwrap(),
+            );
+            p.intersects(q)
+        };
+        let mut groups: Vec<Vec<SolidId>> = Vec::new();
+        for &s in a.iter().chain(b.iter()) {
+            let (touching, rest): (Vec<Vec<SolidId>>, Vec<Vec<SolidId>>) = groups
+                .into_iter()
+                .partition(|g| g.iter().any(|&t| boxes_meet(&topo, s, t)));
+            let mut merged = vec![s];
+            merged.extend(touching.into_iter().flatten());
+            groups = rest;
+            groups.push(merged);
+        }
+        let mut step = 0;
+        for g in &groups {
+            let mut acc = g[0];
+            for &s in &g[1..] {
+                if stop == Some(step) {
+                    std::fs::write(
+                        "part.step",
+                        brepkit_io::step::write_step(&topo, &[acc]).unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        "tool.step",
+                        brepkit_io::step::write_step(&topo, &[s]).unwrap(),
+                    )
+                    .unwrap();
+                    println!("wrote part.step and tool.step for fuse {step}");
+                    return;
+                }
+                let before = brepkit_operations::boolean::mesh_fallback_count();
+                match brepkit_operations::boolean::boolean_with_options(
+                    &mut topo,
+                    op,
+                    acc,
+                    s,
+                    BooleanOptions::default(),
+                ) {
+                    Ok(r) => {
+                        let fb = brepkit_operations::boolean::mesh_fallback_count() > before;
+                        println!(
+                            "fuse {step}: fallback={fb} {} + {} -> {}",
+                            census(&topo, acc),
+                            census(&topo, s),
+                            census(&topo, r)
+                        );
+                        acc = r;
+                    }
+                    Err(e) => {
+                        println!("fuse {step}: error {e}");
+                        break;
+                    }
+                }
+                step += 1;
+            }
+        }
+        return;
+    }
     // REPEAT=<n>: run the boolean n more times on copies of the inputs and
     // print the median time, for profiling
     if let Some(n) = std::env::var("REPEAT")
