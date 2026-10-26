@@ -88,7 +88,11 @@ fn reads_closed(stretch: f64) {
     .unwrap();
     #[allow(clippy::cast_possible_truncation)]
     let key = |p: brepkit_math::vec::Point3| {
-        ((p.x() * 1e5).round() as i64, (p.y() * 1e5).round() as i64, (p.z() * 1e5).round() as i64)
+        (
+            (p.x() * 1e5).round() as i64,
+            (p.y() * 1e5).round() as i64,
+            (p.z() * 1e5).round() as i64,
+        )
     };
     let mut weld = std::collections::HashMap::new();
     let ids: Vec<usize> = mesh

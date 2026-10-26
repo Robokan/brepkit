@@ -406,7 +406,10 @@ fn orient_chamfer_face(
 /// to the other contact point. Each such detour is replaced by the chamfer's
 /// cross edge between the two points, which the end face then shares with
 /// the chamfer face. That drops the corner triangle from the end face at a
-/// convex edge and adds it at a concave one. A cross edge with no detour to
+/// convex edge and adds it at a concave one. The detour can pass more
+/// vertices than the corner, where an end face's straight edge was left in
+/// pieces and the chamfer reaches past the piece at the corner; the shortest
+/// run between the contact points is taken. A cross edge with no detour to
 /// take it (two chamfers meeting at the vertex, or a contact edge that
 /// could not be matched to the trimmer's) would leave the shell open, so
 /// the chamfer is refused.
@@ -424,8 +427,11 @@ fn close_chamfer_ends(
         })
     };
     for &(cross, from, to, chamfer) in cross_edges {
-        let mut spliced_one = false;
-        'faces: for &fid in faces {
+        // The shortest run of two or more edges, in any end face's wire,
+        // from one contact point to the other: (face, wire, first edge,
+        // edges in the run, whether it starts at `from`).
+        let mut best: Option<(FaceId, WireId, usize, usize, bool)> = None;
+        for &fid in faces {
             let face = topo.face(fid)?;
             let wires: Vec<WireId> = std::iter::once(face.outer_wire())
                 .chain(face.inner_wires().iter().copied())
@@ -437,30 +443,36 @@ fn close_chamfer_ends(
                     continue;
                 }
                 for i in 0..n {
-                    let (a, corner) = ends(topo, &edges[i])?;
-                    let (corner2, b) = ends(topo, &edges[(i + 1) % n])?;
-                    if corner != corner2 || !((a == from && b == to) || (a == to && b == from)) {
+                    let (a, _) = ends(topo, &edges[i])?;
+                    if a != from && a != to {
                         continue;
                     }
-                    let mut spliced: Vec<OrientedEdge> =
-                        (0..n).map(|k| edges[(i + 2 + k) % n]).take(n - 2).collect();
-                    spliced.push(OrientedEdge::new(cross, a == from));
-                    let new_wire = topo.add_wire(Wire::new(spliced, true)?);
-                    let face = topo.face_mut(fid)?;
-                    if face.outer_wire() == wid {
-                        face.set_outer_wire(new_wire);
-                    } else if let Some(slot) =
-                        face.inner_wires_mut().iter_mut().find(|w| **w == wid)
-                    {
-                        *slot = new_wire;
+                    let other = if a == from { to } else { from };
+                    for k in 1..n {
+                        let (_, b) = ends(topo, &edges[(i + k - 1) % n])?;
+                        if b == from || b == to {
+                            if b == other && k >= 2 && best.is_none_or(|(.., len, _)| k < len) {
+                                best = Some((fid, wid, i, k, a == from));
+                            }
+                            break;
+                        }
                     }
-                    spliced_one = true;
-                    break 'faces;
                 }
             }
         }
-        if !spliced_one {
+        let Some((fid, wid, i, k, starts_at_from)) = best else {
             return Err(BlendError::TrimmingFailure { face: chamfer });
+        };
+        let edges = topo.wire(wid)?.edges().to_vec();
+        let n = edges.len();
+        let mut spliced: Vec<OrientedEdge> = (0..n - k).map(|j| edges[(i + k + j) % n]).collect();
+        spliced.push(OrientedEdge::new(cross, starts_at_from));
+        let new_wire = topo.add_wire(Wire::new(spliced, true)?);
+        let face = topo.face_mut(fid)?;
+        if face.outer_wire() == wid {
+            face.set_outer_wire(new_wire);
+        } else if let Some(slot) = face.inner_wires_mut().iter_mut().find(|w| **w == wid) {
+            *slot = new_wire;
         }
     }
     Ok(())
