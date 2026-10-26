@@ -3057,7 +3057,21 @@ pub fn volume_from_direct_face_tessellation(
     // their shared edge differ (a chord against the curve it sags from) the
     // gap's flux grows with its distance from the anchor: take the solid's
     // own centre, not the origin a part may sit far from.
-    let about = solid_centre(topo, solid);
+    // The torus closed forms below read wrong about a point off the
+    // torus's axis (a torus cut by planes, measured about its piece's
+    // centre, summed short), so a solid with torus faces keeps the old
+    // anchor.
+    let has_torus = brepkit_topology::explorer::solid_faces(topo, solid)?
+        .into_iter()
+        .any(|f| {
+            topo.face(f)
+                .is_ok_and(|f| matches!(f.surface(), FaceSurface::Torus(_)))
+        });
+    let about = if has_torus {
+        sum_anchor(topo, solid)
+    } else {
+        solid_centre(topo, solid)
+    };
     let mut total: f64 = 0.0;
     for fid in brepkit_topology::explorer::solid_faces(topo, solid)? {
         let face = topo.face(fid)?;
