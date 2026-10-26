@@ -42,6 +42,16 @@ enum ChamferEdgeSet {
         /// Angle from face 1 (radians).
         angle: f64,
     },
+    /// Two distances, `d1` on each edge's given reference face and `d2` on
+    /// its other face.
+    Referenced {
+        /// Edges to chamfer, each with its reference face.
+        edges: Vec<(EdgeId, FaceId)>,
+        /// Distance on the reference face.
+        d1: f64,
+        /// Distance on the other face.
+        d2: f64,
+    },
 }
 
 /// Builder for chamfer (bevel) operations on solid edges.
@@ -91,6 +101,26 @@ impl<'a> ChamferBuilder<'a> {
         self
     }
 
+    /// Add edges with two distances, `d1` on each edge's reference face and
+    /// `d2` on its other face (a distance-and-angle chamfer measured from a
+    /// chosen face is `d2 = d1 * tan(angle)`). A reference face that does
+    /// not border its edge fails the build.
+    ///
+    /// Returns `&mut Self` for method chaining.
+    pub fn add_edges_asymmetric_on(
+        &mut self,
+        edges: &[(EdgeId, FaceId)],
+        d1: f64,
+        d2: f64,
+    ) -> &mut Self {
+        self.edge_sets.push(ChamferEdgeSet::Referenced {
+            edges: edges.to_vec(),
+            d1,
+            d2,
+        });
+        self
+    }
+
     /// Add edges with distance-angle chamfer.
     ///
     /// `distance` is measured on face 1; `angle` (radians) determines
@@ -130,24 +160,39 @@ impl<'a> ChamferBuilder<'a> {
     /// [`BlendResult::failed`] rather than aborting the whole operation.
     #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Result<BlendResult, BlendError> {
-        let all_edges: Vec<(EdgeId, f64, f64)> = self
-            .edge_sets
-            .into_iter()
-            .flat_map(|set| {
-                let (edges, d1, d2) = match set {
-                    ChamferEdgeSet::TwoDistance { edges, d1, d2 } => (edges, d1, d2),
-                    ChamferEdgeSet::DistanceAngle {
-                        edges,
-                        distance,
-                        angle,
-                    } => {
-                        let d2 = distance * angle.tan();
-                        (edges, distance, d2)
+        let adjacency = self.topo.build_adjacency(self.solid)?;
+        let mut all_edges: Vec<(EdgeId, f64, f64)> = Vec::new();
+        for set in self.edge_sets {
+            match set {
+                ChamferEdgeSet::TwoDistance { edges, d1, d2 } => {
+                    all_edges.extend(edges.into_iter().map(|eid| (eid, d1, d2)));
+                }
+                ChamferEdgeSet::DistanceAngle {
+                    edges,
+                    distance,
+                    angle,
+                } => {
+                    let d2 = distance * angle.tan();
+                    all_edges.extend(edges.into_iter().map(|eid| (eid, distance, d2)));
+                }
+                // Each stripe takes d1 on the edge's first adjacent face.
+                ChamferEdgeSet::Referenced { edges, d1, d2 } => {
+                    for (eid, reference) in edges {
+                        match adjacency.faces_for_edge(eid) {
+                            [first, _] if *first == reference => all_edges.push((eid, d1, d2)),
+                            [_, second] if *second == reference => all_edges.push((eid, d2, d1)),
+                            _ => {
+                                return Err(BlendError::Topology(
+                                    brepkit_topology::TopologyError::Empty {
+                                        entity: "chamfer reference face on its edge",
+                                    },
+                                ));
+                            }
+                        }
                     }
-                };
-                edges.into_iter().map(move |eid| (eid, d1, d2))
-            })
-            .collect();
+                }
+            }
+        }
 
         if all_edges.is_empty() {
             return Err(BlendError::Topology(
@@ -158,8 +203,6 @@ impl<'a> ChamferBuilder<'a> {
         }
 
         let topo = self.topo;
-
-        let adjacency = topo.build_adjacency(self.solid)?;
 
         let shell_id = topo.solid(self.solid)?.outer_shell();
         let original_faces: Vec<FaceId> = topo.shell(shell_id)?.faces().to_vec();

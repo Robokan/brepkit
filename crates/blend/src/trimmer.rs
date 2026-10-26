@@ -373,11 +373,43 @@ pub fn trim_face(
     let mut loop_edges = kept_chain;
     loop_edges.push(OrientedEdge::new(contact_edge_id, contact_forward));
 
+    // The face's holes on the kept side stay with it, and those beyond the
+    // contact line go with the cut-off part. A hole across the line cannot
+    // be trimmed this way.
+    let keep_left = keep_side == TrimSide::Left;
+    let mut kept_holes = Vec::new();
+    for &hole in topo.face(face_id)?.inner_wires() {
+        let mut sides = (false, false);
+        for oe in topo.wire(hole)?.edges() {
+            let edge = topo.edge(oe.edge())?;
+            let (sp, ep) = (
+                topo.vertex(edge.start())?.point(),
+                topo.vertex(edge.end())?.point(),
+            );
+            let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
+            for k in 0..8 {
+                let t = (t1 - t0).mul_add(f64::from(k) / 8.0, t0);
+                let p = edge.curve().evaluate_with_endpoints(t, sp, ep);
+                let side = face_normal.dot(contact_dir.cross(p - hit_a.point_3d));
+                if side > 1e-9 {
+                    sides.0 = true;
+                } else if side < -1e-9 {
+                    sides.1 = true;
+                }
+            }
+        }
+        match sides {
+            (true, true) => return Err(BlendError::TrimmingFailure { face: face_id }),
+            (left, _) if left == keep_left => kept_holes.push(hole),
+            _ => {}
+        }
+    }
+
     let trimmed_wire =
         Wire::new(loop_edges, true).map_err(|_| BlendError::TrimmingFailure { face: face_id })?;
     let trimmed_wire_id = topo.add_wire(trimmed_wire);
 
-    let mut trimmed_face = Face::new(trimmed_wire_id, Vec::new(), surface);
+    let mut trimmed_face = Face::new(trimmed_wire_id, kept_holes, surface);
     if reversed {
         trimmed_face.set_reversed(true);
     }
