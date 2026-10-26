@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793025332101,
+  "lastUpdate": 1793027590366,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -917,6 +917,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 48021682,
             "range": "± 1291816",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "a25ffe10c556cda390856ad73e14fa6e61716c99",
+          "message": "chore(examples): corpus_case fuses multi-solid inputs group by group\n\nAs the BuzzCAD bridge does: the solids whose boxes meet are fused in\nturn, each step reported, and STEP=<i> writes the i-th pair out.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-26T08:10:09-07:00",
+          "tree_id": "bcf9f909296648b0eb9102e8988256aa6874a743",
+          "url": "https://github.com/Robokan/brepkit/commit/a25ffe10c556cda390856ad73e14fa6e61716c99"
+        },
+        "date": 1793027589356,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 622488,
+            "range": "± 12885",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 679059,
+            "range": "± 4036",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8779,
+            "range": "± 125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 400647,
+            "range": "± 12141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 31578184,
+            "range": "± 357681",
             "unit": "ns/iter"
           }
         ]
