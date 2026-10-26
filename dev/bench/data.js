@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792973634815,
+  "lastUpdate": 1792982333864,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -755,6 +755,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 47723838,
             "range": "± 134944",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "3cdd9a69b486c503bea6ddf06b46c394bd51ef66",
+          "message": "docs: the profile chords fix; point the corpus at the 16003-case replay\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T19:36:21-07:00",
+          "tree_id": "4a3406e44b1de5aab430648757dc2b9b5f987bef",
+          "url": "https://github.com/Robokan/brepkit/commit/3cdd9a69b486c503bea6ddf06b46c394bd51ef66"
+        },
+        "date": 1792982333156,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 854053,
+            "range": "± 2076",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 933941,
+            "range": "± 2720",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11405,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 525727,
+            "range": "± 11130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 39317342,
+            "range": "± 55329",
             "unit": "ns/iter"
           }
         ]
