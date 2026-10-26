@@ -1447,6 +1447,16 @@ pub fn revolve(
         | FaceSurface::Torus(_)
         | FaceSurface::Nurbs(_) => None,
     };
+    // A plane normal to the axis only turns within itself: it sweeps an annulus
+    // with no volume, and every face built from it lies in that one plane.
+    if let Some(normal) = stored_plane_normal
+        && normal.normalize()?.cross(axis).length() < 1e-9
+    {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: "revolve profile's plane is perpendicular to the axis: it sweeps no volume"
+                .into(),
+        });
+    }
     let input_wire_id = face_data.outer_wire();
     let inner_wire_ids: Vec<brepkit_topology::wire::WireId> = face_data.inner_wires().to_vec();
 
@@ -2853,6 +2863,28 @@ mod tests {
             0.0,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn revolve_profile_normal_to_axis_error() {
+        let mut topo = Topology::new();
+        let face = make_unit_square_face(&mut topo);
+
+        // The square lies in z = 0 and the axis is parallel to Z: it only turns
+        // within its own plane, an annulus with no volume, not a solid.
+        for angle in [PI, 2.0 * PI] {
+            let result = revolve(
+                &mut topo,
+                face,
+                Point3::new(-5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                angle,
+            );
+            assert!(
+                matches!(result, Err(crate::OperationsError::InvalidInput { .. })),
+                "angle {angle}: {result:?}"
+            );
+        }
     }
 
     #[test]
