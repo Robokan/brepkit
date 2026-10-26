@@ -92,7 +92,12 @@ Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`
    .venv/bin/python tools/brepkit_corpus/record_examples.py
    ```
 
-3. **Pick the commonest real problem and reproduce it here in Rust.** Each
+3. **Pick the next problem and reproduce it here in Rust.** Take it from
+   the corpus's work queue, `buzzcad-corpus/PRIORITIES.md`: the top open
+   family first (it ranks silently wrong results, then failures, then face
+   counts, by how often each hits real work), and mark the family in
+   progress or fixed there when you commit. If the queue is empty or older
+   than the newest replay, take the commonest real problem instead. Each
    case that doesn't pass is exported to `replays/<time>/failures/<op>/<key>/`:
    - `case.json`: the operation, its parameters and the picks. Picks are
      indices into the input's edge or face map, plus a point on each pick.
