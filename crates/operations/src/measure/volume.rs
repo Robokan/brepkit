@@ -200,6 +200,12 @@ fn vertex_box(topo: &Topology, solid: SolidId) -> Option<(Point3, Point3)> {
     })
 }
 
+/// The centre of a solid's vertex box, or the origin for a solid without
+/// vertices.
+fn solid_centre(topo: &Topology, solid: SolidId) -> Point3 {
+    vertex_box(topo, solid).map_or(Point3::new(0.0, 0.0, 0.0), |(lo, hi)| lo + (hi - lo) * 0.5)
+}
+
 /// The point the volume paths sum each face's flux about. A closed surface's
 /// total does not depend on it, but a meshed face can leave slivers open
 /// against its exact neighbours and a faulty solid's faces need not close, so
@@ -1328,10 +1334,20 @@ pub fn solid_volume(
     // watertight (its band path needs the solid's shared boundary vertices), and
     // its analytic integral is the hard u-dependent lune trim we defer. The
     // whole-solid mesh IS watertight, so take the divergence-theorem volume off
-    // that closed mesh.
-    if solid_has_scalloped_sphere_collar(topo, solid) {
+    // that closed mesh. Not with NURBS faces: they are integrated on their
+    // surfaces below, and their inscribed mesh reads the solid short.
+    let has_nurbs = brepkit_topology::explorer::solid_faces(topo, solid)?
+        .into_iter()
+        .any(|f| {
+            topo.face(f)
+                .is_ok_and(|f| matches!(f.surface(), FaceSurface::Nurbs(_)))
+        });
+    if !has_nurbs && solid_has_scalloped_sphere_collar(topo, solid) {
         let mesh = tessellate::tessellate_solid(topo, solid, deflection)?;
         if !mesh.indices.is_empty() && mesh_boundary_edge_count(&mesh) == 0 {
+            if vol_trace_enabled() {
+                log::debug!("VOL_TRACE scalloped sphere collar mesh");
+            }
             return Ok(signed_volume_from_mesh(&mesh));
         }
         // Non-watertight mesh: fall through to the generic paths below rather
@@ -1344,9 +1360,12 @@ pub fn solid_volume(
     // (the structured notch-band tessellator), so take the divergence-theorem
     // volume off it. Per-face summation would under-count (the band's own per-
     // face mesh isn't closed).
-    if solid_has_torus_notch_band(topo, solid) {
+    if !has_nurbs && solid_has_torus_notch_band(topo, solid) {
         let mesh = tessellate::tessellate_solid(topo, solid, deflection)?;
         if !mesh.indices.is_empty() && mesh_boundary_edge_count(&mesh) == 0 {
+            if vol_trace_enabled() {
+                log::debug!("VOL_TRACE torus notch band mesh");
+            }
             return Ok(signed_volume_from_mesh(&mesh));
         }
         // Non-watertight mesh: fall through rather than return a leaky volume.
@@ -1372,13 +1391,15 @@ pub fn solid_volume(
     // So does a torus, cylinder or cone face trimmed by a free-form curve (a
     // wall's hyperbola or ellipse), whose flux follows exactly along its
     // boundary where a mesh would only inscribe it, a whole ring (around a
-    // cavity, say), whose flux is its volume, and a sphere face whose outer
-    // loop winds none of its u (a rod's end cap).
+    // cavity, say), whose flux is its volume, a sphere face whose outer
+    // loop winds none of its u (a rod's end cap), and a NURBS face, whose
+    // flux is integrated on the surface rather than on its inscribed mesh.
     let needs_direct_tessellation = brepkit_topology::explorer::solid_faces(topo, solid)?
         .into_iter()
         .any(|fid| {
             topo.face(fid).is_ok_and(|f| {
                 !f.inner_wires().is_empty()
+                    || matches!(f.surface(), FaceSurface::Nurbs(_))
                     || (f.is_reversed() && !matches!(f.surface(), FaceSurface::Plane { .. }))
                     || (matches!(f.surface(), FaceSurface::Torus(_)) && is_whole_ring(topo, f))
                     || (matches!(
@@ -2182,15 +2203,11 @@ fn analytic_cone_signed_volume(
                 && let brepkit_topology::edge::EdgeCurve::Circle(circle) = edge.curve()
                 && let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end()))
             {
-                let ts = circle.project(sv.point());
-                let te = circle.project(ev.point());
-                let fwd = (te - ts).rem_euclid(std::f64::consts::TAU);
-                let mid_t = if fwd <= std::f64::consts::PI {
-                    ts + fwd * 0.5
-                } else {
-                    ts - (std::f64::consts::TAU - fwd) * 0.5
-                };
-                let mid = circle.evaluate(mid_t);
+                // The arc's own domain says which way round it runs: taken the
+                // shorter way, the two halves of a split circle can both sample
+                // one side, and the band reads half its turn or all of it.
+                let (t0, t1) = edge.curve().domain_with_endpoints(sv.point(), ev.point());
+                let mid = circle.evaluate(f64::midpoint(t0, t1));
                 let (u, _) = cone.project_point(mid);
                 u_vals.push(u);
             }
@@ -2217,7 +2234,11 @@ fn analytic_cone_signed_volume(
         return Ok(0.0);
     }
 
-    let u_range = compute_angular_range(&mut u_vals);
+    // Read the turn off the wire's arcs as the cylinder does: a wall
+    // bounded by two whole circles and a seam has only the seam's angle
+    // among its vertices, and the samples alone read a part turn.
+    let u_range = angular_range_from_wire_arcs(topo, wire, |p| cone.project_point(p).0)
+        .unwrap_or_else(|| compute_angular_range(&mut u_vals));
 
     let (sin_a, cos_a) = cone.half_angle().sin_cos();
     let x_axis = cone.x_axis();
@@ -2308,15 +2329,11 @@ fn analytic_sphere_signed_volume(
                 && let brepkit_topology::edge::EdgeCurve::Circle(circle) = edge.curve()
                 && let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end()))
             {
-                let ts = circle.project(sv.point());
-                let te = circle.project(ev.point());
-                let fwd = (te - ts).rem_euclid(std::f64::consts::TAU);
-                let mid_t = if fwd <= std::f64::consts::PI {
-                    ts + fwd * 0.5
-                } else {
-                    ts - (std::f64::consts::TAU - fwd) * 0.5
-                };
-                let mid = circle.evaluate(mid_t);
+                // The arc's own domain says which way round it runs: taken the
+                // shorter way, the two halves of a split circle can both sample
+                // one side, and the band reads half its turn or all of it.
+                let (t0, t1) = edge.curve().domain_with_endpoints(sv.point(), ev.point());
+                let mid = circle.evaluate(f64::midpoint(t0, t1));
                 let (u, _) = sph.project_point(mid);
                 u_vals.push(u);
             }
@@ -2737,15 +2754,10 @@ fn analytic_torus_signed_volume(
             {
                 let mid = match edge.curve() {
                     brepkit_topology::edge::EdgeCurve::Circle(circle) => {
-                        let ts = circle.project(sv.point());
-                        let te = circle.project(ev.point());
-                        let fwd = (te - ts).rem_euclid(std::f64::consts::TAU);
-                        let mid_t = if fwd <= std::f64::consts::PI {
-                            ts + fwd * 0.5
-                        } else {
-                            ts - (std::f64::consts::TAU - fwd) * 0.5
-                        };
-                        Some(circle.evaluate(mid_t))
+                        // The arc's own domain says which way round it runs (see
+                        // the cone's samples).
+                        let (t0, t1) = edge.curve().domain_with_endpoints(sv.point(), ev.point());
+                        Some(circle.evaluate(f64::midpoint(t0, t1)))
                     }
                     brepkit_topology::edge::EdgeCurve::NurbsCurve(nc) => {
                         let (t0, t1) = edge.curve().domain_with_endpoints(sv.point(), ev.point());
@@ -2813,7 +2825,28 @@ fn analytic_torus_signed_volume(
         }
     };
 
-    let u_range = sector.unwrap_or_else(|| compute_angular_range(&mut u_vals));
+    // A band bounded by a whole parallel (a closed circle round the torus's
+    // axis, as a fillet round a shaft's end has) runs the whole ring; its
+    // vertices give only the seam's angle, which the samples read as a part
+    // turn.
+    let whole_parallel = wire.edges().iter().any(|oe| {
+        topo.edge(oe.edge()).is_ok_and(|edge| match edge.curve() {
+            brepkit_topology::edge::EdgeCurve::Circle(circle) if edge.is_closed() => {
+                let off = circle.center() - tor.center();
+                circle.normal().cross(tor.z_axis()).length() < 1e-9
+                    && (off - tor.z_axis() * off.dot(tor.z_axis())).length()
+                        <= 1e-7 * tor.major_radius().max(1.0)
+            }
+            _ => false,
+        })
+    });
+    let u_range = sector.unwrap_or_else(|| {
+        if whole_parallel {
+            (0.0, std::f64::consts::TAU)
+        } else {
+            compute_angular_range(&mut u_vals)
+        }
+    });
 
     let big_r = tor.major_radius();
     let small_r = tor.minor_radius();
@@ -3020,21 +3053,26 @@ pub fn volume_from_direct_face_tessellation(
     solid: SolidId,
     deflection: f64,
 ) -> Result<f64, crate::OperationsError> {
-    let about = sum_anchor(topo, solid);
+    // Each face is integrated on its own, and where two faces' readings of
+    // their shared edge differ (a chord against the curve it sags from) the
+    // gap's flux grows with its distance from the anchor: take the solid's
+    // own centre, not the origin a part may sit far from.
+    let about = solid_centre(topo, solid);
     let mut total: f64 = 0.0;
     for fid in brepkit_topology::explorer::solid_faces(topo, solid)? {
         let face = topo.face(fid)?;
 
         // Use exact analytical volume for analytic surface faces. The
         // closed forms below take a cylinder or cone face as a band between
-        // two iso-circles; a face with holes, or trimmed by a free-form
-        // curve (a bore's saddle-shaped entry loop), is integrated along its
-        // boundary instead.
+        // two iso-circles, which a face with holes, one trimmed by a
+        // free-form curve (a bore's saddle-shaped entry loop) or one stepped
+        // along its rim is not: any face that does not wind its axis is
+        // integrated along its boundary instead, which holds for every
+        // outline.
         if matches!(
             face.surface(),
             FaceSurface::Cylinder(_) | FaceSurface::Cone(_)
-        ) && (!face.inner_wires().is_empty() || has_free_form_boundary(topo, fid)?)
-            && let Some(flux) = developable_face_flux(topo, fid, about)?
+        ) && let Some(flux) = developable_face_flux(topo, fid, about)?
         {
             if vol_trace_enabled() {
                 log::debug!("VOL_TRACE holed developable face {fid:?} -> {flux}");
@@ -3079,21 +3117,13 @@ pub fn volume_from_direct_face_tessellation(
             FaceSurface::Nurbs(_) => {}
         }
 
-        let mesh = tessellate::tessellate(topo, fid, deflection)?;
-        let idx = &mesh.indices;
-        let pos = &mesh.positions;
-        let tri_count = idx.len() / 3;
-
-        let mut face_total = 0.0;
-        for t in 0..tri_count {
-            let v0 = pos[idx[t * 3] as usize];
-            let v1 = pos[idx[t * 3 + 1] as usize];
-            let v2 = pos[idx[t * 3 + 2] as usize];
-
-            let (a, b, c) = (v0 - about, v1 - about, v2 - about);
-
-            face_total += a.dot((b - a).cross(c - a));
-        }
+        let uv_mesh = tessellate::tessellate_with_uvs(topo, fid, deflection)?;
+        let nurbs = match face.surface() {
+            FaceSurface::Nurbs(s) => Some(s),
+            _ => None,
+        };
+        let (face_total, _) = surface_flux_over_mesh(&uv_mesh, nurbs, deflection, about);
+        let tri_count = uv_mesh.mesh.indices.len() / 3;
 
         if vol_trace_enabled() {
             log::debug!(
@@ -3107,6 +3137,149 @@ pub fn volume_from_direct_face_tessellation(
     }
 
     Ok((total / 6.0).abs())
+}
+
+/// Twice the flux `∫ (P − about)·N dA` of a face over its mesh, the
+/// signed-tetrahedra sum's unit, and the matching first moment: the sum of
+/// each tetrahedron's six volumes times its three free corners, which is
+/// six times the flux of `r (r·N)` for `r = P − about`.
+///
+/// On a NURBS face each triangle is integrated on the surface itself, by
+/// Gauss quadrature over the triangle's own `(u, v)`: the flat triangles
+/// inscribe a curved wall, and an extruded spline profile's side wall came
+/// out short of its caps (which are exact) by about two thirds of the sag
+/// times the profile's length. The surface is shifted by its corners'
+/// offsets from the mesh, interpolated across the triangle, so the patch
+/// runs through the mesh's own corners: a boundary vertex sits on its edge,
+/// which an imported face's surface can miss by a good deal more than the
+/// sag, and the triangles' `(u, v)` alone would then trim the face short.
+///
+/// A triangle keeps its flat contribution where the surface does not
+/// reproduce its corners (a `u` unwrapped past a period, say), or where its
+/// `(u, v)` winding disagrees with its own.
+fn surface_flux_over_mesh(
+    uv_mesh: &tessellate::TriangleMeshUV,
+    nurbs: Option<&brepkit_math::nurbs::surface::NurbsSurface>,
+    deflection: f64,
+    about: Point3,
+) -> (f64, Vec3) {
+    let mesh = &uv_mesh.mesh;
+    let (idx, pos, uvs) = (&mesh.indices, &mesh.positions, &uv_mesh.uvs);
+    let flat_flux = |i0: usize, i1: usize, i2: usize| {
+        let (a, b, c) = (pos[i0] - about, pos[i1] - about, pos[i2] - about);
+        let six_vol = a.dot((b - a).cross(c - a));
+        (six_vol, (a + b + c) * six_vol)
+    };
+    let add = |(f, m): (f64, Vec3), (g, n): (f64, Vec3)| (f + g, m + n);
+    let zero = (0.0, Vec3::new(0.0, 0.0, 0.0));
+    let Some(s) = nurbs.filter(|_| uvs.len() == pos.len()) else {
+        return idx
+            .chunks_exact(3)
+            .map(|t| flat_flux(t[0] as usize, t[1] as usize, t[2] as usize))
+            .fold(zero, add);
+    };
+    // Each vertex's offset from the surface at its (u, v), or `None` past
+    // what a sag can explain.
+    let mut ev = s.evaluator();
+    let tol = (10.0 * deflection).max(1e-6);
+    let offsets: Vec<Option<Vec3>> = pos
+        .iter()
+        .zip(uvs)
+        .map(|(p, uv)| {
+            let d = *p - ev.point(uv[0], uv[1]);
+            (d.length() <= tol).then_some(d)
+        })
+        .collect();
+    let mut total = zero;
+    for tri in idx.chunks_exact(3) {
+        let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+        let flat = flat_flux(i0, i1, i2);
+        let (Some(d0), Some(d1), Some(d2)) = (offsets[i0], offsets[i1], offsets[i2]) else {
+            total = add(total, flat);
+            continue;
+        };
+        let corners = [(i0, d0), (i1, d1), (i2, d2)];
+        let on_surface = triangle_flux_on_surface(&mut ev, uvs, pos, corners, deflection, about);
+        total = add(total, on_surface.unwrap_or(flat));
+    }
+    total
+}
+
+/// Twice the flux about `about` of the surface patch over one mesh
+/// triangle, and its first moment (see [`surface_flux_over_mesh`]), or
+/// `None` where the flat triangle is the better reading.
+fn triangle_flux_on_surface(
+    ev: &mut brepkit_math::nurbs::evaluator::SurfaceEvaluator<'_>,
+    uvs: &[[f64; 2]],
+    pos: &[Point3],
+    corners: [(usize, Vec3); 3],
+    deflection: f64,
+    about: Point3,
+) -> Option<(f64, Vec3)> {
+    // Dunavant's degree-4 rule: barycentric (a, a, b) in each order.
+    const RULE: [(f64, f64, f64); 2] = [
+        (
+            0.445_948_490_915_965,
+            0.108_103_018_168_070,
+            0.223_381_589_678_011,
+        ),
+        (
+            0.091_576_213_509_771,
+            0.816_847_572_980_459,
+            0.109_951_743_655_322,
+        ),
+    ];
+    let [(i0, d0), (i1, d1), (i2, d2)] = corners;
+    let (ua, ub, uc) = (uvs[i0], uvs[i1], uvs[i2]);
+    let uv_area2 = (ub[0] - ua[0]) * (uc[1] - ua[1]) - (uc[0] - ua[0]) * (ub[1] - ua[1]);
+    if uv_area2.abs() < 1e-300 {
+        return None;
+    }
+    let flat_normal = (pos[i1] - pos[i0]).cross(pos[i2] - pos[i0]);
+    let centroid = |p: Point3, q: Point3, r: Point3| {
+        Point3::new(
+            (p.x() + q.x() + r.x()) / 3.0,
+            (p.y() + q.y() + r.y()) / 3.0,
+            (p.z() + q.z() + r.z()) / 3.0,
+        )
+    };
+    // Corners a period apart on a closed surface each map right, and the
+    // triangle between them spans the surface the long way round.
+    let longest = (pos[i1] - pos[i0])
+        .length()
+        .max((pos[i2] - pos[i1]).length())
+        .max((pos[i0] - pos[i2]).length());
+    let third = 1.0 / 3.0;
+    let mid = ev.point(
+        (ua[0] + ub[0] + uc[0]) * third,
+        (ua[1] + ub[1] + uc[1]) * third,
+    ) + (d0 + d1 + d2) * third;
+    if (mid - centroid(pos[i0], pos[i1], pos[i2])).length() > (10.0 * deflection).max(0.5 * longest)
+    {
+        return None;
+    }
+    // The interpolated offset's own slope in u and v.
+    let (b1u, b1v) = ((uc[1] - ua[1]) / uv_area2, -(uc[0] - ua[0]) / uv_area2);
+    let (b2u, b2v) = (-(ub[1] - ua[1]) / uv_area2, (ub[0] - ua[0]) / uv_area2);
+    let off_u = (d1 - d0) * b1u + (d2 - d0) * b2u;
+    let off_v = (d1 - d0) * b1v + (d2 - d0) * b2v;
+    let (mut sum, mut moment, mut agrees) = (0.0, Vec3::new(0.0, 0.0, 0.0), true);
+    for &(p, q, w) in &RULE {
+        for (w0, w1, w2) in [(p, p, q), (p, q, p), (q, p, p)] {
+            let u = w0 * ua[0] + w1 * ub[0] + w2 * uc[0];
+            let v = w0 * ua[1] + w1 * ub[1] + w2 * uc[1];
+            let (p_uv, s_u, s_v) = ev.point_and_partials(u, v)?;
+            let n = (s_u + off_u).cross(s_v + off_v);
+            agrees &= n.dot(flat_normal) * uv_area2 >= 0.0;
+            let r = (p_uv - about) + d0 * w0 + d1 * w1 + d2 * w2;
+            sum += w * r.dot(n);
+            moment += r * (w * r.dot(n));
+        }
+    }
+    // The rule's weights sum to one; `uv_area2` is twice the triangle's
+    // signed `(u, v)` area, which makes this twice its flux, and three
+    // times it six times the moment's flux.
+    agrees.then_some((sum * uv_area2, moment * (3.0 * uv_area2)))
 }
 
 /// Compute the volume of a solid directly from its face vertex
@@ -3203,33 +3376,28 @@ pub fn solid_center_of_mass(
 
     // tessellate() already handles face reversal (flips winding),
     // so signed tetrahedra sum is correct without winding heuristics.
-    // Per-face meshes need not close up; see `oriented_solid_volume`.
-    let p0 = Point3::new(0.0, 0.0, 0.0);
+    // Per-face meshes need not close up, so the sums are taken about a
+    // point on the solid, where a gap between two faces' meshes weighs
+    // least (about the origin, a part far from it read its centre off by
+    // its gaps times its distance). A NURBS face is integrated on its
+    // surface, as `solid_volume` does.
+    let p0 =
+        vertex_box(topo, solid).map_or(Point3::new(0.0, 0.0, 0.0), |(lo, hi)| lo + (hi - lo) * 0.5);
     let mut total_vol: f64 = 0.0;
-    let mut cx = 0.0;
-    let mut cy = 0.0;
-    let mut cz = 0.0;
+    let mut moment = Vec3::new(0.0, 0.0, 0.0);
 
     for fid in brepkit_topology::explorer::solid_faces(topo, solid)? {
-        let mesh = tessellate::tessellate(topo, fid, deflection)?;
-        let idx = &mesh.indices;
-        let pos = &mesh.positions;
-        let tri_count = idx.len() / 3;
-
-        for t in 0..tri_count {
-            let v0 = pos[idx[t * 3] as usize];
-            let v1 = pos[idx[t * 3 + 1] as usize];
-            let v2 = pos[idx[t * 3 + 2] as usize];
-
-            let (a, b, c) = (v0 - p0, v1 - p0, v2 - p0);
-
-            let signed_vol = a.dot((b - a).cross(c - a));
-            total_vol += signed_vol;
-            cx += signed_vol * (a.x() + b.x() + c.x());
-            cy += signed_vol * (a.y() + b.y() + c.y());
-            cz += signed_vol * (a.z() + b.z() + c.z());
-        }
+        let uv_mesh = tessellate::tessellate_with_uvs(topo, fid, deflection)?;
+        let face = topo.face(fid)?;
+        let nurbs = match face.surface() {
+            FaceSurface::Nurbs(s) => Some(s),
+            _ => None,
+        };
+        let (six_vol, face_moment) = surface_flux_over_mesh(&uv_mesh, nurbs, deflection, p0);
+        total_vol += six_vol;
+        moment += face_moment;
     }
+    let (cx, cy, cz) = (moment.x(), moment.y(), moment.z());
 
     if total_vol.abs() < 1e-15 {
         // Volume too small to compute weighted CoM -- fall back to vertex centroid.
@@ -4114,5 +4282,214 @@ mod tests {
             "flux {vol}, truth {}",
             PI / 6.0
         );
+    }
+
+    /// A band of revolution whose rim is split opposite its seam (the rim it
+    /// shares with a neighbour whose own seam lies on the far side, as files
+    /// write them) has two half arcs, and their midpoints, each taken the
+    /// shorter way round, can both land on one side: the band then read as
+    /// half a turn. Its whole circle says it runs the whole turn.
+    fn split_rim_at_antipode(
+        topo: &mut Topology,
+        face_id: FaceId,
+        rim: brepkit_topology::edge::EdgeId,
+    ) -> FaceId {
+        let face = topo.face(face_id).unwrap().clone();
+        let wire = topo.wire(face.outer_wire()).unwrap().clone();
+        let edge = topo.edge(rim).unwrap().clone();
+        let EdgeCurve::Circle(circle) = edge.curve().clone() else {
+            unreachable!("the rim is a circle");
+        };
+        // A hair past the antipode, as a file's coordinates leave it: one
+        // half then runs a little over half a turn and the other a little
+        // under.
+        let start = topo.vertex(edge.start()).unwrap().point();
+        let opposite = circle.evaluate(circle.project(start) + std::f64::consts::PI + 1e-6);
+        let far = topo.add_vertex(Vertex::new(opposite, 1e-7));
+        let out = topo.add_edge(Edge::new(
+            edge.start(),
+            far,
+            EdgeCurve::Circle(circle.clone()),
+        ));
+        let back = topo.add_edge(Edge::new(far, edge.start(), EdgeCurve::Circle(circle)));
+        let mut edges = Vec::new();
+        for oe in wire.edges() {
+            if oe.edge() != rim {
+                edges.push(*oe);
+            } else if oe.is_forward() {
+                edges.extend([OrientedEdge::new(out, true), OrientedEdge::new(back, true)]);
+            } else {
+                edges.extend([
+                    OrientedEdge::new(back, false),
+                    OrientedEdge::new(out, false),
+                ]);
+            }
+        }
+        let wire = topo.add_wire(Wire::new(edges, true).unwrap());
+        topo.add_face(Face::new(wire, vec![], face.surface().clone()))
+    }
+
+    #[test]
+    fn cone_band_with_a_rim_split_opposite_its_seam_reads_the_whole_turn() {
+        let mut topo = Topology::new();
+        let solid = make_cone(&mut topo, 6.0, 4.0, 3.0).unwrap();
+        let band = brepkit_topology::explorer::solid_faces(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cone(_)))
+            .unwrap();
+        let rim = topo
+            .wire(topo.face(band).unwrap().outer_wire())
+            .unwrap()
+            .edges()
+            .iter()
+            .map(OrientedEdge::edge)
+            .find(|&e| topo.edge(e).unwrap().is_closed())
+            .unwrap();
+        // About the base's centre the base adds nothing and the top a third
+        // of its height times its area: the band has the rest of the
+        // frustum, pi h (R^2 + R r) / 3.
+        let about = Point3::new(0.0, 0.0, 0.0);
+        let expected = std::f64::consts::PI * 3.0 * (36.0 + 24.0) / 3.0;
+        let split = split_rim_at_antipode(&mut topo, band, rim);
+        for face in [band, split] {
+            let read = analytic_cone_signed_volume(&topo, face, about).unwrap();
+            assert!(
+                (read.abs() - expected).abs() <= 1e-9 * expected,
+                "band reads {read}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn torus_band_with_a_rim_split_opposite_its_seam_reads_the_whole_turn() {
+        use brepkit_math::surfaces::ToroidalSurface;
+        let mut topo = Topology::new();
+        let (big, small, (v1, v2)) = (5.0, 1.0, (-1.0_f64, 1.0_f64));
+        let centre = Point3::new(0.0, 0.0, 0.0);
+        let torus = ToroidalSurface::new(centre, big, small).unwrap();
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let parallel = |v: f64| {
+            Circle3D::new(centre + z * (small * v.sin()), z, big + small * v.cos()).unwrap()
+        };
+        let [a1, a2] = [v1, v2].map(|v| topo.add_vertex(Vertex::new(torus.evaluate(0.0, v), 1e-7)));
+        let low = topo.add_edge(Edge::new(a1, a1, EdgeCurve::Circle(parallel(v1))));
+        let high = topo.add_edge(Edge::new(a2, a2, EdgeCurve::Circle(parallel(v2))));
+        // The meridian at u = 0, run from v1 to v2 through the tube's outside.
+        let meridian =
+            Circle3D::new(Point3::new(big, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0), small).unwrap();
+        let seam = topo.add_edge(Edge::new(a1, a2, EdgeCurve::Circle(meridian)));
+        let wire = topo.add_wire(
+            Wire::new(
+                vec![
+                    OrientedEdge::new(low, true),
+                    OrientedEdge::new(seam, true),
+                    OrientedEdge::new(high, false),
+                    OrientedEdge::new(seam, false),
+                ],
+                true,
+            )
+            .unwrap(),
+        );
+        let band = topo.add_face(Face::new(wire, vec![], FaceSurface::Torus(torus)));
+        // About the torus's centre, P·N = R cos v + r and the area element
+        // is r (R + r cos v) du dv.
+        let about = centre;
+        let expected = 2.0 * std::f64::consts::PI * small / 3.0
+            * ((big * big + small * small) * (v2.sin() - v1.sin())
+                + big * small * (0.5 * (v2 - v1) + 0.25 * ((2.0 * v2).sin() - (2.0 * v1).sin()))
+                + big * small * (v2 - v1));
+        let split = split_rim_at_antipode(&mut topo, band, low);
+        for face in [band, split] {
+            let read = analytic_torus_signed_volume(&topo, face, about).unwrap();
+            assert!(
+                (read.abs() - expected).abs() <= 1e-9 * expected,
+                "band reads {read}, expected {expected}"
+            );
+        }
+    }
+
+    /// A quarter cylinder as a rational NURBS patch, meshed on a coarse
+    /// `(u, v)` grid whose bottom corners sit `drop` below the surface's own
+    /// edge (as an imported face's edge can miss its surface).
+    fn quarter_cylinder_mesh(
+        radius: f64,
+        height: f64,
+        drop: f64,
+    ) -> (
+        brepkit_math::nurbs::surface::NurbsSurface,
+        tessellate::TriangleMeshUV,
+    ) {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let column = |x: f64, y: f64| vec![Point3::new(x, y, 0.0), Point3::new(x, y, height)];
+        let surface = brepkit_math::nurbs::surface::NurbsSurface::new(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                column(radius, 0.0),
+                column(radius, radius),
+                column(0.0, radius),
+            ],
+            vec![vec![1.0, 1.0], vec![w, w], vec![1.0, 1.0]],
+        )
+        .unwrap();
+        let n = 4_u32;
+        let mut mesh = tessellate::TriangleMeshUV::default();
+        for j in 0..2_u32 {
+            for i in 0..=n {
+                let (u, v) = (f64::from(i) / f64::from(n), f64::from(j));
+                let lift = if j == 0 { -drop } else { 0.0 };
+                mesh.mesh
+                    .positions
+                    .push(surface.evaluate(u, v) + Vec3::new(0.0, 0.0, lift));
+                mesh.mesh.normals.push(Vec3::new(0.0, 0.0, 0.0));
+                mesh.uvs.push([u, v]);
+            }
+        }
+        for i in 0..n {
+            let (a, b, c, d) = (i, i + 1, n + 2 + i, n + 1 + i);
+            mesh.mesh.indices.extend([a, b, c, a, c, d]);
+        }
+        (surface, mesh)
+    }
+
+    /// About a point on its axis a cylinder's flux density is its radius, so
+    /// the patch's twice-flux is twice its radius times its area. The flat
+    /// triangles inscribe it and fall short; the patch integrated on the
+    /// surface does not, and it follows the mesh's corners where they leave
+    /// the surface.
+    #[test]
+    fn nurbs_face_flux_is_integrated_on_its_surface() {
+        let (radius, height) = (2.0, 3.0);
+        let about = Point3::new(0.0, 0.0, 0.0);
+        for (drop, on_surface) in [(0.0, true), (0.05, false)] {
+            let (surface, mesh) = quarter_cylinder_mesh(radius, height, drop);
+            let exact = 2.0 * radius * (0.5 * std::f64::consts::PI * radius) * (height + drop);
+            let (flux, _) = surface_flux_over_mesh(&mesh, None, 0.05, about);
+            assert!(
+                (flux - exact).abs() > 1e-2 * exact,
+                "the flat mesh reads {flux}, {exact}"
+            );
+            let (flux, moment) = surface_flux_over_mesh(&mesh, Some(&surface), 0.05, about);
+            assert!(
+                (flux - exact).abs() < 1e-5 * exact,
+                "drop {drop}: patch reads {flux}, expected {exact}"
+            );
+            if on_surface {
+                // Six times the flux of r (r·N) = R r: 6 R ∫ r dA.
+                let (r, h) = (radius, height);
+                let expected = Vec3::new(
+                    r * r * h,
+                    r * r * h,
+                    0.25 * std::f64::consts::PI * r * h * h,
+                ) * (6.0 * r);
+                assert!(
+                    (moment - expected).length() < 1e-5 * expected.length(),
+                    "moment {moment:?}, expected {expected:?}"
+                );
+            }
+        }
     }
 }
