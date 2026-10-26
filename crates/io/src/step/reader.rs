@@ -767,6 +767,13 @@ impl<'a> StepBuilder<'a> {
             }
         };
 
+        let surface = match (surface, loop_vertex) {
+            (FaceSurface::Sphere(sphere), Some(pole)) if inner_wires.is_empty() => {
+                FaceSurface::Sphere(self.sphere_about_cap(sphere, outer, pole)?)
+            }
+            (surface, _) => surface,
+        };
+
         // Turning a face over flips its normal, not the side of its surface
         // its loops wind about.
         let face_id = if let (true, FaceSurface::Plane { normal, d }) = (absorb, &surface) {
@@ -785,6 +792,47 @@ impl<'a> StepBuilder<'a> {
             self.vertex_loops.insert(face_id, vertex);
         }
         Ok(face_id)
+    }
+
+    /// A sphere face bounded by one circle and a vertex loop is the cap on
+    /// the vertex's side of the circle: a ball cut by a tilted plane, written
+    /// with the sphere's pole as its vertex. Seen from the sphere's own axis
+    /// the circle winds no pole, and its loop alone encloses the smaller cap,
+    /// which the meshers took. About the circle's axis, pointing to the
+    /// vertex's side, the face is the cap round that pole, under a latitude.
+    fn sphere_about_cap(
+        &self,
+        sphere: brepkit_math::surfaces::SphericalSurface,
+        outer: brepkit_topology::wire::WireId,
+        pole: brepkit_topology::vertex::VertexId,
+    ) -> Result<brepkit_math::surfaces::SphericalSurface, IoError> {
+        let [oe] = self.topo.wire(outer)?.edges() else {
+            return Ok(sphere);
+        };
+        let edge = self.topo.edge(oe.edge())?;
+        let EdgeCurve::Circle(circle) = edge.curve() else {
+            return Ok(sphere);
+        };
+        if edge.start() != edge.end() {
+            return Ok(sphere);
+        }
+        let side = circle
+            .normal()
+            .dot(self.topo.vertex(pole)?.point() - circle.center());
+        if side.abs() <= 1e-6 * sphere.radius() {
+            return Ok(sphere);
+        }
+        let axis = if side > 0.0 {
+            circle.normal()
+        } else {
+            -circle.normal()
+        };
+        Ok(brepkit_math::surfaces::SphericalSurface::with_axis(
+            sphere.center(),
+            sphere.radius(),
+            axis,
+        )
+        .unwrap_or(sphere))
     }
 
     fn build_surface(&self, surface_ref: u64) -> Result<FaceSurface, IoError> {
@@ -3166,6 +3214,83 @@ mod tests {
         let union = 48.0 + 10.0 / 3.0 * std::f64::consts::PI;
         let volume = brepkit_operations::measure::solid_volume(&topo, fused, 0.001).unwrap();
         assert!((volume - union).abs() < 1e-3 * union, "{volume} vs {union}");
+    }
+
+    /// A ball cut by a tilted plane, its sphere face written with the
+    /// sphere's pole as a vertex loop and the cut circle as its one edge
+    /// loop: the face is the big part round that pole. Its loop alone
+    /// encloses the small cap on the sphere's own axis, which the mesher
+    /// took, so the body's centre came out in the cap.
+    #[test]
+    fn tilted_cut_ball_meshes_the_side_its_vertex_loop_names() {
+        // Radius 2, cut at distance 1 along n = (0, 0.96, 0.28), far enough
+        // from the sphere's axis that the cap misses its pole; the circle's
+        // axis points out of the material.
+        let step = "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n\
+            #1 = MANIFOLD_SOLID_BREP('',#2);\n\
+            #2 = CLOSED_SHELL('',(#3,#30));\n\
+            #3 = ADVANCED_FACE('',(#4,#7),#8,.T.);\n\
+            #4 = FACE_BOUND('',#5,.T.);\n\
+            #5 = VERTEX_LOOP('',#6);\n\
+            #6 = VERTEX_POINT('',#13);\n\
+            #13 = CARTESIAN_POINT('',(0.,0.,-2.));\n\
+            #7 = FACE_BOUND('',#14,.T.);\n\
+            #14 = EDGE_LOOP('',(#15));\n\
+            #15 = ORIENTED_EDGE('',*,*,#16,.F.);\n\
+            #16 = EDGE_CURVE('',#17,#17,#18,.T.);\n\
+            #17 = VERTEX_POINT('',#19);\n\
+            #19 = CARTESIAN_POINT('',(1.7320508075688772,0.96,0.28));\n\
+            #18 = CIRCLE('',#21,1.7320508075688772);\n\
+            #21 = AXIS2_PLACEMENT_3D('',#22,#23,#24);\n\
+            #22 = CARTESIAN_POINT('',(0.,0.96,0.28));\n\
+            #23 = DIRECTION('',(0.,0.96,0.28));\n\
+            #24 = DIRECTION('',(1.,0.,0.));\n\
+            #8 = SPHERICAL_SURFACE('',#9,2.);\n\
+            #9 = AXIS2_PLACEMENT_3D('',#10,#11,#12);\n\
+            #10 = CARTESIAN_POINT('',(0.,0.,0.));\n\
+            #11 = DIRECTION('',(0.,0.,1.));\n\
+            #12 = DIRECTION('',(1.,0.,0.));\n\
+            #30 = ADVANCED_FACE('',(#31),#34,.T.);\n\
+            #31 = FACE_BOUND('',#32,.T.);\n\
+            #32 = EDGE_LOOP('',(#33));\n\
+            #33 = ORIENTED_EDGE('',*,*,#16,.T.);\n\
+            #34 = PLANE('',#21);\n\
+            ENDSEC;\nEND-ISO-10303-21;\n";
+        let mut topo = Topology::new();
+        let solids = read_step(step, &mut topo).unwrap();
+        assert_eq!(solids.len(), 1);
+        let pi = std::f64::consts::PI;
+        // The ball less a cap 1 high: 32 pi / 3 - 5 pi / 3.
+        let body = 9.0 * pi;
+        let volume = brepkit_operations::measure::solid_volume(&topo, solids[0], 0.01).unwrap();
+        assert!((volume - body).abs() < 1e-3 * body, "{volume} vs {body}");
+        // The sphere face has 2 pi R (R + d) of the sphere, and its mesh
+        // covers that, not the cap's 2 pi R (R - d).
+        let sphere_face = brepkit_topology::explorer::solid_faces(&topo, solids[0])
+            .unwrap()
+            .into_iter()
+            .find(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Sphere(_)))
+            .unwrap();
+        let mesh = brepkit_operations::tessellate::tessellate(&topo, sphere_face, 0.01).unwrap();
+        let meshed: f64 = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|i| mesh.positions[i as usize]);
+                0.5 * (b - a).cross(c - a).length()
+            })
+            .sum();
+        let big = 2.0 * pi * 2.0 * 3.0;
+        assert!((meshed - big).abs() < 1e-2 * big, "{meshed} vs {big}");
+        // The cap's moment taken off the ball's: the centre sits a quarter
+        // of the way back along -n.
+        let centre =
+            brepkit_operations::measure::solid_center_of_mass(&topo, solids[0], 0.01).unwrap();
+        let expected = Point3::new(0.0, -0.24, -0.07);
+        assert!(
+            (centre - expected).length() < 1e-3,
+            "{centre:?} vs {expected:?}"
+        );
     }
 
     #[test]
