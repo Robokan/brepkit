@@ -259,6 +259,73 @@ pub fn trim_face(
         }
     }
 
+    // Use the face plane normal and contact direction to determine left/right.
+    let face_normal = match &surface {
+        FaceSurface::Plane { normal, .. } => {
+            if reversed {
+                -*normal
+            } else {
+                *normal
+            }
+        }
+        FaceSurface::Cylinder(_)
+        | FaceSurface::Cone(_)
+        | FaceSurface::Sphere(_)
+        | FaceSurface::Torus(_)
+        | FaceSurface::Nurbs(_) => return Err(BlendError::TrimmingFailure { face: face_id }),
+    };
+
+    let contact_dir = hit_b.point_3d - hit_a.point_3d;
+
+    // Take a sample point from chain 1 to determine which side it is on.
+    let sample_pt = edge_data
+        .get(if hit_a.edge_idx + 1 < hit_b.edge_idx {
+            hit_a.edge_idx + 1
+        } else {
+            hit_a.edge_idx
+        })
+        .map(|(_, s, _)| *s)
+        .ok_or(BlendError::TrimmingFailure { face: face_id })?;
+
+    let to_sample = sample_pt - hit_a.point_3d;
+    let cross = contact_dir.cross(to_sample);
+    let chain1_is_left = face_normal.dot(cross) > 0.0;
+
+    let keep_side = match keep {
+        TrimKeep::Side(side) => side,
+        TrimKeep::AwayFrom(p) => {
+            let p_is_left = face_normal.dot(contact_dir.cross(p - hit_a.point_3d)) > 0.0;
+            if p_is_left {
+                TrimSide::Right
+            } else {
+                TrimSide::Left
+            }
+        }
+    };
+
+    // The trimmed face keeps the face's holes, so each must lie wholly on
+    // the kept side: one across the contact line cannot be trimmed this way,
+    // and one beyond it would leave with the cut-off strip while its wall
+    // stays in the solid. Checked before the splits, so a refusal leaves
+    // every wire as it was.
+    let across = face_normal
+        .cross(contact_dir)
+        .normalize()
+        .map_err(|_| BlendError::TrimmingFailure { face: face_id })?;
+    let keep_left = keep_side == TrimSide::Left;
+    let holes = topo.face(face_id)?.inner_wires().to_vec();
+    for &hole in &holes {
+        let (mut left, mut right) = (false, false);
+        for oe in topo.wire(hole)?.edges() {
+            let (lo, hi) = edge_side_range(topo, oe.edge(), hit_a.point_3d, across)?;
+            left |= hi > VERTEX_TOL;
+            right |= lo < -VERTEX_TOL;
+        }
+        if left == right || left != keep_left {
+            return Err(BlendError::TrimmingFailure { face: face_id });
+        }
+    }
+
     // Each hit either splits its oriented edge into two sub-edges, or —
     // when it lands on an existing boundary vertex (a previous stripe's
     // propagated split) — reuses that vertex outright: splitting at t=0/1
@@ -307,50 +374,6 @@ pub fn trim_face(
         chain2.push(oe);
     }
 
-    // Use the face plane normal and contact direction to determine left/right.
-    let face_normal = match &surface {
-        FaceSurface::Plane { normal, .. } => {
-            if reversed {
-                -*normal
-            } else {
-                *normal
-            }
-        }
-        FaceSurface::Cylinder(_)
-        | FaceSurface::Cone(_)
-        | FaceSurface::Sphere(_)
-        | FaceSurface::Torus(_)
-        | FaceSurface::Nurbs(_) => return Err(BlendError::TrimmingFailure { face: face_id }),
-    };
-
-    let contact_dir = hit_b.point_3d - hit_a.point_3d;
-
-    // Take a sample point from chain 1 to determine which side it is on.
-    let sample_pt = edge_data
-        .get(if hit_a.edge_idx + 1 < hit_b.edge_idx {
-            hit_a.edge_idx + 1
-        } else {
-            hit_a.edge_idx
-        })
-        .map(|(_, s, _)| *s)
-        .ok_or(BlendError::TrimmingFailure { face: face_id })?;
-
-    let to_sample = sample_pt - hit_a.point_3d;
-    let cross = contact_dir.cross(to_sample);
-    let chain1_is_left = face_normal.dot(cross) > 0.0;
-
-    let keep_side = match keep {
-        TrimKeep::Side(side) => side,
-        TrimKeep::AwayFrom(p) => {
-            let p_is_left = face_normal.dot(contact_dir.cross(p - hit_a.point_3d)) > 0.0;
-            if p_is_left {
-                TrimSide::Right
-            } else {
-                TrimSide::Left
-            }
-        }
-    };
-
     // chain1 runs va→…→vb, so the contact edge (va→vb) closes it REVERSED;
     // chain2 runs vb→…→va and closes with the contact edge forward.
     let (kept_chain, contact_forward) = match keep_side {
@@ -373,43 +396,11 @@ pub fn trim_face(
     let mut loop_edges = kept_chain;
     loop_edges.push(OrientedEdge::new(contact_edge_id, contact_forward));
 
-    // The face's holes on the kept side stay with it, and those beyond the
-    // contact line go with the cut-off part. A hole across the line cannot
-    // be trimmed this way.
-    let keep_left = keep_side == TrimSide::Left;
-    let mut kept_holes = Vec::new();
-    for &hole in topo.face(face_id)?.inner_wires() {
-        let mut sides = (false, false);
-        for oe in topo.wire(hole)?.edges() {
-            let edge = topo.edge(oe.edge())?;
-            let (sp, ep) = (
-                topo.vertex(edge.start())?.point(),
-                topo.vertex(edge.end())?.point(),
-            );
-            let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
-            for k in 0..8 {
-                let t = (t1 - t0).mul_add(f64::from(k) / 8.0, t0);
-                let p = edge.curve().evaluate_with_endpoints(t, sp, ep);
-                let side = face_normal.dot(contact_dir.cross(p - hit_a.point_3d));
-                if side > 1e-9 {
-                    sides.0 = true;
-                } else if side < -1e-9 {
-                    sides.1 = true;
-                }
-            }
-        }
-        match sides {
-            (true, true) => return Err(BlendError::TrimmingFailure { face: face_id }),
-            (left, _) if left == keep_left => kept_holes.push(hole),
-            _ => {}
-        }
-    }
-
     let trimmed_wire =
         Wire::new(loop_edges, true).map_err(|_| BlendError::TrimmingFailure { face: face_id })?;
     let trimmed_wire_id = topo.add_wire(trimmed_wire);
 
-    let mut trimmed_face = Face::new(trimmed_wire_id, kept_holes, surface);
+    let mut trimmed_face = Face::new(trimmed_wire_id, holes, surface);
     if reversed {
         trimmed_face.set_reversed(true);
     }
@@ -427,6 +418,78 @@ pub fn trim_face(
         new_vertices,
         contact_edge: Some(contact_edge_id),
     })
+}
+
+/// The least and greatest of `across · (p - origin)` over an edge's points
+/// `p`: their signed distance from the contact line through `origin`, whose
+/// unit normal in the face's plane is `across`. It is linear in `p`, so a
+/// line takes its extremes at its ends, a circle or ellipse arc at its ends
+/// or where its sinusoid peaks inside the arc, and a NURBS curve lies within
+/// its control points' values (their convex hull holds it while every
+/// weight is positive; otherwise it is taken to reach every value).
+fn edge_side_range(
+    topo: &Topology,
+    edge_id: EdgeId,
+    origin: Point3,
+    across: brepkit_math::vec::Vec3,
+) -> Result<(f64, f64), BlendError> {
+    let edge = topo.edge(edge_id)?;
+    let sp = topo.vertex(edge.start())?.point();
+    let ep = topo.vertex(edge.end())?.point();
+    let side = |p: Point3| across.dot(p - origin);
+    let span = |values: &mut dyn Iterator<Item = f64>| {
+        values.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s), hi.max(s))
+        })
+    };
+    let arc = || edge.curve().domain_with_endpoints(sp, ep);
+    Ok(match edge.curve() {
+        EdgeCurve::Line => span(&mut [side(sp), side(ep)].into_iter()),
+        EdgeCurve::Circle(c) => sinusoid_range(
+            side(c.center()),
+            (
+                c.radius() * across.dot(c.u_axis()),
+                c.radius() * across.dot(c.v_axis()),
+            ),
+            arc(),
+        ),
+        EdgeCurve::Ellipse(e) => sinusoid_range(
+            side(e.center()),
+            (
+                e.semi_major() * across.dot(e.u_axis()),
+                e.semi_minor() * across.dot(e.v_axis()),
+            ),
+            arc(),
+        ),
+        EdgeCurve::NurbsCurve(n) => {
+            if n.weights().iter().all(|&w| w > 0.0) {
+                span(&mut n.control_points().iter().map(|&p| side(p)))
+            } else {
+                (f64::NEG_INFINITY, f64::INFINITY)
+            }
+        }
+    })
+}
+
+/// The range of `s0 + a cos t + b sin t` for `t` from `t0` to `t1`: its
+/// values at the ends and at the peak and trough angles inside the span.
+fn sinusoid_range(s0: f64, (a, b): (f64, f64), (t0, t1): (f64, f64)) -> (f64, f64) {
+    use std::f64::consts::{PI, TAU};
+    let (lo, hi) = if t1 >= t0 { (t0, t1) } else { (t1, t0) };
+    if hi - lo >= TAU {
+        let reach = a.hypot(b);
+        return (s0 - reach, s0 + reach);
+    }
+    let at = |t: f64| a.mul_add(t.cos(), b.mul_add(t.sin(), s0));
+    let mut range = (at(lo).min(at(hi)), at(lo).max(at(hi)));
+    let peak = b.atan2(a);
+    for t in [peak, peak + PI] {
+        let t = lo + (t - lo).rem_euclid(TAU);
+        if t <= hi {
+            range = (range.0.min(at(t)), range.1.max(at(t)));
+        }
+    }
+    range
 }
 
 /// How one boundary hit resolves: the vertex at the crossing plus the
@@ -3070,6 +3133,61 @@ mod tests {
                 .any(|p| (p.0 - 0.5).abs() < 1e-10 && (p.1 - 1.0).abs() < 1e-10),
             "expected intersection at (0.5, 1, 0)"
         );
+    }
+
+    /// A 6 x 6 square with a unit-circle hole at its centre whose seam sits
+    /// at pi/8, cut by the line x = 0.95: the hole crosses the line, but an
+    /// even sampling of its circle from the seam (eighths of a turn) peaks
+    /// at x = cos(pi/8) ~ 0.924 and would read it as wholly on one side.
+    #[test]
+    fn a_hole_crossing_the_contact_line_between_samples_refuses_the_trim() {
+        use brepkit_math::curves::Circle3D;
+
+        for side in [TrimSide::Left, TrimSide::Right] {
+            let mut topo = Topology::new();
+            let corners = [(-3.0, -3.0), (3.0, -3.0), (3.0, 3.0), (-3.0, 3.0)]
+                .map(|(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), VERTEX_TOL)));
+            let outer: Vec<OrientedEdge> = (0..4)
+                .map(|i| {
+                    let e = Edge::new(corners[i], corners[(i + 1) % 4], EdgeCurve::Line);
+                    OrientedEdge::new(topo.add_edge(e), true)
+                })
+                .collect();
+            let outer = topo.add_wire(Wire::new(outer, true).unwrap());
+            let (sin, cos) = std::f64::consts::FRAC_PI_8.sin_cos();
+            let circle = Circle3D::new_with_ref(
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                1.0,
+                Vec3::new(cos, sin, 0.0),
+            )
+            .unwrap();
+            let seam = topo.add_vertex(Vertex::new(circle.evaluate(0.0), VERTEX_TOL));
+            let rim = topo.add_edge(Edge::new(seam, seam, EdgeCurve::Circle(circle)));
+            let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, false)], true).unwrap());
+            let face_id = topo.add_face(Face::new(
+                outer,
+                vec![hole],
+                FaceSurface::Plane {
+                    normal: Vec3::new(0.0, 0.0, 1.0),
+                    d: 0.0,
+                },
+            ));
+
+            let contact_3d = vec![Point3::new(0.95, -3.0, 0.0), Point3::new(0.95, 3.0, 0.0)];
+            let contact_uv = vec![(0.95, -3.0), (0.95, 3.0)];
+            let result = trim_face(
+                &mut topo,
+                face_id,
+                &contact_3d,
+                &contact_uv,
+                TrimKeep::Side(side),
+            );
+            assert!(
+                matches!(result, Err(BlendError::TrimmingFailure { face }) if face == face_id),
+                "{side:?}: {result:?}"
+            );
+        }
     }
 
     /// Attach a neighbor square below the shared bottom edge `e0` of
