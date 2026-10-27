@@ -499,7 +499,11 @@ impl<'a> StepBuilder<'a> {
         // middle when it has none, each raised to multiplicity p.
         let p = n.degree_v();
         let (v0, v1) = n.domain_v();
-        let eps = 1e-12 * (v1 - v0).abs().max(1.0);
+        if v1 <= v0 {
+            return Ok(None);
+        }
+        // Relative to the domain: a file's knots can all lie within 1e-12.
+        let eps = 1e-12 * (v1 - v0);
         let mut splits = vec![v0];
         for &k in n.knots_v() {
             if k > v0 + eps && k < v1 - eps && splits.last().is_none_or(|&l| k > l + eps) {
@@ -1489,9 +1493,10 @@ pub(super) fn refs_after_name(attrs: &str) -> Vec<u64> {
     Vec::new()
 }
 
-/// The sphere a B-spline surface lies on, when every point of a grid over
-/// it does (to 1e-7 of its radius), and whether the surface's normal points
-/// out of it. Its axis runs to the surface's point at the start of `u`.
+/// The sphere a B-spline surface lies on, when every knot span of it does
+/// (to 1e-7 of its radius, see [`spans_lie_on_sphere`]), and whether the
+/// surface's normal points out of it. Its axis runs to the surface's point
+/// at the start of `u`.
 fn nurbs_as_sphere(
     n: &brepkit_math::nurbs::surface::NurbsSurface,
 ) -> Option<(brepkit_math::surfaces::SphericalSurface, bool)> {
@@ -1545,6 +1550,7 @@ fn nurbs_as_sphere(
     if pts
         .iter()
         .any(|p| ((*p - center).length() - radius).abs() > 1e-7 * radius)
+        || !spans_lie_on_sphere(n, center, radius)
     {
         return None;
     }
@@ -1553,6 +1559,54 @@ fn nurbs_as_sphere(
     let axis = (n.evaluate(u0, vm) - center).normalize().ok()?;
     let sphere = brepkit_math::surfaces::SphericalSurface::with_axis(center, radius, axis).ok()?;
     Some((sphere, outward))
+}
+
+/// Whether every knot span of `n` lies on the sphere about `center`. On one
+/// span `(|S - c|^2 - r^2) w^2` is a polynomial of degree 2p in u and 2q in
+/// v, so it is fixed over the span by its values on a grid of 2p + 1 by
+/// 2q + 1 parameters; Chebyshev points one more each way keep a sample's
+/// error from growing far between them. A grid over the whole surface can
+/// step over a bump within one span.
+#[allow(clippy::cast_precision_loss)]
+fn spans_lie_on_sphere(
+    n: &brepkit_math::nurbs::surface::NurbsSurface,
+    center: Point3,
+    radius: f64,
+) -> bool {
+    let spans = |knots: &[f64], (lo, hi): (f64, f64)| -> Vec<(f64, f64)> {
+        let mut breaks: Vec<f64> = knots
+            .iter()
+            .copied()
+            .filter(|&k| k >= lo && k <= hi)
+            .collect();
+        breaks.dedup();
+        breaks
+            .windows(2)
+            .filter(|w| w[1] > w[0])
+            .map(|w| (w[0], w[1]))
+            .collect()
+    };
+    let nodes = |(a, b): (f64, f64), degree: usize| -> Vec<f64> {
+        let m = 2 * degree + 2;
+        (0..m)
+            .map(|k| {
+                let c = (std::f64::consts::PI * k as f64 / (m - 1) as f64).cos();
+                (0.5 * (b - a)).mul_add(-c, 0.5 * (a + b))
+            })
+            .collect()
+    };
+    let v_nodes: Vec<Vec<f64>> = spans(n.knots_v(), n.domain_v())
+        .into_iter()
+        .map(|s| nodes(s, n.degree_v()))
+        .collect();
+    spans(n.knots_u(), n.domain_u()).into_iter().all(|su| {
+        nodes(su, n.degree_u()).into_iter().all(|u| {
+            v_nodes
+                .iter()
+                .flatten()
+                .all(|&v| ((n.evaluate(u, v) - center).length() - radius).abs() <= 1e-7 * radius)
+        })
+    })
 }
 
 /// A surface of linear extrusion as brepkit reads it: a surface its curve
@@ -2091,6 +2145,82 @@ mod tests {
 
     use super::*;
     use crate::step::writer;
+
+    /// A ball of radius 5 about the origin as one rational quadratic
+    /// B-spline: a semicircle meridian from pole to pole in u, swept round
+    /// z as a circle of four quarter arcs in v.
+    fn bspline_ball() -> brepkit_math::nurbs::NurbsSurface {
+        use std::f64::consts::FRAC_1_SQRT_2 as S;
+        let r = 5.0;
+        let meridian = [
+            (0.0, -r, 1.0),
+            (r, -r, S),
+            (r, 0.0, 1.0),
+            (r, r, S),
+            (0.0, r, 1.0),
+        ];
+        let round = [
+            (1.0, 0.0, 1.0),
+            (1.0, 1.0, S),
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, S),
+            (-1.0, 0.0, 1.0),
+            (-1.0, -1.0, S),
+            (0.0, -1.0, 1.0),
+            (1.0, -1.0, S),
+            (1.0, 0.0, 1.0),
+        ];
+        let points = meridian
+            .iter()
+            .map(|&(x, z, _)| {
+                round
+                    .iter()
+                    .map(|&(cx, cy, _)| Point3::new(x * cx, x * cy, z))
+                    .collect()
+            })
+            .collect();
+        let weights = meridian
+            .iter()
+            .map(|&(_, _, wm)| round.iter().map(|&(_, _, wc)| wm * wc).collect())
+            .collect();
+        brepkit_math::nurbs::NurbsSurface::new(
+            2,
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 4.0],
+            points,
+            weights,
+        )
+        .unwrap()
+    }
+
+    /// A bump confined to one short knot span, between every point of a
+    /// grid over the whole surface, still keeps it from reading as a sphere.
+    #[test]
+    fn a_bump_within_one_knot_span_is_no_sphere() {
+        use brepkit_math::nurbs::knot_ops::surface_knot_insert_u;
+        let mut ball = bspline_ball();
+        assert!(nurbs_as_sphere(&ball).is_some());
+        // Row 3's basis function then lives on (0.30, 0.33) alone, between
+        // grid rows at u = 2/9 and 4/9.
+        for k in [0.30, 0.31, 0.32, 0.33] {
+            ball = surface_knot_insert_u(&ball, k, 1).unwrap();
+        }
+        assert!(nurbs_as_sphere(&ball).is_some(), "refined, still the ball");
+        let mut points = ball.control_points().to_vec();
+        let p = points[3][2];
+        points[3][2] = Point3::new(p.x() * 1.05, p.y() * 1.05, p.z() * 1.05);
+        let bumped = brepkit_math::nurbs::NurbsSurface::new(
+            2,
+            2,
+            ball.knots_u().to_vec(),
+            ball.knots_v().to_vec(),
+            points,
+            ball.weights().to_vec(),
+        )
+        .unwrap();
+        assert!(nurbs_as_sphere(&bumped).is_none());
+    }
 
     #[test]
     fn rational_surface_roundtrip_preserves_rectangular_weight_grid() {
