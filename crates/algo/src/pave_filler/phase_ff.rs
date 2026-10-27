@@ -3790,6 +3790,24 @@ fn trim_ellipse_to_boundary_crossings(
     }
     // Need at least two crossings to bound an arc.
     if crossings.len() < 2 {
+        // A closed section that meets none of the face's edges, its holes'
+        // included, lies wholly on the face or wholly off it. One wholly
+        // inside a round hole (a bore just inside a boss the face is fused
+        // to) is off it, though the face's outline and boxes hold it; left
+        // to the sampled restriction, it was kept and split the analytic
+        // face along a curve no face shares.
+        if crossings.iter().all(|(_, src)| src.is_empty())
+            && section_lies_off_face(
+                topo,
+                plane_face,
+                *plane_n,
+                sec.evaluate(0.0),
+                analytic_surf,
+                tol,
+            )
+        {
+            return Some(Vec::new());
+        }
         return None;
     }
 
@@ -3886,6 +3904,62 @@ fn trim_ellipse_to_boundary_crossings(
     }
 
     if arcs.is_empty() { None } else { Some(arcs) }
+}
+
+/// Whether a closed plane section through `point`, crossing none of the
+/// plane face's outer edges, lies wholly off the face (in one of its holes,
+/// or beyond its outline): no hole edge meets the analytic surface, and
+/// `point` is outside the face's exact outline, its lines and arcs.
+fn section_lies_off_face(
+    topo: &Topology,
+    plane_face: FaceId,
+    plane_n: Vec3,
+    point: Point3,
+    analytic_surf: &FaceSurface,
+    tol: Tolerance,
+) -> bool {
+    let Ok(face) = topo.face(plane_face) else {
+        return false;
+    };
+    for &wid in face.inner_wires() {
+        let Ok(wire) = topo.wire(wid) else {
+            return false;
+        };
+        for oe in wire.edges() {
+            let Ok(edge) = topo.edge(oe.edge()) else {
+                return false;
+            };
+            let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+                return false;
+            };
+            let (sp, ep) = (sv.point(), ev.point());
+            let hits = if matches!(edge.curve(), EdgeCurve::Line) {
+                line_segment_surface_crossings(sp, ep, analytic_surf)
+            } else if edge_lies_on_surface(edge.curve(), sp, ep, analytic_surf, tol.linear) {
+                // The section may run along the hole's rim, partly on the
+                // face: no crossings here proves nothing.
+                return false;
+            } else {
+                edge_surface_crossings(edge.curve(), sp, ep, analytic_surf, tol.linear)
+            };
+            if !hits.is_empty() {
+                return false;
+            }
+        }
+    }
+    let Ok(frame) = brepkit_math::frame::Frame3::from_normal(point, plane_n) else {
+        return false;
+    };
+    let Ok(Some(pieces)) =
+        brepkit_topology::planar::face_boundary_2d(topo, plane_face, point, frame.x, frame.y)
+    else {
+        return false;
+    };
+    brepkit_math::region2d::point_in_region(
+        &pieces,
+        brepkit_math::vec::Point2::new(0.0, 0.0),
+        tol.linear,
+    ) == Some(false)
 }
 
 /// Crossings of a circular boundary ARC with the plane `normal·p = d`.
@@ -4150,7 +4224,7 @@ fn edge_surface_crossings(
     let f = |t: f64| analytic_signed_distance(surface, at(t));
     let (t0, t1) = curve.domain_with_endpoints(sp, ep);
     // An edge lying on the surface crosses nothing; its distance is noise.
-    if (0..=32).all(|k| f((t1 - t0).mul_add(f64::from(k) / 32.0, t0)).abs() <= 4.0 * tol) {
+    if edge_lies_on_surface(curve, sp, ep, surface, tol) {
         return Vec::new();
     }
     let mut budget = 4096_u32;
@@ -4255,6 +4329,23 @@ fn edge_surface_crossings(
     }
     flush(&mut group, &mut out);
     out
+}
+
+/// Whether a curved edge lies on a cylinder or cone to within its distance
+/// noise at every sample, so that where it crosses the surface is unknown.
+fn edge_lies_on_surface(
+    curve: &EdgeCurve,
+    sp: Point3,
+    ep: Point3,
+    surface: &FaceSurface,
+    tol: f64,
+) -> bool {
+    let (t0, t1) = curve.domain_with_endpoints(sp, ep);
+    (0..=32).all(|k| {
+        let t = (t1 - t0).mul_add(f64::from(k) / 32.0, t0);
+        analytic_signed_distance(surface, curve.evaluate_with_endpoints(t, sp, ep)).abs()
+            <= 4.0 * tol
+    })
 }
 
 /// Points along a curved edge in wire order, its end left out, no chord
@@ -9184,6 +9275,64 @@ mod tests {
     /// a quarter patch of its outer upper tube holds none of the inner one:
     /// the box face holding that circle whole does not make it a section.
     /// (The outer circle passes whole; closed circles split downstream.)
+    /// A plane face round a hole of `hole_radius` centred `offset` along x,
+    /// and the section of a unit cylinder about z: whether that section is
+    /// judged wholly off the face, read at its point (1, 0, 0).
+    fn unit_section_lies_off_face(hole_radius: f64, offset: f64) -> bool {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::CylindricalSurface;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let mut topo = Topology::default();
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let corners: Vec<_> = [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)]
+            .iter()
+            .map(|&(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), 1e-7)))
+            .collect();
+        let sides: Vec<_> = (0..4)
+            .map(|i| {
+                let e = topo.add_edge(Edge::new(corners[i], corners[(i + 1) % 4], EdgeCurve::Line));
+                OrientedEdge::new(e, true)
+            })
+            .collect();
+        let outer = topo.add_wire(Wire::new(sides, true).unwrap());
+        let rim = Circle3D::new(Point3::new(offset, 0.0, 0.0), up, hole_radius).unwrap();
+        let v = topo.add_vertex(Vertex::new(rim.evaluate(0.0), 1e-7));
+        let rim_edge = topo.add_edge(Edge::new(v, v, EdgeCurve::Circle(rim)));
+        let hole =
+            topo.add_wire(Wire::new(vec![OrientedEdge::new(rim_edge, false)], true).unwrap());
+        let face = topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane { normal: up, d: 0.0 },
+        ));
+        let cylinder = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), up, 1.0).unwrap(),
+        );
+        section_lies_off_face(
+            &topo,
+            face,
+            up,
+            Point3::new(1.0, 0.0, 0.0),
+            &cylinder,
+            Tolerance::default(),
+        )
+    }
+
+    #[test]
+    fn a_section_well_inside_a_hole_lies_off_the_face() {
+        assert!(unit_section_lies_off_face(2.0, 0.0));
+    }
+
+    /// A rim within distance noise of the cylinder crosses it nowhere that
+    /// can be told, though here it crosses twice and the section runs on the
+    /// face beyond them: the section is kept.
+    #[test]
+    fn a_section_along_a_hole_rim_is_not_judged_off_the_face() {
+        let tol = Tolerance::default().linear;
+        assert!(!unit_section_lies_off_face(1.0 + tol, 2.5 * tol));
+    }
+
     #[test]
     fn a_torus_patch_takes_no_plane_circle_lying_off_it() {
         use brepkit_math::curves::Circle3D;
