@@ -9,6 +9,7 @@ use std::f64::consts::PI;
 
 use brepkit_math::mat::Mat4;
 use brepkit_math::vec::Point3;
+use brepkit_operations::OperationsError;
 use brepkit_operations::boolean::{BooleanOp, boolean};
 use brepkit_operations::chamfer::chamfer_two_on;
 use brepkit_operations::measure::solid_volume;
@@ -277,6 +278,154 @@ fn a_chamfer_past_a_pieced_edge_closes_its_ends() {
     let report = validate_solid(&topo, cut).unwrap();
     assert!(report.is_valid(), "{:?}", report.issues);
     let want = 200.0 * 80.0 * 20.0 - 2.0 * 0.5 * d1 * d2 * 20.0;
+    let volume = solid_volume(&topo, cut, 0.001).unwrap();
+    assert!(
+        (volume - want).abs() < 1e-6 * want,
+        "volume {volume}, want {want}"
+    );
+}
+
+/// The plate's top edge chamfered 14 into the top face sets the top back
+/// past the whole hole (y 7 to 13): the hole would leave with the cut-off
+/// strip while its bore stayed, so the chamfer is refused and the plate
+/// left closed.
+#[test]
+fn a_hole_beyond_the_chamfer_refuses_it() {
+    let mut topo = Topology::new();
+    let plate = drilled_plate(&mut topo);
+    let edge = edge_between(
+        &topo,
+        plate,
+        Point3::new(0.0, 20.0, 10.0),
+        Point3::new(40.0, 20.0, 10.0),
+    );
+    let top = plane_along(&topo, plate, edge, [0.0, 0.0, 1.0]);
+    assert!(chamfer_two_on(&mut topo, plate, &[(edge, top)], 14.0, 2.0).is_err());
+    let report = validate_solid(&topo, plate).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+}
+
+/// A rim and a straight edge in one call are refused before either is cut.
+#[test]
+fn rims_and_other_edges_are_refused_together() {
+    let mut topo = Topology::new();
+    let plate = drilled_plate(&mut topo);
+    let rim = brepkit_topology::explorer::solid_edges(&topo, plate)
+        .unwrap()
+        .into_iter()
+        .find(|&e| {
+            let edge = topo.edge(e).unwrap();
+            matches!(edge.curve(), EdgeCurve::Circle(c) if (c.center().z() - 10.0).abs() < 1e-9)
+        })
+        .unwrap();
+    let cap = plane_along(&topo, plate, rim, [0.0, 0.0, 1.0]);
+    let edge = edge_between(
+        &topo,
+        plate,
+        Point3::new(0.0, 20.0, 10.0),
+        Point3::new(40.0, 20.0, 10.0),
+    );
+    let picks = [(rim, cap), (edge, cap)];
+    let result = chamfer_two_on(&mut topo, plate, &picks, 1.0, 1.0);
+    assert!(
+        matches!(result, Err(OperationsError::InvalidInput { .. })),
+        "{result:?}"
+    );
+    let report = validate_solid(&topo, plate).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+}
+
+/// A reference face must border its edge, on either path: a rod's top rim
+/// measured on its bottom cap, and the plate's top edge on its bottom face.
+#[test]
+fn a_reference_face_off_its_edge_is_refused() {
+    let mut topo = Topology::new();
+    let rod = make_cylinder(&mut topo, 3.0, 10.0).unwrap();
+    let rims: Vec<EdgeId> = brepkit_topology::explorer::solid_edges(&topo, rod)
+        .unwrap()
+        .into_iter()
+        .filter(|&e| matches!(topo.edge(e).unwrap().curve(), EdgeCurve::Circle(_)))
+        .collect();
+    let at_height = |topo: &Topology, z: f64| {
+        rims.iter()
+            .copied()
+            .find(|&e| {
+                let start = topo.edge(e).unwrap().start();
+                (topo.vertex(start).unwrap().point().z() - z).abs() < 1e-9
+            })
+            .unwrap()
+    };
+    let (top_rim, bottom_rim) = (at_height(&topo, 10.0), at_height(&topo, 0.0));
+    let bottom = plane_along(&topo, rod, bottom_rim, [0.0, 0.0, -1.0]);
+    let result = chamfer_two_on(&mut topo, rod, &[(top_rim, bottom)], 1.0, 2.0);
+    assert!(
+        matches!(result, Err(OperationsError::InvalidInput { .. })),
+        "{result:?}"
+    );
+
+    let plate = drilled_plate(&mut topo);
+    let edge = edge_between(
+        &topo,
+        plate,
+        Point3::new(0.0, 20.0, 10.0),
+        Point3::new(40.0, 20.0, 10.0),
+    );
+    let floor = brepkit_topology::explorer::solid_faces(&topo, plate)
+        .unwrap()
+        .into_iter()
+        .find(|&f| {
+            matches!(topo.face(f).unwrap().surface(), FaceSurface::Plane { normal, d }
+                if normal.z() < -1.0 + 1e-9 && d.abs() < 1e-9)
+        })
+        .unwrap();
+    let result = chamfer_two_on(&mut topo, plate, &[(edge, floor)], 1.0, 2.0);
+    assert!(
+        matches!(result, Err(OperationsError::InvalidInput { .. })),
+        "{result:?}"
+    );
+}
+
+/// A 10-unit block with an enclosed 3-unit cubic cavity keeps the cavity
+/// through a chamfer of an outer edge; an edge of the cavity is refused.
+#[test]
+fn a_cavity_survives_a_chamfer_of_an_outer_edge() {
+    let (d1, d2) = (2.0, 1.0);
+    let mut topo = Topology::new();
+    let block = make_box(&mut topo, 10.0, 10.0, 10.0).unwrap();
+    let cube = make_box(&mut topo, 3.0, 3.0, 3.0).unwrap();
+    transform_solid(&mut topo, cube, &Mat4::translation(3.5, 3.5, 3.5)).unwrap();
+    let hollow = boolean(&mut topo, BooleanOp::Cut, block, cube).unwrap();
+    assert_eq!(topo.solid(hollow).unwrap().inner_shells().len(), 1);
+
+    let cavity_edge = edge_between(
+        &topo,
+        hollow,
+        Point3::new(3.5, 3.5, 6.5),
+        Point3::new(6.5, 3.5, 6.5),
+    );
+    let cavity_face = brepkit_topology::explorer::solid_faces(&topo, hollow)
+        .unwrap()
+        .into_iter()
+        .find(|&f| {
+            brepkit_topology::explorer::face_edges(&topo, f)
+                .unwrap()
+                .contains(&cavity_edge)
+        })
+        .unwrap();
+    assert!(chamfer_two_on(&mut topo, hollow, &[(cavity_edge, cavity_face)], 0.5, 0.5).is_err());
+
+    let edge = edge_between(
+        &topo,
+        hollow,
+        Point3::new(0.0, 0.0, 10.0),
+        Point3::new(10.0, 0.0, 10.0),
+    );
+    let top = plane_along(&topo, hollow, edge, [0.0, 0.0, 1.0]);
+    let cut = chamfer_two_on(&mut topo, hollow, &[(edge, top)], d1, d2).unwrap();
+    assert_eq!(topo.solid(cut).unwrap().inner_shells().len(), 1);
+    let report = validate_solid(&topo, cut).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+    let want = 1000.0 - 27.0 - 0.5 * d1 * d2 * 10.0;
     let volume = solid_volume(&topo, cut, 0.001).unwrap();
     assert!(
         (volume - want).abs() < 1e-6 * want,

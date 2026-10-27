@@ -149,23 +149,46 @@ impl<'a> ChamferBuilder<'a> {
     /// 2. For each target edge, find the two adjacent faces.
     /// 3. Build single-edge spines (no chain propagation in v1).
     /// 4. Compute stripes via analytic fast path or record failure.
-    /// 5. Trim adjacent faces along contact curves.
-    /// 6. Assemble new solid from trimmed faces, blend faces, and untouched
-    ///    original faces.
+    /// 5. Trim adjacent faces along contact curves, recording a stripe that
+    ///    cannot trim both its faces as a failure.
+    /// 6. Assemble new solid from trimmed faces, blend faces, untouched
+    ///    original faces, and the input's inner shells.
     ///
     /// # Errors
     ///
-    /// Returns [`BlendError`] if no edges were specified, or if topology
-    /// lookups fail. Individual edge failures are recorded in
-    /// [`BlendResult::failed`] rather than aborting the whole operation.
+    /// Returns [`BlendError`] if no edges were specified, an edge lies on an
+    /// inner shell, or topology lookups fail. Individual edge failures are
+    /// recorded in [`BlendResult::failed`] rather than aborting the whole
+    /// operation.
     #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Result<BlendResult, BlendError> {
         let adjacency = self.topo.build_adjacency(self.solid)?;
+        let solid = self.topo.solid(self.solid)?;
+        let (shell_id, inner_shells) = (solid.outer_shell(), solid.inner_shells().to_vec());
+        // The chamfer rebuilds the outer shell only and carries the inner
+        // shells over as they are, so it cannot cut a cavity's edge.
+        let mut cavity_edges: HashSet<EdgeId> = HashSet::new();
+        for &shell in &inner_shells {
+            for &face in self.topo.shell(shell)?.faces() {
+                cavity_edges.extend(brepkit_topology::explorer::face_edges(self.topo, face)?);
+            }
+        }
+        let on_outer_shell = |eid: EdgeId| {
+            if cavity_edges.contains(&eid) {
+                Err(BlendError::PlanningFailure {
+                    reason: format!("chamfer edge {eid:?} is on an inner shell"),
+                })
+            } else {
+                Ok(eid)
+            }
+        };
         let mut all_edges: Vec<(EdgeId, f64, f64)> = Vec::new();
         for set in self.edge_sets {
             match set {
                 ChamferEdgeSet::TwoDistance { edges, d1, d2 } => {
-                    all_edges.extend(edges.into_iter().map(|eid| (eid, d1, d2)));
+                    for eid in edges {
+                        all_edges.push((on_outer_shell(eid)?, d1, d2));
+                    }
                 }
                 ChamferEdgeSet::DistanceAngle {
                     edges,
@@ -173,12 +196,14 @@ impl<'a> ChamferBuilder<'a> {
                     angle,
                 } => {
                     let d2 = distance * angle.tan();
-                    all_edges.extend(edges.into_iter().map(|eid| (eid, distance, d2)));
+                    for eid in edges {
+                        all_edges.push((on_outer_shell(eid)?, distance, d2));
+                    }
                 }
                 // Each stripe takes d1 on the edge's first adjacent face.
                 ChamferEdgeSet::Referenced { edges, d1, d2 } => {
                     for (eid, reference) in edges {
-                        match adjacency.faces_for_edge(eid) {
+                        match adjacency.faces_for_edge(on_outer_shell(eid)?) {
                             [first, _] if *first == reference => all_edges.push((eid, d1, d2)),
                             [_, second] if *second == reference => all_edges.push((eid, d2, d1)),
                             _ => {
@@ -204,53 +229,27 @@ impl<'a> ChamferBuilder<'a> {
 
         let topo = self.topo;
 
-        let shell_id = topo.solid(self.solid)?.outer_shell();
         let original_faces: Vec<FaceId> = topo.shell(shell_id)?.faces().to_vec();
-
-        let mut touched_faces: HashSet<FaceId> = HashSet::new();
 
         let mut succeeded: Vec<EdgeId> = Vec::new();
         let mut failed: Vec<(EdgeId, BlendError)> = Vec::new();
-        let mut stripe_results: Vec<StripeResult> = Vec::new();
+        let mut stripe_results: Vec<(EdgeId, StripeResult)> = Vec::new();
 
-        for (edge_id, d1, d2) in &all_edges {
-            let result = compute_chamfer_stripe(topo, &adjacency, *edge_id, *d1, *d2);
-            match result {
-                Ok(sr) => {
-                    touched_faces.insert(sr.stripe.face1);
-                    touched_faces.insert(sr.stripe.face2);
-                    stripe_results.push(sr);
-                    succeeded.push(*edge_id);
-                }
-                Err(e) => {
-                    failed.push((*edge_id, e));
-                }
+        for &(edge_id, d1, d2) in &all_edges {
+            match compute_chamfer_stripe(topo, &adjacency, edge_id, d1, d2) {
+                Ok(sr) => stripe_results.push((edge_id, sr)),
+                Err(e) => failed.push((edge_id, e)),
             }
-        }
-
-        // If no stripes succeeded, return the original solid with all failures.
-        if stripe_results.is_empty() {
-            return Ok(BlendResult {
-                solid: self.solid,
-                succeeded: Vec::new(),
-                failed,
-                is_partial: false,
-            });
         }
 
         let mut face_replacements: std::collections::HashMap<FaceId, FaceId> =
             std::collections::HashMap::new();
 
-        let mut stripe_contact_edges: Vec<(
-            Option<brepkit_topology::edge::EdgeId>,
-            Option<brepkit_topology::edge::EdgeId>,
-        )> = Vec::new();
-        for sr in &stripe_results {
+        // Each stripe that trims both its faces, with the contact edges the
+        // trims left on them.
+        let mut trimmed: Vec<(StripeResult, [Option<EdgeId>; 2])> = Vec::new();
+        for (edge_id, sr) in stripe_results {
             let stripe = &sr.stripe;
-            stripe_contact_edges.push((None, None));
-
-            let contact1_pts = sample_nurbs_endpoints(&stripe.contact1);
-            let contact2_pts = sample_nurbs_endpoints(&stripe.contact2);
 
             // Keep the side of the contact line AWAY from the spine edge
             // (mirrors the fillet builder): the strip between the contact
@@ -264,70 +263,75 @@ impl<'a> ChamferBuilder<'a> {
             let spine_pt = stripe.spine.evaluate(topo, 0.0)?;
             let keep = TrimKeep::AwayFrom(spine_pt);
 
-            let current_face1 = face_replacements
-                .get(&stripe.face1)
-                .copied()
-                .unwrap_or(stripe.face1);
-            let trim1 = trimmer::trim_face(
-                topo,
-                current_face1,
-                &contact1_pts,
-                &[(0.0, 0.0), (1.0, 0.0)],
-                keep,
-            );
-
-            match trim1 {
-                Ok(tr) if tr.trimmed_face != current_face1 => {
-                    if let Some(slot) = stripe_contact_edges.last_mut() {
-                        slot.0 = tr.contact_edge;
+            // The stripe trims both its faces or neither: a face left whole
+            // (the trimmer refused it, or cannot cut its surface) would leave
+            // the chamfer face's contact edge on it unshared and the shell
+            // open, so the edge is left unchamfered and recorded as failed.
+            let faces = [stripe.face1, stripe.face2];
+            let before = faces.map(|f| face_replacements.get(&f).copied());
+            let mut contacts = [None, None];
+            let mut failure = None;
+            for (slot, (face, contact)) in faces
+                .into_iter()
+                .zip([&stripe.contact1, &stripe.contact2])
+                .enumerate()
+            {
+                let current = face_replacements.get(&face).copied().unwrap_or(face);
+                match trimmer::trim_face(
+                    topo,
+                    current,
+                    &sample_nurbs_endpoints(contact),
+                    &[(0.0, 0.0), (1.0, 0.0)],
+                    keep,
+                ) {
+                    Ok(tr) if tr.trimmed_face != current => {
+                        contacts[slot] = tr.contact_edge;
+                        face_replacements.insert(face, tr.trimmed_face);
                     }
-                    face_replacements.insert(stripe.face1, tr.trimmed_face);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("chamfer trimming failed on face {:?}: {e}", stripe.face1);
+                    Ok(_) => {
+                        failure = Some(BlendError::TrimmingFailure { face: current });
+                        break;
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
                 }
             }
-
-            let current_face2 = face_replacements
-                .get(&stripe.face2)
-                .copied()
-                .unwrap_or(stripe.face2);
-            let trim2 = trimmer::trim_face(
-                topo,
-                current_face2,
-                &contact2_pts,
-                &[(0.0, 0.0), (1.0, 0.0)],
-                keep,
-            );
-
-            match trim2 {
-                Ok(tr) if tr.trimmed_face != current_face2 => {
-                    if let Some(slot) = stripe_contact_edges.last_mut() {
-                        slot.1 = tr.contact_edge;
-                    }
-                    face_replacements.insert(stripe.face2, tr.trimmed_face);
+            if let Some(error) = failure {
+                for (face, prior) in faces.into_iter().zip(before) {
+                    match prior {
+                        Some(f) => face_replacements.insert(face, f),
+                        None => face_replacements.remove(&face),
+                    };
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("chamfer trimming failed on face {:?}: {e}", stripe.face2);
-                }
+                failed.push((edge_id, error));
+                continue;
             }
+            succeeded.push(edge_id);
+            trimmed.push((sr, contacts));
+        }
+
+        // If no stripe trimmed, return the original solid with all failures.
+        if trimmed.is_empty() {
+            return Ok(BlendResult {
+                solid: self.solid,
+                succeeded: Vec::new(),
+                failed,
+                is_partial: false,
+            });
         }
 
         let mut blend_face_ids: Vec<FaceId> = Vec::new();
         let mut cross_edges: Vec<(EdgeId, VertexId, VertexId, FaceId)> = Vec::new();
 
-        for (si, sr) in stripe_results.iter().enumerate() {
+        for (sr, [c1, c2]) in &trimmed {
             // Reuse the trimmed neighbours' contact edges (mirrors the fillet
             // builder): a freshly minted duplicate leaves both copies use-1
             // and opens the shell along the chamfer flanks.
-            let (c1, c2) = stripe_contact_edges
-                .get(si)
-                .copied()
-                .unwrap_or((None, None));
-            let info =
-                crate::builder_utils::create_chamfer_face_with_contacts(topo, &sr.stripe, c1, c2)?;
+            let info = crate::builder_utils::create_chamfer_face_with_contacts(
+                topo, &sr.stripe, *c1, *c2,
+            )?;
             orient_chamfer_face(topo, info.face, &sr.stripe)?;
             // A closed rim has no end faces to take its cross edges.
             if !sr.stripe.spine.is_closed() {
@@ -338,25 +342,17 @@ impl<'a> ChamferBuilder<'a> {
             blend_face_ids.push(info.face);
         }
 
-        let mut result_faces: Vec<FaceId> = Vec::new();
-
-        for &fid in &original_faces {
-            if !touched_faces.contains(&fid) {
-                result_faces.push(fid);
-            }
-        }
-
-        for &fid in &touched_faces {
-            let replacement = face_replacements.get(&fid).copied();
-            result_faces.push(replacement.unwrap_or(fid));
-        }
+        let mut result_faces: Vec<FaceId> = original_faces
+            .iter()
+            .map(|fid| face_replacements.get(fid).copied().unwrap_or(*fid))
+            .collect();
 
         close_chamfer_ends(topo, &result_faces, &cross_edges)?;
         result_faces.extend(&blend_face_ids);
 
         let new_shell = Shell::new(result_faces)?;
         let new_shell_id = topo.add_shell(new_shell);
-        let new_solid = Solid::new(new_shell_id, Vec::new());
+        let new_solid = Solid::new(new_shell_id, inner_shells);
         let new_solid_id = topo.add_solid(new_solid);
 
         let is_partial = !failed.is_empty();
@@ -637,5 +633,140 @@ mod tests {
         let builder = ChamferBuilder::new(&mut topo, solid);
         let result = builder.build();
         assert!(result.is_err(), "empty edge set should produce an error");
+    }
+
+    /// A wall and a cap on a closed circular rim of `radius` at z = 0, laid
+    /// out as the cylinder and cone primitives lay out their bottom rims:
+    /// the wall first, running the rim forward, then the cap (outward -z)
+    /// running it backward.
+    fn bottom_rim(topo: &mut Topology, radius: f64, wall: FaceSurface) -> (SolidId, EdgeId) {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+
+        let v = topo.add_vertex(Vertex::new(Point3::new(radius, 0.0, 0.0), 1e-7));
+        let circle =
+            Circle3D::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), radius).unwrap();
+        let rim = topo.add_edge(Edge::new(v, v, EdgeCurve::Circle(circle)));
+        let cap = FaceSurface::Plane {
+            normal: Vec3::new(0.0, 0.0, -1.0),
+            d: 0.0,
+        };
+        let mut faces = Vec::new();
+        for (forward, surface) in [(true, wall), (false, cap)] {
+            let wire =
+                topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, forward)], true).unwrap());
+            faces.push(topo.add_face(Face::new(wire, Vec::new(), surface)));
+        }
+        let shell = topo.add_shell(Shell::new(faces).unwrap());
+        (topo.add_solid(Solid::new(shell, Vec::new())), rim)
+    }
+
+    /// Each contact circle's radius and height, in either order.
+    fn assert_contacts(stripe: &crate::stripe::Stripe, want: [(f64, f64); 2]) {
+        let at = |c: &brepkit_math::nurbs::curve::NurbsCurve| {
+            let p = c.evaluate(c.domain().0);
+            (p.x().hypot(p.y()), p.z())
+        };
+        let got = [at(&stripe.contact1), at(&stripe.contact2)];
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() + (a.1 - b.1).abs() < 1e-9;
+        assert!(
+            (near(got[0], want[0]) && near(got[1], want[1]))
+                || (near(got[0], want[1]) && near(got[1], want[0])),
+            "contacts {got:?}, want {want:?}"
+        );
+    }
+
+    /// The trimmer cannot cut a face along a closed rim, so the builder
+    /// records the rim as failed and hands the solid back as it was.
+    fn assert_rim_refused(topo: &mut Topology, solid: SolidId, rim: EdgeId, d: f64) {
+        let mut builder = ChamferBuilder::new(topo, solid);
+        builder.add_edges_symmetric(&[rim], d);
+        let result = builder.build().unwrap();
+        assert_eq!(result.solid, solid);
+        assert!(result.succeeded.is_empty());
+        assert!(
+            matches!(result.failed[..], [(e, BlendError::TrimmingFailure { .. })] if e == rim),
+            "{:?}",
+            result.failed
+        );
+    }
+
+    /// A cylinder's bottom rim: the stripe is an exact 45-degree cone from
+    /// radius `r - d` on the cap to height `d` up the wall (not below the
+    /// cap).
+    #[test]
+    fn a_cylinder_rims_stripe_is_an_exact_cone() {
+        use brepkit_math::surfaces::CylindricalSurface;
+        use brepkit_math::traits::ParametricSurface;
+
+        let (r, d) = (2.0, 0.4);
+        let mut topo = Topology::new();
+        let wall = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), r)
+            .unwrap();
+        let (solid, rim) = bottom_rim(&mut topo, r, FaceSurface::Cylinder(wall));
+        let adjacency = topo.build_adjacency(solid).unwrap();
+        let stripe = compute_chamfer_stripe(&topo, &adjacency, rim, d, d)
+            .unwrap()
+            .stripe;
+        let FaceSurface::Cone(cone) = &stripe.surface else {
+            panic!("expected a cone, got {}", stripe.surface.type_tag());
+        };
+        let alpha = std::f64::consts::FRAC_PI_4;
+        assert!((cone.half_angle() - alpha).abs() < 1e-12);
+        // At u = 0 the cone's radial direction is +y, the wall's frame.
+        for (v, want) in [
+            ((r - d) / alpha.cos(), Point3::new(0.0, r - d, 0.0)),
+            (r / alpha.cos(), Point3::new(0.0, r, d)),
+        ] {
+            let got = ParametricSurface::evaluate(cone, 0.0, v);
+            assert!(
+                (got - want).length() < 1e-9,
+                "at v={v}: {got:?}, want {want:?}"
+            );
+        }
+        assert_contacts(&stripe, [(r - d, 0.0), (r, d)]);
+        assert_rim_refused(&mut topo, solid, rim, d);
+    }
+
+    /// A frustum's bottom rim (radius 3, wall at `alpha = atan2(6, 3)` from
+    /// the cap): the stripe is an exact cone at `pi/2 - alpha/2` from the
+    /// cap's contact at `r - d` to the wall's, `d` along the wall.
+    #[test]
+    fn a_frustum_rims_stripe_is_an_exact_cone() {
+        use brepkit_math::surfaces::ConicalSurface;
+        use brepkit_math::traits::ParametricSurface;
+
+        let (r, d) = (3.0, 0.4);
+        let alpha = 6.0_f64.atan2(3.0);
+        let mut topo = Topology::new();
+        let wall =
+            ConicalSurface::new(Point3::new(0.0, 0.0, 6.0), Vec3::new(0.0, 0.0, -1.0), alpha)
+                .unwrap();
+        let (solid, rim) = bottom_rim(&mut topo, r, FaceSurface::Cone(wall));
+        let adjacency = topo.build_adjacency(solid).unwrap();
+        let stripe = compute_chamfer_stripe(&topo, &adjacency, rim, d, d)
+            .unwrap()
+            .stripe;
+        let FaceSurface::Cone(cone) = &stripe.surface else {
+            panic!("expected a cone, got {}", stripe.surface.type_tag());
+        };
+        let beta = std::f64::consts::FRAC_PI_2 - alpha * 0.5;
+        assert!((cone.half_angle() - beta).abs() < 1e-9);
+        // The wall's frame about -z puts the cone's u = 0 direction at -y.
+        let (wall_r, wall_z) = (r - d * alpha.cos(), d * alpha.sin());
+        for (v, want) in [
+            ((r - d) / beta.cos(), Point3::new(0.0, -(r - d), 0.0)),
+            (wall_r / beta.cos(), Point3::new(0.0, -wall_r, wall_z)),
+        ] {
+            let got = ParametricSurface::evaluate(cone, 0.0, v);
+            assert!(
+                (got - want).length() < 1e-9,
+                "at v={v}: {got:?}, want {want:?}"
+            );
+        }
+        assert_contacts(&stripe, [(r - d, 0.0), (wall_r, wall_z)]);
+        assert_rim_refused(&mut topo, solid, rim, d);
     }
 }

@@ -91,15 +91,18 @@ pub fn chamfer_asymmetric(
 /// Two-distance chamfer, `d1` on each edge's reference face and `d2` on its
 /// other face.
 ///
-/// A distance-and-angle chamfer is `d2 = d1 * tan(angle)`. Closed circular rims between a cap and a coaxial wall (a hole's mouth, a
-/// rod's end) are cut here; other edges go to the blend engine's chamfer,
-/// which keeps the faces it does not touch, holes and curves included.
+/// A distance-and-angle chamfer is `d2 = d1 * tan(angle)`. Closed circular
+/// rims between a cap and a coaxial wall (a hole's mouth, a rod's end) are
+/// cut here; other edges go to the blend engine's chamfer, which keeps the
+/// faces it does not touch, holes and curves included. One call takes rims
+/// or other edges, not both.
 ///
 /// # Errors
 ///
 /// Returns an error if either distance is zero or negative, no edges are
-/// given, a reference face does not border its edge, a distance consumes a
-/// face, or the blend engine fails on an edge.
+/// given, a reference face does not border its edge, the edges mix rims
+/// with other edges, a distance consumes a face, or the blend engine fails
+/// on an edge.
 pub fn chamfer_two_on(
     topo: &mut Topology,
     solid: SolidId,
@@ -117,7 +120,29 @@ pub fn chamfer_two_on(
             reason: "no edges specified for chamfer".into(),
         });
     }
+    let faces = brepkit_topology::explorer::solid_faces(topo, solid)?;
+    let adjacency = brepkit_topology::adjacency::AdjacencyIndex::build_from_faces(topo, &faces)?;
+    for &(edge, face) in edges {
+        if !adjacency.faces_for_edge(edge).contains(&face) {
+            return Err(crate::OperationsError::InvalidInput {
+                reason: format!("chamfer reference face {face:?} does not border edge {edge:?}"),
+            });
+        }
+    }
     let ids: Vec<EdgeId> = edges.iter().map(|&(e, _)| e).collect();
+    // The rim chamfer takes a selection only when every edge is a rim, and
+    // the blend engine cannot close a rim, so a mixed selection has no path.
+    let mut rims = 0;
+    for &edge in &ids {
+        if find_rim(topo, solid, edge)?.is_some() {
+            rims += 1;
+        }
+    }
+    if rims > 0 && rims < ids.len() {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: "closed circular rims cannot be chamfered together with other edges".into(),
+        });
+    }
     let on_wall = |edge: EdgeId, wall: FaceId| edges.iter().any(|&(e, f)| e == edge && f == wall);
     let split = |edge: EdgeId, _cap: FaceId, wall: FaceId| {
         if on_wall(edge, wall) {
