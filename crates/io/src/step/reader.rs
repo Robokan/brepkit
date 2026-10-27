@@ -296,6 +296,10 @@ impl<'a> StepBuilder<'a> {
                 face_ids.extend(halves);
                 continue;
             }
+            if let Some(lunes) = self.build_pole_closed_face(face_ref, flip)? {
+                face_ids.extend(lunes);
+                continue;
+            }
             let face_id = self.build_face(face_ref, flip)?;
             face_ids.push(face_id);
         }
@@ -333,14 +337,20 @@ impl<'a> StepBuilder<'a> {
         let Some(&surface_ref) = parse_refs(&attrs).iter().rev().find(|r| **r != bound_ref) else {
             return Ok(None);
         };
-        if self.get_entity(surface_ref)?.entity_type != "SPHERICAL_SURFACE" {
-            return Ok(None);
-        }
-        let FaceSurface::Sphere(sphere) = self.build_surface(surface_ref)? else {
-            return Ok(None);
+        // A ball can also be written as a rational B-spline surface closing
+        // up to a pole at each end; it reads as the sphere it is. Its normal
+        // may point in, which turns the face's own flag around.
+        let (sphere, inward) = match self.build_surface(surface_ref)? {
+            FaceSurface::Sphere(sphere) => (sphere, false),
+            FaceSurface::Nurbs(n) => match nurbs_as_sphere(&n) {
+                Some((sphere, outward)) => (sphere, !outward),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
         };
         let orient_tail = attrs.trim_end_matches(')').trim();
-        let face_reversed = orient_tail.ends_with(".F.") || orient_tail.ends_with(".FALSE.");
+        let face_reversed =
+            (orient_tail.ends_with(".F.") || orient_tail.ends_with(".FALSE.")) != inward;
 
         let (c, r) = (sphere.center(), sphere.radius());
         let (x, y) = (sphere.x_axis(), sphere.y_axis());
@@ -386,6 +396,232 @@ impl<'a> StepBuilder<'a> {
             });
         }
         Ok(Some([halves[0], halves[1]]))
+    }
+
+    /// A face bounded only by vertex loops on a B-spline surface that closes
+    /// round one direction and collapses to a pole at each end of the other
+    /// (a ball or a lemon written as one face) has no edge to bound it. It
+    /// reads as the lunes brepkit's revolve builds: the surface cut along
+    /// meridians where it is only C0 (knots raised to full multiplicity), each
+    /// piece a face between two meridian edges from pole to pole. `None` for
+    /// any other face.
+    #[allow(clippy::too_many_lines)]
+    fn build_pole_closed_face(
+        &mut self,
+        face_ref: u64,
+        flip: bool,
+    ) -> Result<Option<Vec<brepkit_topology::face::FaceId>>, IoError> {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        use brepkit_math::nurbs::surface::NurbsSurface;
+
+        let attrs = self.get_entity(face_ref)?.attrs.clone();
+        let list_refs = parse_list_refs(&attrs);
+        if list_refs.is_empty() {
+            return Ok(None);
+        }
+        for &bound_ref in &list_refs {
+            let Some(&loop_ref) = parse_refs(&self.get_entity(bound_ref)?.attrs.clone()).first()
+            else {
+                return Ok(None);
+            };
+            if self.get_entity(loop_ref)?.entity_type != "VERTEX_LOOP" {
+                return Ok(None);
+            }
+        }
+        let list_set: std::collections::HashSet<u64> = list_refs.iter().copied().collect();
+        let Some(&surface_ref) = parse_refs(&attrs)
+            .iter()
+            .rev()
+            .find(|r| !list_set.contains(r))
+        else {
+            return Ok(None);
+        };
+        let FaceSurface::Nurbs(surface) = self.build_surface(surface_ref)? else {
+            return Ok(None);
+        };
+
+        // Poles at both ends of u and closed round v; else the same with u
+        // and v swapped, which turns the surface's normal round.
+        let grid = |n: &NurbsSurface| -> bool {
+            let cps = n.control_points();
+            let (Some(first), Some(last)) = (cps.first(), cps.last()) else {
+                return false;
+            };
+            if first.is_empty() || last.is_empty() {
+                return false;
+            }
+            let scale = cps
+                .iter()
+                .flatten()
+                .map(|p| (*p - first[0]).length())
+                .fold(0.0_f64, f64::max)
+                .max(1e-300);
+            let pole =
+                |row: &Vec<Point3>| row.iter().all(|p| (*p - row[0]).length() <= 1e-9 * scale);
+            let (v0, v1) = n.domain_v();
+            let (u0, u1) = n.domain_u();
+            let closed = (0..=8).all(|k| {
+                let u = (u1 - u0).mul_add(f64::from(k) / 8.0, u0);
+                (n.evaluate(u, v0) - n.evaluate(u, v1)).length() <= 1e-9 * scale
+            });
+            pole(first) && pole(last) && closed
+        };
+        let transpose = |n: &NurbsSurface| -> Option<NurbsSurface> {
+            let cps = n.control_points();
+            let ws = n.weights();
+            let cols = cps.first()?.len();
+            let t_cps = (0..cols)
+                .map(|j| cps.iter().map(|row| row[j]).collect())
+                .collect();
+            let t_ws = (0..cols)
+                .map(|j| ws.iter().map(|row| row[j]).collect())
+                .collect();
+            NurbsSurface::new(
+                n.degree_v(),
+                n.degree_u(),
+                n.knots_v().to_vec(),
+                n.knots_u().to_vec(),
+                t_cps,
+                t_ws,
+            )
+            .ok()
+        };
+        let (mut n, swapped) = if grid(&surface) {
+            (surface, false)
+        } else {
+            match transpose(&surface) {
+                Some(t) if grid(&t) => (t, true),
+                _ => return Ok(None),
+            }
+        };
+
+        // Split values round v: its ends and its interior knots, or its
+        // middle when it has none, each raised to multiplicity p.
+        let p = n.degree_v();
+        let (v0, v1) = n.domain_v();
+        if v1 <= v0 {
+            return Ok(None);
+        }
+        // Relative to the domain: a file's knots can all lie within 1e-12.
+        let eps = 1e-12 * (v1 - v0);
+        let mut splits = vec![v0];
+        for &k in n.knots_v() {
+            if k > v0 + eps && k < v1 - eps && splits.last().is_none_or(|&l| k > l + eps) {
+                splits.push(k);
+            }
+        }
+        if splits.len() < 2 {
+            splits.push(0.5 * (v0 + v1));
+        }
+        splits.push(v1);
+        let run = |n: &NurbsSurface, v: f64| -> (usize, usize) {
+            let kv = n.knots_v();
+            let s = kv
+                .iter()
+                .position(|&k| (k - v).abs() <= eps)
+                .unwrap_or(kv.len());
+            let m = kv[s.min(kv.len())..]
+                .iter()
+                .take_while(|&&k| (k - v).abs() <= eps)
+                .count();
+            (s, m)
+        };
+        for &v in &splits {
+            let (_, m) = run(&n, v);
+            if m < p {
+                n = brepkit_math::nurbs::knot_ops::surface_knot_insert_v(&n, v, p - m).map_err(
+                    |e| IoError::ParseError {
+                        reason: format!("ADVANCED_FACE #{face_ref}: {e}"),
+                    },
+                )?;
+            }
+        }
+        // The control column through a split value: where the knot repeats
+        // p + 1 times (a clamped end) the surface has two, the right limit
+        // starting a piece and the left limit ending one; at p they agree.
+        let column = |n: &NurbsSurface, v: f64| -> usize {
+            let (s, m) = run(n, v);
+            (s + m).saturating_sub(p + 1)
+        };
+        let column_end = |n: &NurbsSurface, v: f64| -> usize { run(n, v).0.saturating_sub(1) };
+        let (cps, ws) = (n.control_points().to_vec(), n.weights().to_vec());
+        let meridian = |j: usize| -> Option<NurbsCurve> {
+            if cps.iter().any(|row| row.len() <= j) {
+                return None;
+            }
+            NurbsCurve::new(
+                n.degree_u(),
+                n.knots_u().to_vec(),
+                cps.iter().map(|row| row[j]).collect(),
+                ws.iter().map(|row| row[j]).collect(),
+            )
+            .ok()
+        };
+        let (u0, u1) = n.domain_u();
+        let pole_a = self.topo.add_vertex(Vertex::new(n.evaluate(u0, v0), 1e-7));
+        let pole_b = self.topo.add_vertex(Vertex::new(n.evaluate(u1, v0), 1e-7));
+        // One meridian edge per split, the last (v1) being the first (v0).
+        let mut edges = Vec::with_capacity(splits.len() - 1);
+        for &v in &splits[..splits.len() - 1] {
+            let Some(curve) = meridian(column(&n, v)) else {
+                return Ok(None);
+            };
+            edges.push(
+                self.topo
+                    .add_edge(Edge::new(pole_a, pole_b, EdgeCurve::NurbsCurve(curve))),
+            );
+        }
+        let orient_tail = attrs.trim_end_matches(')').trim();
+        let face_reversed =
+            (orient_tail.ends_with(".F.") || orient_tail.ends_with(".FALSE.")) != swapped;
+        let mut lunes = Vec::with_capacity(edges.len());
+        for k in 0..edges.len() {
+            let (a, b) = (splits[k], splits[k + 1]);
+            let (ca, cb) = (column(&n, a), column_end(&n, b));
+            if ca >= cb || cps.iter().any(|row| row.len() <= cb) {
+                return Ok(None);
+            }
+            let mut knots = vec![a; p + 1];
+            knots.extend(
+                n.knots_v()
+                    .iter()
+                    .copied()
+                    .filter(|&kv| kv > a + eps && kv < b - eps),
+            );
+            knots.extend(std::iter::repeat_n(b, p + 1));
+            let piece = NurbsSurface::new(
+                n.degree_u(),
+                p,
+                n.knots_u().to_vec(),
+                knots,
+                cps.iter().map(|row| row[ca..=cb].to_vec()).collect(),
+                ws.iter().map(|row| row[ca..=cb].to_vec()).collect(),
+            )
+            .map_err(|e| IoError::ParseError {
+                reason: format!("ADVANCED_FACE #{face_ref}: {e}"),
+            })?;
+            // Up one meridian and down the next runs counterclockwise in
+            // (u, v), about the surface's normal.
+            let wire = Wire::new(
+                vec![
+                    OrientedEdge::new(edges[k], true),
+                    OrientedEdge::new(edges[(k + 1) % edges.len()], false),
+                ],
+                true,
+            )
+            .map_err(|e| IoError::ParseError {
+                reason: format!("ADVANCED_FACE #{face_ref}: {e}"),
+            })?;
+            let wire = self.topo.add_wire(wire);
+            let surface = FaceSurface::Nurbs(piece);
+            lunes.push(if face_reversed == flip {
+                self.topo.add_face(Face::new(wire, Vec::new(), surface))
+            } else {
+                self.topo
+                    .add_face(Face::new_reversed(wire, Vec::new(), surface))
+            });
+        }
+        Ok(Some(lunes))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1257,6 +1493,122 @@ pub(super) fn refs_after_name(attrs: &str) -> Vec<u64> {
     Vec::new()
 }
 
+/// The sphere a B-spline surface lies on, when every knot span of it does
+/// (to 1e-7 of its radius, see [`spans_lie_on_sphere`]), and whether the
+/// surface's normal points out of it. Its axis runs to the surface's point
+/// at the start of `u`.
+fn nurbs_as_sphere(
+    n: &brepkit_math::nurbs::surface::NurbsSurface,
+) -> Option<(brepkit_math::surfaces::SphericalSurface, bool)> {
+    const GRID: u32 = 9;
+    let ((u0, u1), (v0, v1)) = (n.domain_u(), n.domain_v());
+    let at = |i: u32, j: u32| {
+        let (fu, fv) = (
+            f64::from(i) / f64::from(GRID),
+            f64::from(j) / f64::from(GRID),
+        );
+        n.evaluate((u1 - u0).mul_add(fu, u0), (v1 - v0).mul_add(fv, v0))
+    };
+    let pts: Vec<Point3> = (0..=GRID)
+        .flat_map(|i| (0..=GRID).map(move |j| (i, j)))
+        .map(|(i, j)| at(i, j))
+        .collect();
+    // |p|^2 = 2 c . p + k, least squares in (c, k)
+    let mut m = [[0.0_f64; 5]; 4];
+    for p in &pts {
+        let row = [2.0 * p.x(), 2.0 * p.y(), 2.0 * p.z(), 1.0];
+        let rhs = p.x().mul_add(p.x(), p.y().mul_add(p.y(), p.z() * p.z()));
+        for a in 0..4 {
+            for b in 0..4 {
+                m[a][b] += row[a] * row[b];
+            }
+            m[a][4] += row[a] * rhs;
+        }
+    }
+    for col in 0..4 {
+        let pivot = (col..4).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
+        m.swap(col, pivot);
+        if m[col][col].abs() < 1e-300 {
+            return None;
+        }
+        for r in 0..4 {
+            if r != col {
+                let f = m[r][col] / m[col][col];
+                for c in col..5 {
+                    m[r][c] -= f * m[col][c];
+                }
+            }
+        }
+    }
+    let center = Point3::new(m[0][4] / m[0][0], m[1][4] / m[1][1], m[2][4] / m[2][2]);
+    let k = m[3][4] / m[3][3];
+    let c2 = Vec3::new(center.x(), center.y(), center.z()).length_squared();
+    let radius = (k + c2).sqrt();
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    if pts
+        .iter()
+        .any(|p| ((*p - center).length() - radius).abs() > 1e-7 * radius)
+        || !spans_lie_on_sphere(n, center, radius)
+    {
+        return None;
+    }
+    let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+    let outward = n.normal(um, vm).ok()?.dot(n.evaluate(um, vm) - center) > 0.0;
+    let axis = (n.evaluate(u0, vm) - center).normalize().ok()?;
+    let sphere = brepkit_math::surfaces::SphericalSurface::with_axis(center, radius, axis).ok()?;
+    Some((sphere, outward))
+}
+
+/// Whether every knot span of `n` lies on the sphere about `center`. On one
+/// span `(|S - c|^2 - r^2) w^2` is a polynomial of degree 2p in u and 2q in
+/// v, so it is fixed over the span by its values on a grid of 2p + 1 by
+/// 2q + 1 parameters; Chebyshev points one more each way keep a sample's
+/// error from growing far between them. A grid over the whole surface can
+/// step over a bump within one span.
+#[allow(clippy::cast_precision_loss)]
+fn spans_lie_on_sphere(
+    n: &brepkit_math::nurbs::surface::NurbsSurface,
+    center: Point3,
+    radius: f64,
+) -> bool {
+    let spans = |knots: &[f64], (lo, hi): (f64, f64)| -> Vec<(f64, f64)> {
+        let mut breaks: Vec<f64> = knots
+            .iter()
+            .copied()
+            .filter(|&k| k >= lo && k <= hi)
+            .collect();
+        breaks.dedup();
+        breaks
+            .windows(2)
+            .filter(|w| w[1] > w[0])
+            .map(|w| (w[0], w[1]))
+            .collect()
+    };
+    let nodes = |(a, b): (f64, f64), degree: usize| -> Vec<f64> {
+        let m = 2 * degree + 2;
+        (0..m)
+            .map(|k| {
+                let c = (std::f64::consts::PI * k as f64 / (m - 1) as f64).cos();
+                (0.5 * (b - a)).mul_add(-c, 0.5 * (a + b))
+            })
+            .collect()
+    };
+    let v_nodes: Vec<Vec<f64>> = spans(n.knots_v(), n.domain_v())
+        .into_iter()
+        .map(|s| nodes(s, n.degree_v()))
+        .collect();
+    spans(n.knots_u(), n.domain_u()).into_iter().all(|su| {
+        nodes(su, n.degree_u()).into_iter().all(|u| {
+            v_nodes
+                .iter()
+                .flatten()
+                .all(|&v| ((n.evaluate(u, v) - center).length() - radius).abs() <= 1e-7 * radius)
+        })
+    })
+}
+
 /// A surface of linear extrusion as brepkit reads it: a surface its curve
 /// and direction fix on their own, or a B-spline curve and its unit
 /// direction, whose sweep must span the face that lies on it.
@@ -1793,6 +2145,82 @@ mod tests {
 
     use super::*;
     use crate::step::writer;
+
+    /// A ball of radius 5 about the origin as one rational quadratic
+    /// B-spline: a semicircle meridian from pole to pole in u, swept round
+    /// z as a circle of four quarter arcs in v.
+    fn bspline_ball() -> brepkit_math::nurbs::NurbsSurface {
+        use std::f64::consts::FRAC_1_SQRT_2 as S;
+        let r = 5.0;
+        let meridian = [
+            (0.0, -r, 1.0),
+            (r, -r, S),
+            (r, 0.0, 1.0),
+            (r, r, S),
+            (0.0, r, 1.0),
+        ];
+        let round = [
+            (1.0, 0.0, 1.0),
+            (1.0, 1.0, S),
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, S),
+            (-1.0, 0.0, 1.0),
+            (-1.0, -1.0, S),
+            (0.0, -1.0, 1.0),
+            (1.0, -1.0, S),
+            (1.0, 0.0, 1.0),
+        ];
+        let points = meridian
+            .iter()
+            .map(|&(x, z, _)| {
+                round
+                    .iter()
+                    .map(|&(cx, cy, _)| Point3::new(x * cx, x * cy, z))
+                    .collect()
+            })
+            .collect();
+        let weights = meridian
+            .iter()
+            .map(|&(_, _, wm)| round.iter().map(|&(_, _, wc)| wm * wc).collect())
+            .collect();
+        brepkit_math::nurbs::NurbsSurface::new(
+            2,
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 4.0],
+            points,
+            weights,
+        )
+        .unwrap()
+    }
+
+    /// A bump confined to one short knot span, between every point of a
+    /// grid over the whole surface, still keeps it from reading as a sphere.
+    #[test]
+    fn a_bump_within_one_knot_span_is_no_sphere() {
+        use brepkit_math::nurbs::knot_ops::surface_knot_insert_u;
+        let mut ball = bspline_ball();
+        assert!(nurbs_as_sphere(&ball).is_some());
+        // Row 3's basis function then lives on (0.30, 0.33) alone, between
+        // grid rows at u = 2/9 and 4/9.
+        for k in [0.30, 0.31, 0.32, 0.33] {
+            ball = surface_knot_insert_u(&ball, k, 1).unwrap();
+        }
+        assert!(nurbs_as_sphere(&ball).is_some(), "refined, still the ball");
+        let mut points = ball.control_points().to_vec();
+        let p = points[3][2];
+        points[3][2] = Point3::new(p.x() * 1.05, p.y() * 1.05, p.z() * 1.05);
+        let bumped = brepkit_math::nurbs::NurbsSurface::new(
+            2,
+            2,
+            ball.knots_u().to_vec(),
+            ball.knots_v().to_vec(),
+            points,
+            ball.weights().to_vec(),
+        )
+        .unwrap();
+        assert!(nurbs_as_sphere(&bumped).is_none());
+    }
 
     #[test]
     fn rational_surface_roundtrip_preserves_rectangular_weight_grid() {

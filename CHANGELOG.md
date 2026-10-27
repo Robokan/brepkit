@@ -1,5 +1,46 @@
 # Changelog
 
+## [4.2.14](https://github.com/andymai/brepkit/compare/v4.2.13...v4.2.14) (2026-10-27)
+
+
+### Bug Fixes
+
+* **operations:** refuse a revolve whose profile plane is normal to the axis ([#2069](https://github.com/andymai/brepkit/issues/2069)) ([30ae460](https://github.com/andymai/brepkit/commit/30ae460dd16ca6a4417f7ed86c41b76c0b376fe0))
+
+
+### Performance
+
+* **topology:** dedupe a face's edges and vertices by scanning ([#2068](https://github.com/andymai/brepkit/issues/2068)) ([7c42f65](https://github.com/andymai/brepkit/commit/7c42f65e1deaead14335c1b10bb0138fa35177c1))
+
+## [4.2.13](https://github.com/andymai/brepkit/compare/v4.2.12...v4.2.13) (2026-10-26)
+
+
+### Bug Fixes
+
+* **topology:** read a curved fillet band's winding in its (u, v) ([#2081](https://github.com/andymai/brepkit/issues/2081)) ([f9d55d9](https://github.com/andymai/brepkit/commit/f9d55d9947ab6c615c64634e380befaf9285570f))
+
+## [4.2.12](https://github.com/andymai/brepkit/compare/v4.2.11...v4.2.12) (2026-10-26)
+
+
+### Bug Fixes
+
+* **blend:** round a plane-cylinder edge inside the cylinder when the plane caps it ([#2078](https://github.com/andymai/brepkit/issues/2078)) ([0d93b43](https://github.com/andymai/brepkit/commit/0d93b43aa6bff71e7350266ae9141cbf2bebcfe6))
+* **operations:** measure and classify a horn torus corner through its pinch ([#2080](https://github.com/andymai/brepkit/issues/2080)) ([2a6ea95](https://github.com/andymai/brepkit/commit/2a6ea95b1f949bcfd4bda83e69ff6ef9ca711b66))
+
+## [4.2.11](https://github.com/andymai/brepkit/compare/v4.2.10...v4.2.11) (2026-10-26)
+
+
+### Bug Fixes
+
+* **algo:** trace a holed plane face's regions when no section reaches its holes ([#2076](https://github.com/andymai/brepkit/issues/2076)) ([f27b7b8](https://github.com/andymai/brepkit/commit/f27b7b8b6bea32429a58257ae72c66371cef523f))
+
+## [4.2.10](https://github.com/andymai/brepkit/compare/v4.2.9...v4.2.10) (2026-10-26)
+
+
+### Bug Fixes
+
+* **operations:** mesh a cylinder wall whose ruling a neighbour's vertex splits ([#2065](https://github.com/andymai/brepkit/issues/2065)) ([94f8f27](https://github.com/andymai/brepkit/commit/94f8f277fe75c377ce633b712fabe16d4afa0a98))
+
 ## [4.2.9](https://github.com/andymai/brepkit/compare/v4.2.8...v4.2.9) (2026-10-25)
 
 
