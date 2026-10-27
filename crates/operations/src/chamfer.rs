@@ -47,7 +47,9 @@ pub fn chamfer(
             reason: "no edges specified for chamfer".into(),
         });
     }
-    if let Some(result) = chamfer_circular_rims(topo, solid, edges, distance)? {
+    if let Some(result) =
+        chamfer_circular_rims(topo, solid, edges, &|_, _, _| (distance, distance))?
+    {
         return Ok(result);
     }
     chamfer_core(topo, solid, edges, ChamferDistances::Symmetric(distance))
@@ -84,6 +86,81 @@ pub fn chamfer_asymmetric(
         });
     }
     chamfer_core(topo, solid, edges, ChamferDistances::Asymmetric { d1, d2 })
+}
+
+/// Two-distance chamfer, `d1` on each edge's reference face and `d2` on its
+/// other face.
+///
+/// A distance-and-angle chamfer is `d2 = d1 * tan(angle)`. Closed circular
+/// rims between a cap and a coaxial wall (a hole's mouth, a rod's end) are
+/// cut here; other edges go to the blend engine's chamfer, which keeps the
+/// faces it does not touch, holes and curves included. One call takes rims
+/// or other edges, not both.
+///
+/// # Errors
+///
+/// Returns an error if either distance is zero or negative, no edges are
+/// given, a reference face does not border its edge, the edges mix rims
+/// with other edges, a distance consumes a face, or the blend engine fails
+/// on an edge.
+pub fn chamfer_two_on(
+    topo: &mut Topology,
+    solid: SolidId,
+    edges: &[(EdgeId, FaceId)],
+    d1: f64,
+    d2: f64,
+) -> Result<SolidId, crate::OperationsError> {
+    if d1 <= 0.0 || d2 <= 0.0 {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: format!("chamfer distances must be positive, got d1={d1}, d2={d2}"),
+        });
+    }
+    if edges.is_empty() {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: "no edges specified for chamfer".into(),
+        });
+    }
+    let faces = brepkit_topology::explorer::solid_faces(topo, solid)?;
+    let adjacency = brepkit_topology::adjacency::AdjacencyIndex::build_from_faces(topo, &faces)?;
+    for &(edge, face) in edges {
+        if !adjacency.faces_for_edge(edge).contains(&face) {
+            return Err(crate::OperationsError::InvalidInput {
+                reason: format!("chamfer reference face {face:?} does not border edge {edge:?}"),
+            });
+        }
+    }
+    let ids: Vec<EdgeId> = edges.iter().map(|&(e, _)| e).collect();
+    // The rim chamfer takes a selection only when every edge is a rim, and
+    // the blend engine cannot close a rim, so a mixed selection has no path.
+    let mut rims = 0;
+    for &edge in &ids {
+        if find_rim(topo, solid, edge)?.is_some() {
+            rims += 1;
+        }
+    }
+    if rims > 0 && rims < ids.len() {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: "closed circular rims cannot be chamfered together with other edges".into(),
+        });
+    }
+    let on_wall = |edge: EdgeId, wall: FaceId| edges.iter().any(|&(e, f)| e == edge && f == wall);
+    let split = |edge: EdgeId, _cap: FaceId, wall: FaceId| {
+        if on_wall(edge, wall) {
+            (d2, d1)
+        } else {
+            (d1, d2)
+        }
+    };
+    if let Some(result) = chamfer_circular_rims(topo, solid, &ids, &split)? {
+        return Ok(result);
+    }
+    let result = crate::blend_ops::chamfer_v2_on(topo, solid, edges, d1, d2)?;
+    if !result.failed.is_empty() {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: format!("chamfer failed on {} edge(s)", result.failed.len()),
+        });
+    }
+    Ok(result.solid)
 }
 
 /// How chamfer distances are assigned to edges.
@@ -222,10 +299,16 @@ fn chamfer_core(
     // For side-face corners, compute max distance from any chamfered edge meeting
     // at each vertex so the offset stays consistent with the largest adjacent bevel.
     let mut vertex_max_distance: HashMap<usize, f64> = HashMap::new();
+    // The chamfered edges ending at each vertex.
+    let mut vertex_chamfered_edges: HashMap<usize, Vec<usize>> = HashMap::new();
     for &edge_id in &filtered_edges {
         let edge = topo.edge(edge_id)?;
         let max_d = distances.max_distance();
         for vid in [edge.start(), edge.end()] {
+            vertex_chamfered_edges
+                .entry(vid.index())
+                .or_default()
+                .push(edge_id.index());
             vertex_chamfer_endpoints.insert(vid.index());
             let entry = vertex_max_distance.entry(vid.index()).or_insert(0.0_f64);
             if max_d > *entry {
@@ -296,12 +379,34 @@ fn chamfer_core(
                         .get(&poly.vertex_ids[i].index())
                         .copied()
                         .unwrap_or_else(|| distances.max_distance());
+                    // With one chamfered edge ending here, each of this face's
+                    // edges at the vertex runs along one of that edge's faces,
+                    // and the bevel meets it at that face's own distance, the
+                    // point that face's polygon takes. The largest distance on
+                    // both left wedges on an asymmetric chamfer's ends.
+                    let along = |side_edge: EdgeId| -> f64 {
+                        let Some(&[chamfered]) = vertex_chamfered_edges
+                            .get(&poly.vertex_ids[i].index())
+                            .map(Vec::as_slice)
+                        else {
+                            return side_dist;
+                        };
+                        let across = edge_to_faces
+                            .get(&side_edge.index())
+                            .and_then(|fs| fs.iter().find(|&&f| f != face_id));
+                        match (across, edge_to_faces.get(&chamfered)) {
+                            (Some(&f), Some(fs)) if fs.contains(&f) => {
+                                distances.distance_for(chamfered, f, &edge_to_faces)
+                            }
+                            _ => side_dist,
+                        }
+                    };
 
                     let dir_prev = (prev_pos - pos).normalize()?;
-                    new_verts.push(pos + dir_prev * side_dist);
+                    new_verts.push(pos + dir_prev * along(poly.wire_edge_ids[prev_i]));
 
                     let dir_next = (next_pos - pos).normalize()?;
-                    new_verts.push(pos + dir_next * side_dist);
+                    new_verts.push(pos + dir_next * along(poly.wire_edge_ids[i]));
                 }
                 (true, false, _) => {
                     // Only the edge before is chamfered. Offset toward V[next].
@@ -841,16 +946,17 @@ fn replace_in_wire(
     Ok(topo.add_wire(Wire::new(edges, closed)?))
 }
 
-/// Chamfer closed circular rims (a rod's end, a tube's mouth) at `distance`:
-/// the cap's circle moves `distance` into the cap, the wall's rim moves
-/// `distance` along the wall's rulings, and a cone band joins the two. The
-/// result is a new solid; `None` unless every edge is such a rim.
+/// Chamfer closed circular rims (a rod's end, a tube's mouth): the cap's
+/// circle moves into the cap, the wall's rim moves along the wall's rulings,
+/// and a cone band joins the two. `distances` gives each rim its cap and
+/// wall distances from the rim's edge, cap face and wall face. The result is
+/// a new solid; `None` unless every edge is such a rim.
 #[allow(clippy::too_many_lines)]
 fn chamfer_circular_rims(
     topo: &mut Topology,
     solid: SolidId,
     edges: &[EdgeId],
-    distance: f64,
+    distances: &dyn Fn(EdgeId, FaceId, FaceId) -> (f64, f64),
 ) -> Result<Option<SolidId>, crate::OperationsError> {
     use brepkit_math::curves::Circle3D;
     use brepkit_math::surfaces::ConicalSurface;
@@ -866,12 +972,13 @@ fn chamfer_circular_rims(
         let Some(rim) = find_rim(topo, solid, edge)? else {
             return Ok(None);
         };
-        circles.push(rim.circle);
+        let (cap_d, wall_d) = distances(edge, rim.cap, rim.wall);
+        circles.push((rim.circle, cap_d, wall_d));
     }
     let copy = crate::copy::copy_solid(topo, solid)?;
     let tol = Tolerance::new().linear;
     let mut bands = Vec::with_capacity(circles.len());
-    for circle in &circles {
+    for &(ref circle, cap_d, wall_d) in &circles {
         // The copy's image of the rim: the closed circle edge on the same
         // circle.
         let image = brepkit_topology::explorer::solid_edges(topo, copy)?
@@ -908,9 +1015,9 @@ fn chamfer_circular_rims(
             .iter()
             .any(|oe| oe.edge() == rim.edge);
         let cap_radius = if on_outer {
-            rim.circle.radius() - distance
+            rim.circle.radius() - cap_d
         } else {
-            rim.circle.radius() + distance
+            rim.circle.radius() + cap_d
         };
         let (ring_lo, ring_hi) = (
             cap_radius.min(rim.circle.radius()),
@@ -932,7 +1039,7 @@ fn chamfer_circular_rims(
         }
         if !ring_clear {
             return Err(crate::OperationsError::InvalidInput {
-                reason: format!("chamfer distance {distance} consumes the cap"),
+                reason: format!("chamfer distance {cap_d} consumes the cap"),
             });
         }
 
@@ -954,12 +1061,12 @@ fn chamfer_circular_rims(
                 }
             }
         }
-        if (v_far - v_rim).abs() <= distance + tol {
+        if (v_far - v_rim).abs() <= wall_d + tol {
             return Err(crate::OperationsError::InvalidInput {
-                reason: format!("chamfer distance {distance} consumes the wall"),
+                reason: format!("chamfer distance {wall_d} consumes the wall"),
             });
         }
-        let v_new = v_rim + distance * (v_far - v_rim).signum();
+        let v_new = v_rim + wall_d * (v_far - v_rim).signum();
         let (wall_center, wall_radius) = match &wall_surface {
             FaceSurface::Cylinder(c) => (c.origin() + c.axis() * v_new, c.radius()),
             FaceSurface::Cone(c) => {
@@ -1343,9 +1450,8 @@ mod tests {
     ///
     /// Removes a right-triangular prism with legs d1=0.2 and d2=0.3, length 1.0.
     /// The cross-section is a right triangle with legs d1 and d2.
-    /// V_removed = (d1 * d2 / 2) × L = 0.03.
-    /// Side-face corner offsets use max(d1,d2)=0.3, which introduces
-    /// small extra triangular wedges at each end, giving V ≈ 0.965.
+    /// V_removed = (d1 * d2 / 2) × L = 0.03, so V = 0.97: each end face
+    /// loses the same triangle, d1 along one side and d2 along the other.
     #[test]
     fn chamfer_asymmetric_single_edge_volume() {
         let mut topo = Topology::new();
@@ -1355,7 +1461,7 @@ mod tests {
         let result = chamfer_asymmetric(&mut topo, cube, &[edges[0]], 0.2, 0.3).unwrap();
 
         let vol = crate::measure::solid_volume(&topo, result, 0.01).unwrap();
-        let expected = 0.965;
+        let expected = 0.97;
         let rel_err = (vol - expected).abs() / expected;
         assert!(
             rel_err < 1e-3,

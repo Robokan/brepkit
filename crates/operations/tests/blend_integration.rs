@@ -10,6 +10,7 @@ use brepkit_math::traits::ParametricSurface;
 use brepkit_operations::blend_ops::{chamfer_distance_angle, chamfer_v2, fillet_v2};
 use brepkit_operations::measure::solid_volume;
 use brepkit_operations::primitives::{make_box, make_cone, make_cylinder};
+use brepkit_operations::validate::validate_solid;
 use brepkit_topology::Topology;
 use brepkit_topology::edge::EdgeCurve;
 use brepkit_topology::explorer::{solid_edges, solid_faces};
@@ -348,206 +349,39 @@ fn fillet_cone_bottom_rim_produces_torus() {
     );
 }
 
-/// Plane-cylinder chamfer on a primitive cylinder's bottom rim. The
-/// analytic dispatcher should produce an exact conical chamfer face
-/// passing through both contact circles at the predicted positions.
+/// The blend chamfer cannot trim a cap or a wall along a closed rim, so a
+/// cylinder's or a frustum's bottom rim is recorded as failed and the solid
+/// comes back as it was, closed. The cone each rim's stripe would take is
+/// checked in the chamfer builder's own tests.
 #[test]
-fn chamfer_cylinder_base_circle_produces_cone() {
+fn chamfer_v2_records_a_closed_rim_as_failed() {
     let mut topo = Topology::new();
-    let r_c = 2.0;
-    let height = 4.0;
-    let solid = make_cylinder(&mut topo, r_c, height).unwrap();
-    let d = 0.4;
+    let primitives = [
+        ("cylinder", make_cylinder(&mut topo, 2.0, 4.0).unwrap()),
+        ("frustum", make_cone(&mut topo, 3.0, 1.0, 4.0).unwrap()),
+    ];
+    for (name, solid) in primitives {
+        let bottom_rim = solid_edges(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&eid| {
+                let edge = topo.edge(eid).unwrap();
+                matches!(edge.curve(), EdgeCurve::Circle(c) if c.center().z().abs() < 1e-9)
+            })
+            .unwrap();
+        let before = solid_volume(&topo, solid, 0.01).unwrap();
 
-    let bottom_rim = solid_edges(&topo, solid)
-        .unwrap()
-        .into_iter()
-        .find(|&eid| {
-            let edge = topo.edge(eid).unwrap();
-            // Pick the Circle edge whose vertex is at z=0 (the bottom rim).
-            matches!(edge.curve(), EdgeCurve::Circle(_))
-                && topo.vertex(edge.start()).unwrap().point().z().abs() < 1e-9
-        })
-        .expect("cylinder bottom rim must exist");
-
-    let result = chamfer_v2(&mut topo, solid, &[bottom_rim], d, d).unwrap();
-    assert!(
-        !result.succeeded.is_empty(),
-        "cylinder rim chamfer must produce at least one stripe; failed = {:?}",
-        result.failed
-    );
-
-    // The new blend face should be a Cone (not a NURBS approximation) when
-    // the analytic chamfer fast path fired.
-    let new_faces = solid_faces(&topo, result.solid).unwrap();
-    let cone = new_faces
-        .iter()
-        .find_map(|&fid| {
-            if let FaceSurface::Cone(c) = topo.face(fid).unwrap().surface() {
-                Some(c.clone())
-            } else {
-                None
-            }
-        })
-        .expect("plane-cylinder chamfer should produce a Cone face via the analytic fast path");
-
-    // Symmetric d1 = d2 = 0.4 ⇒ half-angle = atan2(0.4, 0.4) = π/4 (45°).
-    assert!(
-        (cone.half_angle() - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
-        "cone half-angle should be π/4 for symmetric chamfer; got {}",
-        cone.half_angle()
-    );
-
-    // Verify both contacts are points on the cone:
-    //   - plate contact at radial r_c - d, on the plate (z = 0)
-    //   - cylinder contact at radial r_c, axially d into the material
-    //     (z = +d for cylinder primitive with material at z ≥ 0).
-    // Frame3::from_normal(z=+1) gives x_axis = (0, 1, 0), so the contacts
-    // appear in the +y direction at u = 0.
-    let want_plate = brepkit_math::vec::Point3::new(0.0, r_c - d, 0.0);
-    let want_cyl = brepkit_math::vec::Point3::new(0.0, r_c, d);
-    // For each predicted contact, find the cone (u, v) and verify the cone
-    // evaluates to the same point. We solve analytically:
-    //   - At cone u=0 the radial axis is +y (matches Frame3 derivation),
-    //     so position(0, v) = apex + v · (cos(α)·y + sin(α)·cone_axis).
-    //   - cone_axis = -axial_into_material = -z (away from cylinder material).
-    //   - apex axial = +d2 · (r_c - d1) / d1 (above the plate, into material).
-    //     With d1 = d2 = d: apex_axial = r_c - d.
-    let alpha = std::f64::consts::FRAC_PI_4;
-    // (apex_axial = (r_c - d) · d / d = r_c - d for symmetric chamfer)
-    // For plate contact at radial = r_c - d, z = 0:
-    //   v_plate · cos(α) = r_c - d (radial component)
-    //   v_plate · sin(α) = -apex_axial = -(r_c - d) (axial drop from apex to plate)
-    //   ⇒ v_plate = (r_c - d) / cos(α). For α=π/4: v_plate = (r_c - d) · √2.
-    let v_plate = (r_c - d) / alpha.cos();
-    let p_plate = ParametricSurface::evaluate(&cone, 0.0, v_plate);
-    assert!(
-        (p_plate - want_plate).length() < 1e-9,
-        "cone at v={v_plate:.6} should touch plate at {want_plate:?}; got {p_plate:?}"
-    );
-    // Cylinder contact at radial = r_c, z = +d (above the plate, on the
-    // cylinder material side). The cone here has axis +z (opening upward
-    // from apex below the plate), so cone z = apex_z + v·sin(α) and we want
-    // that to equal +d.
-    let v_cyl = r_c / alpha.cos();
-    let p_cyl = ParametricSurface::evaluate(&cone, 0.0, v_cyl);
-    assert!(
-        (p_cyl - want_cyl).length() < 1e-9,
-        "cone at v={v_cyl:.6} should touch cylinder at {want_cyl:?}; got {p_cyl:?}"
-    );
-
-    // Also guard against the bug where the chamfer's separately-built
-    // contact circle gets placed on the wrong side of the plate. Walk the
-    // chamfer cone's outer wire and confirm no `Circle3D` edge is
-    // positioned at `z = -d` (the misplaced location); any preserved
-    // contact circle on the cone must sit at `z = +d` instead.
-    let cone_face = new_faces
-        .iter()
-        .copied()
-        .find(|&fid| matches!(topo.face(fid).unwrap().surface(), FaceSurface::Cone(_)))
-        .unwrap();
-    let cone_wire = topo.face(cone_face).unwrap().outer_wire();
-    let has_misplaced = topo.wire(cone_wire).unwrap().edges().iter().any(|oe| {
-        if let EdgeCurve::Circle(c) = topo.edge(oe.edge()).unwrap().curve() {
-            (c.center().z() + d).abs() < 1e-6 && (c.radius() - r_c).abs() < 1e-6
-        } else {
-            false
-        }
-    });
-    assert!(
-        !has_misplaced,
-        "no contact circle should sit at z = -d (cylinder contact misplaced)"
-    );
-}
-
-/// Plane-cone chamfer on a frustum primitive's bottom rim. Verifies the
-/// analytic dispatcher produces an exact conical chamfer face whose
-/// half-angle matches `atan2(d1 - d2·cos α, d2·sin α)` and whose contacts
-/// land at the predicted positions on both the plate and the cone.
-#[test]
-fn chamfer_cone_bottom_rim_produces_cone() {
-    let mut topo = Topology::new();
-    // Regular frustum: bottom_radius=3 > top_radius=1, height=4.
-    // Half-angle α = atan2(6, 3) (the cone primitive uses the virtual-apex
-    // height; see `make_cone` for the derivation).
-    let solid = make_cone(&mut topo, 3.0, 1.0, 4.0).unwrap();
-    let d = 0.4;
-
-    let bottom_rim = solid_edges(&topo, solid)
-        .unwrap()
-        .into_iter()
-        .find(|&eid| {
-            if let EdgeCurve::Circle(c) = topo.edge(eid).unwrap().curve() {
-                (c.radius() - 3.0).abs() < 1e-6
-            } else {
-                false
-            }
-        })
-        .expect("frustum bottom rim should exist with radius 3");
-
-    let result = chamfer_v2(&mut topo, solid, &[bottom_rim], d, d).unwrap();
-    assert!(
-        !result.succeeded.is_empty(),
-        "cone bottom-rim chamfer must produce at least one stripe; failed = {:?}",
-        result.failed
-    );
-
-    // The new face should be a Cone (the chamfer surface — distinct from
-    // the original frustum lateral cone, which is also a Cone).
-    let new_faces = solid_faces(&topo, result.solid).unwrap();
-    let alpha = 6.0_f64.atan2(3.0);
-    let r_p = 3.0;
-    // For symmetric d1 = d2 = d, brepkit's ConicalSurface measures the
-    // half-angle from the AXIS to the generator, giving β = π/2 − α/2.
-    let expected_half_angle = std::f64::consts::FRAC_PI_2 - alpha * 0.5;
-
-    let chamfer_cone = new_faces
-        .iter()
-        .find_map(|&fid| {
-            if let FaceSurface::Cone(c) = topo.face(fid).unwrap().surface() {
-                // Distinguish the chamfer cone from the frustum's original
-                // lateral cone by half-angle. The frustum cone has α; the
-                // chamfer cone has β = π/2 − α/2.
-                if (c.half_angle() - expected_half_angle).abs() < 1e-6 {
-                    return Some(c.clone());
-                }
-            }
-            None
-        })
-        .expect("chamfer cone face with half-angle = π/2 - α/2 should exist");
-
-    assert!(
-        (chamfer_cone.half_angle() - expected_half_angle).abs() < 1e-9,
-        "chamfer cone half-angle should be π/2 - α/2 = {expected_half_angle:.6}, got {}",
-        chamfer_cone.half_angle()
-    );
-
-    // Frustum cone primitive's frame: axis = (0, 0, -1), so
-    // `Frame3::from_normal` gives x_axis = (0, -1, 0). The bottom rim
-    // "u = 0" point is therefore in the −y direction. The chamfer cone
-    // built with the same x_axis as ref_dir inherits that convention.
-    let want_plate = brepkit_math::vec::Point3::new(0.0, -(r_p - d), 0.0);
-    let cone_contact_axial = d * alpha.sin();
-    let cone_contact_radial = r_p - d * alpha.cos();
-    let want_cone = brepkit_math::vec::Point3::new(0.0, -cone_contact_radial, cone_contact_axial);
-
-    // Contact v parameters on the chamfer cone, given:
-    //   chamfer_axis = +z (toward cylinder material from apex below);
-    //   x_axis = (0, -1, 0) (so radial at u=0 points in -y).
-    // Position(0, v) = apex + v · (cos(β)·(0, -1, 0) + sin(β)·(0, 0, 1))
-    //                = (0, -v·cos(β), apex.z + v·sin(β))
-    // Plate contact: -v·cos(β) = -(r_p - d) → v = (r_p - d)/cos β.
-    // Cone-side contact: -v·cos(β) = -(r_p - d·cos α) → v = (r_p - d·cos α)/cos β.
-    let v_plate = (r_p - d) / expected_half_angle.cos();
-    let p_plate = ParametricSurface::evaluate(&chamfer_cone, 0.0, v_plate);
-    assert!(
-        (p_plate - want_plate).length() < 1e-9,
-        "chamfer cone at v={v_plate:.6} should touch plate at {want_plate:?}; got {p_plate:?}"
-    );
-    let v_cone = (r_p - d * alpha.cos()) / expected_half_angle.cos();
-    let p_cone = ParametricSurface::evaluate(&chamfer_cone, 0.0, v_cone);
-    assert!(
-        (p_cone - want_cone).length() < 1e-9,
-        "chamfer cone at v={v_cone:.6} should touch cone at {want_cone:?}; got {p_cone:?}"
-    );
+        let result = chamfer_v2(&mut topo, solid, &[bottom_rim], 0.4, 0.4).unwrap();
+        assert_eq!(result.solid, solid, "{name}");
+        assert!(result.succeeded.is_empty(), "{name}");
+        assert_eq!(result.failed.len(), 1, "{name}: {:?}", result.failed);
+        assert_eq!(result.failed[0].0, bottom_rim, "{name}");
+        let report = validate_solid(&topo, solid).unwrap();
+        assert!(report.is_valid(), "{name}: {:?}", report.issues);
+        let after = solid_volume(&topo, solid, 0.01).unwrap();
+        assert!(
+            (after - before).abs() < 1e-9 * before,
+            "{name}: {after} vs {before}"
+        );
+    }
 }
