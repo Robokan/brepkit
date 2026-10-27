@@ -84,6 +84,10 @@ impl<'a> SurfaceEvaluator<'a> {
     /// avoiding the O(p^2) Cox-de Boor recurrence on each call.
     #[allow(clippy::many_single_char_names)]
     pub fn point(&mut self, u: f64, v: f64) -> Point3 {
+        // Past the stack buffers' degree, the surface's own evaluation.
+        if self.surface.degree_u().max(self.surface.degree_v()) > basis::MAX_STACK_OUTPUT {
+            return self.surface.evaluate(u, v);
+        }
         self.ensure_power_basis();
 
         let pu = self.surface.degree_u();
@@ -149,6 +153,12 @@ impl<'a> SurfaceEvaluator<'a> {
     /// `normal()` method, and ultimately to `(0, 0, 1)`.
     #[allow(clippy::many_single_char_names, clippy::too_many_lines)]
     pub fn normal(&mut self, u: f64, v: f64) -> Vec3 {
+        if self.surface.degree_u().max(self.surface.degree_v()) > basis::MAX_STACK_OUTPUT {
+            return self
+                .surface
+                .normal(u, v)
+                .unwrap_or_else(|_| Vec3::new(0.0, 0.0, 1.0));
+        }
         self.ensure_power_basis();
 
         let pu = self.surface.degree_u();
