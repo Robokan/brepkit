@@ -3195,6 +3195,9 @@ fn surface_flux_over_mesh(
             .map(|t| flat_flux(t[0] as usize, t[1] as usize, t[2] as usize))
             .fold(zero, add);
     };
+    if let Some(whole) = whole_patch_flux(uv_mesh, s, about) {
+        return whole;
+    }
     // Each vertex's offset from the surface at its (u, v), or `None` past
     // what a sag can explain.
     let mut ev = s.evaluator();
@@ -3220,6 +3223,93 @@ fn surface_flux_over_mesh(
         total = add(total, on_surface.unwrap_or(flat));
     }
     total
+}
+
+/// Twice the flux and six times the moment's flux (as
+/// [`surface_flux_over_mesh`]) of a face that is its surface's whole
+/// patch, integrated over the parameter domain by Gauss quadrature on each
+/// knot span; `None` for a trimmed face. A revolved spline's band is one:
+/// its mesh triangles, read on the surface, still left the solid a few
+/// parts in a million short (an ellipse revolved, 1.2e-6).
+///
+/// The face's mesh tells: its `(u, v)` all lie in the domain and cover all
+/// of it, which a face trimmed by any curve does not (its loop's inscribed
+/// `(u, v)` polygon is smaller), and its vertices lie on the surface. The
+/// mesh's winding in `(u, v)` says which
+/// way the face turns from the surface's own normal.
+fn whole_patch_flux(
+    uv_mesh: &tessellate::TriangleMeshUV,
+    s: &brepkit_math::nurbs::surface::NurbsSurface,
+    about: Point3,
+) -> Option<(f64, Vec3)> {
+    let ((u0, u1), (v0, v1)) = (s.domain_u(), s.domain_v());
+    let domain = (u1 - u0) * (v1 - v0);
+    let uvs = &uv_mesh.uvs;
+    if uvs.len() != uv_mesh.mesh.positions.len() || domain <= 0.0 {
+        return None;
+    }
+    let (du, dv) = (1e-9 * (u1 - u0), 1e-9 * (v1 - v0));
+    if uvs
+        .iter()
+        .any(|uv| uv[0] < u0 - du || uv[0] > u1 + du || uv[1] < v0 - dv || uv[1] > v1 + dv)
+    {
+        return None;
+    }
+    let signed: f64 = uv_mesh
+        .mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let (a, b, c) = (uvs[t[0] as usize], uvs[t[1] as usize], uvs[t[2] as usize]);
+            0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
+        })
+        .sum();
+    // The polygons of a trimmed face's loops fall short of the domain by
+    // their sag, far more than this.
+    if (signed.abs() - domain).abs() > 1e-9 * domain {
+        return None;
+    }
+    // Nor is it the patch when its edges miss the surface (an imported
+    // face's can): the mesh follows the edges.
+    let mut ev = s.evaluator();
+    if uv_mesh
+        .mesh
+        .positions
+        .iter()
+        .zip(uvs)
+        .any(|(p, uv)| (*p - ev.point(uv[0], uv[1])).length() > 1e-7)
+    {
+        return None;
+    }
+    let spans = |knots: &[f64], lo: f64, hi: f64| {
+        let mut ends = vec![lo];
+        ends.extend(knots.iter().copied().filter(|&k| k > lo && k < hi));
+        ends.push(hi);
+        ends.dedup();
+        ends
+    };
+    let (us, vs) = (spans(s.knots_u(), u0, u1), spans(s.knots_v(), v0, v1));
+    let gauss =
+        brepkit_math::quadrature::gauss_legendre_points(brepkit_math::quadrature::MAX_ORDER);
+    let (mut flux, mut moment) = (0.0, Vec3::new(0.0, 0.0, 0.0));
+    for u_span in us.windows(2) {
+        let (hu, mu) = (0.5 * (u_span[1] - u_span[0]), 0.5 * (u_span[1] + u_span[0]));
+        for v_span in vs.windows(2) {
+            let (hv, mv) = (0.5 * (v_span[1] - v_span[0]), 0.5 * (v_span[1] + v_span[0]));
+            for gu in gauss {
+                for gv in gauss {
+                    let (p, s_u, s_v) =
+                        ev.point_and_partials(hu.mul_add(gu.x, mu), hv.mul_add(gv.x, mv))?;
+                    let r = p - about;
+                    let w = gu.w * gv.w * hu * hv * r.dot(s_u.cross(s_v));
+                    flux += w;
+                    moment += r * w;
+                }
+            }
+        }
+    }
+    let sign = signed.signum();
+    Some((2.0 * sign * flux, moment * (6.0 * sign)))
 }
 
 /// Twice the flux about `about` of the surface patch over one mesh
