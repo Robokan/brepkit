@@ -179,6 +179,13 @@ pub(super) fn split_boundary_edges_at_3d_points(
                     (edge.end_uv.x() - edge.start_uv.x()).mul_add(t, edge.start_uv.x()),
                     edge.start_uv.y(),
                 )
+            } else if let (EdgeCurve::Line, FaceSurface::Cylinder(_)) = (&edge.curve_3d, surface) {
+                // A line on a cylinder is a ruling at one u: a split on a
+                // seam copy keeps that copy's u, and only v runs along it.
+                brepkit_math::vec::Point2::new(
+                    edge.start_uv.x(),
+                    (edge.end_uv.y() - edge.start_uv.y()).mul_add(t, edge.start_uv.y()),
+                )
             } else if let (EdgeCurve::Line, FaceSurface::Cone(cone)) = (&edge.curve_3d, surface) {
                 // A line on a cone is a ruling at one u: a split on a seam
                 // copy keeps that copy's u (the apex end's own u is its
@@ -369,10 +376,17 @@ pub(super) fn find_splits_on_circle(
     // sections it) has the same origin-vs-start mismatch and projects its
     // split UVs through the frame instead. Anchoring both at the start keeps
     // the seam from reading as an interior split (a zero-length piece the
-    // arrangement then traces as its own loop).
+    // arrangement then traces as its own loop). A whole circle on a torus
+    // or a sphere projects its split UVs, so the parameter only orders the
+    // splits, and from the origin a ring seamed elsewhere came out covered
+    // twice.
     let closed_anchor = (matches!(
         surface,
-        FaceSurface::Cylinder(_) | FaceSurface::Cone(_) | FaceSurface::Plane { .. }
+        FaceSurface::Cylinder(_)
+            | FaceSurface::Cone(_)
+            | FaceSurface::Plane { .. }
+            | FaceSurface::Torus(_)
+            | FaceSurface::Sphere(_)
     ) && (edge.start_3d - edge.end_3d).length() < tol)
         .then(|| circle.project(edge.start_3d));
     let u_span = edge.end_uv.x() - edge.start_uv.x();
@@ -402,13 +416,20 @@ pub(super) fn find_splits_on_circle(
             let turns = ((mid - u_raw) / std::f64::consts::TAU).round();
             let u = std::f64::consts::TAU.mul_add(turns, u_raw);
             (u - edge.start_uv.x()) / u_span
-        } else if matches!(surface, FaceSurface::Plane { .. }) && !edge.forward {
-            // A reversed-traversal plane arc covers ccw(end→start); the
+        } else if matches!(surface, FaceSurface::Plane { .. } | FaceSurface::Torus(_))
+            && !edge.forward
+        {
+            // A reversed-traversal arc covers ccw(end→start); the
             // ccw(start→end) span below is its COMPLEMENT, so on-arc points
             // would normalize outside [0,1] and drop (a bay ring absorbed
-            // into the outer boundary is walked CW — its section crossings
-            // never split it). Normalize in the physical span and map back
-            // to traversal order.
+            // into a plane's outer boundary is walked CW, so its section
+            // crossings never split it), and a point on the complement
+            // would split it (the half of a torus meridian walked back to
+            // the seam split at the meridian's far end). Normalize in the
+            // physical span and map back to traversal order. A NURBS face
+            // keeps the start-to-end reading: the scooped fillet's clip to
+            // its tapered envelope (`fillet_taper_clip_inmem.rs`) is exact
+            // with it and falls back without it.
             let (p0, p1) = edge
                 .curve_3d
                 .domain_with_endpoints(edge.end_3d, edge.start_3d);
@@ -1193,5 +1214,126 @@ mod tests {
                 assert!((ellipse.evaluate(ellipse.project(p)) - p).length() < 1e-9);
             }
         }
+    }
+
+    /// A whole circle of radius 25 round the z axis (a torus's outer
+    /// equator, a sphere's equator) seamed away from its circle's own zero
+    /// angle and split three times tiles the ring once, walked either way:
+    /// the split parameters run from the edge's start, not from the
+    /// circle's origin.
+    #[test]
+    fn a_closed_ring_split_from_its_seam_tiles_the_ring_once() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::{SphericalSurface, ToroidalSurface};
+        use brepkit_math::vec::Vec3;
+        use std::f64::consts::{PI, TAU};
+
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        for surface in [
+            FaceSurface::Torus(ToroidalSurface::new(origin, 20.0, 5.0).unwrap()),
+            FaceSurface::Sphere(SphericalSurface::new(origin, 25.0).unwrap()),
+        ] {
+            let circle = Circle3D::new_with_ref(
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                25.0,
+                Vec3::new(1.0, 0.0, 0.0),
+            )
+            .unwrap();
+            let seam_angle = 1.5 * PI;
+            let seam = circle.evaluate(seam_angle);
+            let splits = vec![
+                circle.evaluate(seam_angle - 0.3),
+                circle.evaluate(seam_angle + 0.3),
+                circle.evaluate(seam_angle + PI),
+            ];
+            for forward in [true, false] {
+                let edge = OrientedPCurveEdge {
+                    curve_3d: EdgeCurve::Circle(circle.clone()),
+                    pcurve: Curve2D::Line(
+                        Line2D::new(Point2::new(seam_angle, 0.0), Vec2::new(1.0, 0.0)).unwrap(),
+                    ),
+                    start_uv: Point2::new(seam_angle, 0.0),
+                    end_uv: Point2::new(seam_angle + TAU, 0.0),
+                    start_3d: seam,
+                    end_3d: seam,
+                    forward,
+                    source_edge_idx: None,
+                    pave_block_id: None,
+                };
+                let pieces =
+                    split_boundary_edges_at_3d_points(vec![edge], &splits, None, &surface, 1e-7);
+                assert_eq!(
+                    pieces.len(),
+                    4,
+                    "forward {forward}: {} pieces",
+                    pieces.len()
+                );
+                for w in pieces.windows(2) {
+                    assert!(
+                        (w[0].end_3d - w[1].start_3d).length() < 1e-9,
+                        "forward {forward}: pieces do not chain"
+                    );
+                }
+                let sweep = chain_sweep(&pieces, &surface, forward);
+                assert!(
+                    (sweep - TAU).abs() < 1e-9,
+                    "{} forward {forward}: the pieces sweep {sweep}",
+                    surface.type_tag()
+                );
+            }
+        }
+    }
+
+    /// A quarter of a torus meridian walked against its circle, from the
+    /// tube's top down to its outer equator, splits at a point on that
+    /// quarter and at none on the other three.
+    #[test]
+    fn a_reversed_meridian_splits_only_on_its_own_arc() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::ToroidalSurface;
+        use brepkit_math::vec::Vec3;
+        use std::f64::consts::FRAC_PI_2;
+
+        let surface = FaceSurface::Torus(
+            ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 20.0, 5.0).unwrap(),
+        );
+        // Counterclockwise about -y the circle turns from +x up to +z, so
+        // the stored arc from the equator to the top is the quarter.
+        let circle =
+            Circle3D::new(Point3::new(20.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 5.0).unwrap();
+        let (top, equator) = (Point3::new(20.0, 0.0, 5.0), Point3::new(25.0, 0.0, 0.0));
+        let edge = OrientedPCurveEdge {
+            curve_3d: EdgeCurve::Circle(circle),
+            pcurve: Curve2D::Line(
+                Line2D::new(Point2::new(0.0, FRAC_PI_2), Vec2::new(0.0, -1.0)).unwrap(),
+            ),
+            start_uv: Point2::new(0.0, FRAC_PI_2),
+            end_uv: Point2::new(0.0, 0.0),
+            start_3d: top,
+            end_3d: equator,
+            forward: false,
+            source_edge_idx: None,
+            pave_block_id: None,
+        };
+        let inner_equator = Point3::new(15.0, 0.0, 0.0);
+        let pieces = split_boundary_edges_at_3d_points(
+            vec![edge.clone()],
+            &[inner_equator],
+            None,
+            &surface,
+            1e-7,
+        );
+        assert_eq!(pieces.len(), 1, "split at a point off the quarter");
+
+        let half = std::f64::consts::FRAC_1_SQRT_2 * 5.0;
+        let between = Point3::new(20.0 + half, 0.0, half);
+        let pieces =
+            split_boundary_edges_at_3d_points(vec![edge], &[between], None, &surface, 1e-7);
+        assert_eq!(pieces.len(), 2, "the quarter is not split where it runs");
+        assert!((pieces[0].start_3d - top).length() < 1e-9);
+        assert!((pieces[0].end_3d - between).length() < 1e-9);
+        assert!((pieces[1].start_3d - between).length() < 1e-9);
+        assert!((pieces[1].end_3d - equator).length() < 1e-9);
     }
 }

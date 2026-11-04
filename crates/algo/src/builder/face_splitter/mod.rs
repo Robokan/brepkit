@@ -13,12 +13,13 @@ pub(in crate::builder) use special_cases::cylinder_cone_remainder_interior;
 
 pub use conversion::collect_wire_points;
 
+use brepkit_math::region2d::point_in_region;
 use brepkit_math::vec::{Point2, Point3, Vec3};
 use brepkit_topology::Topology;
 use brepkit_topology::edge::EdgeCurve;
 use brepkit_topology::face::{FaceId, FaceSurface};
 
-use super::classify_2d::{sample_interior_point, signed_area_2d};
+use super::classify_2d::{sample_interior_point, sample_interior_point_where, signed_area_2d};
 use super::pcurve_compute::{
     compute_pcurve_on_surface, evaluate_edge_at_t, project_point_on_surface,
 };
@@ -2731,7 +2732,7 @@ fn split_periodic_face_around_seam_holes(
         rank,
         precomputed_interior: None,
     };
-    let remainder_interior = cylinder_cone_remainder_interior(&probe)?;
+    let remainder_interior = cylinder_cone_remainder_interior(&probe, tol)?;
     sub_faces.insert(
         0,
         SplitSubFace {
@@ -2887,6 +2888,31 @@ fn wire_loops_have_degenerate_area_periodic(
         }
         area.abs() <= perimeter * tol
     })
+}
+
+/// `loops` with the second of any two loops running the same edges dropped:
+/// a loop inside a face comes back twice, as its region and as the hole it
+/// leaves in the region around it.
+fn without_twin_loops(loops: &[Vec<OrientedPCurveEdge>], tol: f64) -> Vec<Vec<OrientedPCurveEdge>> {
+    let q = |p: Point2| ((p.x() / tol).round() as i64, (p.y() / tol).round() as i64);
+    let mut seen: Vec<Vec<[i64; 4]>> = Vec::new();
+    let mut out = Vec::new();
+    for lp in loops {
+        let mut keys: Vec<_> = lp
+            .iter()
+            .map(|e| {
+                let (a, b) = (q(e.start_uv), q(e.end_uv));
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                [a.0, a.1, b.0, b.1]
+            })
+            .collect();
+        keys.sort_unstable();
+        if !seen.contains(&keys) {
+            seen.push(keys);
+            out.push(lp.clone());
+        }
+    }
+    out
 }
 
 /// Whether one loop's edges are entirely duplicated by another loop — the
@@ -5503,6 +5529,7 @@ pub fn split_face_2d(
         Vec<brepkit_topology::edge::EdgeId>,
         impl std::hash::BuildHasher,
     >,
+    kept_splits: &std::collections::BTreeSet<brepkit_topology::vertex::VertexId>,
     split_registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
 ) -> Vec<SplitSubFace> {
     let run_impl = move |secs: &[SectionEdge]| {
@@ -5515,6 +5542,7 @@ pub fn split_face_2d(
             frame,
             info,
             edge_images,
+            kept_splits,
             split_registry,
         )
     };
@@ -5551,8 +5579,8 @@ pub fn split_face_2d(
     // else stays in `sections` and reaches the impl unchanged.
     // The frame must be built from the same points the impl uses, so the
     // sub-face UVs and the projected circle centres agree; the containment
-    // polygon must follow wire traversal order (see
-    // [`collect_wire_points_oriented`]).
+    // polygon follows wire traversal order along each edge's own curve, so
+    // a face bounded by one circle (one vertex) still has an outline.
     let frame_pts = collect_wire_points(topo, face.outer_wire());
     let owned_frame;
     let cap_frame = if let Some(f) = frame {
@@ -5562,7 +5590,7 @@ pub fn split_face_2d(
         owned_frame = PlaneFrame::from_plane_face(normal, &frame_pts);
         &owned_frame
     };
-    let outer_poly: Vec<Point2> = collect_wire_points_oriented(topo, face.outer_wire())
+    let outer_poly: Vec<Point2> = sample_wire_outline(topo, face.outer_wire())
         .iter()
         .map(|&p| cap_frame.project(p))
         .collect();
@@ -5579,12 +5607,22 @@ pub fn split_face_2d(
             EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => None,
         };
         let closed = (s.start - s.end).length() < tol.linear && outer_poly.len() >= 3;
+        // A ring near the face's rim (one standing on a tube's top) has
+        // its centre within the margin of the outline but lies on the face
+        // all round, crossing none of its boundary, as a tangent corner
+        // circle does not.
         let cap_center = if closed && let Some((center, reach)) = conic {
             let center_uv = cap_frame.project(center);
             (super::classify_2d::point_in_polygon_2d(center_uv, &outer_poly)
-                && super::classify_2d::distance_to_polygon_boundary(center_uv, &outer_poly)
-                    > reach * CAP_INTERIORITY_MARGIN)
-                .then_some(center)
+                && (super::classify_2d::distance_to_polygon_boundary(center_uv, &outer_poly)
+                    > reach * CAP_INTERIORITY_MARGIN
+                    || super::fill_images_faces::conic_side_of_plane_face(
+                        topo,
+                        face_id,
+                        &s.curve_3d,
+                        tol.linear,
+                    ) == Some(true)))
+            .then_some(center)
         } else if closed && matches!(s.curve_3d, EdgeCurve::NurbsCurve(_)) {
             interior_loop_center(s, cap_frame, &outer_poly)
         } else {
@@ -5657,6 +5695,41 @@ fn interior_loop_center(
     Some(Point3::new(mean.x(), mean.y(), mean.z()))
 }
 
+/// Samples per curved edge of an outline: a chord of a circle in 64 sags
+/// 0.12% of its radius.
+const OUTLINE_CURVE_SAMPLES: usize = 64;
+
+/// A wire's outline in traversal order: each line's start, and each curved
+/// edge sampled along its own span.
+fn sample_wire_outline(topo: &Topology, wire_id: brepkit_topology::wire::WireId) -> Vec<Point3> {
+    let Ok(wire) = topo.wire(wire_id) else {
+        return Vec::new();
+    };
+    let mut pts = Vec::new();
+    for oe in wire.edges() {
+        let Ok(edge) = topo.edge(oe.edge()) else {
+            continue;
+        };
+        let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+            continue;
+        };
+        let n = if matches!(edge.curve(), EdgeCurve::Line) {
+            1
+        } else {
+            OUTLINE_CURVE_SAMPLES
+        };
+        super::pcurve_compute::sample_edge_uniform_native(
+            edge.curve(),
+            sv.point(),
+            ev.point(),
+            n,
+            oe.is_forward(),
+            &mut pts,
+        );
+    }
+    pts
+}
+
 /// Slack on the cap interiority test. A genuine drilled hole's centre clears
 /// the face outline by more than its radius, while a corner cylinder's section
 /// circle is exactly tangent (centre exactly one radius out); the 5% margin
@@ -5667,10 +5740,13 @@ const CAP_INTERIORITY_MARGIN: f64 = 1.05;
 
 /// A loop with the two halves of one of `rims` back to back (the rim split
 /// only at its seam's antipode, touched by no section) with that rim whole
-/// in their place, starting where the first half starts.
+/// in their place, starting where the first half starts. Two pieces of a
+/// rim meeting at one of `trace_splits`, a point the rim was split at only
+/// for the trace, are joined into one arc the same way.
 fn rejoin_untouched_rims(
     wire: Vec<OrientedPCurveEdge>,
     rims: &[OrientedPCurveEdge],
+    trace_splits: &[Point3],
     tol: f64,
 ) -> Vec<OrientedPCurveEdge> {
     use brepkit_math::curves2d::{Curve2D, Line2D};
@@ -5691,68 +5767,197 @@ fn rejoin_untouched_rims(
             continue;
         }
         let Some(rim) = rims.iter().find(|r| {
-            same_circle(&r.curve_3d, &first.curve_3d)
-                && same_circle(&r.curve_3d, &second.curve_3d)
-                && near(r.start_3d, first.start_3d)
+            same_circle(&r.curve_3d, &first.curve_3d) && same_circle(&r.curve_3d, &second.curve_3d)
         }) else {
             continue;
         };
-        if !near(first.end_3d, second.start_3d) || !near(second.end_3d, first.start_3d) {
+        if !near(first.end_3d, second.start_3d) {
+            continue;
+        }
+        let whole = near(rim.start_3d, first.start_3d) && near(second.end_3d, first.start_3d);
+        if !whole && !trace_splits.iter().any(|&p| near(p, first.end_3d)) {
+            continue;
+        }
+        // Joined into half a turn or more, the arc would run between the
+        // same two points as the rest of the rim, and the edge merge would
+        // weld the two: keep the split.
+        if !whole && (second.end_uv.x() - first.start_uv.x()).abs() >= std::f64::consts::PI - 1e-6 {
             continue;
         }
         let Ok(line) = Line2D::new(first.start_uv, second.end_uv - first.start_uv) else {
             continue;
         };
-        let whole = OrientedPCurveEdge {
+        let joined = OrientedPCurveEdge {
             curve_3d: rim.curve_3d.clone(),
             pcurve: Curve2D::Line(line),
             start_uv: first.start_uv,
             end_uv: second.end_uv,
             start_3d: first.start_3d,
-            end_3d: first.start_3d,
+            end_3d: if whole { first.start_3d } else { second.end_3d },
             forward: first.forward,
             source_edge_idx: None,
-            pave_block_id: rim.pave_block_id,
+            pave_block_id: if whole { rim.pave_block_id } else { None },
         };
         let mut out: Vec<OrientedPCurveEdge> = Vec::with_capacity(n - 1);
         for k in 0..n {
             if k == i {
-                out.push(whole.clone());
+                out.push(joined.clone());
             } else if k != (i + 1) % n {
                 out.push(wire[k].clone());
             }
         }
-        return rejoin_untouched_rims(out, rims, tol);
+        return rejoin_untouched_rims(out, rims, trace_splits, tol);
     }
     wire
 }
 
-/// Wire points in TRAVERSAL order, honouring each oriented edge's direction.
-///
-/// [`collect_wire_points`] pushes every edge's stored `start()` and ignores the
-/// orientation flag, so a wire carrying reversed edges comes back scrambled.
-/// Containment tests need the traversal-ordered outline, so they use this.
-fn collect_wire_points_oriented(
-    topo: &Topology,
-    wire_id: brepkit_topology::wire::WireId,
-) -> Vec<Point3> {
-    let Ok(wire) = topo.wire(wire_id) else {
-        return Vec::new();
+/// Lay a periodic face's outer boundary out as one walk in `u` from its
+/// first closed rim: every edge moves by whole periods to start where the
+/// edge before it ends, so the seam's two copies land a period apart with
+/// the rims running between them. A closed rim's UVs run its curve's own
+/// sense whatever its traversal, so one traversed against its curve leaves
+/// the walk a turn back from its start. False, with nothing moved, when
+/// there is no closed rim to walk from or a closed rim is not a circle (the
+/// split of a closed ellipse rim takes its pieces' u from projection, not
+/// from the rim's own span).
+fn walk_boundary_from_closed_rim(edges: &mut [OrientedPCurveEdge]) -> bool {
+    use std::f64::consts::TAU;
+    let closed = |e: &OrientedPCurveEdge| (e.start_3d - e.end_3d).length() < 1e-10;
+    if edges
+        .iter()
+        .any(|e| closed(e) && !matches!(e.curve_3d, EdgeCurve::Circle(_)))
+    {
+        return false;
+    }
+    let Some(first) = edges.iter().position(closed) else {
+        return false;
     };
-    let mut pts = Vec::new();
-    for oe in wire.edges() {
-        if let Ok(edge) = topo.edge(oe.edge()) {
-            let vid = if oe.is_forward() {
-                edge.start()
-            } else {
-                edge.end()
-            };
-            if let Ok(v) = topo.vertex(vid) {
-                pts.push(v.point());
-            }
+    let n = edges.len();
+    let mut cur = edges[first].start_uv.x();
+    for k in 0..n {
+        let e = &mut edges[(first + k) % n];
+        let shift = ((cur - e.start_uv.x()) / TAU).round() * TAU;
+        if shift != 0.0 {
+            e.start_uv = Point2::new(e.start_uv.x() + shift, e.start_uv.y());
+            e.end_uv = Point2::new(e.end_uv.x() + shift, e.end_uv.y());
+        }
+        cur = if closed(e) && !e.forward {
+            2.0f64.mul_add(e.start_uv.x(), -e.end_uv.x())
+        } else {
+            e.end_uv.x()
+        };
+    }
+    true
+}
+
+/// Move a section edge's ends by whole periods into the one-turn window
+/// `[lo, lo + period]` its face's boundary spans. An open section's interior
+/// lies inside the window, so its curve's samples, unwrapped from the
+/// middle, say which copy each end takes, an end on the seam included; its
+/// own end UVs can come from separate projections and need not be one span.
+/// A closed section winds once from the seam and moves as a whole.
+fn place_section_in_turn(e: &mut OrientedPCurveEdge, surface: &FaceSurface, lo: f64, period: f64) {
+    const SAMPLES: u32 = 8;
+    let nearest = |u: f64, target: f64| u - ((u - target) / period).round() * period;
+    let shift_to = |e: &mut OrientedPCurveEdge, start_u: f64, end_u: f64| {
+        e.start_uv = Point2::new(start_u, e.start_uv.y());
+        e.end_uv = Point2::new(end_u, e.end_uv.y());
+    };
+    if (e.start_3d - e.end_3d).length() < 1e-10 {
+        let mid = f64::midpoint(e.start_uv.x(), e.end_uv.x());
+        let shift = -((mid - lo) / period).floor() * period;
+        shift_to(e, e.start_uv.x() + shift, e.end_uv.x() + shift);
+        return;
+    }
+    let (s3, e3) = if e.forward {
+        (e.start_3d, e.end_3d)
+    } else {
+        (e.end_3d, e.start_3d)
+    };
+    let (t0, t1) = e.curve_3d.domain_with_endpoints(s3, e3);
+    let Some(mut path) = (0..=SAMPLES)
+        .map(|k| {
+            let t = (t1 - t0).mul_add(f64::from(k) / f64::from(SAMPLES), t0);
+            surface
+                .project_point(e.curve_3d.evaluate_with_endpoints(t, s3, e3))
+                .map(|(u, _)| u)
+        })
+        .collect::<Option<Vec<f64>>>()
+    else {
+        return;
+    };
+    let mid = path.len() / 2;
+    path[mid] = lo + (path[mid] - lo).rem_euclid(period);
+    for k in (0..mid).rev() {
+        path[k] = nearest(path[k], path[k + 1]);
+    }
+    for k in mid + 1..path.len() {
+        path[k] = nearest(path[k], path[k - 1]);
+    }
+    // A marched curve's domain can run from either end.
+    let first = e.curve_3d.evaluate_with_endpoints(t0, s3, e3);
+    let (at_start, at_end) = if (first - e.start_3d).length() <= (first - e.end_3d).length() {
+        (path[0], path[path.len() - 1])
+    } else {
+        (path[path.len() - 1], path[0])
+    };
+    shift_to(
+        e,
+        nearest(e.start_uv.x(), at_start),
+        nearest(e.end_uv.x(), at_end),
+    );
+}
+
+/// Give each end of a sliver section lying on the seam the seam copy of the
+/// section it continues. Where a section loop crosses the seam at its fold,
+/// the marched pieces can end a hair apart on either side, joined by a
+/// sliver whose samples all sit on the seam: [`place_section_in_turn`] lays
+/// it wholly on one copy, and the piece on the other copy then dangles. The
+/// sliver has to step from one copy to the other.
+fn place_seam_slivers(sections: &mut [OrientedPCurveEdge], lo: f64, period: f64, tol: f64) {
+    let near = 100.0 * tol;
+    let on_seam = |u: f64| {
+        let d = (u - lo).rem_euclid(period);
+        d.min(period - d) < 1e-6
+    };
+    let seam_sliver = |e: &OrientedPCurveEdge| {
+        is_sliver(e, near) && on_seam(e.start_uv.x()) && on_seam(e.end_uv.x())
+    };
+    let ends: Vec<(Point3, f64)> = sections
+        .iter()
+        .filter(|e| !seam_sliver(e))
+        .flat_map(|e| [(e.start_3d, e.start_uv.x()), (e.end_3d, e.end_uv.x())])
+        .filter(|&(_, u)| on_seam(u))
+        .collect();
+    let copy_at = |p: Point3| {
+        ends.iter()
+            .map(|&(q, u)| ((q - p).length(), u))
+            .filter(|&(d, _)| d < near)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, u)| u)
+    };
+    for e in sections.iter_mut().filter(|e| seam_sliver(e)) {
+        if let Some(u) = copy_at(e.start_3d) {
+            e.start_uv = Point2::new(u, e.start_uv.y());
+        }
+        if let Some(u) = copy_at(e.end_3d) {
+            e.end_uv = Point2::new(u, e.end_uv.y());
         }
     }
-    pts
+}
+
+/// Whether an edge's ends and its middle all lie within `size` of one
+/// another: a sliver, not a closed curve whose ends merely meet. An edge
+/// whose ends meet on an open curve is a point of it: its span reads as the
+/// whole curve, whose own ends lie apart.
+fn is_sliver(e: &OrientedPCurveEdge, size: f64) -> bool {
+    let (s, t) = (e.start_3d, e.end_3d);
+    if (s - t).length() >= size {
+        return false;
+    }
+    let (t0, t1) = e.curve_3d.domain_with_endpoints(s, t);
+    let at = |u: f64| e.curve_3d.evaluate_with_endpoints(u, s, t);
+    (at(t0) - at(t1)).length() >= size || (at(f64::midpoint(t0, t1)) - s).length() < size
 }
 
 /// Carve closed cap circles and ellipses (see [`split_face_2d`]) into the
@@ -5816,9 +6021,28 @@ fn distribute_cap_circles(
         // The frame-based sampler is orientation-unambiguous; the stored-pcurve
         // sampler can fold a loop carrying reversed arc sections into a
         // self-crossing polygon (see [`sample_wire_loop_uv_via_frame`]).
-        let poly = sample_wire_loop_uv_via_frame(&in_frame(&sf.outer_wire), frame);
+        let outer = in_frame(&sf.outer_wire);
         let holes: Vec<Vec<OrientedPCurveEdge>> =
             sf.inner_wires.iter().map(|h| in_frame(h)).collect();
+        let poly = sample_wire_loop_uv_via_frame(&outer, frame);
+        // Read on the sub-face's own lines and arcs where it has no NURBS
+        // edge: eight chords of a circular outline leave a cap's point off it.
+        let exact = |wire: &[OrientedPCurveEdge]| containment::exact_hole(wire, frame);
+        let outer_exact = exact(&outer);
+        let holes_exact: Vec<_> = holes.iter().map(|h| exact(h)).collect();
+        let in_outer = |p: Point2| match &outer_exact {
+            Some(pieces) => point_in_region(pieces, p, 0.0) == Some(true),
+            None => super::classify_2d::point_in_polygon_2d(p, &poly),
+        };
+        let in_hole = |p: Point2| {
+            holes
+                .iter()
+                .zip(&holes_exact)
+                .any(|(hole, pieces)| match pieces {
+                    Some(pieces) => point_in_region(pieces, p, 0.0) == Some(true),
+                    None => is_inside_any_hole(&p, std::slice::from_ref(hole)),
+                })
+        };
         let contained: Vec<SectionEdge> = if poly.len() < 3 {
             Vec::new()
         } else {
@@ -5826,10 +6050,7 @@ fn distribute_cap_circles(
                 .iter()
                 .enumerate()
                 .filter_map(|(i, cs)| {
-                    if assigned[i]
-                        || !super::classify_2d::point_in_polygon_2d(points_uv[i], &poly)
-                        || is_inside_any_hole(&points_uv[i], &holes)
-                    {
+                    if assigned[i] || !in_outer(points_uv[i]) || in_hole(points_uv[i]) {
                         return None;
                     }
                     assigned[i] = true;
@@ -5845,7 +6066,9 @@ fn distribute_cap_circles(
                 .iter()
                 .flat_map(|e| [e.start_3d, e.end_3d])
                 .collect();
-            let carved = split_face_with_internal_loops(
+            // Caps are closed curves, which the internal-loops path never
+            // declines.
+            if let Some(carved) = split_face_with_internal_loops(
                 &sf.surface,
                 &sf.outer_wire,
                 &sf.inner_wires,
@@ -5854,8 +6077,13 @@ fn distribute_cap_circles(
                 sf.reversed,
                 face_id,
                 &sub_wire_pts,
-            );
-            result.extend(carved);
+                // A plane face: the wall search this clears is never run.
+                brepkit_math::tolerance::Tolerance::new().linear,
+            ) {
+                result.extend(carved);
+            } else {
+                result.push(sf);
+            }
         }
     }
     result
@@ -5876,6 +6104,7 @@ fn split_face_2d_impl(
         Vec<brepkit_topology::edge::EdgeId>,
         impl std::hash::BuildHasher,
     >,
+    kept_splits: &std::collections::BTreeSet<brepkit_topology::vertex::VertexId>,
     mut split_registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
 ) -> Vec<SplitSubFace> {
     let face = match topo.face(face_id) {
@@ -6006,6 +6235,7 @@ fn split_face_2d_impl(
                 &wire_pts,
                 if is_plane { Some(frame) } else { None },
                 edge_images,
+                kept_splits,
                 &section_anchor_pts,
                 is_plane,
             )
@@ -6601,7 +6831,7 @@ fn split_face_2d_impl(
             "split_face_2d: face {face_id:?} routed to internal-loops path ({} sections)",
             secs.len()
         );
-        return split_face_with_internal_loops(
+        if let Some(pieces) = split_face_with_internal_loops(
             &surface,
             &boundary_edges,
             &original_inner_wires,
@@ -6610,7 +6840,10 @@ fn split_face_2d_impl(
             reversed,
             face_id,
             &wire_pts,
-        );
+            tol.linear,
+        ) {
+            return pieces;
+        }
     }
 
     let mut split_pts_3d: Vec<Point3> = sections.iter().flat_map(|s| [s.start, s.end]).collect();
@@ -6648,6 +6881,7 @@ fn split_face_2d_impl(
     // For periodic faces, align closed boundary edge UV with seam edge UV.
     // The same 3D vertex projects to u=0 (from circle unwrapping) and u=seam
     // (from Line edge projection). Shift the circle UV so it starts at seam_u.
+    let mut walked_from_closed_rim = false;
     if u_periodic {
         let seam_u_opt = boundary_edges.iter().find_map(|e| {
             if matches!(e.curve_3d, EdgeCurve::Line) {
@@ -6715,6 +6949,9 @@ fn split_face_2d_impl(
                     }
                 }
             }
+            if matches!(surface, FaceSurface::Cylinder(_)) {
+                walked_from_closed_rim = walk_boundary_from_closed_rim(&mut boundary_edges);
+            }
         }
     }
 
@@ -6726,6 +6963,9 @@ fn split_face_2d_impl(
     // with the seam Line edge. Splitting the circle at the UV-antipodal
     // point creates half-arcs whose endpoints match the seam edge vertices,
     // enabling the wire builder to form proper rectangular bands.
+    // A cylinder's rim points split here for the trace alone, which no
+    // neighbouring face shares: the pieces meeting at one rejoin afterwards.
+    let mut trace_splits: Vec<Point3> = Vec::new();
     if u_periodic && !sections.is_empty() {
         // Find the seam Line edge's vertex UV to determine seam_u.
         let seam_u = {
@@ -6756,6 +6996,9 @@ fn split_face_2d_impl(
                         .iter()
                         .any(|&p| (p - anti_pt).length() < 100.0 * tol.linear);
                     split_pts_3d.push(anti_pt);
+                    if !taken && matches!(surface, FaceSurface::Cylinder(_)) {
+                        trace_splits.push(anti_pt);
+                    }
                     if taken && matches!(surface, FaceSurface::Cone(_)) {
                         for quarter in [0.5, 1.5] {
                             if let Some(p) =
@@ -7743,9 +7986,13 @@ fn split_face_2d_impl(
     // seam lines out in one continuous u window, which need not be the
     // principal one; a section projected to its principal u would then sit
     // a period away from the rims it ends on. Move each section by whole
-    // periods so its midpoint falls inside the window.
+    // periods so its midpoint falls inside the window. A cylinder's boundary
+    // walked from a closed rim spans exactly one turn, and its sections go
+    // in end by end (`place_section_in_turn`): their own end UVs need not be
+    // one continuous span.
+    let mut one_turn: Option<(f64, f64)> = None;
     if u_periodic
-        && matches!(surface, FaceSurface::Cone(_))
+        && matches!(surface, FaceSurface::Cone(_) | FaceSurface::Cylinder(_))
         && all_edges.len() > n_boundary_edges
         && let (Some(u_period), _) = super::pcurve_compute::surface_periods(&surface)
     {
@@ -7755,7 +8002,15 @@ fn split_face_2d_impl(
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), u| {
                 (lo.min(u), hi.max(u))
             });
-        if hi - lo > 0.5 * u_period {
+        if matches!(surface, FaceSurface::Cylinder(_)) {
+            if walked_from_closed_rim && (hi - lo - u_period).abs() < 1e-6 {
+                for e in &mut all_edges[n_boundary_edges..] {
+                    place_section_in_turn(e, &surface, lo, u_period);
+                }
+                place_seam_slivers(&mut all_edges[n_boundary_edges..], lo, u_period, tol.linear);
+                one_turn = Some((lo, u_period));
+            }
+        } else if hi - lo > 0.5 * u_period {
             for e in &mut all_edges[n_boundary_edges..] {
                 let mid = f64::midpoint(e.start_uv.x(), e.end_uv.x());
                 let shift = -((mid - lo) / u_period).floor() * u_period;
@@ -7779,6 +8034,26 @@ fn split_face_2d_impl(
         && !is_plane
         && let (Some(u_period), _) = super::pcurve_compute::surface_periods(&surface)
     {
+        // The boundary walk lays the face's outline out in one unbroken run
+        // of u, which spans the face: the window starts at its low end. The
+        // endpoints' widest gap cannot always say which side is the face: a
+        // half band's vertices all sit on its two rulings half a turn apart,
+        // its two gaps tie, and rounding can pick the side it does not cover.
+        // A whole ring's seam placeholders all sit at one u and span nothing.
+        let boundary = &all_edges[..n_boundary_edges];
+        let unbroken = !boundary.is_empty()
+            && boundary
+                .iter()
+                .zip(boundary.iter().cycle().skip(1))
+                .all(|(a, b)| (b.start_uv.x() - a.end_uv.x()).abs() < 1e-9);
+        let (walk_lo, walk_hi) = boundary
+            .iter()
+            .flat_map(|e| [e.start_uv.x(), e.end_uv.x()])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), u| {
+                (lo.min(u), hi.max(u))
+            });
+        let span = walk_hi - walk_lo;
+        let walked = (unbroken && span > 1e-6 && span < u_period - 1e-6).then_some(walk_lo);
         let mut us: Vec<f64> = all_edges
             .iter()
             .flat_map(|e| [e.start_uv.x(), e.end_uv.x()])
@@ -7795,7 +8070,7 @@ fn split_face_2d_impl(
                 }
             }
             if max_gap > 0.05 {
-                let lo = gap_start + max_gap;
+                let lo = walked.unwrap_or(gap_start + max_gap);
                 for e in &mut all_edges {
                     let remap = |uv: Point2| -> Point2 {
                         let mut d = (uv.x() - lo).rem_euclid(u_period);
@@ -8429,8 +8704,23 @@ fn split_face_2d_impl(
         all_edges
     };
 
+    // Laid out in one turn, the face is a strip cut open along its seam and
+    // is traced as one: glued at the seam, a vertex there offers the edges
+    // leaving both of its copies, and the walk can cross to the far copy (an
+    // ellipse closing at the seam's end, where it touches the rim). A sliver
+    // run from one seam copy to the other (`place_seam_slivers`) is a step
+    // across the seam, not a chord across the strip: such a face is traced
+    // periodic.
+    let strip = one_turn.is_some_and(|(lo, period)| {
+        all_edges.iter().all(|e| {
+            let (a, b) = (e.start_uv.x(), e.end_uv.x());
+            a.min(b) >= lo - 1e-6
+                && a.max(b) <= lo + period + 1e-6
+                && ((b - a).abs() < 0.5 * period || !is_sliver(e, 100.0 * tol.linear))
+        })
+    });
     // Build wire loops via angular-sorting traversal.
-    let mut loops = build_wire_loops(&all_edges, tol.linear, u_periodic, v_periodic);
+    let mut loops = build_wire_loops(&all_edges, tol.linear, u_periodic && !strip, v_periodic);
     if trace_split {
         let mut rows: Vec<String> = all_edges
             .iter()
@@ -8722,7 +9012,9 @@ fn split_face_2d_impl(
     // double-covers the ring and orphans the far rim, so it is broken even
     // though no loop self-crosses. Detected separately from `greedy_broken`
     // so the cone arm below can gate on exactly this signature.
-    let ring_duplicated = wire_loops_duplicate_cover(&loops, tol.linear);
+    // An island and the hole it leaves are one pair, not a duplicated ring.
+    let ring_duplicated =
+        wire_loops_duplicate_cover(&without_twin_loops(&loops, tol.linear), tol.linear);
 
     // Sector rescue for an UNDER-split u-periodic lateral: one full-height
     // ruling plus the glued seam should sector the strip, but to the glued
@@ -8791,33 +9083,8 @@ fn split_face_2d_impl(
         // A loop inside the face comes back twice, as its region and as the
         // hole it leaves in the region around it: one pair, not a
         // duplicated ring.
-        let unpaired: Vec<Vec<OrientedPCurveEdge>> = {
-            let q = |p: Point2| {
-                (
-                    (p.x() / tol.linear).round() as i64,
-                    (p.y() / tol.linear).round() as i64,
-                )
-            };
-            let mut seen: Vec<Vec<[i64; 4]>> = Vec::new();
-            let mut out = Vec::new();
-            for lp in &dcel {
-                let mut keys: Vec<_> = lp
-                    .iter()
-                    .map(|e| {
-                        let (a, b) = (q(e.start_uv), q(e.end_uv));
-                        let (a, b) = if a <= b { (a, b) } else { (b, a) };
-                        [a.0, a.1, b.0, b.1]
-                    })
-                    .collect();
-                keys.sort_unstable();
-                if !seen.contains(&keys) {
-                    seen.push(keys);
-                    out.push(lp.clone());
-                }
-            }
-            out
-        };
-        let duplicated = wire_loops_duplicate_cover(&unpaired, tol.linear);
+        let duplicated =
+            wire_loops_duplicate_cover(&without_twin_loops(&dcel, tol.linear), tol.linear);
         let degenerate = wire_loops_have_degenerate_area_periodic(
             &dcel,
             tol.linear,
@@ -9099,13 +9366,15 @@ fn split_face_2d_impl(
     // on its own reverse left the region it bounds unsplit. The DCEL face
     // trace partitions the arrangement itself; adopt it when it strictly
     // refines the greedy partition and is clean by every loop-health
-    // signature. A holed face takes the trace only for a section closed on
+    // signature. Holes no section reaches stay out of the arrangement and
+    // attach whole afterwards, so they do not bar the trace. A face with
+    // holes in the arrangement takes the trace only for a section closed on
     // its own reverse (an arc ending where the face's boundary turns away
-    // from it, a wall's notch over a bore: the walker follows the notch),
-    // its holes attached to the pieces afterwards as to the walker's.
+    // from it, a wall's notch over a bore: the walker follows the notch).
     if is_plane
         && !sections.is_empty()
-        && ((original_inner_wires.is_empty()
+        && ((woven_inner_wires.is_empty()
+            && !holes_promoted
             && loops
                 .iter()
                 .any(|lp| split_loop_at_pinch_vertices(lp, tol.linear).len() != 1))
@@ -9120,6 +9389,7 @@ fn split_face_2d_impl(
             u_periodic,
             v_periodic,
             Some(&frame_area),
+            Some(!cw_loops),
         );
         if dcel.len() > greedy_region_count(&loops, tol.linear, Some(frame))
             && !dcel
@@ -9213,9 +9483,12 @@ fn split_face_2d_impl(
                 .any(|e| !matches!(e.curve_3d, EdgeCurve::Line));
             // A loop running along part of the face's boundary and back
             // along a section (a conic tongue off a cone's rim, a cylinder
-            // band's piece between two sections running rim to rim) bounds a
-            // region of the face too; only a loop of sections alone is a hole.
-            let on_boundary = matches!(surface, FaceSurface::Cone(_) | FaceSurface::Cylinder(_))
+            // band's piece between two sections running rim to rim, the lens
+            // between a cylinder's rim and an oblique plane's ellipse traced
+            // on its strip) bounds a region of the face too; only a loop of
+            // sections alone is a hole.
+            let on_boundary = (matches!(surface, FaceSurface::Cone(_) | FaceSurface::Cylinder(_))
+                || strip)
                 && wire_loop.iter().any(|e| e.source_edge_idx.is_none())
                 && wire_loop.iter().any(|e| e.source_edge_idx.is_some());
             // On a partial band, a loop of sections alone (a strut poking
@@ -9434,6 +9707,7 @@ fn split_face_2d_impl(
         };
     let hole_margin = tol.linear * 10.0;
     let mut sub_faces = Vec::new();
+    let mut halves: Vec<(usize, Vec<OrientedPCurveEdge>)> = Vec::new();
     for (outer_wire, _area) in outers {
         if !hole_polys_for_discard.is_empty() {
             let poly = sample_wire_loop_uv_via_frame(&outer_wire, frame);
@@ -9489,11 +9763,19 @@ fn split_face_2d_impl(
             precomputed_interior: None,
         };
         // A whole rim spans a period in one edge, which the periodic
-        // sampler folds away: take the interior point from the halves.
-        let rejoined = rejoin_untouched_rims(sub_face.outer_wire.clone(), &closed_rims, tol.linear);
+        // sampler folds away: the interior point is read from the halves,
+        // once the holes are attached.
+        let rejoined = rejoin_untouched_rims(
+            sub_face.outer_wire.clone(),
+            &closed_rims,
+            &trace_splits,
+            tol.linear,
+        );
         if rejoined.len() != sub_face.outer_wire.len() {
-            sub_face.precomputed_interior = Some(interior_point_3d(&sub_face, None));
-            sub_face.outer_wire = rejoined;
+            halves.push((
+                sub_faces.len(),
+                std::mem::replace(&mut sub_face.outer_wire, rejoined),
+            ));
         }
         sub_faces.push(sub_face);
     }
@@ -9717,6 +9999,30 @@ fn split_face_2d_impl(
         attach_whole_holes(&mut sub_faces, &passthrough_inner_wires);
     }
 
+    // The interior point is read once the holes are in: one read before can
+    // sit in a hole. A wall with a lens hole is searched clear of its holes in
+    // 3D, as `fill_images_faces` searches one: the lens's one closed edge
+    // gives no hole polygon in UV.
+    for (i, wire) in halves {
+        let sub_face = &mut sub_faces[i];
+        let whole = std::mem::replace(&mut sub_face.outer_wire, wire);
+        let lens = sub_face.inner_wires.iter().any(|hole| {
+            matches!(
+                hole.as_slice(),
+                [e] if matches!(
+                    e.curve_3d,
+                    EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_)
+                )
+            )
+        });
+        sub_face.precomputed_interior = if lens {
+            cylinder_cone_remainder_interior(sub_face, tol.linear)
+        } else {
+            interior_point_3d(sub_face, None, tol.linear)
+        };
+        sub_face.outer_wire = whole;
+    }
+
     sub_faces
 }
 
@@ -9760,8 +10066,15 @@ pub fn face_has_curved_lens_holes(topo: &Topology, face_id: FaceId) -> bool {
 
 /// Get a point guaranteed inside a sub-face's outer wire (in UV space),
 /// not inside any inner wire (hole), then evaluate it to 3D via the surface.
+/// `None` for a plane piece bounded by lines and conic arcs when no point
+/// inside them stands clear of them: a point off its own curves would
+/// classify a neighbour.
 #[allow(clippy::too_many_lines)]
-pub fn interior_point_3d(sub_face: &SplitSubFace, frame: Option<&PlaneFrame>) -> Point3 {
+pub fn interior_point_3d(
+    sub_face: &SplitSubFace,
+    frame: Option<&PlaneFrame>,
+    clearance: f64,
+) -> Option<Point3> {
     // For a lateral analytic band (cylinder/cone), the section edges' pcurves
     // can evaluate to a different 2pi window than the boundary edges' stored
     // (already-unwrapped) UV — e.g. a rounded-rect corner band split by a
@@ -9780,7 +10093,15 @@ pub fn interior_point_3d(sub_face: &SplitSubFace, frame: Option<&PlaneFrame>) ->
         sampling::sample_wire_loop_uv_on_surface(&sub_face.outer_wire, &sub_face.surface)
     } else if matches!(&sub_face.surface, FaceSurface::Cylinder(_)) {
         let (u_period, v_period) = super::pcurve_compute::surface_periods(&sub_face.surface);
-        sample_wire_loop_uv_periodic(&sub_face.outer_wire, u_period, v_period)
+        // A wire laid out in one unbroken run of u, each edge starting where
+        // the one before it ends, is sampled as it lies: unwrapping would
+        // fold a piece spanning half a turn or more onto its complement.
+        let wire = &sub_face.outer_wire;
+        let unbroken = wire
+            .iter()
+            .zip(wire.iter().cycle().skip(1))
+            .all(|(a, b)| (b.start_uv.x() - a.end_uv.x()).abs() < 1e-9);
+        sample_wire_loop_uv_periodic(wire, if unbroken { None } else { u_period }, v_period)
     } else if let Some(pts) = sphere_loop_uv(sub_face) {
         pts
     } else if let (FaceSurface::Plane { .. }, Some(f)) = (&sub_face.surface, frame) {
@@ -9794,7 +10115,26 @@ pub fn interior_point_3d(sub_face: &SplitSubFace, frame: Option<&PlaneFrame>) ->
     } else {
         sample_wire_loop_uv(&sub_face.outer_wire)
     };
-    let mut interior_uv = sample_interior_point(&pts_2d);
+    // A plane loop of lines and conic arcs is read on its curves: its sampled
+    // polygon runs on each arc's chords, and the centroid of a crescent whose
+    // inner arc passes near it can sit between that arc and its chords, in the
+    // neighbouring region. A crescent thinner than its chords' sag has no
+    // candidate across its polygon inside it, so one is stepped off its curves.
+    let exact = match (&sub_face.surface, frame) {
+        (FaceSurface::Plane { .. }, Some(f)) => containment::exact_hole(&sub_face.outer_wire, f),
+        _ => None,
+    };
+    let mut interior_uv = match exact.as_ref() {
+        Some(pieces) => {
+            let clear = |p: Point2| point_in_region(pieces, p, clearance) == Some(true);
+            sample_interior_point_where(&pts_2d, clear)
+                .or_else(|| containment::point_stepped_into_region(pieces, &pts_2d, clearance))
+                // The polygon's own sample asks for more room than the
+                // curves do (a thin rectangle's centre clears its sides).
+                .or_else(|| Some(sample_interior_point(&pts_2d)).filter(|&p| clear(p)))?
+        }
+        None => sample_interior_point(&pts_2d),
+    };
 
     // Periodic lateral walls (cone/cylinder): the closed boundary circles
     // share a seam, and `sample_wire_loop_uv` can emit a lopsided uv polygon
@@ -9918,7 +10258,7 @@ pub fn interior_point_3d(sub_face: &SplitSubFace, frame: Option<&PlaneFrame>) ->
                             super::classify_2d::point_in_polygon_2d(Point2::new(at, v), hole)
                         });
                         if !covered && let Some(p) = sub_face.surface.evaluate(u, v) {
-                            return p;
+                            return Some(p);
                         }
                     }
                     interior_uv = Point2::new(outer[0].x(), v);
@@ -9950,17 +10290,17 @@ pub fn interior_point_3d(sub_face: &SplitSubFace, frame: Option<&PlaneFrame>) ->
 
     // Evaluate back to 3D.
     if let Some(p) = sub_face.surface.evaluate(interior_uv.x(), interior_uv.y()) {
-        return p;
+        return Some(p);
     }
 
     // For plane faces, evaluate via PlaneFrame.
     if let FaceSurface::Plane { normal, .. } = &sub_face.surface {
         if let Some(f) = frame {
-            return f.evaluate(interior_uv.x(), interior_uv.y());
+            return Some(f.evaluate(interior_uv.x(), interior_uv.y()));
         }
         let wire_pts: Vec<Point3> = sub_face.outer_wire.iter().map(|e| e.start_3d).collect();
         let f = PlaneFrame::from_plane_face(*normal, &wire_pts);
-        return f.evaluate(interior_uv.x(), interior_uv.y());
+        return Some(f.evaluate(interior_uv.x(), interior_uv.y()));
     }
 
     // Last resort: average of 3D endpoints.
@@ -9971,7 +10311,7 @@ pub fn interior_point_3d(sub_face: &SplitSubFace, frame: Option<&PlaneFrame>) ->
             acc + (e.start_3d - Point3::new(0.0, 0.0, 0.0))
         });
     let n = sub_face.outer_wire.len() as f64;
-    Point3::new(sum.x() / n, sum.y() / n, sum.z() / n)
+    Some(Point3::new(sum.x() / n, sum.y() / n, sum.z() / n))
 }
 
 /// Give each of a sphere face's holes, none of which a section touches, to the
@@ -10859,6 +11199,7 @@ mod tests {
             None,
             None,
             &edge_images,
+            &std::collections::BTreeSet::new(),
             None,
         );
         assert_eq!(
@@ -11358,5 +11699,196 @@ mod tests {
         let out = split_loop_at_pinch_vertices(&wire, 1e-7);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 4);
+    }
+
+    /// The crescent a disc keeps outside a second disc of its radius whose
+    /// rim runs through its centre, turned through every degree in its
+    /// plane. The longest chord across its sampled polygon starts beside its
+    /// seam and runs past the disc's centre along the other rim, between
+    /// that arc and its chords; the interior point must lie in the crescent.
+    #[test]
+    fn a_crescents_interior_point_lies_off_its_inner_arc() {
+        use brepkit_math::curves::Circle3D;
+        use std::f64::consts::{FRAC_PI_2, FRAC_PI_3};
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let frame = PlaneFrame::from_normal_and_point(z, Point3::new(0.0, 0.0, 0.0));
+        let mut topo = Topology::new();
+        let face_id = make_unit_square_face(&mut topo);
+        let r = 5.0_f64;
+        let b = Point3::new(0.0, 0.0, 0.0);
+        for degree in 0..360 {
+            let turn = f64::from(degree).to_radians();
+            let on = |c: Point3, at: f64| {
+                Point3::new(
+                    r.mul_add((turn + at).cos(), c.x()),
+                    r.mul_add((turn + at).sin(), c.y()),
+                    0.0,
+                )
+            };
+            let a = on(b, 0.0);
+            let (seam, p, q) = (on(b, FRAC_PI_2), on(b, FRAC_PI_3), on(b, -FRAC_PI_3));
+            let arc =
+                |centre: Point3, from: Point3, to: Point3, forward: bool| OrientedPCurveEdge {
+                    curve_3d: EdgeCurve::Circle(Circle3D::new(centre, z, r).unwrap()),
+                    pcurve: dummy_pcurve(),
+                    start_uv: frame.project(from),
+                    end_uv: frame.project(to),
+                    start_3d: from,
+                    end_3d: to,
+                    forward,
+                    source_edge_idx: None,
+                    pave_block_id: None,
+                };
+            let crescent = SplitSubFace {
+                surface: FaceSurface::Plane { normal: z, d: 0.0 },
+                outer_wire: vec![
+                    arc(b, seam, p, false),
+                    arc(a, p, b, true),
+                    arc(a, b, q, true),
+                    arc(b, q, seam, false),
+                ],
+                inner_wires: vec![],
+                reversed: false,
+                parent: face_id,
+                rank: Rank::A,
+                precomputed_interior: None,
+            };
+            let pt =
+                interior_point_3d(&crescent, Some(&frame), containment::SEED_CLEARANCE).unwrap();
+            assert!(
+                (pt - b).length() < r && (pt - a).length() > r,
+                "turned {degree} degrees: {pt:?}"
+            );
+        }
+    }
+
+    /// The crescent a disc keeps outside a second of its radius whose centre
+    /// lies `gap` from its own, turned every 15 degrees in its plane: of
+    /// radius 5 with a gap of 0.001, of radius 1e6 with a gap of 1e-4, and of
+    /// radius 5 with gaps of 3e-7 and 2.2e-7, whose widest points clear both
+    /// arcs by only 1.5e-7 and 1.1e-7, between two halving steps.
+    /// Each is far thinner than its arcs' chords' sag, so no candidate taken
+    /// across its sampled polygon lies inside it; the interior point must
+    /// still lie in the crescent. One of radius 5 with a gap of 1e-8 holds no
+    /// point clear of its arcs, and gets none.
+    #[test]
+    fn a_thin_crescents_interior_point_lies_inside_it() {
+        use brepkit_math::curves::Circle3D;
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let frame = PlaneFrame::from_normal_and_point(z, Point3::new(0.0, 0.0, 0.0));
+        let mut topo = Topology::new();
+        let face_id = make_unit_square_face(&mut topo);
+        let point_in = |r: f64, gap: f64, degrees: i32| {
+            let turn = f64::from(degrees).to_radians();
+            let (c, s) = (turn.cos(), turn.sin());
+            let at = |x: f64, y: f64| Point3::new(c * x - s * y, s * x + c * y, 0.0);
+            let reach = gap.mul_add(-gap * 0.25, r * r).sqrt();
+            let (kept, cut) = (at(0.0, 0.0), at(gap, 0.0));
+            let (top, bottom) = (at(gap * 0.5, reach), at(gap * 0.5, -reach));
+            let arc =
+                |centre: Point3, from: Point3, to: Point3, forward: bool| OrientedPCurveEdge {
+                    curve_3d: EdgeCurve::Circle(Circle3D::new(centre, z, r).unwrap()),
+                    pcurve: dummy_pcurve(),
+                    start_uv: frame.project(from),
+                    end_uv: frame.project(to),
+                    start_3d: from,
+                    end_3d: to,
+                    forward,
+                    source_edge_idx: None,
+                    pave_block_id: None,
+                };
+            let crescent = SplitSubFace {
+                surface: FaceSurface::Plane { normal: z, d: 0.0 },
+                outer_wire: vec![arc(kept, top, bottom, true), arc(cut, bottom, top, false)],
+                inner_wires: vec![],
+                reversed: false,
+                parent: face_id,
+                rank: Rank::A,
+                precomputed_interior: None,
+            };
+            (
+                interior_point_3d(&crescent, Some(&frame), containment::SEED_CLEARANCE),
+                kept,
+                cut,
+            )
+        };
+        for (r, gap) in [
+            (5.0_f64, 0.001_f64),
+            (1e6, 1e-4),
+            (5.0, 3e-7),
+            (5.0, 2.2e-7),
+        ] {
+            for step in 0..24 {
+                let (pt, kept, cut) = point_in(r, gap, step * 15);
+                let pt = pt.unwrap();
+                assert!(
+                    (pt - kept).length() < r && (pt - cut).length() > r,
+                    "radius {r}, turned {} degrees: {pt:?}",
+                    step * 15
+                );
+            }
+        }
+        assert!(point_in(5.0, 1e-8, 0).0.is_none());
+    }
+
+    /// Rectangles 1 by 1e-6 and 100 by 1e-5 get a point inside them at the
+    /// default clearance, though their sampled polygons ask for more room,
+    /// and corner steps stay too near their ends; one 1e-3 by
+    /// 1.5e-7 gets one at a clearance of 1e-11, but none at 1e-7, which no
+    /// point of it clears.
+    #[test]
+    fn a_thin_rectangles_interior_point_lies_inside_it() {
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let frame = PlaneFrame::from_normal_and_point(z, Point3::new(0.0, 0.0, 0.0));
+        let mut topo = Topology::new();
+        let face_id = make_unit_square_face(&mut topo);
+        let rectangle = |w: f64, h: f64| {
+            let corners = [
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(w, 0.0, 0.0),
+                Point3::new(w, h, 0.0),
+                Point3::new(0.0, h, 0.0),
+            ];
+            SplitSubFace {
+                surface: FaceSurface::Plane { normal: z, d: 0.0 },
+                outer_wire: (0..4)
+                    .map(|k| {
+                        let (from, to) = (corners[k], corners[(k + 1) % 4]);
+                        OrientedPCurveEdge {
+                            curve_3d: EdgeCurve::Line,
+                            pcurve: dummy_pcurve(),
+                            start_uv: frame.project(from),
+                            end_uv: frame.project(to),
+                            start_3d: from,
+                            end_3d: to,
+                            forward: true,
+                            source_edge_idx: None,
+                            pave_block_id: None,
+                        }
+                    })
+                    .collect(),
+                inner_wires: vec![],
+                reversed: false,
+                parent: face_id,
+                rank: Rank::A,
+                precomputed_interior: None,
+            }
+        };
+        let inside =
+            |p: Point3, w: f64, h: f64| p.x() > 0.0 && p.x() < w && p.y() > 0.0 && p.y() < h;
+        let p = interior_point_3d(
+            &rectangle(1.0, 1e-6),
+            Some(&frame),
+            containment::SEED_CLEARANCE,
+        )
+        .unwrap();
+        assert!(inside(p, 1.0, 1e-6), "{p:?}");
+        let long = rectangle(100.0, 1e-5);
+        let p = interior_point_3d(&long, Some(&frame), containment::SEED_CLEARANCE).unwrap();
+        assert!(inside(p, 100.0, 1e-5), "{p:?}");
+        let thin = rectangle(1e-3, 1.5e-7);
+        let p = interior_point_3d(&thin, Some(&frame), 1e-11).unwrap();
+        assert!(inside(p, 1e-3, 1.5e-7), "{p:?}");
+        assert!(interior_point_3d(&thin, Some(&frame), containment::SEED_CLEARANCE).is_none());
     }
 }

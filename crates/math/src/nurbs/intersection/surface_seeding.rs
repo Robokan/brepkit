@@ -8,18 +8,158 @@ use crate::aabb::Aabb3;
 use crate::bvh::Bvh;
 use crate::nurbs::curve::NurbsCurve;
 use crate::nurbs::decompose::{BezierPatch, surface_to_bezier_patches};
-use crate::nurbs::fitting::interpolate;
-use crate::nurbs::projection::project_point_to_surface;
+use crate::nurbs::projection::{
+    SurfaceProjection, project_point_to_surface, project_point_to_surface_from,
+};
 use crate::nurbs::surface::NurbsSurface;
 use crate::vec::{Point3, Vec3};
 
-use super::chaining::{build_curves_from_chains, chain_traced_segments};
+use super::chaining::{Section, build_curves_from_chains, chain_traced_segments};
 use super::curve_surface::intersect_curve_surface;
 use super::surface_marching::{
     constrain_param, constrain_state, march_with_branches, near_existing_segment,
     surface_newton_step,
 };
 use super::{IntersectionCurve, IntersectionPoint, MAX_NEWTON_ITER, MAX_QUEUE_SIZE, MAX_SEGMENTS};
+
+/// The plane a patch lies in, when every control point lies on it to
+/// rounding: as `(unit normal, offset)`, from the cross of its corners'
+/// diagonals. Rounding is weighed by the plane's own terms, so that a patch
+/// far along the plane keeps its curvature.
+pub(super) fn plane_of(surface: &NurbsSurface) -> Option<(Vec3, f64)> {
+    let cps = surface.control_points();
+    let (first, last) = (cps.first()?, cps.last()?);
+    let corners = [
+        *first.first()?,
+        *first.last()?,
+        *last.first()?,
+        *last.last()?,
+    ];
+    let across = (corners[3] - corners[0]).cross(corners[1] - corners[2]);
+    let normal = across.normalize().ok()?;
+    let offset = normal.dot(Vec3::new(corners[0].x(), corners[0].y(), corners[0].z()));
+    let scale = cps
+        .iter()
+        .flatten()
+        .map(|&p| super::plane::plane_terms(normal, offset, p))
+        .fold(0.0, f64::max);
+    cps.iter()
+        .flatten()
+        .all(|&p| normal.dot(p - corners[0]).abs() <= 64.0 * f64::EPSILON * scale)
+        .then_some((normal, offset))
+}
+
+/// Points along a flat patch's fitted section checked to lie on the patch,
+/// for each point of the section.
+const CURVE_CHECKS: usize = 4;
+
+/// When `flat` lies in a plane, the plane's section of `other`, as
+/// [`intersect_plane_nurbs`](super::intersect_plane_nurbs) finds it, with
+/// each point's parameters on both patches (`flat`'s first when
+/// `flat_first`). `None` unless the section lies on `flat` itself, at its
+/// points and along its fitted curve between them: a section reaching past
+/// the patch is left to the marcher, and so is one the plane's grid may
+/// have missed a branch of, where the search below can find it.
+pub(super) fn planar_patch_sections(
+    flat: &NurbsSurface,
+    other: &NurbsSurface,
+    samples: usize,
+    flat_first: bool,
+) -> Result<Option<Vec<IntersectionCurve>>, MathError> {
+    let Some((normal, offset)) = plane_of(flat) else {
+        return Ok(None);
+    };
+    let mut curves = super::intersect_plane_nurbs(other, normal, offset, samples)?;
+    if curves.is_empty() {
+        return Ok(None);
+    }
+    // The plane's grid can miss a branch narrower than its step while it
+    // finds others. A span of `other` whose control points reach the plane,
+    // to rounding, may meet it there, crossing or only touching it; where
+    // no point of the section lies in such a span, the search looks
+    // instead.
+    let rounding = 64.0
+        * f64::EPSILON
+        * other
+            .control_points()
+            .iter()
+            .flatten()
+            .map(|&p| super::plane::plane_terms(normal, offset, p))
+            .fold(0.0, f64::max);
+    let Ok(patches) = surface_to_bezier_patches(other) else {
+        return Ok(None);
+    };
+    for patch in patches {
+        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in patch.surface.control_points().iter().flatten() {
+            let side = normal.dot(Vec3::new(p.x(), p.y(), p.z())) - offset;
+            (low, high) = (low.min(side), high.max(side));
+        }
+        let (u0, u1) = patch.u_range;
+        let (v0, v1) = patch.v_range;
+        let (su, sv) = (1e-9 * (u1 - u0), 1e-9 * (v1 - v0));
+        let met = curves.iter().flat_map(|c| &c.points).any(|q| {
+            let (u, v) = q.param1;
+            (u0 - su..=u1 + su).contains(&u) && (v0 - sv..=v1 + sv).contains(&v)
+        });
+        if low <= rounding && high >= -rounding && !met {
+            return Ok(None);
+        }
+    }
+    let (u_lo, u_hi) = flat.domain_u();
+    let (v_lo, v_hi) = flat.domain_v();
+    let slack = 1e-9 * (u_hi - u_lo).max(v_hi - v_lo);
+    let on_flat = |foot: &SurfaceProjection| {
+        (u_lo - slack..=u_hi + slack).contains(&foot.u)
+            && (v_lo - slack..=v_hi + slack).contains(&foot.v)
+            && foot.distance <= 1e-7
+    };
+    for curve in &mut curves {
+        let mut feet = Vec::with_capacity(curve.points.len());
+        for point in &mut curve.points {
+            let Ok(foot) = project_point_to_surface(flat, point.point, 1e-10) else {
+                return Ok(None);
+            };
+            if !on_flat(&foot) {
+                return Ok(None);
+            }
+            feet.push((point.point, (foot.u, foot.v)));
+            let on_other = point.param1;
+            (point.param1, point.param2) = if flat_first {
+                ((foot.u, foot.v), on_other)
+            } else {
+                (on_other, (foot.u, foot.v))
+            };
+        }
+        // The fitted curve between the points must lie on the patch too: a
+        // section passing just outside the patch's edge between points, or
+        // across a gap in it, leaves its points on the patch.
+        let (t0, t1) = curve.curve.domain();
+        let checks = CURVE_CHECKS * feet.len();
+        for k in 0..=checks {
+            #[allow(clippy::cast_precision_loss)]
+            let q = curve
+                .curve
+                .evaluate((t1 - t0).mul_add(k as f64 / checks as f64, t0));
+            let Some(&(_, near)) = feet
+                .iter()
+                .min_by(|a, b| (a.0 - q).length().total_cmp(&(b.0 - q).length()))
+            else {
+                return Ok(None);
+            };
+            let Ok(foot) = project_point_to_surface_from(flat, q, near, 1e-10) else {
+                return Ok(None);
+            };
+            let inside = (u_lo - slack..=u_hi + slack).contains(&foot.u)
+                && (v_lo - slack..=v_hi + slack).contains(&foot.v);
+            // The fit keeps within its tolerance of the plane, not on it.
+            if !inside || foot.distance > 1e-6 {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(curves))
+}
 
 /// Intersect two NURBS surfaces.
 ///
@@ -47,6 +187,12 @@ pub fn intersect_nurbs_nurbs(
     samples: usize,
     march_step: f64,
 ) -> Result<Vec<IntersectionCurve>, MathError> {
+    if let Some(curves) = planar_patch_sections(surface1, surface2, samples, true)? {
+        return Ok(curves);
+    }
+    if let Some(curves) = planar_patch_sections(surface2, surface1, samples, false)? {
+        return Ok(curves);
+    }
     let n = samples.max(5);
     let tolerance = 1e-6;
 
@@ -160,15 +306,31 @@ pub fn intersect_nurbs_nurbs(
     if chains.is_empty() {
         return Ok(Vec::new());
     }
-    let curves = build_curves_from_chains(&chains)?;
-
-    // Phase 4: Validate fitted curves against both surfaces.
-    // Reject or refit curves whose NURBS approximation deviates too far
-    // from the actual intersection.
-    // 10x relaxation: fitted NURBS curve may deviate slightly from sample points
-    let validated = validate_intersection_curves(&curves, surface1, surface2, tolerance * 10.0);
-
-    Ok(validated)
+    let foot = |s: &NurbsSurface, p: Point3, uv: (f64, f64)| {
+        project_point_to_surface_from(s, p, uv, tolerance)
+            .or_else(|_| project_point_to_surface(s, p, tolerance))
+            .ok()
+    };
+    let off = |p: Point3, near: &IntersectionPoint| {
+        let a = foot(surface1, p, near.param1)?;
+        let b = foot(surface2, p, near.param2)?;
+        Some(a.distance.max(b.distance))
+    };
+    // Newton aims a tenth inside the tolerance and its fallback accepts ten
+    // times its aim, so no point the fit adds strays past the tolerance.
+    let settle = |p: Point3, near: &IntersectionPoint| {
+        let a = foot(surface1, p, near.param1)?;
+        let b = foot(surface2, p, near.param2)?;
+        refine_ssi_point(surface1, surface2, a.u, a.v, b.u, b.v, tolerance * 0.1)
+    };
+    build_curves_from_chains(
+        &chains,
+        tolerance,
+        &Section {
+            off: &off,
+            settle: &settle,
+        },
+    )
 }
 
 /// Curves between boundary seeds no traced segment reached. A march keeps
@@ -416,126 +578,6 @@ fn boundary_curves(s: &NurbsSurface) -> Vec<(NurbsCurve, bool, f64)> {
         }
     }
     out
-}
-
-/// Validate intersection curves by checking that the fitted NURBS curve
-/// matches the stored sample points within tolerance, and that the curve
-/// actually lies on both input surfaces.
-///
-/// Two-phase validation:
-/// 1. **Sample-point check**: verify the curve passes near its own sample
-///    points. Since those sample points are known to lie on the
-///    intersection, large deviations indicate a bad LSPIA fit.
-/// 2. **Dual-surface check**: project evenly-spaced curve points onto
-///    both surfaces and verify they are within tolerance.  Curves that
-///    pass phase 1 but fail phase 2 are re-fitted via interpolation
-///    (exact through sample points).
-///
-/// Curves that deviate too far are re-fitted via interpolation (exact
-/// through sample points). If refitting fails, the curve is kept as-is.
-#[allow(clippy::cast_precision_loss)]
-fn validate_intersection_curves(
-    curves: &[IntersectionCurve],
-    s1: &NurbsSurface,
-    s2: &NurbsSurface,
-    tolerance: f64,
-) -> Vec<IntersectionCurve> {
-    let mut result = Vec::with_capacity(curves.len());
-
-    for ic in curves {
-        if ic.points.len() < 2 {
-            result.push(ic.clone());
-            continue;
-        }
-
-        // Phase 1: Check deviation at a subset of stored sample points.
-        // Evaluate the curve at evenly spaced parameters and compare
-        // against the nearest sample point.
-        let (t_min, t_max) = ic.curve.domain();
-        let n_check = 5.min(ic.points.len());
-        let step = ic.points.len() / n_check;
-
-        let mut max_dev = 0.0_f64;
-        for i in 0..n_check {
-            let idx = (i * step).min(ic.points.len() - 1);
-            let sample_pt = ic.points[idx].point;
-
-            // Find the parameter closest to this sample point by
-            // evaluating the curve at a proportional parameter.
-            let t = t_min + (t_max - t_min) * idx as f64 / (ic.points.len() - 1).max(1) as f64;
-            let curve_pt = ic.curve.evaluate(t.clamp(t_min, t_max));
-            let dev = (curve_pt - sample_pt).length();
-            max_dev = max_dev.max(dev);
-        }
-
-        // Use the refitted curve if Phase 1 failed, otherwise the original.
-        let working_curve = if max_dev > tolerance {
-            refit_from_samples(ic)
-        } else {
-            ic.clone()
-        };
-
-        // Phase 2: Dual-surface validation -- verify the curve lies on
-        // both input surfaces by projecting evenly-spaced curve points.
-        let (wt_min, wt_max) = working_curve.curve.domain();
-        let n_surface_check = 5;
-        let mut max_surface_dev = 0.0_f64;
-        let mut successful_projections = 0_u32;
-        for i in 0..n_surface_check {
-            let t = wt_min + (wt_max - wt_min) * i as f64 / (n_surface_check - 1).max(1) as f64;
-            let curve_pt = working_curve.curve.evaluate(t.clamp(wt_min, wt_max));
-
-            // Project onto surface 1 and measure deviation.
-            if let Ok(proj) = project_point_to_surface(s1, curve_pt, tolerance) {
-                max_surface_dev = max_surface_dev.max(proj.distance);
-                successful_projections += 1;
-            }
-            // Project onto surface 2 and measure deviation.
-            if let Ok(proj) = project_point_to_surface(s2, curve_pt, tolerance) {
-                max_surface_dev = max_surface_dev.max(proj.distance);
-                successful_projections += 1;
-            }
-        }
-
-        if successful_projections == 0 {
-            // No projections succeeded -- can't validate, keep curve as-is.
-            result.push(working_curve);
-            continue;
-        }
-
-        if max_surface_dev > tolerance {
-            log::warn!(
-                "SSI: curve deviates {max_surface_dev:.2e} from surface(s) \
-                 (tolerance={tolerance:.2e}), re-fitting from sample points"
-            );
-            let refit_curve = refit_from_samples(ic);
-            result.push(refit_curve);
-        } else {
-            result.push(working_curve);
-        }
-    }
-
-    result
-}
-
-/// Re-fit an intersection curve from its stored sample points via
-/// interpolation.  Falls back to the original curve if interpolation
-/// fails.
-fn refit_from_samples(ic: &IntersectionCurve) -> IntersectionCurve {
-    let positions: Vec<Point3> = ic.points.iter().map(|p| p.point).collect();
-    let degree = if positions.len() <= 3 {
-        1
-    } else {
-        3.min(positions.len() - 1)
-    };
-    if let Ok(refit) = interpolate(&positions, degree) {
-        IntersectionCurve {
-            curve: refit,
-            points: ic.points.clone(),
-        }
-    } else {
-        ic.clone()
-    }
 }
 
 /// Find SSI seed points using recursive Bezier patch subdivision + BVH overlap.

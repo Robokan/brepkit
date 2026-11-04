@@ -8,7 +8,7 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 
 use crate::MathError;
 use crate::aabb::Aabb3;
-use crate::curves::{Circle3D, Ellipse3D};
+use crate::curves::{Circle3D, Ellipse3D, Hyperbola3D, Line3D, Parabola3D};
 use crate::frame::Frame3;
 use crate::nurbs::curve::NurbsCurve;
 use crate::nurbs::fitting::interpolate;
@@ -28,10 +28,282 @@ pub enum ExactIntersectionCurve {
     Points(Vec<Point3>),
 }
 
+/// A plane's section of an analytic surface, from [`exact_plane_section`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum PlaneSection {
+    /// A circle.
+    Circle(Circle3D),
+    /// An ellipse.
+    Ellipse(Ellipse3D),
+    /// A straight section: a cylinder's ruling, running both ways from the
+    /// line's origin, or with `ray` a cone's ruling, running from the apex at
+    /// the line's origin along its direction only.
+    Line {
+        /// The ruling's line.
+        line: Line3D,
+        /// Whether the section runs one way only, from the line's origin.
+        ray: bool,
+    },
+    /// The one point where the plane touches the surface.
+    Point(Point3),
+    /// A sampled chain of points along the section.
+    Points(Vec<Point3>),
+    /// A cone's parabola.
+    Parabola(Parabola3D),
+    /// The branch of a cone's hyperbola on the cone's one nappe, which the
+    /// hyperbola's `u_axis` points to from its centre.
+    Hyperbola(Hyperbola3D),
+}
+
+impl From<ExactIntersectionCurve> for PlaneSection {
+    fn from(curve: ExactIntersectionCurve) -> Self {
+        match curve {
+            ExactIntersectionCurve::Circle(circle) => Self::Circle(circle),
+            ExactIntersectionCurve::Ellipse(ellipse) => Self::Ellipse(ellipse),
+            ExactIntersectionCurve::Points(points) => Self::Points(points),
+        }
+    }
+}
+
+/// A plane's exact section of an analytic surface.
+///
+/// It includes the sections [`exact_plane_analytic`] has no curve for: the
+/// rulings a plane along a cylinder's axis or through a cone's apex cuts,
+/// and the point where a plane touches a sphere or meets a cone at its apex
+/// alone. A cone's parabola and hyperbola come back as curves, which
+/// [`exact_plane_analytic`] samples into points, except in a band about the
+/// parabola where neither form keeps its digits.
+///
+/// The plane is `dot(normal, p) = d`, with `normal` of unit length.
+///
+/// # Errors
+///
+/// Returns an error if a section's curve cannot be built.
+pub fn exact_plane_section(
+    surface: AnalyticSurface<'_>,
+    normal: Vec3,
+    d: f64,
+) -> Result<Vec<PlaneSection>, MathError> {
+    match surface {
+        AnalyticSurface::Cylinder(cyl) if normal.dot(cyl.axis()).abs() < 1e-10 => {
+            return plane_cylinder_rulings(cyl, normal, d);
+        }
+        AnalyticSurface::Cone(cone) if plane_holds_apex(cone, normal, d) => {
+            return plane_cone_apex_rulings(cone, normal);
+        }
+        AnalyticSurface::Cone(cone) => {
+            if let Some(open) = plane_cone_open_section(cone, normal, d)? {
+                return Ok(open);
+            }
+        }
+        AnalyticSurface::Sphere(sphere) => {
+            let h = dot_np(normal, sphere.center()) - d;
+            let r = sphere.radius();
+            if (r - h.abs()).abs() <= TOUCH * r {
+                return Ok(vec![PlaneSection::Point(Point3::new(
+                    h.mul_add(-normal.x(), sphere.center().x()),
+                    h.mul_add(-normal.y(), sphere.center().y()),
+                    h.mul_add(-normal.z(), sphere.center().z()),
+                ))]);
+            }
+        }
+        AnalyticSurface::Cylinder(_) | AnalyticSurface::Torus(_) => {}
+    }
+    Ok(exact_plane_analytic(surface, normal, d)?
+        .into_iter()
+        .map(PlaneSection::from)
+        .collect())
+}
+
+/// How far a cone section's `e² − 1` (its eccentricity squared, less one)
+/// may sit from zero for the section to be read as a parabola.
+const PARABOLIC: f64 = 1e-12;
+
+/// Where a cone's hyperbola starts, in `e² − 1`: its centre lies the
+/// plane's offset over the conic coefficient away, and nearer zero its
+/// vertex loses digits.
+const HYPERBOLIC: f64 = 1e-6;
+
+/// A plane's parabola or hyperbola section of a cone, on the cone's one
+/// nappe, worked in the frame of [`exact_plane_cone`]. `None` for a circle
+/// or an ellipse, in the band between [`PARABOLIC`] and [`HYPERBOLIC`], and
+/// for a curve whose points do not hold to the cone (a cone so narrow or so
+/// flat that the formulas lose their digits), all of which go to the
+/// sampled section.
+#[allow(clippy::many_single_char_names)]
+fn plane_cone_open_section(
+    cone: &ConicalSurface,
+    normal: Vec3,
+    d: f64,
+) -> Result<Option<Vec<PlaneSection>>, MathError> {
+    let axis = cone.axis();
+    let c = normal.dot(axis);
+    let p2 = c.mul_add(-c, 1.0).max(0.0);
+    let p = p2.sqrt();
+    let rise = cone.half_angle().sin();
+    let k = rise * rise;
+    let a_coeff = p2 - k;
+    let eccentric = a_coeff / k;
+    let m = axis - normal * c;
+    let m_len = m.length();
+    if m_len < 1e-12 || eccentric < -PARABOLIC || (eccentric > PARABOLIC && eccentric <= HYPERBOLIC)
+    {
+        return Ok(None);
+    }
+    let e1 = m * (1.0 / m_len);
+    let e2 = normal.cross(e1);
+    let apex = cone.apex();
+    let e = d - dot_np(normal, apex);
+    let origin = apex + normal * e;
+    // A point `s` along `e1` from `origin` lies `e·c + s·p` up the axis from
+    // the apex, which the real nappe keeps non-negative.
+    let real = |s: f64| e.mul_add(c, s * p) >= 0.0;
+    // On the one nappe a point's height up the axis is `rise` times its
+    // distance from the apex.
+    let holds = |q: Point3| {
+        let w = q - apex;
+        let reach = w.length();
+        reach.is_finite() && (w.dot(axis) - rise * reach).abs() <= 1e-9 * (1.0 + reach)
+    };
+    if eccentric <= PARABOLIC {
+        // k t² = 2ecp s + e²(c² − k): the vertex at t = 0, opening along e1
+        // with the sign of ecp, `1 / 4f = k / 2|ecp|`.
+        let ecp = e * c * p;
+        let vertex_s = -e * (c * c - k) / (2.0 * c * p);
+        let focal = ecp.abs() / (2.0 * k);
+        if !(vertex_s.is_finite() && focal > 0.0 && focal.is_finite()) {
+            return Ok(None);
+        }
+        if !real(vertex_s) {
+            return Ok(Some(Vec::new()));
+        }
+        let parabola = Parabola3D::with_axes(origin + e1 * vertex_s, e1 * ecp.signum(), e2, focal)?;
+        if ![0.0, focal, -focal]
+            .iter()
+            .all(|&t| holds(parabola.evaluate(t)))
+        {
+            return Ok(None);
+        }
+        return Ok(Some(vec![PlaneSection::Parabola(parabola)]));
+    }
+    // A(s − s_c)² − k t² = e²k(1 − k)/A: the branches' vertices lie a real
+    // semi-axis either side of the centre, one on each nappe.
+    let centre_s = -e * c * p / a_coeff;
+    let rhs = e * e * k * (1.0 - k) / a_coeff;
+    let (real_axis, imaginary_axis) = ((rhs / a_coeff).sqrt(), (rhs / k).sqrt());
+    if !(real_axis > 0.0 && imaginary_axis > 0.0 && centre_s.is_finite()) {
+        return Ok(None);
+    }
+    let toward = if real(centre_s + real_axis) { e1 } else { -e1 };
+    let hyperbola = Hyperbola3D::with_axes(
+        origin + e1 * centre_s,
+        real_axis,
+        imaginary_axis,
+        toward,
+        e2,
+    )?;
+    if ![0.0, 1.0, -1.0]
+        .iter()
+        .all(|&t| holds(hyperbola.evaluate(t)))
+    {
+        return Ok(None);
+    }
+    Ok(Some(vec![PlaneSection::Hyperbola(hyperbola)]))
+}
+
+/// Rounding band, relative, within which a plane counts as touching a
+/// surface or passing through a cone's apex.
+const TOUCH: f64 = 4.0 * f64::EPSILON;
+
+/// The rulings a plane along a cylinder's axis cuts from it: two lines, the
+/// one it touches along, or none.
+fn plane_cylinder_rulings(
+    cyl: &CylindricalSurface,
+    normal: Vec3,
+    d: f64,
+) -> Result<Vec<PlaneSection>, MathError> {
+    // n·P(u, 0) = n·O + r·(a cos u + b sin u): the plane holds the ruling at
+    // u where cos(u − φ) = (d − n·O) / (r·√(a² + b²)).
+    let (a, b) = (normal.dot(cyl.x_axis()), normal.dot(cyl.y_axis()));
+    let amp = a.hypot(b);
+    if amp < 1e-12 {
+        return Ok(vec![]);
+    }
+    let ratio = (d - dot_np(normal, cyl.origin())) / (cyl.radius() * amp);
+    if ratio.abs() > 1.0 + TOUCH {
+        return Ok(vec![]);
+    }
+    let phi = b.atan2(a);
+    let spread = ratio.clamp(-1.0, 1.0).acos();
+    let at = if ratio.abs() >= 1.0 - TOUCH {
+        vec![phi + spread]
+    } else {
+        vec![phi + spread, phi - spread]
+    };
+    at.into_iter()
+        .map(|u| {
+            Ok(PlaneSection::Line {
+                line: Line3D::new(cyl.evaluate(u, 0.0), cyl.axis())?,
+                ray: false,
+            })
+        })
+        .collect()
+}
+
+/// Whether a plane passes through a cone's apex, but for rounding.
+fn plane_holds_apex(cone: &ConicalSurface, normal: Vec3, d: f64) -> bool {
+    let apex = cone.apex() - Point3::new(0.0, 0.0, 0.0);
+    (normal.dot(apex) - d).abs() <= TOUCH * (1.0 + apex.length() + d.abs())
+}
+
+/// The rulings a plane through a cone's apex cuts from its nappe, as rays
+/// from the apex: two, the one it touches along, or none, when the plane
+/// meets the cone at the apex alone.
+fn plane_cone_apex_rulings(
+    cone: &ConicalSurface,
+    normal: Vec3,
+) -> Result<Vec<PlaneSection>, MathError> {
+    // g(u) = cos a·(cos u·X + sin u·Y) + sin a·axis, so n·g(u) = 0 reads
+    // A cos u + B sin u = −C.
+    let (sin_a, cos_a) = cone.half_angle().sin_cos();
+    let a = cos_a * normal.dot(cone.x_axis());
+    let b = cos_a * normal.dot(cone.y_axis());
+    let c = sin_a * normal.dot(cone.axis());
+    let amp = a.hypot(b);
+    let apex = cone.apex();
+    if amp < 1e-12 * c.abs().max(1.0) {
+        return Ok(vec![PlaneSection::Point(apex)]);
+    }
+    let ratio = -c / amp;
+    if ratio.abs() > 1.0 + TOUCH {
+        return Ok(vec![PlaneSection::Point(apex)]);
+    }
+    let phi = b.atan2(a);
+    let spread = ratio.clamp(-1.0, 1.0).acos();
+    let at = if ratio.abs() >= 1.0 - TOUCH {
+        vec![phi + spread]
+    } else {
+        vec![phi + spread, phi - spread]
+    };
+    at.into_iter()
+        .map(|u| {
+            Ok(PlaneSection::Line {
+                line: Line3D::new(apex, cone.evaluate(u, 1.0) - apex)?,
+                ray: true,
+            })
+        })
+        .collect()
+}
+
 /// Compute exact intersection curves between a plane and an analytic surface.
 ///
 /// Returns exact `Circle3D` or `Ellipse3D` where possible, falling back to
 /// sampled points for complex cases (torus).
+///
+/// A plane along a cylinder's axis or through a cone's apex, whose sections
+/// are straight, and a plane touching a sphere get no curve here;
+/// [`exact_plane_section`] returns those sections.
 ///
 /// The plane is defined by `dot(normal, p) = d`.
 ///
@@ -62,6 +334,7 @@ pub fn exact_plane_analytic_reaching(
     match surface {
         AnalyticSurface::Cylinder(cyl) => exact_plane_cylinder(cyl, plane_normal, plane_d),
         AnalyticSurface::Sphere(sphere) => exact_plane_sphere(sphere, plane_normal, plane_d),
+        AnalyticSurface::Cone(cone) if plane_holds_apex(cone, plane_normal, plane_d) => Ok(vec![]),
         AnalyticSurface::Cone(cone) => exact_plane_cone(cone, plane_normal, plane_d, reach),
         AnalyticSurface::Torus(torus) => {
             if let Some(circles) = exact_plane_torus(torus, plane_normal, plane_d)? {
@@ -166,13 +439,9 @@ fn exact_plane_cylinder(
     let r = cyl.radius();
 
     if cos_theta < 1e-10 {
-        // Plane parallel to cylinder axis → 0 or 2 line segments.
-        // Fall back to sampled points.
-        let chains = sample_plane_cylinder(cyl, normal, d)?;
-        return Ok(chains
-            .into_iter()
-            .map(ExactIntersectionCurve::Points)
-            .collect());
+        // A plane along the axis cuts straight rulings, which
+        // `exact_plane_section` returns.
+        return Ok(vec![]);
     }
 
     // Find where axis intersects the plane: axis_point + t*axis, dot(normal, P) = d
@@ -231,7 +500,9 @@ fn exact_plane_sphere(
     let h = dot_np(normal, sphere.center()) - d;
     let r = sphere.radius();
 
-    if h.abs() > r - 1e-10 {
+    // A plane touching the sphere meets it at a point, which
+    // `exact_plane_section` returns.
+    if r - h.abs() <= TOUCH * r {
         return Ok(vec![]);
     }
 
@@ -244,6 +515,46 @@ fn exact_plane_sphere(
 
     let circle = Circle3D::new(circle_center, normal, circle_r)?;
     Ok(vec![ExactIntersectionCurve::Circle(circle)])
+}
+
+/// Exact sphere-sphere intersection: the circle on the two spheres' radical
+/// plane, its normal pointing from the first centre to the second. `None`
+/// for one sphere twice (the same surface, no curve).
+///
+/// The circle is built from the smaller sphere, whose radius bounds it, and
+/// from the centres' offset alone, so neither the operands' order nor where
+/// the pair sits in space decides whether a small circle survives.
+///
+/// # Errors
+///
+/// Returns an error if the circle cannot be built.
+pub fn exact_sphere_sphere(
+    s1: &SphericalSurface,
+    s2: &SphericalSurface,
+) -> Result<Option<Vec<ExactIntersectionCurve>>, MathError> {
+    let delta = s2.center() - s1.center();
+    let d = delta.length();
+    let (r1, r2) = (s1.radius(), s2.radius());
+    let scale = r1.max(r2);
+    if d <= 1e-12 * scale {
+        // Concentric spheres of different radii never meet.
+        return Ok(((r1 - r2).abs() > 1e-12 * scale).then(Vec::new));
+    }
+    let normal = delta * (1.0 / d);
+    // From the smaller sphere's centre toward the larger's, the radical plane
+    // lies `along` away.
+    let (centre, toward, r_small, r_big) = if r1 <= r2 {
+        (s1.center(), normal, r1, r2)
+    } else {
+        (s2.center(), -normal, r2, r1)
+    };
+    let along = d.mul_add(d, r_small.mul_add(r_small, -(r_big * r_big))) / (2.0 * d);
+    if along.abs() > r_small - 1e-10 * scale.max(1.0) {
+        return Ok(Some(Vec::new()));
+    }
+    let radius = r_small.mul_add(r_small, -(along * along)).sqrt();
+    let circle = Circle3D::new(centre + toward * along, normal, radius)?;
+    Ok(Some(vec![ExactIntersectionCurve::Circle(circle)]))
 }
 
 /// Exact plane-cone intersection.
@@ -1048,8 +1359,9 @@ const PLANE_TORUS_LOOP_SAMPLES: (f64, f64) = (24.0, 512.0);
 /// every `v` is two loops winding the tube, one per branch. Every point
 /// comes from the closed form, so the loops need no chaining.
 ///
-/// A loop whose branches touch inside its run (a plane tangent to an
-/// equator) is a self-touching section, not a simple loop, and is left open.
+/// Where the branches touch inside a run (a plane tangent to the tube's
+/// inner side, at a saddle) the section crosses itself: each branch passes
+/// through that node, and each loop there starts and ends on it.
 ///
 /// When `s ≈ 0` the plane is perpendicular to the axis and the section is up
 /// to two full circles at the `v` values solving `r·c·sin v = d − n·center`,
@@ -1109,103 +1421,284 @@ fn plane_torus_loops(
             .collect();
     }
 
-    // The scan is offset by half a step so it never lands on a node where
-    // the branches touch (the inner-tangent figure-eight at v = π).
-    let step = TAU / (n_v as f64);
-    let v_off = step * 0.5;
     // R + r·cos v > 0 on a ring torus.
-    let rhs_at = |v: f64| (d_local - small_r * c * v.sin()) / (s * small_r.mul_add(v.cos(), big_r));
-    let branch = |v: f64, sign: f64| point(sign.mul_add(rhs_at(v).clamp(-1.0, 1.0).acos(), phi), v);
-    let inside = |v: f64| rhs_at(v).abs() <= 1.0;
-    let scan: Vec<f64> = (0..n_v).map(|i| (i as f64).mul_add(step, v_off)).collect();
-    // Whether |rhs| reaches 1 between two scan samples inside the section:
-    // the branches touch there.
-    let touches = |lo: f64, hi: f64| {
-        let golden = 0.5 * (5.0_f64.sqrt() - 1.0);
-        let (mut lo, mut hi) = (lo, hi);
-        for _ in 0..80 {
-            let (m1, m2) = (hi - golden * (hi - lo), lo + golden * (hi - lo));
-            if rhs_at(m1).abs() > rhs_at(m2).abs() {
-                hi = m2;
-            } else {
-                lo = m1;
-            }
+    let length = normal.length();
+    TorusSection {
+        torus,
+        phi,
+        num: [d_local, 0.0, -small_r * c],
+        den: [s * big_r, s * small_r],
+        clearance: |p: Point3| (dot_np(normal, p) - d) / length,
+        slack: 64.0 * f64::EPSILON * (big_r + small_r + d_local.abs() / length),
+    }
+    .loops(n_v, PLANE_TORUS_LOOP_SAMPLES)
+}
+
+/// A surface's section of a ring torus that holds, at each tube angle `v`,
+/// the torus's points with `cos(u − phi) = rhs(v)`: the two branches
+/// `u = phi ± acos(rhs(v))` wherever `|rhs(v)| <= 1`, as for a plane
+/// ([`plane_torus_loops`]) or a sphere off the axis ([`sphere_torus_section`]).
+/// For both, `rhs(v) = (n0 + n1·cos v + n2·sin v) / (d0 + d1·cos v)` with a
+/// positive denominator, so `rhs` meets `±1` where a sum of `cos v` and
+/// `sin v` vanishes, at up to four tube angles in closed form.
+struct TorusSection<'a, F> {
+    torus: &'a ToroidalSurface,
+    phi: f64,
+    /// `n0`, `n1`, `n2`.
+    num: [f64; 3],
+    /// `d0`, `d1`.
+    den: [f64; 2],
+    /// A point's signed distance from the surface cutting the torus.
+    clearance: F,
+    /// The distance rounding can make or hide between the two surfaces.
+    slack: f64,
+}
+
+impl<F: Fn(Point3) -> f64> TorusSection<'_, F> {
+    fn rhs(&self, v: f64) -> f64 {
+        let [n0, n1, n2] = self.num;
+        let [d0, d1] = self.den;
+        let (sin, cos) = v.sin_cos();
+        n2.mul_add(sin, n1.mul_add(cos, n0)) / d1.mul_add(cos, d0)
+    }
+
+    fn point(&self, u: f64, v: f64) -> IntersectionPoint {
+        IntersectionPoint {
+            point: self.torus.evaluate(u, v),
+            param1: (u.rem_euclid(TAU), v.rem_euclid(TAU)),
+            param2: (0.0, 0.0),
         }
-        1.0 - rhs_at(f64::midpoint(lo, hi)).abs() < 1e-12
-    };
-    // Where the section's run ends between an inside and an outside sample.
-    let turn = |v_in: f64, v_out: f64| {
-        let (mut lo, mut hi) = (v_in, v_out);
-        for _ in 0..60 {
-            let mid = f64::midpoint(lo, hi);
-            if inside(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
+    }
+
+    fn branch(&self, v: f64, sign: f64) -> IntersectionPoint {
+        self.point(
+            sign.mul_add(self.rhs(v).clamp(-1.0, 1.0).acos(), self.phi),
+            v,
+        )
+    }
+
+    /// Where both branches meet at `v`: `acos` is 0 or π there.
+    fn node(&self, v: f64) -> IntersectionPoint {
+        let u = if self.rhs(v) >= 0.0 {
+            self.phi
+        } else {
+            self.phi + std::f64::consts::PI
+        };
+        self.point(u, v)
+    }
+
+    /// How far the surface lies from the point where the branches would meet
+    /// at `v`: zero where the section's run ends, and where it only touches.
+    fn depth(&self, v: f64) -> f64 {
+        (self.clearance)(self.node(v).point).abs()
+    }
+
+    /// The tube angles in `[0, 2π)` where `rhs` is `±1`, in order. Each solves
+    /// `α + β·cos v + γ·sin v = 0`, so `cos(v − atan2(γ, β)) = −α / hypot(β, γ)`;
+    /// a ratio past 1 by rounding alone is a double root, a touch.
+    fn crossings(&self) -> Vec<f64> {
+        let [n0, n1, n2] = self.num;
+        let [d0, d1] = self.den;
+        let mut roots = Vec::with_capacity(4);
+        for c in [1.0_f64, -1.0] {
+            let (alpha, beta, gamma) = (c.mul_add(-d0, n0), c.mul_add(-d1, n1), n2);
+            let m = beta.hypot(gamma);
+            let ratio = -alpha / m;
+            if !ratio.is_finite() || ratio.abs() > 1.0 + 1e-12 {
+                continue;
             }
+            let theta = gamma.atan2(beta);
+            let delta = ratio.clamp(-1.0, 1.0).acos();
+            roots.push((theta - delta).rem_euclid(TAU));
+            roots.push((theta + delta).rem_euclid(TAU));
         }
-        lo
-    };
-    let in_scan: Vec<bool> = scan.iter().map(|&v| inside(v)).collect();
-    if in_scan.iter().all(|&x| x) {
-        let touching = scan.iter().any(|&v| touches(v, v + step));
-        return [1.0, -1.0]
-            .into_iter()
-            .map(|sign| {
-                let run: Vec<IntersectionPoint> = scan.iter().map(|&v| branch(v, sign)).collect();
-                if touching { run } else { closed(run) }
+        roots.sort_by(f64::total_cmp);
+        roots
+    }
+
+    /// Each run of `v` where the section lies, from `lo` to `hi` unwrapped,
+    /// with the node inside it where its branches touch, and whether it
+    /// takes the whole turn. Between two crossings `|rhs|` stays on one side
+    /// of 1; a stretch the surface clears or cuts by no more than `slack` is
+    /// a touch, a node inside a run and nothing between runs.
+    fn runs(&self) -> Vec<(f64, f64, Option<f64>, bool)> {
+        let roots = self.crossings();
+        let n = roots.len();
+        if n == 0 {
+            let whole = self.rhs(0.0).abs() <= 1.0 && self.depth(0.0) > self.slack;
+            return if whole {
+                vec![(0.0, TAU, None, true)]
+            } else {
+                Vec::new()
+            };
+        }
+        let arcs: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                (
+                    roots[i],
+                    if i + 1 < n {
+                        roots[i + 1]
+                    } else {
+                        roots[0] + TAU
+                    },
+                )
             })
             .collect();
-    }
-    let Some(first) = (0..n_v).find(|&i| in_scan[i] && !in_scan[(i + n_v - 1) % n_v]) else {
-        return Vec::new();
-    };
-    let mut loops = Vec::new();
-    let mut k = 0;
-    while k < n_v {
-        let i = (first + k) % n_v;
-        if !in_scan[i] {
-            k += 1;
-            continue;
-        }
-        // The run from scan sample `i`, its `v` unwrapped past a turn.
-        let len = (0..n_v - k).take_while(|&j| in_scan[(i + j) % n_v]).count();
-        let v_a = scan[i];
-        let v_b = ((len - 1) as f64).mul_add(step, v_a);
-        let run_v = |j: usize| (j as f64).mul_add(step, v_a);
-        let (t_lo, t_hi) = (turn(v_a, v_a - step), turn(v_b, v_b + step));
-        let touching = (0..len - 1).any(|j| touches(run_v(j), run_v(j + 1)));
-        // `u` moves like the square root of the distance in `v` to a turn, so
-        // the loop is sampled at `v = t_lo + (t_hi - t_lo) (1 - cos θ) / 2`
-        // for even steps of `θ`: `v` then moves like `θ²` at each turn and the
-        // points fall at near-even steps along the curve, turns included. A
-        // loop that sweeps far round the axis on a short run of `v` (a plane
-        // through the centre, tilted a little) takes a step per half scan
-        // step of `u` its branches sweep.
-        let (u_lo, u_hi) = (0..len)
-            .map(run_v)
-            .chain([t_lo, t_hi])
-            .map(|v| rhs_at(v).clamp(-1.0, 1.0).acos())
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), u| {
-                (lo.min(u), hi.max(u))
-            });
-        let m = (len as f64)
-            .max((n_v as f64) * (u_hi - u_lo) / std::f64::consts::PI)
-            .max(PLANE_TORUS_LOOP_SAMPLES.0)
-            .min(PLANE_TORUS_LOOP_SAMPLES.1)
-            .ceil();
-        let at = |k: f64| {
-            let f = 0.5 * (1.0 - (std::f64::consts::PI * k / m).cos());
-            (t_hi - t_lo).mul_add(f, t_lo)
+        let middle = |i: usize| f64::midpoint(arcs[i].0, arcs[i].1);
+        let inside: Vec<bool> = (0..n).map(|i| self.rhs(middle(i)).abs() <= 1.0).collect();
+        let shallow: Vec<bool> = (0..n)
+            .map(|i| self.depth(middle(i)) <= self.slack)
+            .collect();
+        let deep_beside = |i: usize, back: bool| {
+            (1..n)
+                .map(|j| if back { (i + n - j) % n } else { (i + j) % n })
+                .find(|&j| !shallow[j])
         };
-        let steps = m as usize;
-        let mut pts: Vec<IntersectionPoint> =
-            (0..=steps).map(|k| branch(at(k as f64), 1.0)).collect();
-        pts.extend((1..steps).rev().map(|k| branch(at(k as f64), -1.0)));
-        loops.push(if touching { pts } else { closed(pts) });
-        k += len;
+        let kept: Vec<bool> = (0..n)
+            .map(|i| {
+                if !shallow[i] {
+                    return inside[i];
+                }
+                matches!(
+                    (deep_beside(i, true), deep_beside(i, false)),
+                    (Some(a), Some(b)) if inside[a] && inside[b]
+                )
+            })
+            .collect();
+        let node_in = |from: usize, len: usize| {
+            (0..len).find_map(|j| {
+                let i = (from + j) % n;
+                let wraps = if from + j >= n { TAU } else { 0.0 };
+                shallow[i].then(|| middle(i) + wraps)
+            })
+        };
+        let Some(first) = (0..n).find(|&i| kept[i] && !kept[(i + n - 1) % n]) else {
+            return if kept.iter().all(|&k| k) {
+                let node = node_in(0, n);
+                let lo = node.unwrap_or(roots[0]);
+                vec![(lo, lo + TAU, node, true)]
+            } else {
+                Vec::new()
+            };
+        };
+        let mut runs = Vec::new();
+        let mut j = 0;
+        while j < n {
+            let i = (first + j) % n;
+            if !kept[i] {
+                j += 1;
+                continue;
+            }
+            let len = (0..n - j).take_while(|&k| kept[(i + k) % n]).count();
+            let last = i + len - 1;
+            let hi = arcs[last % n].1 + if last >= n { TAU } else { 0.0 };
+            runs.push((arcs[i].0, hi, node_in(i, len), false));
+            j += len;
+        }
+        runs
     }
-    loops
+
+    /// Each run of the section as one loop, out along one branch to where
+    /// the run ends and back along the other, closed by repeating its first
+    /// point; a run taking the whole turn is two loops winding the tube.
+    /// Where the branches touch inside a run the section crosses itself:
+    /// each branch passes through that node, and each loop there starts and
+    /// ends on it.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn loops(&self, n_v: usize, (fewest, most): (f64, f64)) -> Vec<Vec<IntersectionPoint>> {
+        let closed = |mut run: Vec<IntersectionPoint>| {
+            run.push(run[0]);
+            run
+        };
+        let step = TAU / (n_v as f64);
+        let mut loops = Vec::new();
+        for (t_lo, t_hi, at_node, whole) in self.runs() {
+            if whole {
+                for sign in [1.0, -1.0] {
+                    loops.push(closed(match at_node {
+                        Some(v_node) => std::iter::once(self.node(v_node))
+                            .chain(
+                                (1..n_v)
+                                    .map(|i| self.branch((i as f64).mul_add(step, v_node), sign)),
+                            )
+                            .collect(),
+                        None => (0..n_v)
+                            .map(|i| self.branch((i as f64 + 0.5).mul_add(step, t_lo), sign))
+                            .collect(),
+                    }));
+                }
+                continue;
+            }
+            // `u` moves like the square root of the distance in `v` to a turn,
+            // so the loop is sampled at `v = t_lo + (t_hi - t_lo) (1 - cos θ) / 2`
+            // for even steps of `θ`: `v` then moves like `θ²` at each turn and
+            // the points fall at near-even steps along the curve, turns
+            // included. A loop that sweeps far round the axis on a short run of
+            // `v` (a plane through the centre, tilted a little) takes a step per
+            // half scan step of `u` its branches sweep.
+            let len = ((t_hi - t_lo) / step).ceil();
+            let probes = (len as usize).max(8);
+            let (u_lo, u_hi) = (0..=probes)
+                .map(|k| (t_hi - t_lo).mul_add(k as f64 / probes as f64, t_lo))
+                .map(|v| self.rhs(v).clamp(-1.0, 1.0).acos())
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), u| {
+                    (lo.min(u), hi.max(u))
+                });
+            let m = len
+                .max((n_v as f64) * (u_hi - u_lo) / std::f64::consts::PI)
+                .max(fewest)
+                .min(most)
+                .ceil();
+            let steps = m as usize;
+            if let Some(v_node) = at_node {
+                // Out along one branch from the node to a turn and back along
+                // the other, once each side of the node.
+                for (from, to) in [(v_node, t_lo), (v_node, t_hi)] {
+                    let along = |k: usize| {
+                        let f = 0.5 * (1.0 - (std::f64::consts::PI * k as f64 / m).cos());
+                        (to - from).mul_add(f, from)
+                    };
+                    let mut pts = vec![self.node(v_node)];
+                    pts.extend((1..=steps).map(|k| self.branch(along(k), 1.0)));
+                    pts.extend((1..steps).rev().map(|k| self.branch(along(k), -1.0)));
+                    loops.push(closed(pts));
+                }
+            } else {
+                let at = |k: usize| {
+                    let f = 0.5 * (1.0 - (std::f64::consts::PI * k as f64 / m).cos());
+                    (t_hi - t_lo).mul_add(f, t_lo)
+                };
+                let mut pts: Vec<IntersectionPoint> =
+                    (0..=steps).map(|k| self.branch(at(k), 1.0)).collect();
+                pts.extend((1..steps).rev().map(|k| self.branch(at(k), -1.0)));
+                loops.push(closed(pts));
+            }
+        }
+        loops
+    }
+
+    /// The section's point halfway in `v` between two of its points, given
+    /// by their `(u, v)` on the torus, on the branch nearer their middle `u`.
+    fn between(&self, a: (f64, f64), b: (f64, f64)) -> IntersectionPoint {
+        let half = |from: f64, to: f64| {
+            let gap = (to - from + std::f64::consts::PI).rem_euclid(TAU) - std::f64::consts::PI;
+            0.5_f64.mul_add(gap, from)
+        };
+        let (u, v) = (half(a.0, b.0), half(a.1, b.1));
+        let off = self.rhs(v).clamp(-1.0, 1.0).acos();
+        let miss =
+            |w: f64| ((w - u + std::f64::consts::PI).rem_euclid(TAU) - std::f64::consts::PI).abs();
+        let sign = if miss(self.phi + off) <= miss(self.phi - off) {
+            1.0
+        } else {
+            -1.0
+        };
+        self.branch(v, sign)
+    }
 }
 
 /// The two sections of a plane that crosses every tube cross-section of a
@@ -1843,6 +2336,9 @@ fn try_algebraic_intersection(
                     }
                     return Ok(Some(vec![])); // Coaxial, different radii
                 }
+                if let Some(rulings) = parallel_cylinders(c1, c2, v_range_a, v_range_b)? {
+                    return Ok(Some(rulings));
+                }
             }
             // Non-coaxial: algebraic quadratic in v.
             algebraic_cylinder_cylinder(c1, c2)
@@ -1854,7 +2350,12 @@ fn try_algebraic_intersection(
         (AnalyticSurface::Cylinder(c), AnalyticSurface::Sphere(s)) => {
             algebraic_sphere_cylinder(s, c, false)
         }
-        (AnalyticSurface::Cone(c1), AnalyticSurface::Cone(c2)) => algebraic_cone_cone(c1, c2),
+        (AnalyticSurface::Cone(c1), AnalyticSurface::Cone(c2)) => {
+            if let Some(rulings) = shared_apex_cones(c1, c2, v_range_a, v_range_b)? {
+                return Ok(Some(rulings));
+            }
+            algebraic_cone_cone(c1, c2)
+        }
         (AnalyticSurface::Cone(cone), AnalyticSurface::Sphere(sphere)) => {
             Ok(ruling_cone_sphere(cone, sphere, true))
         }
@@ -1862,13 +2363,44 @@ fn try_algebraic_intersection(
             Ok(ruling_cone_sphere(cone, sphere, false))
         }
         (AnalyticSurface::Torus(t), AnalyticSurface::Cylinder(c)) => {
+            if let Some(exacts) = exact_cylinder_torus(c, t)? {
+                return exact_circle_curves(exacts, |p| (t.project_point(p), c.project_point(p)))
+                    .map(Some);
+            }
             Ok(parallel_axis_torus_cylinder(t, c, true)
                 .or_else(|| ruling_torus_cylinder(t, c, true)))
         }
         (AnalyticSurface::Cylinder(c), AnalyticSurface::Torus(t)) => {
+            if let Some(exacts) = exact_cylinder_torus(c, t)? {
+                return exact_circle_curves(exacts, |p| (c.project_point(p), t.project_point(p)))
+                    .map(Some);
+            }
             Ok(parallel_axis_torus_cylinder(t, c, false)
                 .or_else(|| ruling_torus_cylinder(t, c, false)))
         }
+        (AnalyticSurface::Sphere(s), AnalyticSurface::Torus(t)) => {
+            match exact_sphere_torus(s, t)? {
+                Some(exacts) => {
+                    exact_circle_curves(exacts, |p| (s.project_point(p), t.project_point(p)))
+                        .map(Some)
+                }
+                None => Ok(sphere_torus_curves(s, t, true)),
+            }
+        }
+        (AnalyticSurface::Torus(t), AnalyticSurface::Sphere(s)) => {
+            match exact_sphere_torus(s, t)? {
+                Some(exacts) => {
+                    exact_circle_curves(exacts, |p| (t.project_point(p), s.project_point(p)))
+                        .map(Some)
+                }
+                None => Ok(sphere_torus_curves(s, t, false)),
+            }
+        }
+        (AnalyticSurface::Torus(t1), AnalyticSurface::Torus(t2)) => exact_torus_torus(t1, t2)?
+            .map(|exacts| {
+                exact_circle_curves(exacts, |p| (t1.project_point(p), t2.project_point(p)))
+            })
+            .transpose(),
         _ => Ok(None),
     }
 }
@@ -1917,9 +2449,10 @@ fn parallel_axis_torus_cylinder(
 
 /// Where two circles in a half-plane through an axis cross, as `(rho, z)`
 /// pairs (distance from the axis, height along it): each sweeps a circle
-/// about the axis. `None` (defer to the marcher) when the circles coincide
-/// or touch, or a crossing lands on or past the axis; `Some` of none when
-/// they miss.
+/// about the axis. Two crossings closer than the linear tolerance are the
+/// one point where the circles touch, side by side or one inside the
+/// other. `None` (defer to the marcher) when the circles coincide or a
+/// crossing lands on or past the axis; `Some` of none when they miss.
 fn meridian_crossings(
     first: (f64, f64, f64),
     second: (f64, f64, f64),
@@ -1929,17 +2462,23 @@ fn meridian_crossings(
     let (dx, dz) = (x2 - x1, z2 - z1);
     let dist = dx.hypot(dz);
     let slack = 1e-9 * scale;
-    if dist < slack || (dist - (r1 + r2)).abs() < slack || (dist - (r1 - r2).abs()).abs() < slack {
+    if dist < slack {
         return None;
     }
-    if dist > r1 + r2 || dist < (r1 - r2).abs() {
+    let rounding = 8.0 * f64::EPSILON * (x1.abs() + x2.abs() + z1.abs() + z2.abs() + r1 + r2);
+    if dist > r1 + r2 + rounding || dist < (r1 - r2).abs() - rounding {
         return Some(Vec::new());
     }
     let along = r2.mul_add(-r2, r1.mul_add(r1, dist * dist)) / (2.0 * dist);
     let across = r1.mul_add(r1, -(along * along)).max(0.0).sqrt();
     let (ux, uz) = (dx / dist, dz / dist);
-    let mut crossings = Vec::with_capacity(2);
-    for side in [1.0, -1.0] {
+    let sides: &[f64] = if 2.0 * across <= Tolerance::new().linear {
+        &[0.0]
+    } else {
+        &[1.0, -1.0]
+    };
+    let mut crossings = Vec::with_capacity(sides.len());
+    for side in sides {
         let rho = x1 + along * ux - side * across * uz;
         if rho <= slack {
             return None;
@@ -1947,6 +2486,51 @@ fn meridian_crossings(
         crossings.push((rho, z1 + along * uz + side * across * ux));
     }
     Some(crossings)
+}
+
+/// Exact circles as intersection curves, each sampled at 33 points that
+/// carry both surfaces' parameters, and a lone touching point as a curve
+/// that stays on it.
+fn exact_circle_curves(
+    exacts: Vec<ExactIntersectionCurve>,
+    params: impl Fn(Point3) -> ((f64, f64), (f64, f64)),
+) -> Result<Vec<IntersectionCurve>, MathError> {
+    let mut curves = Vec::with_capacity(exacts.len());
+    for exact in exacts {
+        match exact {
+            ExactIntersectionCurve::Circle(circle) => {
+                let points = (0..=32)
+                    .map(|i| {
+                        let point = circle.evaluate(TAU * f64::from(i) / 32.0);
+                        let (param1, param2) = params(point);
+                        IntersectionPoint {
+                            point,
+                            param1,
+                            param2,
+                        }
+                    })
+                    .collect();
+                let r = circle.radius();
+                let curve = conic_loop(circle.center(), circle.u_axis(), circle.v_axis(), r, r)?;
+                curves.push(IntersectionCurve { curve, points });
+            }
+            // A lone point is where the surfaces touch.
+            ExactIntersectionCurve::Points(points) if points.len() == 1 => {
+                let point = points[0];
+                let (param1, param2) = params(point);
+                curves.push(IntersectionCurve {
+                    curve: interpolate(&[point, point], 1)?,
+                    points: vec![IntersectionPoint {
+                        point,
+                        param1,
+                        param2,
+                    }],
+                });
+            }
+            ExactIntersectionCurve::Ellipse(_) | ExactIntersectionCurve::Points(_) => {}
+        }
+    }
+    Ok(curves)
 }
 
 /// Circles about an axis through `base`, at the given `(rho, z)` crossings.
@@ -1967,8 +2551,9 @@ fn circles_about_axis(
 /// in a half-plane through the axis cross in up to two points, and each sweeps
 /// a circle about the axis.
 ///
-/// `None` (defer to the marcher) unless the axes lie on one line, or when the
-/// cross-sections coincide or touch.
+/// Cross-sections that touch meet at one point, sweeping one circle. `None`
+/// (defer to the marcher) unless the axes lie on one line, or when the
+/// cross-sections coincide.
 ///
 /// # Errors
 ///
@@ -2053,10 +2638,12 @@ pub fn exact_cylinder_torus(
 ///
 /// The sphere's great circle and the tube's cross-section in a half-plane
 /// through the axis cross in up to two points, and each sweeps a circle
-/// about the axis.
+/// about the axis; where they touch (a ball sitting in the ring's hole or
+/// on its rim) they meet along one circle. A sphere off the axis that
+/// touches a ring torus at one point gives that point.
 ///
-/// `None` (defer to the marcher) unless the sphere's centre lies on the axis,
-/// or when the two circles touch.
+/// `None` (defer to the marcher) for a spindle torus, and for a sphere off
+/// the axis that does not touch the torus at one point.
 ///
 /// # Errors
 ///
@@ -2069,8 +2656,32 @@ pub fn exact_sphere_torus(
     let scale = torus.major_radius() + sphere.radius();
     let offset = sphere.center() - torus.center();
     // A spindle torus's tube also crosses the far side of the axis.
-    if torus.minor_radius() >= torus.major_radius() || offset.cross(axis).length() > 1e-9 * scale {
+    if torus.minor_radius() >= torus.major_radius() {
         return Ok(None);
+    }
+    if offset.cross(axis).length() > 1e-9 * scale {
+        // A sphere centred on the core circle with the tube's own radius
+        // holds the meridian circle through its centre, and the tube round
+        // it: they meet along that circle alone. The circle strays from the
+        // tube by the centre's distance from the core circle and the radii's
+        // difference, which must both be rounding and within tolerance.
+        let radial = offset - axis * offset.dot(axis);
+        let slack = 64.0
+            * f64::EPSILON
+            * (torus.major_radius() + torus.minor_radius() + sphere.radius() + offset.length());
+        let stray = (radial.length() - torus.major_radius()).hypot(offset.dot(axis))
+            + (sphere.radius() - torus.minor_radius()).abs();
+        if stray <= slack.min(Tolerance::new().linear) {
+            let along = axis.cross(radial).normalize()?;
+            return Ok(Some(vec![ExactIntersectionCurve::Circle(Circle3D::new(
+                sphere.center(),
+                along,
+                sphere.radius(),
+            )?)]));
+        }
+        return Ok(
+            off_axis_touch(sphere, torus).map(|p| vec![ExactIntersectionCurve::Points(vec![p])])
+        );
     }
     let Some(crossings) = meridian_crossings(
         (0.0, offset.dot(axis), sphere.radius()),
@@ -2080,6 +2691,204 @@ pub fn exact_sphere_torus(
         return Ok(None);
     };
     circles_about_axis(torus.center(), axis, &crossings).map(Some)
+}
+
+/// The fewest and most steps along each branch of a loop a sphere cuts from
+/// a torus: its curve is fitted through them alone, so a small loop takes
+/// enough to hold the fit to the section.
+const SPHERE_TORUS_LOOP_SAMPLES: (f64, f64) = (128.0, 1024.0);
+
+/// The section a sphere off a ring torus's axis cuts from it. In the
+/// torus's frame let the sphere's centre sit at `(a, b, h)`, with
+/// `s = hypot(a, b)` and `phi = atan2(b, a)`. The torus's point at `(u, v)`,
+/// with `ρ = R + r·cos v`, lies on the sphere of radius `q` when
+/// `ρ² − 2ρs·cos(u − phi) + s² + (r·sin v − h)² = q²`, so at each `v`
+/// `cos(u − phi) = (R² + r² + h² + s² − q² + 2Rr·cos v − 2hr·sin v) / (2s·ρ)`.
+/// `None` for a spindle torus, whose `ρ` reaches zero, or a sphere on the
+/// axis, whose sections are circles about it.
+fn sphere_torus_section<'a>(
+    sphere: &SphericalSurface,
+    torus: &'a ToroidalSurface,
+) -> Option<TorusSection<'a, impl Fn(Point3) -> f64>> {
+    let (big, small, radius) = (torus.major_radius(), torus.minor_radius(), sphere.radius());
+    let offset = sphere.center() - torus.center();
+    let (a, b, h) = (
+        offset.dot(torus.x_axis()),
+        offset.dot(torus.y_axis()),
+        offset.dot(torus.z_axis()),
+    );
+    let s = a.hypot(b);
+    if small >= big || s <= 1e-9 * (big + radius) {
+        return None;
+    }
+    let centre = sphere.center();
+    Some(TorusSection {
+        torus,
+        phi: b.atan2(a),
+        num: [
+            big.mul_add(
+                big,
+                small.mul_add(small, h.mul_add(h, s.mul_add(s, -radius * radius))),
+            ),
+            2.0 * big * small,
+            -2.0 * h * small,
+        ],
+        den: [2.0 * s * big, 2.0 * s * small],
+        clearance: move |p: Point3| (p - centre).length() - radius,
+        slack: 64.0 * f64::EPSILON * (big + small + radius + offset.length()),
+    })
+}
+
+/// How many times a loop's fitted curve may be refined where it strays.
+const SPHERE_TORUS_FIT_ROUNDS: usize = 6;
+
+/// The curves a sphere off a ring torus's axis meets it in, each fitted
+/// through the closed-form points of [`sphere_torus_section`] and every point
+/// given its parameters on both surfaces, the sphere's first when
+/// `sphere_first`. Halfway between each pair of points the curve must lie
+/// within a quarter of the linear tolerance of both surfaces; where it
+/// strays the section's own point there joins the fit. `None`, deferring to the marcher, for a
+/// curve that still strays, or whose points do.
+fn sphere_torus_curves(
+    sphere: &SphericalSurface,
+    torus: &ToroidalSurface,
+    sphere_first: bool,
+) -> Option<Vec<IntersectionCurve>> {
+    let section = sphere_torus_section(sphere, torus)?;
+    let tol = Tolerance::new().linear;
+    let (big, small) = (torus.major_radius(), torus.minor_radius());
+    // The centre's least and greatest distance to the torus: the ball meets
+    // it whenever its radius lies between them. A section that comes out
+    // empty for such a ball has lost its loops to rounding, so the marcher
+    // takes it rather than the pair being called apart.
+    let offset = sphere.center() - torus.center();
+    let rise = offset.dot(torus.z_axis());
+    let reach = (offset - torus.z_axis() * rise).length();
+    let (nearest, farthest) = (
+        ((reach - big).hypot(rise) - small).abs(),
+        (reach + big).hypot(rise) + small,
+    );
+    let margin = 8.0 * f64::EPSILON * (big + small + offset.length() + sphere.radius());
+    let crosses = sphere.radius() > nearest + margin && sphere.radius() < farthest - margin;
+    let off = |p: Point3| {
+        let local = p - torus.center();
+        let (x, y, z) = (
+            local.dot(torus.x_axis()),
+            local.dot(torus.y_axis()),
+            local.dot(torus.z_axis()),
+        );
+        let on_torus = (x.hypot(y) - big).hypot(z) - small;
+        on_torus.abs().max((section.clearance)(p).abs())
+    };
+    // `acos` of a ratio near 1 loses digits a small ball on a large torus
+    // needs, so each point steps onto the sphere across the section, along
+    // the torus, the shortest way in its own measure.
+    let centre = sphere.center();
+    let polish = |q: IntersectionPoint| {
+        let (mut u, mut v) = q.param1;
+        let mut best = q;
+        for _ in 0..4 {
+            let gap = (section.clearance)(best.point);
+            let (sin_u, cos_u) = u.sin_cos();
+            let (sin_v, cos_v) = v.sin_cos();
+            let rho = small.mul_add(cos_v, big);
+            let outward = torus.x_axis() * cos_u + torus.y_axis() * sin_u;
+            let p_u = (torus.y_axis() * cos_u - torus.x_axis() * sin_u) * rho;
+            let p_v = outward * (-small * sin_v) + torus.z_axis() * (small * cos_v);
+            let away = best.point - centre;
+            let normal = away * (1.0 / away.length());
+            let (g_u, g_v) = (normal.dot(p_u), normal.dot(p_v));
+            let (w_u, w_v) = (g_u / (rho * rho), g_v / (small * small));
+            let reach = g_u.mul_add(w_u, g_v * w_v);
+            if reach <= f64::MIN_POSITIVE {
+                break;
+            }
+            let next = section.point(gap.mul_add(-w_u / reach, u), gap.mul_add(-w_v / reach, v));
+            if (section.clearance)(next.point).abs() >= gap.abs() {
+                break;
+            }
+            (u, v) = next.param1;
+            best = next;
+        }
+        best
+    };
+    let loops = section.loops(256, SPHERE_TORUS_LOOP_SAMPLES);
+    if loops.is_empty() && crosses {
+        return None;
+    }
+    let mut curves = Vec::new();
+    for points in loops {
+        let mut points: Vec<IntersectionPoint> = points.into_iter().map(polish).collect();
+        if points.iter().any(|q| off(q.point) > tol) {
+            return None;
+        }
+        // Samples past a turn that `acos` clamped onto the same `u` all step
+        // to the turn itself.
+        points.dedup_by(|b, a| (b.point - a.point).length() <= 1e-3 * tol);
+        let mut rounds = 0;
+        let curve = loop {
+            let positions: Vec<Point3> = points.iter().map(|q| q.point).collect();
+            let curve = interpolate(&positions, 3.min(positions.len() - 1)).ok()?;
+            let params = crate::nurbs::fitting::chord_length_params(&positions);
+            let strays: Vec<usize> = (0..positions.len() - 1)
+                .filter(|&k| {
+                    off(curve.evaluate(f64::midpoint(params[k], params[k + 1]))) > 0.25 * tol
+                })
+                .collect();
+            if strays.is_empty() {
+                break curve;
+            }
+            if rounds == SPHERE_TORUS_FIT_ROUNDS {
+                return None;
+            }
+            rounds += 1;
+            for &k in strays.iter().rev() {
+                let mid = polish(section.between(points[k].param1, points[k + 1].param1));
+                if off(mid.point) > tol {
+                    return None;
+                }
+                points.insert(k + 1, mid);
+            }
+        };
+        for q in &mut points {
+            let (on_sphere, on_torus) = (sphere.project_point(q.point), q.param1);
+            (q.param1, q.param2) = if sphere_first {
+                (on_sphere, on_torus)
+            } else {
+                (on_torus, on_sphere)
+            };
+        }
+        curves.push(IntersectionCurve { curve, points });
+    }
+    Some(curves)
+}
+
+/// Where a sphere off a ring torus's axis touches it at one point: from
+/// outside the tube, from inside it, or holding the whole ring. The touch
+/// sits over the core circle's point nearest the sphere's centre, at
+/// `d_near`, or farthest from it, at `d_far`, and the sphere's radius is
+/// then `d_near − r`, `r − d_near` or `d_far + r`. Each is the centre's
+/// least or greatest distance to the torus, so the point is all the two
+/// share. `None` unless the radius matches one to rounding.
+fn off_axis_touch(sphere: &SphericalSurface, torus: &ToroidalSurface) -> Option<Point3> {
+    let axis = torus.z_axis();
+    let (big, small, radius) = (torus.major_radius(), torus.minor_radius(), sphere.radius());
+    let offset = sphere.center() - torus.center();
+    let radial = offset - axis * offset.dot(axis);
+    let out = radial * (1.0 / radial.length());
+    let near = torus.center() + out * big;
+    let far = torus.center() - out * big;
+    let (to_near, to_far) = (sphere.center() - near, sphere.center() - far);
+    let (d_near, d_far) = (to_near.length(), to_far.length());
+    let slack = 64.0 * f64::EPSILON * (big + small + radius + offset.length());
+    // A ball centred on the core circle meets the tube along a whole
+    // meridian, not at a point.
+    if d_near > slack
+        && ((d_near - small - radius).abs() <= slack || (small - d_near - radius).abs() <= slack)
+    {
+        return Some(near + to_near * (small / d_near));
+    }
+    ((d_far + small - radius).abs() <= slack).then(|| far - to_far * (small / d_far))
 }
 
 /// Exact coaxial cone-cone intersection: returns the shared circle.
@@ -2298,11 +3107,225 @@ pub fn exact_cone_cylinder(
     Ok(Some(vec![ExactIntersectionCurve::Circle(circle)]))
 }
 
+/// The exact rational quadratic NURBS of the full ellipse `centre +
+/// a·cos(t)·u + b·sin(t)·v` (a circle when `a == b`), starting at
+/// `centre + a·u`: four quarter arcs, each with its corner weighted by
+/// cos 45°.
+fn conic_loop(centre: Point3, u: Vec3, v: Vec3, a: f64, b: f64) -> Result<NurbsCurve, MathError> {
+    let w = std::f64::consts::FRAC_1_SQRT_2;
+    let corners: [(f64, f64); 9] = [
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (-1.0, 0.0),
+        (-1.0, -1.0),
+        (0.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 0.0),
+    ];
+    let points = corners
+        .iter()
+        .map(|&(x, y)| centre + u * (a * x) + v * (b * y))
+        .collect();
+    let weights = vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0];
+    let knots = vec![
+        0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+    ];
+    NurbsCurve::new(2, knots, points, weights)
+}
+
+/// Two cones sharing an apex meet only along rulings through it. A
+/// ruling's direction `d` makes each cone's angle with its axis, `d·aᵢ =
+/// ±sin(half_angleᵢ)` (the half-angle runs from the radial plane), a line
+/// that crosses the unit sphere twice, touches it where the cones are
+/// tangent along one ruling, or misses it. Along `apex + t·d` the first
+/// cone's `v` is `t` and the second's `±t`, so each ruling runs where both
+/// faces' `v` ranges hold it, as a straight segment cut at the apex. Two
+/// rulings closer than the linear tolerance across the faces are one.
+///
+/// `None` unless both ranges are given, the axes are not parallel (the
+/// coaxial path's case), and the apexes coincide to rounding.
+fn shared_apex_cones(
+    c1: &ConicalSurface,
+    c2: &ConicalSurface,
+    v1: Option<(f64, f64)>,
+    v2: Option<(f64, f64)>,
+) -> Result<Option<Vec<IntersectionCurve>>, MathError> {
+    let (Some(v1), Some(v2)) = (v1, v2) else {
+        return Ok(None);
+    };
+    let (a1, a2, apex) = (c1.axis(), c2.axis(), c1.apex());
+    let across = a1.cross(a2);
+    let sin = across.length();
+    if sin < 1e-9 {
+        return Ok(None);
+    }
+    let reach = v1.0.abs().max(v1.1.abs()).max(v2.0.abs()).max(v2.1.abs());
+    let scale = reach.max((apex - Point3::new(0.0, 0.0, 0.0)).length());
+    if (c2.apex() - apex).length() > 64.0 * f64::EPSILON * scale {
+        return Ok(None);
+    }
+    let normal = across * (1.0 / sin);
+    let tol = Tolerance::new().linear;
+    // A ruling's part across the first axis is `(t2 − s1·cos) / sin`, whose
+    // rounding grows as the axes close up; past a tenth of the tolerance
+    // over the faces, the pair is left to the marcher.
+    if f64::EPSILON * reach > 0.1 * tol * sin {
+        return Ok(None);
+    }
+    // The second axis's part across the first, a unit vector.
+    let toward = normal.cross(a1);
+    let cos = a1.dot(a2);
+    let (s1, s2) = (c1.half_angle().sin(), c2.half_angle().sin());
+    // `evaluate` turns its radial direction round for negative `v`.
+    let params = |cone: &ConicalSurface, p: Point3| {
+        let (u, v) = cone.project_point(p);
+        if v < 0.0 {
+            ((u + std::f64::consts::PI).rem_euclid(TAU), v)
+        } else {
+            (u, v)
+        }
+    };
+    let mut curves = Vec::new();
+    for nappe in [1.0, -1.0] {
+        let t2 = nappe * s2;
+        let side = cos.mul_add(-s1, t2) / sin;
+        let foot = a1 * s1 + toward * side;
+        let lift_sq = s1.mul_add(-s1, side.mul_add(-side, 1.0));
+        let rounding = 4.0 * f64::EPSILON;
+        let lifts = if lift_sq.abs() <= rounding {
+            // Within rounding of touching: the rulings that rounding could
+            // hide part by up to `√(2·rounding)` radians, taken as one while
+            // that stays within ten tolerances over the faces, and beyond
+            // it not settled here.
+            if (2.0 * rounding).sqrt() * reach > 10.0 * tol {
+                return Ok(None);
+            }
+            vec![0.0]
+        } else if lift_sq < 0.0 {
+            Vec::new()
+        } else if 2.0 * lift_sq.sqrt() * reach <= tol {
+            vec![0.0]
+        } else {
+            vec![lift_sq.sqrt(), -lift_sq.sqrt()]
+        };
+        let along2 = if nappe > 0.0 { v2 } else { (-v2.1, -v2.0) };
+        let (lo, hi) = (v1.0.max(along2.0), v1.1.min(along2.1));
+        if hi - lo <= tol {
+            continue;
+        }
+        for lift in lifts {
+            let d = (foot + normal * lift).normalize()?;
+            let pieces = if lo < 0.0 && hi > 0.0 {
+                vec![(lo, 0.0), (0.0, hi)]
+            } else {
+                vec![(lo, hi)]
+            };
+            for (from, to) in pieces {
+                curves.push(ruling_segment(apex + d * from, apex + d * to, |p| {
+                    (params(c1, p), params(c2, p))
+                })?);
+            }
+        }
+    }
+    Ok(Some(curves))
+}
+
+/// Two cylinders of one radius whose axes cross meet in two ellipses, one
+/// in each plane through the crossing that bisects the axes: a point lies
+/// as far from both axes where its offsets along them are equal or
+/// opposite. Both ellipses have their minor axis, of the radius, along the
+/// axes' common normal, and meet at its two ends. They come back as two
+/// closed loops, as the first cylinder's rulings pair them: the halves of
+/// both ellipses on one side of the crossing along its axis, then on the
+/// other, each exact, rational, and cornered where its halves meet. One
+/// loop starts at each end of the common normal.
+///
+/// `None` unless the radii match and the axes cross to rounding: axes that
+/// miss by `δ` part the curves at the crossings by about `√(δ·r)`.
+fn crossing_equal_cylinders(
+    c1: &CylindricalSurface,
+    c2: &CylindricalSurface,
+) -> Result<Option<Vec<IntersectionCurve>>, MathError> {
+    let (d1, d2, r) = (c1.axis(), c2.axis(), c1.radius());
+    if (c2.radius() - r).abs() > 8.0 * f64::EPSILON * r {
+        return Ok(None);
+    }
+    // An ellipse's semi-major axis is `2r / |d1 ∓ d2|`. Rounding the axes
+    // turns its major axis by about `ε / |d1 ∓ d2|`, which moves its far
+    // vertices by `2rε / |d1 ∓ d2|²`; axes nearer parallel than keeps that
+    // well inside the tolerance are left to the rulings.
+    let bisectors = [d1 - d2, d1 + d2];
+    let tol = Tolerance::new().linear;
+    if bisectors
+        .iter()
+        .any(|b| 2.0 * r * f64::EPSILON > 1e-3 * tol * b.dot(*b))
+    {
+        return Ok(None);
+    }
+    let across = d1.cross(d2);
+    let sin = across.length();
+    let normal = across * (1.0 / sin);
+    let w = c1.origin() - c2.origin();
+    let cos = d1.dot(d2);
+    let along = cos.mul_add(d2.dot(w), -d1.dot(w)) / (sin * sin);
+    let centre = c1.origin() + d1 * along;
+    // The miss is read at the crossing's own scale: origins far along
+    // their axes leave it more rounding than that, and are left to the
+    // rulings too.
+    let scale = r.max((centre - Point3::new(0.0, 0.0, 0.0)).length());
+    if w.dot(normal).abs() > 64.0 * f64::EPSILON * scale {
+        return Ok(None);
+    }
+    // Each ellipse's major axis, turned to lean along the first axis, and
+    // its semi-major axis.
+    let majors = bisectors.map(|bisector| {
+        let length = bisector.length();
+        let major = (bisector * (1.0 / length)).cross(normal);
+        let major = if major.dot(d1) < 0.0 { -major } else { major };
+        (major, 2.0 * r / length)
+    });
+    let corner = std::f64::consts::FRAC_1_SQRT_2;
+    let half = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (-1.0, 1.0), (-1.0, 0.0)];
+    let mut curves = Vec::with_capacity(2);
+    for side in [1.0, -1.0] {
+        let [(m1, a1), (m2, a2)] = majors;
+        let out = half
+            .iter()
+            .map(|&(x, y)| centre + normal * (side * r * x) + m1 * (side * a1 * y));
+        let back = half[1..]
+            .iter()
+            .map(|&(x, y)| centre - normal * (side * r * x) + m2 * (side * a2 * y));
+        let curve = NurbsCurve::new(
+            2,
+            vec![
+                0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+            ],
+            out.chain(back).collect(),
+            vec![1.0, corner, 1.0, corner, 1.0, corner, 1.0, corner, 1.0],
+        )?;
+        #[allow(clippy::cast_precision_loss)]
+        let points = (0..=32)
+            .map(|i| {
+                let point = curve.evaluate(i as f64 / 32.0);
+                IntersectionPoint {
+                    point,
+                    param1: c1.project_point(point),
+                    param2: c2.project_point(point),
+                }
+            })
+            .collect();
+        curves.push(IntersectionCurve { curve, points });
+    }
+    Ok(Some(curves))
+}
+
 /// Algebraic cone-cone intersection (NURBS form for the general bounded
-/// path). Delegates to [`exact_cone_cone`] and samples each exact conic
-/// (coaxial circle or offset-parallel radical-plane ellipse) into an
-/// interpolated NURBS `IntersectionCurve`, mirroring the
-/// sphere-cylinder algebraic path. phase FF prefers the exact circle form
+/// path). Delegates to [`exact_cone_cone`] and returns each exact conic
+/// (coaxial circle or offset-parallel radical-plane ellipse) as an exact
+/// rational NURBS `IntersectionCurve` with sample points along it, mirroring
+/// the sphere-cylinder algebraic path. phase FF prefers the exact circle form
 /// directly (so the section edge links to the coincident boundary), but a
 /// caller of `intersect_analytic_analytic_bounded` still gets one clean
 /// curve instead of the marcher's fragments.
@@ -2316,7 +3339,6 @@ fn algebraic_cone_cone(
     let mut curves = Vec::new();
     for exact in exacts {
         let n_samples = 33;
-        let mut positions = Vec::with_capacity(n_samples);
         let mut points = Vec::with_capacity(n_samples);
         #[allow(clippy::cast_precision_loss)]
         for i in 0..n_samples {
@@ -2330,18 +3352,25 @@ fn algebraic_cone_cone(
                 }
                 ExactIntersectionCurve::Points(_) => break,
             };
-            positions.push(pt);
             points.push(IntersectionPoint {
                 point: pt,
                 param1: (0.0, 0.0),
                 param2: (0.0, 0.0),
             });
         }
-        if positions.is_empty() {
-            continue;
-        }
-        let degree = 3.min(positions.len() - 1);
-        let curve = interpolate(&positions, degree)?;
+        let curve = match &exact {
+            ExactIntersectionCurve::Circle(c) => {
+                conic_loop(c.center(), c.u_axis(), c.v_axis(), c.radius(), c.radius())?
+            }
+            ExactIntersectionCurve::Ellipse(e) => conic_loop(
+                e.center(),
+                e.u_axis(),
+                e.v_axis(),
+                e.semi_major(),
+                e.semi_minor(),
+            )?,
+            ExactIntersectionCurve::Points(_) => continue,
+        };
         curves.push(IntersectionCurve { curve, points });
     }
     Ok(Some(curves))
@@ -2476,8 +3505,8 @@ pub fn exact_cone_sphere(
 }
 
 /// Algebraic sphere-cylinder intersection (NURBS form for the general bounded
-/// path). A coaxial pair delegates to [`exact_sphere_cylinder`] and samples
-/// each exact circle into an interpolated NURBS `IntersectionCurve`. phase FF
+/// path). A coaxial pair delegates to [`exact_sphere_cylinder`] and returns
+/// each exact circle as an exact rational NURBS `IntersectionCurve`. phase FF
 /// prefers the exact circle form directly (so the section edge links to the
 /// coincident boundary and the closed-circle splitter can carve the spherical
 /// band), but a caller of `intersect_analytic_analytic_bounded` still gets
@@ -2499,12 +3528,10 @@ fn algebraic_sphere_cylinder(
         };
         let n_samples = 33;
         let mut points = Vec::with_capacity(n_samples);
-        let mut positions = Vec::with_capacity(n_samples);
         #[allow(clippy::cast_precision_loss)]
         for i in 0..n_samples {
             let theta = TAU * i as f64 / (n_samples - 1) as f64;
             let pt = crate::traits::ParametricCurve::evaluate(&circle, theta);
-            positions.push(pt);
             let (param1, param2) = in_order(
                 sphere.project_point(pt),
                 cyl.project_point(pt),
@@ -2516,8 +3543,8 @@ fn algebraic_sphere_cylinder(
                 param2,
             });
         }
-        let degree = 3.min(positions.len() - 1);
-        let curve = interpolate(&positions, degree)?;
+        let r = circle.radius();
+        let curve = conic_loop(circle.center(), circle.u_axis(), circle.v_axis(), r, r)?;
         curves.push(IntersectionCurve { curve, points });
     }
 
@@ -2571,6 +3598,96 @@ const fn in_order(a: (f64, f64), b: (f64, f64), a_first: bool) -> ((f64, f64), (
     if a_first { (a, b) } else { (b, a) }
 }
 
+/// Two cylinders whose axes are parallel but apart meet along rulings:
+/// every plane across the axes cuts them in two circles `d` apart, which
+/// cross in two points, touch in one, or miss, alike in every plane. Each
+/// crossing sweeps a ruling, cut to the stretch of axis both faces' `v`
+/// ranges share. Two crossings closer than the linear tolerance are the one
+/// where the circles touch, side by side or one inside the other. `None`
+/// (the next solver's case) when neither range is known, since a ruling has
+/// no ends of its own, or when a ruling's end strays off the second
+/// cylinder, its axis leaning off the first's by more than the span allows.
+fn parallel_cylinders(
+    c1: &CylindricalSurface,
+    c2: &CylindricalSurface,
+    v_range_1: Option<(f64, f64)>,
+    v_range_2: Option<(f64, f64)>,
+) -> Result<Option<Vec<IntersectionCurve>>, MathError> {
+    let axis = c1.axis();
+    let delta = c2.origin() - c1.origin();
+    let along = delta.dot(axis);
+    let across = delta - axis * along;
+    let d = across.length();
+    let (r1, r2) = (c1.radius(), c2.radius());
+    // The second face's range, measured along the first one's axis.
+    let flip = c2.axis().dot(axis);
+    let ranges = [
+        v_range_1,
+        v_range_2.map(|(a, b)| (along + a * flip, along + b * flip)),
+    ];
+    let (lo, hi) = ranges
+        .into_iter()
+        .flatten()
+        .fold((f64::NEG_INFINITY, f64::INFINITY), |(lo, hi), (a, b)| {
+            (lo.max(a.min(b)), hi.min(a.max(b)))
+        });
+    if !lo.is_finite() || !hi.is_finite() {
+        return Ok(None);
+    }
+    let rounding = 8.0 * f64::EPSILON * (r1 + r2 + d);
+    if d > r1 + r2 + rounding || d < (r1 - r2).abs() - rounding || hi <= lo {
+        return Ok(Some(Vec::new()));
+    }
+    let toward = across * (1.0 / d);
+    let side = axis.cross(toward);
+    let x = r2.mul_add(-r2, d.mul_add(d, r1 * r1)) / (2.0 * d);
+    let y = r1.mul_add(r1, -(x * x)).max(0.0).sqrt();
+    let linear = Tolerance::new().linear;
+    let feet = if 2.0 * y <= linear {
+        vec![toward * x]
+    } else {
+        vec![toward * x + side * y, toward * x - side * y]
+    };
+    let on_second = |p: Point3| {
+        let w = p - c2.origin();
+        ((w - c2.axis() * w.dot(c2.axis())).length() - r2).abs() <= linear
+    };
+    let mut rulings = Vec::with_capacity(feet.len());
+    for foot in feet {
+        let base = c1.origin() + foot;
+        let (from, to) = (base + axis * lo, base + axis * hi);
+        if !on_second(from) || !on_second(to) {
+            return Ok(None);
+        }
+        rulings.push(ruling_segment(from, to, |p| {
+            (c1.project_point(p), c2.project_point(p))
+        })?);
+    }
+    Ok(Some(rulings))
+}
+
+/// A straight intersection curve from `from` to `to`, carrying its ends and
+/// middle as points.
+fn ruling_segment(
+    from: Point3,
+    to: Point3,
+    params: impl Fn(Point3) -> ((f64, f64), (f64, f64)),
+) -> Result<IntersectionCurve, MathError> {
+    let curve = NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![from, to], vec![1.0, 1.0])?;
+    let points = [from, from + (to - from) * 0.5, to]
+        .into_iter()
+        .map(|point| {
+            let (param1, param2) = params(point);
+            IntersectionPoint {
+                point,
+                param1,
+                param2,
+            }
+        })
+        .collect();
+    Ok(IntersectionCurve { curve, points })
+}
+
 /// Algebraic cylinder-cylinder intersection for non-coaxial cylinders.
 ///
 /// For two cylinders with axes that are NOT parallel, the intersection
@@ -2589,6 +3706,9 @@ fn algebraic_cylinder_cylinder(
     c1: &CylindricalSurface,
     c2: &CylindricalSurface,
 ) -> Result<Option<Vec<IntersectionCurve>>, MathError> {
+    if let Some(halves) = crossing_equal_cylinders(c1, c2)? {
+        return Ok(Some(halves));
+    }
     let alpha = c1.axis().dot(c2.axis());
     let a_coeff = 1.0 - alpha * alpha;
 
@@ -3412,10 +4532,9 @@ fn algebraic_sphere_sphere(
     let u_dir = basis.x;
     let v_dir = basis.y;
 
-    // Sample the circle for the IntersectionCurve representation.
+    // Sample points along the circle for the IntersectionCurve.
     let n_samples = 33; // Odd for symmetry
     let mut points = Vec::with_capacity(n_samples);
-    let mut positions = Vec::with_capacity(n_samples);
     #[allow(clippy::cast_precision_loss)]
     for i in 0..n_samples {
         let theta = TAU * i as f64 / (n_samples - 1) as f64;
@@ -3425,7 +4544,6 @@ fn algebraic_sphere_sphere(
             center.y() + (u_dir.y() * cos_t + v_dir.y() * sin_t) * r_circle,
             center.z() + (u_dir.z() * cos_t + v_dir.z() * sin_t) * r_circle,
         );
-        positions.push(pt);
         points.push(IntersectionPoint {
             point: pt,
             param1: (0.0, 0.0),
@@ -3433,8 +4551,7 @@ fn algebraic_sphere_sphere(
         });
     }
 
-    let degree = 3.min(positions.len() - 1);
-    let curve = interpolate(&positions, degree)?;
+    let curve = conic_loop(center, u_dir, v_dir, r_circle, r_circle)?;
 
     Ok(vec![IntersectionCurve { curve, points }])
 }
@@ -4623,31 +5740,113 @@ mod tests {
         }
     }
 
+    /// A plane tangent to the inner equator (x = major - minor = 7) cuts a
+    /// figure-eight that crosses itself on that equator. It comes out as its
+    /// two lobes, each a loop that starts and ends on the node, one either
+    /// side of the plane y = 0, never as one loop sealed across the node.
     #[test]
-    fn plane_torus_inner_tangent_figure_eight_stays_open() {
-        use crate::traits::ParametricCurve;
+    fn plane_torus_inner_tangent_figure_eight_is_two_loops_through_its_node() {
         let (major, minor) = (10.0, 3.0);
         let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), major, minor).unwrap();
-
-        // A plane tangent to the inner equator (x = major - minor = 7) cuts a
-        // self-touching figure-eight: its two branches touch at the node on
-        // the inner equator. It must stay OPEN so a self-touching curve is
-        // never sealed into a simple loop.
         let curves =
             intersect_plane_torus(&torus, Vec3::new(-1.0, 0.0, 0.0), -(major - minor)).unwrap();
-        assert!(!curves.is_empty(), "inner-tangent plane found no curves");
-        let max_gap = curves
+        assert_eq!(curves.len(), 2, "one loop per lobe");
+        let node = Point3::new(major - minor, 0.0, 0.0);
+        let mut sides = Vec::new();
+        for c in &curves {
+            let (first, last) = (c.points[0].point, c.points[c.points.len() - 1].point);
+            assert!((first - node).length() < 1e-6, "starts at {first:?}");
+            assert_eq!(first, last, "closes on the node");
+            for p in c.points.iter().map(|p| p.point) {
+                assert!((p.x() - node.x()).abs() < 1e-9, "off the plane at {p:?}");
+                assert!(
+                    torus_implicit(p, major, minor).abs() < 1e-6,
+                    "off the torus at {p:?}"
+                );
+            }
+            let y: f64 = c.points.iter().map(|p| p.point.y()).sum();
+            sides.push(y > 0.0);
+            assert!(
+                c.points.iter().all(|p| p.point.y() * y >= -1e-9),
+                "a lobe crosses y = 0"
+            );
+        }
+        assert_ne!(sides[0], sides[1], "the lobes lie either side of y = 0");
+    }
+
+    /// A wall just off the inner tangent has no node. Just past it the
+    /// section has a gap 0.028 wide in tube angle about the inner equator,
+    /// between two samples inside it, and is one loop turning either side of
+    /// the gap; just short of it the section winds the tube twice. Every
+    /// point lies on the wall.
+    #[test]
+    fn a_wall_just_off_the_inner_tangent_cuts_no_node() {
+        let (major, minor) = (3.0, 1.0);
+        let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), major, minor).unwrap();
+        for (x, loops) in [(2.0001, 1), (1.9999, 2)] {
+            let curves = intersect_plane_torus(&torus, Vec3::new(1.0, 0.0, 0.0), x).unwrap();
+            assert_eq!(curves.len(), loops, "x = {x}");
+            for c in &curves {
+                let (first, last) = (c.points[0].point, c.points[c.points.len() - 1].point);
+                assert_eq!(first, last, "x = {x}: the loop closes");
+                for p in c.points.iter().map(|p| p.point) {
+                    assert!((p.x() - x).abs() < 1e-9, "x = {x}: off the wall at {p:?}");
+                    assert!(
+                        torus_implicit(p, major, minor).abs() < 1e-6,
+                        "x = {x}: off the torus at {p:?}"
+                    );
+                }
+            }
+        }
+        // The loop past the tangent turns either side of the gap, 0.028 apart.
+        let curves = intersect_plane_torus(&torus, Vec3::new(1.0, 0.0, 0.0), 2.0001).unwrap();
+        let low = curves[0]
+            .points
             .iter()
-            .map(|c| {
-                let p0 = ParametricCurve::evaluate(&c.curve, 0.0);
-                let p1 = ParametricCurve::evaluate(&c.curve, 1.0);
-                (p0 - p1).length()
-            })
-            .fold(0.0_f64, f64::max);
+            .map(|p| p.point)
+            .filter(|p| p.y().abs() < 1e-6)
+            .map(Point3::z)
+            .collect::<Vec<_>>();
+        let gap = (2.0001_f64 - 2.0)
+            .mul_add(2.0, -(2.0001_f64 - 2.0).powi(2))
+            .sqrt();
         assert!(
-            max_gap > 1e-2,
-            "figure-eight chain was wrongly force-closed (max end-gap={max_gap})"
+            low.iter().any(|z| (z - gap).abs() < 1e-6)
+                && low.iter().any(|z| (z + gap).abs() < 1e-6),
+            "turns at {low:?}, not at z = ±{gap}"
         );
+    }
+
+    /// A plane tangent to the tube's inner side off its equator, at a saddle,
+    /// cuts a figure-eight that crosses itself where it touches. Its lobes
+    /// come out as two loops, each starting and ending on that node.
+    #[test]
+    fn a_tilted_plane_tangent_inside_the_tube_cuts_two_loops_through_its_node() {
+        let (major, minor) = (3.0, 1.0);
+        let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), major, minor).unwrap();
+        for v0 in [1.7_f64, 2.0, 2.5, 4.0] {
+            let normal = Vec3::new(v0.cos(), 0.0, v0.sin());
+            let node = torus.evaluate(0.0, v0);
+            let d = normal.dot(Vec3::new(node.x(), node.y(), node.z()));
+            let curves = intersect_plane_torus(&torus, normal, d).unwrap();
+            assert_eq!(curves.len(), 2, "v0 {v0}: one loop per lobe");
+            for c in &curves {
+                let (first, last) = (c.points[0].point, c.points[c.points.len() - 1].point);
+                assert!(
+                    (first - node).length() < 1e-6,
+                    "v0 {v0}: starts at {first:?}, not {node:?}"
+                );
+                assert_eq!(first, last, "v0 {v0}: closes on the node");
+                for p in c.points.iter().map(|p| p.point) {
+                    let off = normal.dot(Vec3::new(p.x(), p.y(), p.z())) - d;
+                    assert!(off.abs() < 1e-9, "v0 {v0}: off the plane at {p:?}");
+                    assert!(
+                        torus_implicit(p, major, minor).abs() < 1e-6,
+                        "v0 {v0}: off the torus at {p:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A wall parallel to the axis cuts one loop from the ring past the
@@ -4880,6 +6079,83 @@ mod tests {
         assert_eq!(curves.len(), 1);
     }
 
+    /// Cylinders of radius 1.5 whose axes cross at 60° meet in two ellipses
+    /// crossing at the ends of the axes' common normal: two exact loops,
+    /// one from each end, each the halves of both ellipses on one side of
+    /// the crossing along the first axis, on both cylinders to rounding.
+    #[test]
+    fn equal_cylinders_with_crossing_axes_meet_in_two_cornered_loops() {
+        let crossing = Point3::new(1.0, 2.0, 3.0);
+        let (s, c) = 60.0_f64.to_radians().sin_cos();
+        let (d1, d2) = (Vec3::new(0.0, 0.0, 1.0), Vec3::new(s, 0.0, c));
+        let c1 = CylindricalSurface::new(crossing - d1 * 2.0, d1, 1.5).unwrap();
+        let c2 = CylindricalSurface::new(crossing + d2 * 0.7, d2, 1.5).unwrap();
+        let curves = algebraic_cylinder_cylinder(&c1, &c2).unwrap().unwrap();
+        assert_eq!(curves.len(), 2);
+        let off = |p: Point3, cyl: &CylindricalSurface| {
+            let q = p - cyl.origin();
+            ((q - cyl.axis() * q.dot(cyl.axis())).length() - 1.5).abs()
+        };
+        let ends = [
+            crossing + Vec3::new(0.0, 1.5, 0.0),
+            crossing - Vec3::new(0.0, 1.5, 0.0),
+        ];
+        let mut vertices: Vec<Point3> = Vec::new();
+        for (ic, (end, side)) in curves.iter().zip([(ends[0], 1.0), (ends[1], -1.0)]) {
+            let (t0, t1) = ic.curve.domain();
+            for k in 0..=400 {
+                let p = ic.curve.evaluate(t0 + (t1 - t0) * f64::from(k) / 400.0);
+                assert!(off(p, &c1).max(off(p, &c2)) < 1e-13);
+                assert!(side * (p - crossing).dot(d1) > -1e-13);
+            }
+            assert!((ic.curve.evaluate(t0) - end).length() < 1e-14);
+            assert!((ic.curve.evaluate(t1) - end).length() < 1e-14);
+            let other = ends[usize::from(side > 0.0)];
+            assert!((ic.curve.evaluate(0.5) - other).length() < 1e-14);
+            for t in [0.25, 0.75] {
+                let vertex = ic.curve.evaluate(t);
+                assert!(vertices.iter().all(|&v| (v - vertex).length() > 1.0));
+                vertices.push(vertex);
+            }
+        }
+    }
+
+    /// Axes that miss each other by 1e-9, or radii that differ by as much,
+    /// part the curves where the ellipses would cross; neither is taken for
+    /// a pair of ellipses, nor a miss of 1e-6 read between origins 1e8
+    /// apart along an axis.
+    #[test]
+    fn nearly_crossing_equal_cylinders_are_not_ellipses() {
+        let z = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+            .unwrap();
+        let x = |(x0, y): (f64, f64), r: f64| {
+            CylindricalSurface::new(Point3::new(x0, y, 0.0), Vec3::new(1.0, 0.0, 0.0), r).unwrap()
+        };
+        let taken = |c: &CylindricalSurface| crossing_equal_cylinders(&z, c).unwrap().is_some();
+        assert!(taken(&x((-2.0, 0.0), 1.0)));
+        assert!(!taken(&x((-2.0, 1e-9), 1.0)));
+        assert!(!taken(&x((-2.0, 0.0), 1.0 + 1e-9)));
+        assert!(!taken(&x((-1e8, 1e-6), 1.0)));
+    }
+
+    /// Axes 1e-8 and 1.5e-5 apart in angle cross in ellipses whose far
+    /// vertices rounding alone would move past the tolerance; they are
+    /// left to the rulings.
+    #[test]
+    fn nearly_parallel_equal_cylinders_are_not_ellipses() {
+        let z = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 10.0)
+            .unwrap();
+        for slope in [1e-8, 1.5e-5] {
+            let tilted = CylindricalSurface::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(slope, 0.0, 1.0),
+                10.0,
+            )
+            .unwrap();
+            assert!(crossing_equal_cylinders(&z, &tilted).unwrap().is_none());
+        }
+    }
+
     #[test]
     fn sphere_cylinder_intersect() {
         let sphere = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 2.0).unwrap();
@@ -5041,6 +6317,170 @@ mod tests {
         }
     }
 
+    /// Balls off a ring torus's axis, one poking out of the tube's top, one
+    /// wider than the tube on its core circle, one anywhere, and one just past
+    /// the tube's outside, in a loop narrower than the scan's step, meet the
+    /// torus in curves whose points lie on both surfaces, given either way
+    /// round, where the marcher found nothing with the torus first.
+    #[test]
+    fn a_ball_off_a_torus_axis_meets_it_in_its_closed_form_loops() {
+        let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
+        let on_torus = |p: Point3| (p.x().hypot(p.y()) - 4.0).hypot(p.z()) - 1.5;
+        for (centre, radius, loops) in [
+            (Point3::new(4.0, 0.0, 1.0), 1.0, 1),
+            (Point3::new(4.0, 0.0, 0.0), 2.0, 2),
+            (Point3::new(2.0, 1.0, 0.5), 1.2, 1),
+            (Point3::new(6.4999, 0.0, 0.0), 1.0, 1),
+        ] {
+            let ball = SphericalSurface::new(centre, radius).unwrap();
+            let on_ball = |p: Point3| (p - centre).length() - radius;
+            for ball_first in [true, false] {
+                let (a, b) = if ball_first {
+                    (
+                        AnalyticSurface::Sphere(&ball),
+                        AnalyticSurface::Torus(&torus),
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Torus(&torus),
+                        AnalyticSurface::Sphere(&ball),
+                    )
+                };
+                let curves = intersect_analytic_analytic(a, b, 32).unwrap();
+                let case = format!("ball {radius} at {centre:?}, ball first {ball_first}");
+                assert_eq!(curves.len(), loops, "{case}");
+                for ic in &curves {
+                    for q in &ic.points {
+                        let off = on_ball(q.point).abs().max(on_torus(q.point).abs());
+                        assert!(off < 1e-9, "{case}: a point lies {off:.2e} off");
+                        let (on_ball_at, on_torus_at) = if ball_first {
+                            (q.param1, q.param2)
+                        } else {
+                            (q.param2, q.param1)
+                        };
+                        let (pb, pt) = (
+                            ball.evaluate(on_ball_at.0, on_ball_at.1),
+                            torus.evaluate(on_torus_at.0, on_torus_at.1),
+                        );
+                        assert!(
+                            (pb - q.point).length() < 1e-9 && (pt - q.point).length() < 1e-9,
+                            "{case}: a point's parameters miss it"
+                        );
+                    }
+                    let (t0, t1) = ic.curve.domain();
+                    for k in 0..=400 {
+                        let p = ic.curve.evaluate(t0 + (t1 - t0) * f64::from(k) / 400.0);
+                        let off = on_ball(p).abs().max(on_torus(p).abs());
+                        assert!(off < 1e-7, "{case}: the curve strays {off:.2e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Balls whose loops a fixed scan of the tube misses or blurs: one far
+    /// smaller than its torus, one near the axis whose two loops share a
+    /// scan step, one a hair larger than the tube it sits in, whose two
+    /// loops lie close together all the way round, and one whose winding
+    /// loops swing round the axis within a few scan steps. Each loop is met
+    /// either way round, and its curve holds to both surfaces.
+    #[test]
+    fn balls_meet_tori_in_loops_a_scan_would_miss() {
+        for (big, small, centre, radius, loops) in [
+            (4000.0, 1500.0, Point3::new(5500.0, 0.0, 0.0), 0.001, 1),
+            (4.0, 1.5, Point3::new(1e-6, 0.0, 0.0), 2.500_002, 2),
+            (1000.0, 1.0, Point3::new(1000.0, 0.0, 0.0), 1.000_000_5, 2),
+            (4.0, 1.5, Point3::new(1.500_001, 0.0, 0.0), 4.0, 2),
+        ] {
+            let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), big, small).unwrap();
+            let ball = SphericalSurface::new(centre, radius).unwrap();
+            let on_torus = |p: Point3| (p.x().hypot(p.y()) - big).hypot(p.z()) - small;
+            let on_ball = |p: Point3| (p - centre).length() - radius;
+            for ball_first in [true, false] {
+                let (a, b) = if ball_first {
+                    (
+                        AnalyticSurface::Sphere(&ball),
+                        AnalyticSurface::Torus(&torus),
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Torus(&torus),
+                        AnalyticSurface::Sphere(&ball),
+                    )
+                };
+                let curves = intersect_analytic_analytic(a, b, 32).unwrap();
+                let case = format!("ball {radius} at {centre:?} on torus ({big}, {small})");
+                assert_eq!(curves.len(), loops, "{case}");
+                for ic in &curves {
+                    for q in &ic.points {
+                        let off = on_ball(q.point).abs().max(on_torus(q.point).abs());
+                        assert!(off < 1e-9, "{case}: a point lies {off:.2e} off");
+                    }
+                    let (t0, t1) = ic.curve.domain();
+                    for k in 0..=2000 {
+                        let p = ic.curve.evaluate(t0 + (t1 - t0) * f64::from(k) / 2000.0);
+                        let off = on_ball(p).abs().max(on_torus(p).abs());
+                        assert!(off < 1e-7, "{case}: the curve strays {off:.2e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sections a closed form can lose to scale or rounding: a plane whose
+    /// equation is scaled by 1e14 keeps the loop of the plane it describes; a
+    /// ball 1e-5 across poking out of a large torus, and a ball a micron wider
+    /// than the tube of a ring 1e8 across, defer to the marcher instead of
+    /// reading as apart, and the last is not taken for the meridian circle.
+    #[test]
+    fn scaled_and_ill_conditioned_sections_are_kept_or_deferred() {
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let torus = ToroidalSurface::new(origin, 4.0, 1.5).unwrap();
+        let unit = plane_torus_loops(&torus, Vec3::new(1.0, 0.0, 0.0), 4.0, 128).len();
+        let scaled = plane_torus_loops(&torus, Vec3::new(1e14, 0.0, 0.0), 4e14, 128).len();
+        assert_eq!((unit, scaled), (1, 1));
+
+        let large = ToroidalSurface::new(origin, 4000.0, 1500.0).unwrap();
+        let speck = SphericalSurface::new(Point3::new(5_500.000_001, 0.0, 0.0), 1e-5).unwrap();
+        assert!(sphere_torus_curves(&speck, &large, true).is_none());
+
+        let ring = ToroidalSurface::new(origin, 1e8, 1.0).unwrap();
+        let ball = SphericalSurface::new(Point3::new(1e8, 0.0, 0.0), 1.000_001).unwrap();
+        assert!(exact_sphere_torus(&ball, &ring).unwrap().is_none());
+        assert!(sphere_torus_curves(&ball, &ring, true).is_none());
+    }
+
+    /// A ball centred on a ring torus's core circle with the tube's own
+    /// radius meets it along the meridian circle through its centre: one
+    /// circle, given either way round.
+    #[test]
+    fn a_ball_filling_a_torus_tube_meets_it_in_one_meridian_circle() {
+        let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
+        let centre = Point3::new(4.0, 0.0, 0.0);
+        let ball = SphericalSurface::new(centre, 1.5).unwrap();
+        for (a, b) in [
+            (
+                AnalyticSurface::Sphere(&ball),
+                AnalyticSurface::Torus(&torus),
+            ),
+            (
+                AnalyticSurface::Torus(&torus),
+                AnalyticSurface::Sphere(&ball),
+            ),
+        ] {
+            let curves = intersect_analytic_analytic(a, b, 32).unwrap();
+            assert_eq!(curves.len(), 1);
+            let (t0, t1) = curves[0].curve.domain();
+            for k in 0..=100 {
+                let p = curves[0]
+                    .curve
+                    .evaluate(t0 + (t1 - t0) * f64::from(k) / 100.0);
+                let off = ((p - centre).length() - 1.5).abs().max(p.y().abs());
+                assert!(off < 1e-9, "the circle strays {off:.2e}");
+            }
+        }
+    }
+
     #[test]
     fn exact_sphere_torus_misses_touches_and_defers() {
         let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
@@ -5052,12 +6492,17 @@ mod tests {
                 .is_empty(),
             "a small ball in the hole misses"
         );
-        assert!(
-            exact_sphere_torus(&ball(0.0, 2.5), &torus)
-                .unwrap()
-                .is_none(),
-            "a ball touching the inner equator defers"
+        let touching = exact_sphere_torus(&ball(0.0, 2.5), &torus)
+            .unwrap()
+            .unwrap();
+        let circles = circles_of(&touching);
+        assert_eq!(
+            circles.len(),
+            1,
+            "a ball in the hole touches the inner equator"
         );
+        assert!((circles[0].radius() - 2.5).abs() < 1e-12);
+        assert!(circles[0].center().z().abs() < 1e-12);
         assert!(
             exact_sphere_torus(&ball(1.0, 3.0), &torus)
                 .unwrap()
@@ -5388,5 +6833,769 @@ mod tests {
                 "hyperbola must be sampled Points, not a closed conic"
             );
         }
+    }
+
+    /// Two spheres meet in one circle on both of them; spheres apart, one
+    /// inside the other, or concentric of different radii meet in nothing,
+    /// and one sphere twice has no curve.
+    #[test]
+    fn sphere_sphere_meets_in_a_circle_on_both() {
+        let ball = |x: f64, y: f64, z: f64, r: f64| {
+            SphericalSurface::new(Point3::new(x, y, z), r).unwrap()
+        };
+        let (a, b) = (ball(0.0, 0.0, 0.0, 2.0), ball(1.6, 0.3, 0.2, 1.5));
+        let curves = exact_sphere_sphere(&a, &b).unwrap().unwrap();
+        assert_eq!(curves.len(), 1);
+        let circle = match &curves[0] {
+            ExactIntersectionCurve::Circle(circle) => circle,
+            other => unreachable!("expected a circle, got {other:?}"),
+        };
+        for k in 0..16 {
+            let p = circle.evaluate(std::f64::consts::TAU * f64::from(k) / 16.0);
+            assert!(((p - a.center()).length() - 2.0).abs() < 1e-12);
+            assert!(((p - b.center()).length() - 1.5).abs() < 1e-12);
+        }
+        assert!(
+            exact_sphere_sphere(&a, &ball(4.0, 0.0, 0.0, 1.5))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            exact_sphere_sphere(&a, &ball(0.2, 0.0, 0.0, 1.0))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            exact_sphere_sphere(&a, &ball(0.0, 0.0, 0.0, 1.0))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            exact_sphere_sphere(&a, &ball(0.0, 0.0, 0.0, 2.0))
+                .unwrap()
+                .is_none()
+        );
+
+        // A tiny sphere nearly bisected by a large one, in either order, and a
+        // pair far from the origin: each meets in its small circle.
+        let radius = |p: &SphericalSurface, q: &SphericalSurface| -> f64 {
+            match exact_sphere_sphere(p, q).unwrap().unwrap().as_slice() {
+                [ExactIntersectionCurve::Circle(c)] => c.radius(),
+                other => unreachable!("expected one circle, got {other:?}"),
+            }
+        };
+        let tiny = ball(2.0, 0.0, 0.0, 1e-5);
+        assert!((radius(&a, &tiny) - 1e-5).abs() < 1e-9);
+        assert!((radius(&tiny, &a) - 1e-5).abs() < 1e-9);
+        let near = radius(&ball(0.0, 0.0, 0.0, 2.0), &ball(3.5, 0.0, 0.0, 1.500_001));
+        let far = radius(
+            &ball(1e10, 0.0, 0.0, 2.0),
+            &ball(1e10 + 3.5, 0.0, 0.0, 1.500_001),
+        );
+        assert!(near > 1e-3);
+        assert!((far - near).abs() < 1e-9 * near.max(1.0));
+    }
+
+    /// Each line among `sections`, and whether it is a ray; any other
+    /// section fails the test.
+    #[allow(clippy::panic)]
+    fn lines_of(sections: &[PlaneSection]) -> Vec<(Line3D, bool)> {
+        sections
+            .iter()
+            .map(|s| match s {
+                PlaneSection::Line { line, ray } => (line.clone(), *ray),
+                other => panic!("expected a line, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A plane along a cylinder's axis cuts its rulings: two through the
+    /// axis, two 2e-6 apart where it sinks a hair into the cylinder, the one
+    /// it touches along, and none past it. `exact_plane_analytic` gives no
+    /// curve for any of them.
+    #[test]
+    fn a_plane_along_a_cylinder_cuts_its_rulings() {
+        let cyl =
+            CylindricalSurface::new(Point3::new(0.0, 0.0, -2.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap();
+        let y = Vec3::new(0.0, 1.0, 0.0);
+        let surface = AnalyticSurface::Cylinder(&cyl);
+        let on_both = |p: Point3, d: f64| {
+            assert!((p.y() - d).abs() < 1e-12, "{p:?} off the plane y = {d}");
+            assert!(
+                (p.x().hypot(p.y()) - 1.0).abs() < 1e-12,
+                "{p:?} off the cylinder"
+            );
+        };
+        for (d, count) in [(0.0, 2), (1e-6_f64.cos(), 2), (1.0, 1), (1.5, 0)] {
+            assert!(exact_plane_analytic(surface, y, d).unwrap().is_empty());
+            let lines = lines_of(&exact_plane_section(surface, y, d).unwrap());
+            assert_eq!(lines.len(), count, "plane y = {d}");
+            let mut xs = Vec::new();
+            for (line, ray) in lines {
+                assert!(!ray);
+                assert!(line.direction().cross(cyl.axis()).length() < 1e-12);
+                for t in [-3.0, 0.0, 3.0] {
+                    on_both(line.evaluate(t), d);
+                }
+                xs.push(line.evaluate(0.0).x());
+            }
+            if count == 2 {
+                let apart = (xs[0] - xs[1]).abs();
+                let want = 2.0 * (1.0 - d * d).sqrt();
+                assert!(
+                    (apart - want).abs() < 1e-9 * want.max(1e-6),
+                    "{apart} apart"
+                );
+            }
+        }
+    }
+
+    /// A plane through a cone's apex cuts rays from it: two for a plane
+    /// through the axis, one for a plane touching the cone along a ruling,
+    /// and the apex alone for a plane missing the nappe. A plane 5e-8 off the
+    /// apex still cuts its conic.
+    #[test]
+    #[allow(clippy::panic)]
+    fn a_plane_through_a_cone_apex_cuts_its_rulings() {
+        use std::f64::consts::FRAC_PI_4;
+
+        let cone = ConicalSurface::new(
+            Point3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            FRAC_PI_4,
+        )
+        .unwrap();
+        let surface = AnalyticSurface::Cone(&cone);
+        let apex = cone.apex();
+        let through = |n: Vec3| {
+            let n = n.normalize().unwrap();
+            let d = n.dot(apex - Point3::new(0.0, 0.0, 0.0));
+            assert!(exact_plane_analytic(surface, n, d).unwrap().is_empty());
+            (n, d, exact_plane_section(surface, n, d).unwrap())
+        };
+        for (n, count) in [
+            (Vec3::new(1.0, 0.0, 0.0), 2),
+            (Vec3::new(1.0, 0.0, -1.0), 1),
+        ] {
+            let (n, d, sections) = through(n);
+            let rays = lines_of(&sections);
+            assert_eq!(rays.len(), count, "plane normal {n:?}");
+            for (line, ray) in rays {
+                assert!(ray);
+                assert!((line.evaluate(0.0) - apex).length() < 1e-12);
+                let p = line.evaluate(2.0);
+                assert!((n.dot(p - Point3::new(0.0, 0.0, 0.0)) - d).abs() < 1e-12);
+                let rel = p - apex;
+                assert!(rel.z() > 0.0, "{p:?} on the phantom nappe");
+                assert!(
+                    (rel.x().hypot(rel.y()) - rel.z()).abs() < 1e-12,
+                    "{p:?} off the cone"
+                );
+            }
+        }
+        for n in [Vec3::new(0.1, 0.0, 1.0), Vec3::new(0.0, 0.0, 1.0)] {
+            let (_, _, sections) = through(n);
+            assert!(
+                matches!(sections[..], [PlaneSection::Point(p)] if (p - apex).length() < 1e-12),
+                "{sections:?}"
+            );
+        }
+
+        let upright = ConicalSurface::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            FRAC_PI_4,
+        )
+        .unwrap();
+        let n = Vec3::new((0.5 - 1e-8_f64).sqrt(), 0.0, (0.5 + 1e-8_f64).sqrt());
+        let sections = exact_plane_section(AnalyticSurface::Cone(&upright), n, 5e-8).unwrap();
+        let [PlaneSection::Ellipse(ellipse)] = &sections[..] else {
+            panic!("{sections:?}");
+        };
+        assert!(
+            ellipse.semi_major() > 1.0,
+            "semi-major {}",
+            ellipse.semi_major()
+        );
+    }
+
+    /// A plane touching a sphere meets it at the point of contact, and one a
+    /// hair inside cuts the small circle there, however small.
+    #[test]
+    #[allow(clippy::panic)]
+    fn a_plane_touching_a_sphere_meets_it_at_a_point() {
+        let sphere = SphericalSurface::new(Point3::new(0.0, 0.0, 1.0), 1.0).unwrap();
+        let surface = AnalyticSurface::Sphere(&sphere);
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        assert!(exact_plane_analytic(surface, z, 0.0).unwrap().is_empty());
+        let sections = exact_plane_section(surface, z, 0.0).unwrap();
+        assert!(
+            matches!(sections[..], [PlaneSection::Point(p)] if p.z().abs() < 1e-15 && p.x() == 0.0),
+            "{sections:?}"
+        );
+        assert!(exact_plane_section(surface, z, -1e-9).unwrap().is_empty());
+        for height in [5e-15, 1e-12, 1e-8] {
+            let sections = exact_plane_section(surface, z, height).unwrap();
+            let [PlaneSection::Circle(circle)] = &sections[..] else {
+                panic!("{sections:?}");
+            };
+            let want = (height * (2.0 - height)).sqrt();
+            assert!(
+                (circle.radius() - want).abs() < 1e-3 * want,
+                "circle at z = {height}: radius {}, want {want}",
+                circle.radius()
+            );
+            assert!((circle.center().z() - height).abs() < 1e-15);
+        }
+    }
+
+    /// The farthest any of `curves` strays from `off`, sampled densely.
+    fn farthest(curves: &[IntersectionCurve], off: impl Fn(Point3) -> f64) -> f64 {
+        let mut far = 0.0_f64;
+        for ic in curves {
+            let (t0, t1) = ic.curve.domain();
+            for i in 0..=2000 {
+                let t = t0 + (t1 - t0) * f64::from(i) / 2000.0;
+                far = far.max(off(ic.curve.evaluate(t)));
+            }
+        }
+        far
+    }
+
+    /// A ball sitting in a bore of its own radius touches it along its
+    /// equator, which comes back as the exact circle.
+    #[test]
+    fn a_ball_in_its_bore_meets_it_on_an_exact_circle() {
+        let ball = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 1.0).unwrap();
+        let bore =
+            CylindricalSurface::new(Point3::new(0.0, 0.0, -2.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap();
+        let curves = intersect_analytic_analytic_bounded(
+            AnalyticSurface::Sphere(&ball),
+            AnalyticSurface::Cylinder(&bore),
+            64,
+            None,
+            Some((0.0, 4.0)),
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 1);
+        let far = farthest(&curves, |p| {
+            let on_ball = ((p - Point3::new(0.0, 0.0, 0.0)).length() - 1.0).abs();
+            on_ball
+                .max((p.x().hypot(p.y()) - 1.0).abs())
+                .max(p.z().abs())
+        });
+        assert!(far < 1e-14, "circle strays {far:.2e}");
+    }
+
+    /// Two unit balls a unit apart meet in a circle of radius √3/2, which
+    /// comes back exact.
+    #[test]
+    fn overlapping_balls_meet_on_an_exact_circle() {
+        let a = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 1.0).unwrap();
+        let b = SphericalSurface::new(Point3::new(1.0, 0.0, 0.0), 1.0).unwrap();
+        let curves = intersect_analytic_analytic_bounded(
+            AnalyticSurface::Sphere(&a),
+            AnalyticSurface::Sphere(&b),
+            64,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 1);
+        let far = farthest(&curves, |p| {
+            let on_a = ((p - Point3::new(0.0, 0.0, 0.0)).length() - 1.0).abs();
+            on_a.max(((p - Point3::new(1.0, 0.0, 0.0)).length() - 1.0).abs())
+        });
+        assert!(far < 1e-14, "circle strays {far:.2e}");
+    }
+
+    /// A loop with semi-axes 3 and 1.5 in a tilted frame lies on its ellipse
+    /// all the way round and starts at the end of its major axis.
+    #[test]
+    fn a_conic_loop_is_its_ellipse() {
+        let centre = Point3::new(1.0, -2.0, 0.5);
+        let frame = Frame3::from_normal(centre, Vec3::new(0.3, -0.4, 1.0)).unwrap();
+        let curve = conic_loop(centre, frame.x, frame.y, 3.0, 1.5).unwrap();
+        let (t0, t1) = curve.domain();
+        assert!((curve.evaluate(t0) - (centre + frame.x * 3.0)).length() < 1e-15);
+        for i in 0..=2000 {
+            let p = curve.evaluate(t0 + (t1 - t0) * f64::from(i) / 2000.0) - centre;
+            let (x, y) = (p.dot(frame.x) / 3.0, p.dot(frame.y) / 1.5);
+            assert!(
+                (x.hypot(y) - 1.0).abs() < 1e-14,
+                "off its ellipse by {}",
+                x.hypot(y) - 1.0
+            );
+            assert!(p.dot(frame.z).abs() < 1e-14);
+        }
+    }
+
+    /// A ball sitting in a ring's hole, and a ring resting on a wider one,
+    /// meet them along the one circle where they touch, and the bounded
+    /// call returns it exactly.
+    #[test]
+    fn touching_coaxial_rings_meet_along_one_circle() {
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let ring =
+            ToroidalSurface::with_axis_and_ref_dir(Point3::new(0.0, 0.0, 0.0), 3.0, 1.0, z, x)
+                .unwrap();
+        let ball = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 2.0).unwrap();
+        let curves = intersect_analytic_analytic_bounded(
+            AnalyticSurface::Sphere(&ball),
+            AnalyticSurface::Torus(&ring),
+            64,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 1);
+        let far = farthest(&curves, |p| {
+            let q = p - Point3::new(0.0, 0.0, 0.0);
+            let rho = q.x().hypot(q.y());
+            let on_ring = ((rho - 3.0).hypot(q.z()) - 1.0).abs();
+            on_ring.max((q.length() - 2.0).abs())
+        });
+        assert!(far < 1e-14, "circle strays {far:.2e}");
+
+        // Tubes of radius 1 and 0.5 on rings of radius 3 and 3.9, the second
+        // raised 1.2: their centres lie 1.5 apart, so they touch a third of
+        // the way along, at height 0.8 on a circle of radius 3.6.
+        let wider =
+            ToroidalSurface::with_axis_and_ref_dir(Point3::new(0.0, 0.0, 1.2), 3.9, 0.5, z, x)
+                .unwrap();
+        let touching = exact_torus_torus(&ring, &wider).unwrap().unwrap();
+        let circles = circles_of(&touching);
+        assert_eq!(circles.len(), 1);
+        assert!(
+            (circles[0].radius() - 3.6).abs() < 1e-12,
+            "{}",
+            circles[0].radius()
+        );
+        assert!((circles[0].center().z() - 0.8).abs() < 1e-12);
+    }
+
+    /// Unit tubes on rings of radius 1e6 and 1e6 + 1.999 overlap by 0.001
+    /// and cross in two circles 0.063 apart; on rings 2.001 apart they miss.
+    /// Neither is read as a touch, at a scale where a millionth of it is
+    /// two thousandths.
+    #[test]
+    fn huge_coaxial_rings_cross_or_miss_rather_than_touch() {
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let ring = |big: f64| {
+            ToroidalSurface::with_axis_and_ref_dir(Point3::new(0.0, 0.0, 0.0), big, 1.0, z, x)
+                .unwrap()
+        };
+        let crossing = exact_torus_torus(&ring(1e6), &ring(1_000_001.999))
+            .unwrap()
+            .unwrap();
+        let circles = circles_of(&crossing);
+        assert_eq!(circles.len(), 2);
+        for circle in circles {
+            let height = (1.0 - 0.9995_f64 * 0.9995).sqrt();
+            assert!(
+                (circle.center().z().abs() - height).abs() < 1e-9,
+                "{}",
+                circle.center().z()
+            );
+        }
+        let apart = exact_torus_torus(&ring(1e6), &ring(1_000_002.001))
+            .unwrap()
+            .unwrap();
+        assert!(apart.is_empty());
+    }
+
+    /// A plane parallel to a cone's axis cuts the branch of a hyperbola on
+    /// the cone's one nappe; planes parallel to a generator cut a parabola
+    /// on one side of the apex and miss the cone on the other.
+    #[test]
+    fn a_plane_cuts_a_cones_open_conics() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let on_cone = |p: Point3, slope: f64| (p.z() - slope * p.x().hypot(p.y())).abs();
+        let steep =
+            ConicalSurface::new(Point3::new(0.0, 0.0, 0.0), up, 60_f64.to_radians()).unwrap();
+        let slope = 60_f64.to_radians().tan();
+        let along =
+            exact_plane_section(AnalyticSurface::Cone(&steep), Vec3::new(1.0, 0.0, 0.0), 1.0)
+                .unwrap();
+        let [PlaneSection::Hyperbola(h)] = along.as_slice() else {
+            unreachable!("{along:?}")
+        };
+        for i in -20..=20 {
+            let p = h.evaluate(f64::from(i) / 5.0);
+            assert!((p.x() - 1.0).abs() < 1e-12 && p.z() > 0.0, "{p:?}");
+            assert!(on_cone(p, slope) < 1e-12 * p.z().max(1.0), "{p:?}");
+        }
+        let even =
+            ConicalSurface::new(Point3::new(0.0, 0.0, 0.0), up, 45_f64.to_radians()).unwrap();
+        let tilt = Vec3::new(-1.0, 0.0, 1.0) * std::f64::consts::FRAC_1_SQRT_2;
+        let above = exact_plane_section(AnalyticSurface::Cone(&even), tilt, 1.0).unwrap();
+        let [PlaneSection::Parabola(parabola)] = above.as_slice() else {
+            unreachable!("{above:?}")
+        };
+        for i in -20..=20 {
+            let p = parabola.evaluate(f64::from(i) / 2.0);
+            assert!(
+                (tilt.dot(p - Point3::new(0.0, 0.0, 0.0)) - 1.0).abs() < 1e-12,
+                "{p:?}"
+            );
+            assert!(
+                p.z() > 0.0 && on_cone(p, 1.0) < 1e-12 * p.z().max(1.0),
+                "{p:?}"
+            );
+        }
+        let below = exact_plane_section(AnalyticSurface::Cone(&even), tilt, -1.0).unwrap();
+        assert!(below.is_empty(), "{below:?}");
+    }
+
+    /// A cone so flat it rises 1e-7 from its radial plane, cut by a plane
+    /// tilted 7e-7 off it, and a cone so narrow it opens 5e-7 off its axis,
+    /// cut by a plane parallel to the axis, give sections that lie on the
+    /// cone: a hyperbola for the flat one, read from its eccentricity, and
+    /// sampled points where the formulas lose their digits.
+    #[test]
+    fn extreme_cones_give_sections_on_the_cone() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let apex = Point3::new(0.0, 0.0, 0.0);
+        let holds = |cone: &ConicalSurface, q: Point3| {
+            let w = q - apex;
+            (w.dot(up) - cone.half_angle().sin() * w.length()).abs() <= 1e-6 * (1.0 + w.length())
+        };
+        let flat = ConicalSurface::new(apex, up, 1e-7).unwrap();
+        let tilt = Vec3::new(5e-13_f64.sqrt(), 0.0, (1.0 - 5e-13_f64).sqrt());
+        let needle = ConicalSurface::new(apex, up, FRAC_PI_2 - 5e-7).unwrap();
+        for (cone, normal, d) in [(&flat, tilt, 1.0), (&needle, Vec3::new(1.0, 0.0, 0.0), 1.0)] {
+            let sections = exact_plane_section(AnalyticSurface::Cone(cone), normal, d).unwrap();
+            assert!(!sections.is_empty());
+            for section in &sections {
+                let points: Vec<Point3> = match section {
+                    PlaneSection::Hyperbola(h) => {
+                        (-4..=4).map(|i| h.evaluate(f64::from(i) / 4.0)).collect()
+                    }
+                    PlaneSection::Parabola(q) => {
+                        (-4..=4).map(|i| q.evaluate(f64::from(i))).collect()
+                    }
+                    PlaneSection::Points(points) => points.clone(),
+                    other => unreachable!("{other:?}"),
+                };
+                for q in points {
+                    assert!(holds(cone, q), "{q:?} off the cone");
+                }
+            }
+        }
+        let flat_section = exact_plane_section(AnalyticSurface::Cone(&flat), tilt, 1.0).unwrap();
+        assert!(matches!(
+            flat_section.as_slice(),
+            [PlaneSection::Hyperbola(_)]
+        ));
+    }
+
+    /// The rulings two parallel cylinders meet along, from the bounded call
+    /// with each face's `v` range: each ruling's ends, sorted by height.
+    fn parallel_rulings(
+        (c1, r1, v1): (Point3, f64, (f64, f64)),
+        (c2, r2, axis2, v2): (Point3, f64, Vec3, (f64, f64)),
+    ) -> Vec<(Point3, Point3)> {
+        rulings_within((c1, r1, v1), (c2, r2, axis2, v2), 1e-12)
+    }
+
+    /// [`parallel_rulings`] with each curve held to `tolerance` of both
+    /// cylinders.
+    fn rulings_within(
+        (c1, r1, v1): (Point3, f64, (f64, f64)),
+        (c2, r2, axis2, v2): (Point3, f64, Vec3, (f64, f64)),
+        tolerance: f64,
+    ) -> Vec<(Point3, Point3)> {
+        let a = CylindricalSurface::new(c1, Vec3::new(0.0, 0.0, 1.0), r1).unwrap();
+        let b = CylindricalSurface::new(c2, axis2, r2).unwrap();
+        let curves = intersect_analytic_analytic_bounded(
+            AnalyticSurface::Cylinder(&a),
+            AnalyticSurface::Cylinder(&b),
+            32,
+            Some(v1),
+            Some(v2),
+        )
+        .unwrap();
+        curves
+            .iter()
+            .map(|ic| {
+                let (t0, t1) = ic.curve.domain();
+                let (p, q) = (ic.curve.evaluate(t0), ic.curve.evaluate(t1));
+                for i in 0..=100 {
+                    let x = ic.curve.evaluate(t0 + (t1 - t0) * f64::from(i) / 100.0);
+                    let on_a = ((x - c1) - Vec3::new(0.0, 0.0, (x - c1).z())).length() - r1;
+                    let w = x - c2;
+                    let on_b = (w - axis2 * w.dot(axis2)).length() - r2;
+                    assert!(
+                        on_a.abs() < tolerance && on_b.abs() < tolerance,
+                        "{x:?} off a cylinder by {on_a:.1e}, {on_b:.1e}"
+                    );
+                }
+                if p.z() <= q.z() { (p, q) } else { (q, p) }
+            })
+            .collect()
+    }
+
+    /// Rods of radius 1 with axes 1.2 apart overlap along two rulings, at
+    /// x 0.6 and y ±0.8, over the height both faces share; the second rod's
+    /// axis runs down, so its range counts down from its origin.
+    #[test]
+    fn overlapping_parallel_rods_meet_along_two_rulings() {
+        let mut rulings = parallel_rulings(
+            (Point3::new(0.0, 0.0, 0.0), 1.0, (0.0, 4.0)),
+            (
+                Point3::new(1.2, 0.0, 3.0),
+                1.0,
+                Vec3::new(0.0, 0.0, -1.0),
+                (0.0, 2.0),
+            ),
+        );
+        rulings.sort_by(|a, b| a.0.y().total_cmp(&b.0.y()));
+        assert_eq!(rulings.len(), 2);
+        for ((lo, hi), y) in rulings.into_iter().zip([-0.8, 0.8]) {
+            assert!((lo - Point3::new(0.6, y, 1.0)).length() < 1e-12, "{lo:?}");
+            assert!((hi - Point3::new(0.6, y, 3.0)).length() < 1e-12, "{hi:?}");
+        }
+    }
+
+    /// Rods touching side by side, or one inside another against its wall,
+    /// meet along the one ruling where they touch; rods apart do not meet.
+    #[test]
+    fn touching_parallel_rods_meet_along_one_ruling() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let beside = parallel_rulings(
+            (Point3::new(0.0, 0.0, 0.0), 1.0, (-2.0, 2.0)),
+            (Point3::new(2.0, 0.0, -2.0), 1.0, up, (0.0, 4.0)),
+        );
+        assert_eq!(beside.len(), 1);
+        assert!((beside[0].0 - Point3::new(1.0, 0.0, -2.0)).length() < 1e-12);
+        assert!((beside[0].1 - Point3::new(1.0, 0.0, 2.0)).length() < 1e-12);
+        let inside = parallel_rulings(
+            (Point3::new(0.0, 0.0, 0.0), 2.0, (0.0, 1.0)),
+            (Point3::new(-1.0, 0.0, 0.0), 1.0, up, (0.0, 1.0)),
+        );
+        assert_eq!(inside.len(), 1);
+        assert!((inside[0].0 - Point3::new(-2.0, 0.0, 0.0)).length() < 1e-12);
+        let apart = parallel_rulings(
+            (Point3::new(0.0, 0.0, 0.0), 1.0, (0.0, 1.0)),
+            (Point3::new(2.5, 0.0, 0.0), 1.0, up, (0.0, 1.0)),
+        );
+        assert!(apart.is_empty());
+    }
+
+    /// Rods whose axes lean 1e-5 apart drift 1e-3 over a span of 100, so
+    /// the rulings defer to the next solver there; over a span of 0.001
+    /// they drift 1e-8 and keep their two rulings.
+    #[test]
+    fn rods_leaning_apart_keep_rulings_only_over_a_short_span() {
+        let up = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+            .unwrap();
+        let lean = Vec3::new(1e-5_f64.sin(), 0.0, 1e-5_f64.cos());
+        let leaning = CylindricalSurface::new(Point3::new(1.2, 0.0, 0.0), lean, 1.0).unwrap();
+        let span = |h: f64| parallel_cylinders(&up, &leaning, Some((0.0, h)), Some((0.0, h)));
+        assert!(span(100.0).unwrap().is_none());
+        assert_eq!(span(0.001).unwrap().map(|r| r.len()), Some(2));
+    }
+
+    /// Huge rods a short stretch long still meet along both rulings, and
+    /// rods of radius 100 whose axes lie 3e-7 short of touching meet along
+    /// two rulings 0.011 apart, not the one where they would touch.
+    #[test]
+    fn parallel_rods_keep_short_and_close_rulings() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let huge = rulings_within(
+            (Point3::new(0.0, 0.0, 0.0), 1e6, (0.0, 0.001)),
+            (Point3::new(1.2e6, 0.0, 0.0), 1e6, up, (0.0, 0.001)),
+            1e-9,
+        );
+        assert_eq!(huge.len(), 2);
+        assert!(
+            huge.iter()
+                .all(|(lo, hi)| ((*hi - *lo).length() - 0.001).abs() < 1e-12)
+        );
+        let mut close = rulings_within(
+            (Point3::new(0.0, 0.0, 0.0), 100.0, (0.0, 1.0)),
+            (Point3::new(199.999_999_7, 0.0, 0.0), 100.0, up, (0.0, 1.0)),
+            1e-9,
+        );
+        assert_eq!(close.len(), 2);
+        close.sort_by(|a, b| a.0.y().total_cmp(&b.0.y()));
+        let apart = close[1].0.y() - close[0].0.y();
+        assert!((apart - 0.010_954).abs() < 1e-5, "{apart}");
+    }
+
+    /// How far `p` lies off `cone` (either nappe), and its `v` there.
+    fn off_cone(cone: &ConicalSurface, p: Point3) -> (f64, f64) {
+        let q = p - cone.apex();
+        let (along, s) = (q.dot(cone.axis()), cone.half_angle().sin());
+        ((along.abs() - s * q.length()).abs(), along / s)
+    }
+
+    /// Cones sharing an apex, their axes 40° apart and each opening 20°
+    /// from its axis, touch along the one ruling between the axes, which
+    /// runs where both faces hold it.
+    #[test]
+    fn cones_sharing_an_apex_touch_along_one_ruling() {
+        let apex = Point3::new(1.0, 2.0, 3.0);
+        let a = 20.0_f64.to_radians();
+        let half = std::f64::consts::FRAC_PI_2 - a;
+        let c1 = ConicalSurface::new(apex, Vec3::new(a.cos(), 0.0, a.sin()), half).unwrap();
+        let c2 = ConicalSurface::new(apex, Vec3::new(a.cos(), 0.0, -a.sin()), half).unwrap();
+        let curves = intersect_analytic_analytic_bounded(
+            AnalyticSurface::Cone(&c1),
+            AnalyticSurface::Cone(&c2),
+            64,
+            Some((0.2, 3.0)),
+            Some((0.5, 4.0)),
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 1);
+        let curve = &curves[0].curve;
+        let (t0, t1) = curve.domain();
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        assert!((curve.evaluate(t0) - (apex + x * 0.5)).length() < 1e-12);
+        assert!((curve.evaluate(t1) - (apex + x * 3.0)).length() < 1e-12);
+    }
+
+    /// Cones sharing an apex, their axes 20° apart and each opening 30°,
+    /// cross along two rulings; faces reaching past the apex hold each on
+    /// both sides of it, in two segments that end there.
+    #[test]
+    fn cones_sharing_an_apex_cross_along_two_rulings() {
+        let apex = Point3::new(-1.0, 0.5, 2.0);
+        let b = 20.0_f64.to_radians();
+        let half = 60.0_f64.to_radians();
+        let c1 = ConicalSurface::new(apex, Vec3::new(0.0, 0.0, 1.0), half).unwrap();
+        let c2 = ConicalSurface::new(apex, Vec3::new(b.sin(), 0.0, b.cos()), half).unwrap();
+        for (range, pieces) in [((0.5, 2.0), 2), ((-2.0, 2.0), 4)] {
+            let curves = intersect_analytic_analytic_bounded(
+                AnalyticSurface::Cone(&c1),
+                AnalyticSurface::Cone(&c2),
+                64,
+                Some(range),
+                Some(range),
+            )
+            .unwrap();
+            assert_eq!(curves.len(), pieces, "{range:?}");
+            for ic in &curves {
+                let (t0, t1) = ic.curve.domain();
+                for k in 0..=20 {
+                    let p = ic.curve.evaluate(t0 + (t1 - t0) * f64::from(k) / 20.0);
+                    for cone in [&c1, &c2] {
+                        let (off, v) = off_cone(cone, p);
+                        assert!(off < 1e-12, "{range:?}: off a cone by {off:.2e}");
+                        assert!(v > range.0 - 1e-12 && v < range.1 + 1e-12);
+                    }
+                }
+                if pieces == 4 {
+                    let ends = [ic.curve.evaluate(t0), ic.curve.evaluate(t1)];
+                    assert!(ends.iter().any(|&e| (e - apex).length() < 1e-12));
+                }
+                for point in &ic.points {
+                    let (on1, on2) = (point.param1, point.param2);
+                    assert!((c1.evaluate(on1.0, on1.1) - point.point).length() < 1e-9);
+                    assert!((c2.evaluate(on2.0, on2.1) - point.point).length() < 1e-9);
+                }
+            }
+        }
+    }
+
+    /// Axes 1e-8 apart in angle leave a ruling's part across them to
+    /// rounding, and cones touching within rounding along a ruling leave
+    /// how far apart their rulings may be 1e6 out to it: neither is solved
+    /// here.
+    #[test]
+    fn cones_sharing_an_apex_defer_what_rounding_cannot_settle() {
+        let apex = Point3::new(0.0, 0.0, 0.0);
+        let half = 60.0_f64.to_radians();
+        let c1 = ConicalSurface::new(apex, Vec3::new(0.0, 0.0, 1.0), half).unwrap();
+        let c2 = ConicalSurface::new(apex, Vec3::new(1e-8_f64.sin(), 0.0, 1e-8_f64.cos()), half)
+            .unwrap();
+        let near = Some((0.5, 2.0));
+        assert!(shared_apex_cones(&c1, &c2, near, near).unwrap().is_none());
+        let a = 20.0_f64.to_radians();
+        let half = std::f64::consts::FRAC_PI_2 - a;
+        let c1 = ConicalSurface::new(apex, Vec3::new(a.cos(), 0.0, a.sin()), half).unwrap();
+        let c2 = ConicalSurface::new(apex, Vec3::new(a.cos(), 0.0, -a.sin()), half).unwrap();
+        let far = Some((0.5, 1e6));
+        assert!(shared_apex_cones(&c1, &c2, far, far).unwrap().is_none());
+    }
+
+    /// Perpendicular cones opening 1e-15 short of touching cross along two
+    /// rulings, which part by about 0.09 a million out: two segments.
+    #[test]
+    fn cones_sharing_an_apex_just_short_of_touching_cross_in_two_rulings() {
+        let apex = Point3::new(0.0, 0.0, 0.0);
+        let half = std::f64::consts::FRAC_PI_4 - 1e-15;
+        let c1 = ConicalSurface::new(apex, Vec3::new(0.0, 0.0, 1.0), half).unwrap();
+        let c2 = ConicalSurface::new(apex, Vec3::new(1.0, 0.0, 0.0), half).unwrap();
+        let range = Some((0.5, 1e6));
+        let curves = shared_apex_cones(&c1, &c2, range, range).unwrap().unwrap();
+        assert_eq!(curves.len(), 2);
+        let ends: Vec<Point3> = curves
+            .iter()
+            .map(|ic| ic.curve.evaluate(ic.curve.domain().1))
+            .collect();
+        assert!((ends[0] - ends[1]).length() > 0.05);
+    }
+
+    /// A ball off a ring's axis touches it at one point from outside the
+    /// tube, from inside it, or holding the whole ring, and that point is
+    /// all they share. A ball reaching 1e-6 further cuts the tube in a small
+    /// loop, which is left to the section's closed form, and one centred on
+    /// the core circle with the tube's radius meets it along the meridian
+    /// circle through its centre.
+    #[test]
+    fn a_ball_off_a_rings_axis_touches_it_at_one_point() {
+        let o = Point3::new(1.0, 2.0, 3.0);
+        let ring = ToroidalSurface::new(o, 3.0, 1.0).unwrap();
+        let (s, c) = 30.0_f64.to_radians().sin_cos();
+        let (out, up) = (Vec3::new(c, s, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        let on_ring = |p: Point3| {
+            let q = p - o;
+            ((q.x().hypot(q.y()) - 3.0).hypot(q.z()) - 1.0).abs()
+        };
+        let balls = [
+            (o + out * 5.0, 1.0),
+            (o + out * 3.2 + up * 0.1, 1.0 - 0.05_f64.sqrt()),
+            (o + out + up * 0.5, 1.0 + 16.25_f64.sqrt()),
+        ];
+        let mut touches = Vec::new();
+        for (centre, radius) in balls {
+            let ball = SphericalSurface::new(centre, radius).unwrap();
+            let exacts = exact_sphere_torus(&ball, &ring).unwrap().unwrap();
+            let p = match exacts.as_slice() {
+                [ExactIntersectionCurve::Points(points)] => points[0],
+                _ => unreachable!("one touching point"),
+            };
+            assert!(on_ring(p) < 1e-12 && ((p - centre).length() - radius).abs() < 1e-12);
+            let curves = intersect_analytic_analytic(
+                AnalyticSurface::Sphere(&ball),
+                AnalyticSurface::Torus(&ring),
+                16,
+            )
+            .unwrap();
+            assert_eq!(curves.len(), 1);
+            let (t0, t1) = curves[0].curve.domain();
+            assert!((curves[0].curve.evaluate(t0) - p).length() < 1e-15);
+            assert!((curves[0].curve.evaluate(t1) - p).length() < 1e-15);
+            touches.push(p);
+        }
+        assert!((touches[0] - (o + out * 4.0)).length() < 1e-12);
+        let past = SphericalSurface::new(o + out * 5.0, 1.0 + 1e-6).unwrap();
+        assert!(exact_sphere_torus(&past, &ring).unwrap().is_none());
+        let on_core = SphericalSurface::new(o + out * 3.0, 1.0).unwrap();
+        let meridian = exact_sphere_torus(&on_core, &ring).unwrap().unwrap();
+        let [ExactIntersectionCurve::Circle(circle)] = meridian.as_slice() else {
+            unreachable!("one meridian circle");
+        };
+        assert!((circle.center() - (o + out * 3.0)).length() < 1e-12);
+        assert!((circle.radius() - 1.0).abs() < 1e-12);
     }
 }

@@ -369,7 +369,10 @@ pub fn fillet(
         });
     }
 
-    crate::boolean::assemble_solid_mixed(topo, &result_specs, tol)
+    // Every bevel sets back `radius` along its faces from a filleted edge,
+    // so the material taken off lies that near one.
+    let result = crate::boolean::assemble_solid_mixed(topo, &result_specs, tol)?;
+    crate::cavities::keep_cavities(topo, solid, result, "fillet")
 }
 
 /// Fillet edges with variable radius using canal surface generation.
@@ -896,26 +899,7 @@ pub fn fillet_variable(
     if solid_has_free_edges(topo, solid_id)? {
         let v2_laws: Vec<(EdgeId, brepkit_blend::radius_law::RadiusLaw)> = edge_laws
             .iter()
-            .map(|(eid, law)| {
-                let mapped = match law {
-                    FilletRadiusLaw::Constant(r) => {
-                        brepkit_blend::radius_law::RadiusLaw::Constant(*r)
-                    }
-                    FilletRadiusLaw::Linear { start, end } => {
-                        brepkit_blend::radius_law::RadiusLaw::Linear {
-                            start: *start,
-                            end: *end,
-                        }
-                    }
-                    FilletRadiusLaw::SCurve { start, end } => {
-                        brepkit_blend::radius_law::RadiusLaw::SCurve {
-                            start: *start,
-                            end: *end,
-                        }
-                    }
-                };
-                (*eid, mapped)
-            })
+            .map(|(eid, law)| (*eid, law.into()))
             .collect();
         match crate::blend_ops::fillet_v2_variable(topo, solid, v2_laws) {
             Ok(v2) => {
@@ -924,7 +908,11 @@ pub fn fillet_variable(
                     "fillet_variable v2 retry: failed_edges={} open={open}",
                     v2.failed.len()
                 );
-                if v2.failed.is_empty() && (!open || std::env::var("BK_FORCE_V2").is_ok()) {
+                // A walking-engine result without the input's cavities has
+                // filled them.
+                let kept = topo.solid(v2.solid)?.inner_shells().len()
+                    == topo.solid(solid)?.inner_shells().len();
+                if v2.failed.is_empty() && kept && (!open || std::env::var("BK_FORCE_V2").is_ok()) {
                     return Ok(v2.solid);
                 }
             }
@@ -932,7 +920,7 @@ pub fn fillet_variable(
         }
     }
 
-    Ok(solid_id)
+    crate::cavities::keep_cavities(topo, solid, solid_id, "fillet")
 }
 
 fn solid_has_free_edges(topo: &Topology, solid: SolidId) -> Result<bool, crate::OperationsError> {

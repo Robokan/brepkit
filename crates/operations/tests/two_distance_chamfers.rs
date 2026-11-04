@@ -9,6 +9,7 @@ use std::f64::consts::PI;
 
 use brepkit_math::mat::Mat4;
 use brepkit_math::vec::Point3;
+use brepkit_operations::OperationsError;
 use brepkit_operations::boolean::{BooleanOp, boolean};
 use brepkit_operations::chamfer::chamfer_two_on;
 use brepkit_operations::measure::solid_volume;
@@ -146,20 +147,6 @@ type Loop<'a> = (&'a [(f64, f64, f64)], [f64; 3]);
 /// a fuse can leave them): the end faces, top and bottom carry a vertex 4
 /// from the front corners.
 fn box_with_pieced_ends(topo: &mut Topology) -> SolidId {
-    use brepkit_topology::edge::Edge;
-    use brepkit_topology::face::Face;
-    use brepkit_topology::shell::Shell;
-    use brepkit_topology::solid::Solid;
-    use brepkit_topology::vertex::Vertex;
-    use brepkit_topology::wire::{OrientedEdge, Wire};
-    use std::collections::HashMap;
-
-    let mut verts: HashMap<(i64, i64, i64), brepkit_topology::vertex::VertexId> = HashMap::new();
-    let mut edges: HashMap<(usize, usize), EdgeId> = HashMap::new();
-    let mut faces = Vec::new();
-    #[allow(clippy::cast_possible_truncation)]
-    let key = |p: (f64, f64, f64)| (p.0.round() as i64, p.1.round() as i64, p.2.round() as i64);
-    // Each loop runs counterclockwise about the face's outward normal.
     let loops: [Loop<'_>; 6] = [
         (
             &[
@@ -224,7 +211,31 @@ fn box_with_pieced_ends(topo: &mut Topology) -> SolidId {
             [-1.0, 0.0, 0.0],
         ),
     ];
-    for (pts, n) in loops {
+    solid_from_loops(topo, &loops)
+}
+
+/// A solid bounded by planar faces, each a loop of corners running
+/// counterclockwise about its outward normal; loops share a corner given
+/// the same coordinates (to a thousandth) and an edge between the same two
+/// corners.
+fn solid_from_loops(topo: &mut Topology, loops: &[Loop<'_>]) -> SolidId {
+    use brepkit_topology::edge::Edge;
+    use brepkit_topology::face::Face;
+    use brepkit_topology::shell::Shell;
+    use brepkit_topology::solid::Solid;
+    use brepkit_topology::vertex::Vertex;
+    use brepkit_topology::wire::{OrientedEdge, Wire};
+    use std::collections::HashMap;
+
+    let mut verts: HashMap<(i64, i64, i64), brepkit_topology::vertex::VertexId> = HashMap::new();
+    let mut edges: HashMap<(usize, usize), EdgeId> = HashMap::new();
+    let mut faces = Vec::new();
+    #[allow(clippy::cast_possible_truncation)]
+    let key = |p: (f64, f64, f64)| {
+        let at = |c: f64| (c * 1000.0).round() as i64;
+        (at(p.0), at(p.1), at(p.2))
+    };
+    for &(pts, n) in loops {
         let ids: Vec<_> = pts
             .iter()
             .map(|&p| {
@@ -277,6 +288,303 @@ fn a_chamfer_past_a_pieced_edge_closes_its_ends() {
     let report = validate_solid(&topo, cut).unwrap();
     assert!(report.is_valid(), "{:?}", report.issues);
     let want = 200.0 * 80.0 * 20.0 - 2.0 * 0.5 * d1 * d2 * 20.0;
+    let volume = solid_volume(&topo, cut, 0.001).unwrap();
+    assert!(
+        (volume - want).abs() < 1e-6 * want,
+        "volume {volume}, want {want}"
+    );
+}
+
+/// A 10-unit cube, corner at the origin, whose top and bottom faces' edges
+/// along x and y from the corner on the z axis are in pieces at 0.6 and
+/// 1.3 from it, shared with the front (y = 0) and left (x = 0) faces.
+fn cube_with_a_pieced_corner(topo: &mut Topology) -> SolidId {
+    let loops: [Loop<'_>; 6] = [
+        (
+            &[
+                (0.0, 0.0, 0.0),
+                (0.0, 0.6, 0.0),
+                (0.0, 1.3, 0.0),
+                (0.0, 10.0, 0.0),
+                (10.0, 10.0, 0.0),
+                (10.0, 0.0, 0.0),
+                (1.3, 0.0, 0.0),
+                (0.6, 0.0, 0.0),
+            ],
+            [0.0, 0.0, -1.0],
+        ),
+        (
+            &[
+                (0.0, 0.0, 10.0),
+                (0.6, 0.0, 10.0),
+                (1.3, 0.0, 10.0),
+                (10.0, 0.0, 10.0),
+                (10.0, 10.0, 10.0),
+                (0.0, 10.0, 10.0),
+                (0.0, 1.3, 10.0),
+                (0.0, 0.6, 10.0),
+            ],
+            [0.0, 0.0, 1.0],
+        ),
+        (
+            &[
+                (0.0, 0.0, 0.0),
+                (0.6, 0.0, 0.0),
+                (1.3, 0.0, 0.0),
+                (10.0, 0.0, 0.0),
+                (10.0, 0.0, 10.0),
+                (1.3, 0.0, 10.0),
+                (0.6, 0.0, 10.0),
+                (0.0, 0.0, 10.0),
+            ],
+            [0.0, -1.0, 0.0],
+        ),
+        (
+            &[
+                (0.0, 10.0, 0.0),
+                (0.0, 10.0, 10.0),
+                (10.0, 10.0, 10.0),
+                (10.0, 10.0, 0.0),
+            ],
+            [0.0, 1.0, 0.0],
+        ),
+        (
+            &[
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 10.0),
+                (0.0, 0.6, 10.0),
+                (0.0, 1.3, 10.0),
+                (0.0, 10.0, 10.0),
+                (0.0, 10.0, 0.0),
+                (0.0, 1.3, 0.0),
+                (0.0, 0.6, 0.0),
+            ],
+            [-1.0, 0.0, 0.0],
+        ),
+        (
+            &[
+                (10.0, 0.0, 0.0),
+                (10.0, 10.0, 0.0),
+                (10.0, 10.0, 10.0),
+                (10.0, 0.0, 10.0),
+            ],
+            [1.0, 0.0, 0.0],
+        ),
+    ];
+    solid_from_loops(topo, &loops)
+}
+
+/// The cube's edge up the pieced corner chamfered 2 each way: the top and
+/// bottom faces' run round the corner from (2, 0) to (0, 2) has six edges
+/// and their other run between the points four, and the corner's run is
+/// the one the chamfer replaces.
+#[test]
+fn a_chamfer_closes_its_ends_round_the_corner_not_the_shorter_way() {
+    let d = 2.0;
+    let mut topo = Topology::new();
+    let solid = cube_with_a_pieced_corner(&mut topo);
+    assert!(validate_solid(&topo, solid).unwrap().is_valid());
+    let edge = edge_between(
+        &topo,
+        solid,
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(0.0, 0.0, 10.0),
+    );
+    let front = plane_along(&topo, solid, edge, [0.0, -1.0, 0.0]);
+    let cut = chamfer_two_on(&mut topo, solid, &[(edge, front)], d, d).unwrap();
+    let report = validate_solid(&topo, cut).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+    let want = 1000.0 - 0.5 * d * d * 10.0;
+    let volume = solid_volume(&topo, cut, 0.001).unwrap();
+    assert!(
+        (volume - want).abs() < 1e-6 * want,
+        "volume {volume}, want {want}"
+    );
+}
+
+/// The plate's top edge chamfered 14 into the top face sets the top back
+/// past the whole hole (y 7 to 13): the hole would leave with the cut-off
+/// strip while its bore stayed, so the chamfer is refused and the plate
+/// left closed.
+#[test]
+fn a_hole_beyond_the_chamfer_refuses_it() {
+    let mut topo = Topology::new();
+    let plate = drilled_plate(&mut topo);
+    let edge = edge_between(
+        &topo,
+        plate,
+        Point3::new(0.0, 20.0, 10.0),
+        Point3::new(40.0, 20.0, 10.0),
+    );
+    let top = plane_along(&topo, plate, edge, [0.0, 0.0, 1.0]);
+    assert!(chamfer_two_on(&mut topo, plate, &[(edge, top)], 14.0, 2.0).is_err());
+    let report = validate_solid(&topo, plate).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+}
+
+/// One edge that chamfers and one refused: the call fails, and the plate
+/// is left as it was though the first edge's bevel was already built. The
+/// bottom's far edge sets back to x = 26, clear of the hole; the top's back
+/// edge would set back past it.
+#[test]
+fn a_refused_edge_leaves_the_plate_as_it_was() {
+    let mut topo = Topology::new();
+    let plate = drilled_plate(&mut topo);
+    let volume = solid_volume(&topo, plate, 0.01).unwrap();
+    let faces = brepkit_topology::explorer::solid_faces(&topo, plate)
+        .unwrap()
+        .len();
+    let far = edge_between(
+        &topo,
+        plate,
+        Point3::new(40.0, 0.0, 0.0),
+        Point3::new(40.0, 20.0, 0.0),
+    );
+    let back = edge_between(
+        &topo,
+        plate,
+        Point3::new(0.0, 20.0, 10.0),
+        Point3::new(40.0, 20.0, 10.0),
+    );
+    let bottom = plane_along(&topo, plate, far, [0.0, 0.0, -1.0]);
+    let top = plane_along(&topo, plate, back, [0.0, 0.0, 1.0]);
+    assert!(chamfer_two_on(&mut topo, plate, &[(far, bottom), (back, top)], 14.0, 2.0).is_err());
+    let report = validate_solid(&topo, plate).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+    assert_eq!(
+        brepkit_topology::explorer::solid_faces(&topo, plate)
+            .unwrap()
+            .len(),
+        faces
+    );
+    let after = solid_volume(&topo, plate, 0.01).unwrap();
+    assert!(
+        (after - volume).abs() < 1e-9 * volume,
+        "{after} vs {volume}"
+    );
+}
+
+/// A rim and a straight edge in one call are refused before either is cut.
+#[test]
+fn rims_and_other_edges_are_refused_together() {
+    let mut topo = Topology::new();
+    let plate = drilled_plate(&mut topo);
+    let rim = brepkit_topology::explorer::solid_edges(&topo, plate)
+        .unwrap()
+        .into_iter()
+        .find(|&e| {
+            let edge = topo.edge(e).unwrap();
+            matches!(edge.curve(), EdgeCurve::Circle(c) if (c.center().z() - 10.0).abs() < 1e-9)
+        })
+        .unwrap();
+    let cap = plane_along(&topo, plate, rim, [0.0, 0.0, 1.0]);
+    let edge = edge_between(
+        &topo,
+        plate,
+        Point3::new(0.0, 20.0, 10.0),
+        Point3::new(40.0, 20.0, 10.0),
+    );
+    let picks = [(rim, cap), (edge, cap)];
+    let result = chamfer_two_on(&mut topo, plate, &picks, 1.0, 1.0);
+    assert!(
+        matches!(result, Err(OperationsError::InvalidInput { .. })),
+        "{result:?}"
+    );
+    let report = validate_solid(&topo, plate).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+}
+
+/// A reference face must border its edge, on either path: a rod's top rim
+/// measured on its bottom cap, and the plate's top edge on its bottom face.
+#[test]
+fn a_reference_face_off_its_edge_is_refused() {
+    let mut topo = Topology::new();
+    let rod = make_cylinder(&mut topo, 3.0, 10.0).unwrap();
+    let rims: Vec<EdgeId> = brepkit_topology::explorer::solid_edges(&topo, rod)
+        .unwrap()
+        .into_iter()
+        .filter(|&e| matches!(topo.edge(e).unwrap().curve(), EdgeCurve::Circle(_)))
+        .collect();
+    let at_height = |topo: &Topology, z: f64| {
+        rims.iter()
+            .copied()
+            .find(|&e| {
+                let start = topo.edge(e).unwrap().start();
+                (topo.vertex(start).unwrap().point().z() - z).abs() < 1e-9
+            })
+            .unwrap()
+    };
+    let (top_rim, bottom_rim) = (at_height(&topo, 10.0), at_height(&topo, 0.0));
+    let bottom = plane_along(&topo, rod, bottom_rim, [0.0, 0.0, -1.0]);
+    let result = chamfer_two_on(&mut topo, rod, &[(top_rim, bottom)], 1.0, 2.0);
+    assert!(
+        matches!(result, Err(OperationsError::InvalidInput { .. })),
+        "{result:?}"
+    );
+
+    let plate = drilled_plate(&mut topo);
+    let edge = edge_between(
+        &topo,
+        plate,
+        Point3::new(0.0, 20.0, 10.0),
+        Point3::new(40.0, 20.0, 10.0),
+    );
+    let floor = brepkit_topology::explorer::solid_faces(&topo, plate)
+        .unwrap()
+        .into_iter()
+        .find(|&f| {
+            matches!(topo.face(f).unwrap().surface(), FaceSurface::Plane { normal, d }
+                if normal.z() < -1.0 + 1e-9 && d.abs() < 1e-9)
+        })
+        .unwrap();
+    let result = chamfer_two_on(&mut topo, plate, &[(edge, floor)], 1.0, 2.0);
+    assert!(
+        matches!(result, Err(OperationsError::InvalidInput { .. })),
+        "{result:?}"
+    );
+}
+
+/// A 10-unit block with an enclosed 3-unit cubic cavity keeps the cavity
+/// through a chamfer of an outer edge; an edge of the cavity is refused.
+#[test]
+fn a_cavity_survives_a_chamfer_of_an_outer_edge() {
+    let (d1, d2) = (2.0, 1.0);
+    let mut topo = Topology::new();
+    let block = make_box(&mut topo, 10.0, 10.0, 10.0).unwrap();
+    let cube = make_box(&mut topo, 3.0, 3.0, 3.0).unwrap();
+    transform_solid(&mut topo, cube, &Mat4::translation(3.5, 3.5, 3.5)).unwrap();
+    let hollow = boolean(&mut topo, BooleanOp::Cut, block, cube).unwrap();
+    assert_eq!(topo.solid(hollow).unwrap().inner_shells().len(), 1);
+
+    let cavity_edge = edge_between(
+        &topo,
+        hollow,
+        Point3::new(3.5, 3.5, 6.5),
+        Point3::new(6.5, 3.5, 6.5),
+    );
+    let cavity_face = brepkit_topology::explorer::solid_faces(&topo, hollow)
+        .unwrap()
+        .into_iter()
+        .find(|&f| {
+            brepkit_topology::explorer::face_edges(&topo, f)
+                .unwrap()
+                .contains(&cavity_edge)
+        })
+        .unwrap();
+    assert!(chamfer_two_on(&mut topo, hollow, &[(cavity_edge, cavity_face)], 0.5, 0.5).is_err());
+
+    let edge = edge_between(
+        &topo,
+        hollow,
+        Point3::new(0.0, 0.0, 10.0),
+        Point3::new(10.0, 0.0, 10.0),
+    );
+    let top = plane_along(&topo, hollow, edge, [0.0, 0.0, 1.0]);
+    let cut = chamfer_two_on(&mut topo, hollow, &[(edge, top)], d1, d2).unwrap();
+    assert_eq!(topo.solid(cut).unwrap().inner_shells().len(), 1);
+    let report = validate_solid(&topo, cut).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+    let want = 1000.0 - 27.0 - 0.5 * d1 * d2 * 10.0;
     let volume = solid_volume(&topo, cut, 0.001).unwrap();
     assert!(
         (volume - want).abs() < 1e-6 * want,

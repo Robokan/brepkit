@@ -22,6 +22,9 @@ use crate::util::{face_polygon, point_in_polygon_3d};
 /// Minimum positive ray parameter to count as a forward hit.
 const RAY_T_MIN: f64 = 1e-12;
 
+/// How near two of a ray's hits on a NURBS face lie to be one hit.
+const NURBS_HIT_REACH: f64 = 1e-6;
+
 /// Threshold for half-space sign test (negative side rejection).
 const HALF_SPACE_EPS: f64 = 1e-10;
 
@@ -259,28 +262,6 @@ where
     Ok(false)
 }
 
-/// The `(u, v)` at which a torus passes through a point on it. A spindle
-/// torus's tube runs across its axis, and a point there lies on the tube
-/// circle half a turn round (where `R + r cos v` is negative), while the
-/// projection reads it on the near tube circle, a sheet's spacing away.
-fn torus_parameters(tor: &brepkit_math::surfaces::ToroidalSurface, p: Point3) -> (f64, f64) {
-    let near = tor.project_point(p);
-    if tor.major_radius() >= tor.minor_radius() {
-        return near;
-    }
-    let rel = p - tor.center();
-    let rho = tor.x_axis().dot(rel).hypot(tor.y_axis().dot(rel));
-    let far = (
-        (near.0 + PI).rem_euclid(std::f64::consts::TAU),
-        tor.z_axis()
-            .dot(rel)
-            .atan2(-rho - tor.major_radius())
-            .rem_euclid(std::f64::consts::TAU),
-    );
-    let off = |(u, v): (f64, f64)| (tor.evaluate(u, v) - p).length();
-    if off(far) < off(near) { far } else { near }
-}
-
 /// Count crossings for analytic (non-planar) faces using UV containment.
 ///
 /// Given ray parameter roots (where the ray hits the infinite surface),
@@ -331,6 +312,28 @@ enum UvRegion {
     Whole,
     /// The outer loop's samples.
     Bounded(Vec<(f64, f64)>),
+}
+
+/// The vertex of a torus face's outer wire on the torus's axis, where its
+/// ring angle `u` is undefined: a horn torus's pinch, where a fillet's corner
+/// patch closes. Its wire closes along that point's tube angle there, as a
+/// pointed cone's does along its apex.
+fn torus_axis_vertex(
+    topo: &Topology,
+    face_id: FaceId,
+    tor: &brepkit_math::surfaces::ToroidalSurface,
+) -> Result<Option<Point3>, CheckError> {
+    let axis = tor.z_axis();
+    let reach = brepkit_math::tolerance::Tolerance::new().linear
+        * (tor.major_radius() + tor.minor_radius()).max(1.0);
+    for oe in topo.wire(topo.face(face_id)?.outer_wire())?.edges() {
+        let p = topo.vertex(topo.edge(oe.edge())?.start())?.point();
+        let from_center = p - tor.center();
+        if (from_center - axis * axis.dot(from_center)).length() <= reach {
+            return Ok(Some(p));
+        }
+    }
+    Ok(None)
 }
 
 /// The outer region of a cylinder, cone or torus face in its `(u, v)`.
@@ -437,47 +440,83 @@ fn uv_extent(loop_uv: &[(f64, f64)]) -> f64 {
 ///
 /// Returns an error if topology lookups fail.
 pub fn face_contains(topo: &Topology, face_id: FaceId, p: Point3) -> Result<bool, CheckError> {
+    Ok(face_contains_each(topo, face_id, &[p])?
+        .first()
+        .copied()
+        .unwrap_or(false))
+}
+
+/// [`face_contains`] for each of `points`, reading the face's boundary once.
+///
+/// # Errors
+///
+/// Returns an error if topology lookups fail.
+pub fn face_contains_each(
+    topo: &Topology,
+    face_id: FaceId,
+    points: &[Point3],
+) -> Result<Vec<bool>, CheckError> {
     let face = topo.face(face_id)?;
     match face.surface() {
-        FaceSurface::Plane { normal, .. } => {
-            if let Some(inside) = plane_hit_inside(topo, face_id, p, *normal)? {
-                return Ok(inside);
-            }
-            let verts = face_polygon(topo, face_id)?;
-            Ok(verts.len() >= 3
-                && point_in_polygon_3d(&p, &verts, normal)
-                && !hit_in_inner_wire_3d(topo, face_id, p, normal)?)
-        }
+        FaceSurface::Plane { normal, .. } => points
+            .iter()
+            .map(|&p| {
+                if let Some(inside) = plane_hit_inside(topo, face_id, p, *normal)? {
+                    return Ok(inside);
+                }
+                let verts = face_polygon(topo, face_id)?;
+                Ok(verts.len() >= 3
+                    && point_in_polygon_3d(&p, &verts, normal)
+                    && !hit_in_inner_wire_3d(topo, face_id, p, normal)?)
+            })
+            .collect(),
         FaceSurface::Cylinder(cyl) => {
             let project = |q: Point3| cyl.project_point(q);
             let region = uv_region(topo, face_id, &project, false, None)?;
-            uv_region_contains(&region, topo, face_id, project(p), &project, false)
+            points
+                .iter()
+                .map(|&p| uv_region_contains(&region, topo, face_id, project(p), &project, false))
+                .collect()
         }
         FaceSurface::Cone(cone) => {
             let project = |q: Point3| cone.project_point(q);
             let region = uv_region(topo, face_id, &project, false, Some(cone.apex()))?;
-            uv_region_contains(&region, topo, face_id, project(p), &project, false)
+            points
+                .iter()
+                .map(|&p| uv_region_contains(&region, topo, face_id, project(p), &project, false))
+                .collect()
         }
         FaceSurface::Torus(tor) => {
-            let project = |q: Point3| torus_parameters(tor, q);
-            let region = uv_region(topo, face_id, &project, true, None)?;
-            uv_region_contains(&region, topo, face_id, project(p), &project, true)
+            let project = |q: Point3| tor.project_point_nearest(q);
+            let apex = torus_axis_vertex(topo, face_id, tor)?;
+            let region = uv_region(topo, face_id, &project, true, apex)?;
+            points
+                .iter()
+                .map(|&p| uv_region_contains(&region, topo, face_id, project(p), &project, true))
+                .collect()
         }
         FaceSurface::Sphere(_) => match SphereRegion::of(topo, face_id)? {
-            Some(region) => region.contains(topo, face_id, p),
-            None => Ok(true),
+            Some(region) => points
+                .iter()
+                .map(|&p| region.contains(topo, face_id, p))
+                .collect(),
+            None => Ok(vec![true; points.len()]),
         },
         FaceSurface::Nurbs(surface) => {
             let project = |q: Point3| -> (f64, f64) { surface.project_point(q) };
             let verts = face_polygon(topo, face_id)?;
-            let (u, v) = project(p);
             let boundary = build_uv_boundary(&verts, &project, false);
             // A closed surface's seam copies project to one `u`, folding its
             // loop flat: such a face is the whole surface.
-            let in_outer = verts.len() < 3
-                || uv_area(&boundary) <= 1e-9 * uv_extent(&boundary)
-                || point_in_uv_boundary(u, v, &boundary, false);
-            Ok(in_outer && !hit_in_inner_wire_uv(topo, face_id, u, v, &project, false)?)
+            let whole = verts.len() < 3 || uv_area(&boundary) <= 1e-9 * uv_extent(&boundary);
+            points
+                .iter()
+                .map(|&p| {
+                    let (u, v) = project(p);
+                    let in_outer = whole || point_in_uv_boundary(u, v, &boundary, false);
+                    Ok(in_outer && !hit_in_inner_wire_uv(topo, face_id, u, v, &project, false)?)
+                })
+                .collect()
         }
     }
 }
@@ -487,17 +526,17 @@ pub fn face_contains(topo: &Topology, face_id: FaceId, p: Point3) -> Result<bool
 ///
 /// The outer loop's Newell normal points to the face's side of the loop. A
 /// loop in one plane bounds exactly the sphere's part on that side; any
-/// other loop of lines and circles is read by the parity of great-circle
-/// arcs ([`SphereRims`]), and one with other curves bounds the points that
-/// project inside it along that normal. A wire that only runs a seam out
-/// and back bounds nothing, and the face is the whole sphere. Holes come
-/// off by [`hit_in_sphere_hole`] where the parity does not count them.
+/// other loop is read by the parity of great-circle arcs ([`SphereRims`]),
+/// and where that parity ties it bounds the points that project inside it
+/// along that normal. A wire that only runs a seam out and back bounds
+/// nothing, and the face is the whole sphere. Holes come off by
+/// [`hit_in_sphere_hole`] where the parity does not count them.
 pub struct SphereRegion {
     outer: Vec<Point3>,
     normal: Vec3,
     whole: bool,
     planar: bool,
-    /// Set for a loop in no one plane whose edges are all lines and circles.
+    /// Set for a loop in no one plane.
     rims: Option<SphereRims>,
 }
 
@@ -554,9 +593,15 @@ impl SphereRegion {
 /// end of the test arc or a rim tangentially, leaving its parity unread.
 const SPHERE_GRAZE: f64 = 1e-9;
 
+/// Chords an ellipse or NURBS edge on a sphere is read as: a quarter turn
+/// of a circle strays under 1e-4 of the radius from the arcs they stand for.
+const CURVE_CHORDS: u32 = 64;
+
 /// A sphere face's edges read on the sphere, holes included, and points
 /// just inside its outer wire. A circle is an arc of itself; a line is a
-/// chord standing for the great-circle arc it projects to from the centre.
+/// chord standing for the great-circle arc it projects to from the centre;
+/// an ellipse or NURBS curve, which lies on the sphere, is a run of such
+/// chords between points along it.
 struct SphereRims {
     center: Point3,
     radius: f64,
@@ -579,7 +624,7 @@ enum SphereRim {
 }
 
 impl SphereRims {
-    /// `None` when an edge is an ellipse or NURBS curve.
+    /// `None` when the face is not on a sphere.
     fn of(topo: &Topology, face_id: FaceId) -> Result<Option<Self>, CheckError> {
         use brepkit_topology::edge::EdgeCurve;
         let face = topo.face(face_id)?;
@@ -657,7 +702,43 @@ impl SphereRims {
                             }
                         }
                     }
-                    EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_) => return Ok(None),
+                    curve @ (EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_)) => {
+                        let (t0, t1) = curve.domain_with_endpoints(a, b);
+                        let at = |f: f64| (t1 - t0).mul_add(f, t0);
+                        let mut from = a;
+                        let mut length = 0.0;
+                        for i in 1..=CURVE_CHORDS {
+                            let to = if i == CURVE_CHORDS {
+                                b
+                            } else {
+                                curve.evaluate_with_endpoints(
+                                    at(f64::from(i) / f64::from(CURVE_CHORDS)),
+                                    a,
+                                    b,
+                                )
+                            };
+                            rims.push(SphereRim::Chord(from - center, to - center));
+                            length += (to - from).length();
+                            from = to;
+                        }
+                        if w == 0 {
+                            // Each mark at a chord's middle, clear of the
+                            // points between chords. A descending domain runs
+                            // the curve against its tangent.
+                            let n = f64::from(CURVE_CHORDS);
+                            let along = if t1 < t0 { -sign } else { sign };
+                            for f in [0.25, 0.5, 0.75] {
+                                let t = at(((f * n).floor() + 0.5) / n);
+                                if let Some(q) = on_sphere(curve.evaluate_with_endpoints(t, a, b)) {
+                                    marks.push((
+                                        length,
+                                        q,
+                                        curve.tangent_with_endpoints(t, a, b) * along,
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -776,14 +857,19 @@ impl SphereRims {
                     let closed = span >= std::f64::consts::TAU - 1e-12;
                     for t in [phi + w, phi - w] {
                         let rel = (t - t0).rem_euclid(std::f64::consts::TAU);
-                        if !closed
+                        // A rim's end leaves the parity unread only on the
+                        // test arc: the great circle through it meets far
+                        // vertices too, as a small circle's pole.
+                        let at_end = !closed
                             && (rel < SPHERE_GRAZE
                                 || std::f64::consts::TAU - rel < SPHERE_GRAZE
-                                || (rel - span).abs() < SPHERE_GRAZE)
+                                || (rel - span).abs() < SPHERE_GRAZE);
+                        if (at_end || rel <= span)
+                            && on_path(center + (u * t.cos() + v * t.sin()) * radius)?
                         {
-                            return None;
-                        }
-                        if rel <= span && on_path(center + (u * t.cos() + v * t.sin()) * radius)? {
+                            if at_end {
+                                return None;
+                            }
                             count += 1;
                         }
                     }
@@ -802,12 +888,12 @@ impl SphereRims {
                             a.cross(x).dot(h) / (a.length() * self.radius),
                             x.cross(b).dot(h) / (b.length() * self.radius),
                         );
-                        if (s0.abs() < SPHERE_GRAZE && a.dot(x) > 0.0)
-                            || (s1.abs() < SPHERE_GRAZE && b.dot(x) > 0.0)
-                        {
-                            return None;
-                        }
-                        if s0 > 0.0 && s1 > 0.0 && on_path(x)? {
+                        let at_end = (s0.abs() < SPHERE_GRAZE && a.dot(x) > 0.0)
+                            || (s1.abs() < SPHERE_GRAZE && b.dot(x) > 0.0);
+                        if (at_end || (s0 > 0.0 && s1 > 0.0)) && on_path(x)? {
+                            if at_end {
+                                return None;
+                            }
                             count += 1;
                         }
                     }
@@ -857,8 +943,10 @@ fn count_3d_polygon_crossings(
 /// For plane faces, uses direct ray-plane + 3D polygon containment.
 /// For analytic curved faces, uses ray-surface intersection + UV containment.
 /// For sphere faces, uses 3D polygon containment (avoids UV pole singularity).
-/// For NURBS faces, uses line-surface intersection. `sphere` keeps a sphere
-/// face's region from one ray to the next.
+/// For NURBS faces, uses line-surface intersection, patch by patch. `cache`
+/// keeps what a sphere or NURBS face builds from one ray to the next, and
+/// `unsure` is set when the ray grazes a NURBS face, so that its count of
+/// crossings there may be wrong.
 ///
 /// # Errors
 ///
@@ -869,7 +957,8 @@ pub fn count_face_ray_crossings(
     face_id: FaceId,
     origin: Point3,
     direction: Vec3,
-    sphere: &std::cell::OnceCell<Option<SphereRegion>>,
+    cache: &FaceRayCache,
+    unsure: &mut bool,
 ) -> Result<u32, CheckError> {
     let face = topo.face(face_id)?;
     match face.surface() {
@@ -907,25 +996,32 @@ pub fn count_face_ray_crossings(
         FaceSurface::Sphere(sph) => {
             let sph = sph.clone();
             let roots = ray_surface::ray_sphere(origin, direction, &sph);
-            count_3d_polygon_crossings(topo, face_id, origin, direction, &roots, sphere)
+            count_3d_polygon_crossings(topo, face_id, origin, direction, &roots, &cache.sphere)
         }
         FaceSurface::Torus(tor) => {
             let tor = tor.clone();
             let roots = ray_surface::ray_torus(origin, direction, &tor);
+            let apex = torus_axis_vertex(topo, face_id, &tor)?;
             count_analytic_crossings(
                 topo,
                 face_id,
                 origin,
                 direction,
                 &roots,
-                |p| torus_parameters(&tor, p),
+                |p| tor.project_point_nearest(p),
                 true,
-                None,
+                apex,
             )
         }
-        FaceSurface::Nurbs(surface) => {
-            ray_crossings_nurbs(topo, face_id, origin, direction, surface)
-        }
+        FaceSurface::Nurbs(surface) => ray_crossings_nurbs(
+            topo,
+            face_id,
+            origin,
+            direction,
+            surface,
+            &cache.nurbs,
+            unsure,
+        ),
     }
 }
 
@@ -989,15 +1085,49 @@ pub fn plane_hit_inside(
     ))
 }
 
+/// What a face's ray crossings build once and keep from one ray to the
+/// next: a sphere face's region, or a NURBS face's surface cut into the
+/// Bezier patches the ray is tested against.
+#[derive(Default)]
+pub struct FaceRayCache {
+    sphere: std::cell::OnceCell<Option<SphereRegion>>,
+    nurbs: std::cell::OnceCell<Option<brepkit_math::nurbs::intersection::RaySurface>>,
+}
+
 /// Count ray crossings for a NURBS face using ray-surface intersection.
+///
+/// The ray is tested against each Bezier patch's control hull, so a
+/// crossing inside a knot span however narrow is found; a grid of the
+/// whole domain passes over a feature that spans a sliver of it. A surface
+/// the patches cannot hold (a weight not positive, knots not clamped) is
+/// sampled on that grid, and the ray is unsure of its count there.
 fn ray_crossings_nurbs(
     topo: &Topology,
     face_id: FaceId,
     origin: Point3,
     direction: Vec3,
     surface: &brepkit_math::nurbs::surface::NurbsSurface,
+    patches: &std::cell::OnceCell<Option<brepkit_math::nurbs::intersection::RaySurface>>,
+    unsure: &mut bool,
 ) -> Result<u32, CheckError> {
-    let hits = ray_surface::ray_nurbs(origin, direction, surface, 20)?;
+    let patches =
+        patches.get_or_init(|| brepkit_math::nurbs::intersection::RaySurface::new(surface));
+    let hits = if let Some(patches) = patches {
+        let found = patches.hits(origin, direction, NURBS_HIT_REACH);
+        *unsure |= found.grazed;
+        // `hits` reads `t` along the unit direction.
+        let scale = direction.length();
+        found
+            .hits
+            .iter()
+            .map(|h| (h.t / scale, h.u, h.v))
+            .filter(|&(t, _, _)| t > RAY_T_MIN)
+            .collect()
+    } else {
+        // The grid can pass over a crossing inside a narrow knot span.
+        *unsure = true;
+        ray_surface::ray_nurbs(origin, direction, surface, 20)?
+    };
     if hits.is_empty() {
         return Ok(0);
     }
@@ -1115,7 +1245,7 @@ mod tests {
         for (u, v) in [(2.3, 4.0), (0.4, 3.6), (5.9, 2.9)] {
             assert!(0.1 + 2.45 * f64::cos(v) < 0.0);
             let p = tor.evaluate(u, v);
-            let (pu, pv) = torus_parameters(&tor, p);
+            let (pu, pv) = tor.project_point_nearest(p);
             assert!((tor.evaluate(pu, pv) - p).length() < 1e-9, "({u}, {v})");
             assert!(
                 pv > FRAC_PI_2 && pv < 3.0 * FRAC_PI_2,
@@ -1123,7 +1253,230 @@ mod tests {
             );
         }
         let p = tor.evaluate(0.3, 5.5);
-        let (pu, pv) = torus_parameters(&tor, p);
+        let (pu, pv) = tor.project_point_nearest(p);
         assert!((pu - 0.3).abs() < 1e-9 && (pv - 5.5).abs() < 1e-9);
+    }
+
+    /// A patch round a unit sphere's pole whose rim dips below the equator is
+    /// no graph over the equator's plane: near a low corner a vertical line
+    /// meets it twice. Its rim is eight great-circle arcs held as NURBS,
+    /// between corners an eighth of a turn apart at heights 0.5 and -0.3 in
+    /// turn. A point below the rim, whose twin above it lies on the patch,
+    /// reads off it.
+    #[test]
+    fn a_patch_rimmed_by_nurbs_arcs_reads_both_sides_of_the_sphere() {
+        use std::f64::consts::{FRAC_PI_4, TAU};
+
+        use brepkit_geometry::convert::curve_to_nurbs::circle_to_nurbs;
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::SphericalSurface;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut topo = Topology::new();
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let corners: Vec<Point3> = (0..8)
+            .map(|k| {
+                let z: f64 = if k % 2 == 0 { 0.5 } else { -0.3 };
+                let (s, c) = (f64::from(k) * FRAC_PI_4).sin_cos();
+                let r = (1.0 - z * z).sqrt();
+                Point3::new(r * c, r * s, z)
+            })
+            .collect();
+        let vertices: Vec<_> = corners
+            .iter()
+            .map(|&p| topo.add_vertex(Vertex::new(p, 1e-7)))
+            .collect();
+        let mut edges = Vec::new();
+        for k in 0..8 {
+            let (a, b) = (corners[k], corners[(k + 1) % 8]);
+            let normal = (a - origin).cross(b - origin).normalize().unwrap();
+            let circle = Circle3D::new(origin, normal, 1.0).unwrap();
+            let t0 = circle.project(a);
+            let t1 = t0 + (circle.project(b) - t0).rem_euclid(TAU);
+            let arc = circle_to_nurbs(&circle, t0, t1).unwrap();
+            let e = topo.add_edge(Edge::new(
+                vertices[k],
+                vertices[(k + 1) % 8],
+                EdgeCurve::NurbsCurve(arc),
+            ));
+            edges.push(OrientedEdge::new(e, true));
+        }
+        let wire = topo.add_wire(Wire::new(edges, true).unwrap());
+        let sphere = SphericalSurface::new(origin, 1.0).unwrap();
+        let face = topo.add_face(Face::new(wire, vec![], FaceSurface::Sphere(sphere)));
+
+        let below = Point3::new(0.897_531_44, 0.392_985_12, -0.2);
+        let above = Point3::new(below.x(), below.y(), 0.2);
+        assert!(!face_contains(&topo, face, below).unwrap());
+        assert!(face_contains(&topo, face, above).unwrap());
+        assert!(face_contains(&topo, face, Point3::new(0.0, 0.0, 1.0)).unwrap());
+        assert!(!face_contains(&topo, face, Point3::new(0.0, 0.0, -1.0)).unwrap());
+    }
+
+    /// A whole patch through (k, u, z_k) for k = 0..=8 along a cubic `v`,
+    /// flat but for (4, u, 1), whose interior knots sit `width` apart after
+    /// 0.5: its bump rises to z = 2/3 at x = 4 inside v from 0.5 + width to
+    /// 0.5 + 5 width, where no even grid of the domain samples it. At
+    /// 1e-8 a unit in the last place of `v` moves the point farther than
+    /// 1e-12 of the patch's size, which Newton cannot then reach. A ray up
+    /// through the bump crosses the face once, and one above it not at all.
+    #[test]
+    fn a_ray_crosses_a_bump_inside_narrow_knot_spans() {
+        for width in [1e-4, 1e-6, 1e-8] {
+            crosses_a_bump(width);
+        }
+    }
+
+    fn crosses_a_bump(width: f64) {
+        let (topo, face) = bump_face(width);
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let cell = FaceRayCache::default();
+        let below = Point3::new(4.0, 0.5, 0.3);
+        let above = Point3::new(4.0, 0.5, 1.0);
+        let crossings = |from| {
+            let mut unsure = false;
+            let n = count_face_ray_crossings(&topo, face, from, up, &cell, &mut unsure).unwrap();
+            assert!(!unsure, "width {width}: unsure from {from:?}");
+            n
+        };
+        assert_eq!(crossings(below), 1, "width {width}: below");
+        assert_eq!(crossings(above), 0, "width {width}: above");
+    }
+
+    /// Along `u` the bump is straight: a ray along its ridge, at the top of
+    /// the bump, runs in the face, and its count there is not to be trusted.
+    #[test]
+    fn a_ray_along_a_nurbs_face_is_unsure_of_its_crossings() {
+        let width = 1e-4_f64;
+        let (topo, face) = bump_face(width);
+        let surface = match topo.face(face).unwrap().surface() {
+            FaceSurface::Nurbs(surface) => Some(surface),
+            _ => None,
+        }
+        .unwrap();
+        let top = surface.evaluate(0.5, width.mul_add(3.0, 0.5));
+        let along = Vec3::new(0.0, 1.0, 0.0);
+        let mut unsure = false;
+        let from = Point3::new(top.x(), -0.5, top.z());
+        count_face_ray_crossings(
+            &topo,
+            face,
+            from,
+            along,
+            &FaceRayCache::default(),
+            &mut unsure,
+        )
+        .unwrap();
+        assert!(unsure, "a ray along the ridge at {top:?}");
+    }
+
+    /// A flat patch at z = 1 whose `u` knots are not clamped, which the
+    /// Bezier patches cannot hold: its grid of samples could pass over a
+    /// crossing, so a ray up through it is unsure of its count.
+    #[test]
+    fn a_ray_through_a_patch_read_on_its_grid_is_unsure() {
+        use brepkit_math::nurbs::surface::NurbsSurface;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let p = Point3::new;
+        let surface = NurbsSurface::new(
+            1,
+            1,
+            vec![0.0, 0.25, 0.5, 0.75, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                vec![p(0.0, 0.0, 1.0), p(0.0, 1.0, 1.0)],
+                vec![p(0.5, 0.0, 1.0), p(0.5, 1.0, 1.0)],
+                vec![p(1.0, 0.0, 1.0), p(1.0, 1.0, 1.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+        )
+        .unwrap();
+        assert!(brepkit_math::nurbs::intersection::RaySurface::new(&surface).is_none());
+        let (u0, u1) = surface.domain_u();
+        let corners =
+            [(u0, 0.0), (u1, 0.0), (u1, 1.0), (u0, 1.0)].map(|(u, v)| surface.evaluate(u, v));
+        let mut topo = Topology::new();
+        let v: Vec<_> = corners
+            .iter()
+            .map(|&c| topo.add_vertex(Vertex::new(c, 1e-7)))
+            .collect();
+        let edges = (0..4)
+            .map(|k| {
+                OrientedEdge::new(
+                    topo.add_edge(Edge::new(v[k], v[(k + 1) % 4], EdgeCurve::Line)),
+                    true,
+                )
+            })
+            .collect();
+        let wire = topo.add_wire(Wire::new(edges, true).unwrap());
+        let face = topo.add_face(Face::new(wire, vec![], FaceSurface::Nurbs(surface)));
+        let mut unsure = false;
+        count_face_ray_crossings(
+            &topo,
+            face,
+            p(0.5, 0.5, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            &FaceRayCache::default(),
+            &mut unsure,
+        )
+        .unwrap();
+        assert!(unsure);
+    }
+
+    /// The face of [`crosses_a_bump`], its bump inside knot spans `width`
+    /// apart.
+    fn bump_face(width: f64) -> (Topology, FaceId) {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        use brepkit_math::nurbs::surface::NurbsSurface;
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut knots_v = vec![0.0; 4];
+        knots_v.extend((1..=5).map(|k| width.mul_add(f64::from(k), 0.5)));
+        knots_v.extend([1.0; 4]);
+        let z = |k: usize| if k == 4 { 1.0 } else { 0.0 };
+        #[allow(clippy::cast_precision_loss)]
+        let row =
+            |u: f64| -> Vec<Point3> { (0..9).map(|k| Point3::new(k as f64, u, z(k))).collect() };
+        let surface = NurbsSurface::new(
+            1,
+            3,
+            vec![0.0, 0.0, 1.0, 1.0],
+            knots_v.clone(),
+            vec![row(0.0), row(1.0)],
+            vec![vec![1.0; 9]; 2],
+        )
+        .unwrap();
+        let side = |u: f64| {
+            EdgeCurve::NurbsCurve(
+                NurbsCurve::new(3, knots_v.clone(), row(u), vec![1.0; 9]).unwrap(),
+            )
+        };
+        let mut topo = Topology::new();
+        let v: Vec<_> = [(0.0, 0.0), (8.0, 0.0), (8.0, 1.0), (0.0, 1.0)]
+            .iter()
+            .map(|&(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), 1e-7)))
+            .collect();
+        let edges = [
+            Edge::new(v[0], v[1], side(0.0)),
+            Edge::new(v[1], v[2], EdgeCurve::Line),
+            Edge::new(v[3], v[2], side(1.0)),
+            Edge::new(v[0], v[3], EdgeCurve::Line),
+        ]
+        .into_iter()
+        .zip([true, true, false, false])
+        .map(|(e, forward)| OrientedEdge::new(topo.add_edge(e), forward))
+        .collect();
+        let wire = topo.add_wire(Wire::new(edges, true).unwrap());
+        let face = topo.add_face(Face::new(wire, vec![], FaceSurface::Nurbs(surface)));
+        (topo, face)
     }
 }

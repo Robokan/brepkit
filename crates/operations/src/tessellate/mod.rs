@@ -37,13 +37,14 @@ use brepkit_topology::face::FaceId;
 pub(crate) use face::sphere_face_is_off_grid;
 pub use face::{tessellate_with_uvs, tessellate_with_uvs_a};
 pub(crate) use mesh_ops::COINCIDENT_DEDUPE_GRID;
+pub(crate) use mesh_ops::drawn_edge_samples;
 pub use mesh_ops::{
     EdgeLines, boundary_edge_count, is_watertight, non_manifold_edge_count, sample_solid_edges,
     sample_solid_edges_filtered,
 };
 pub use solid::{
-    tessellate_solid, tessellate_solid_for_boolean, tessellate_solid_grouped_with_tolerance,
-    tessellate_solid_with_tolerance,
+    tessellate_solid, tessellate_solid_faceted_with_tolerance, tessellate_solid_for_boolean,
+    tessellate_solid_grouped_with_tolerance, tessellate_solid_with_tolerance,
 };
 
 /// Merge-grid cell size for tolerance-based vertex deduplication.
@@ -97,6 +98,20 @@ pub(super) enum AnalyticKind {
     ConeApex,
     /// Triangle fan at v_max only (sphere north pole for a hemisphere face).
     VMaxPole,
+}
+
+/// A deflection the meshers can refine down to: a zero or negative one
+/// subdivides without end.
+pub(super) fn check_deflection(deflection: f64) -> Result<(), crate::OperationsError> {
+    if deflection > 0.0 && deflection.is_finite() {
+        Ok(())
+    } else {
+        Err(crate::OperationsError::InvalidInput {
+            reason: format!(
+                "tessellation deflection must be positive and finite, got {deflection}"
+            ),
+        })
+    }
 }
 
 /// Tessellate a face into a triangle mesh.

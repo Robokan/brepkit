@@ -531,9 +531,13 @@ fn split_noseam_by_arrangement(
             .iter()
             .any(|a| off_vertex(a.start_3d) || off_vertex(a.end_3d))
     {
-        let Some(seam_arcs) =
-            build_seam_arcs_split(surface, boundary_edges, open_sections, tol, true)
-        else {
+        let Some(seam_arcs) = build_seam_arcs_split(
+            surface,
+            boundary_edges,
+            open_sections,
+            tol,
+            SeamSplit::HalveWide,
+        ) else {
             return Vec::new();
         };
         let Some(inside) = region_sample(surface, &seam_arcs, &[]) else {
@@ -567,7 +571,13 @@ fn split_noseam_by_arrangement(
 
     // Reconstruct the seam as its exact circle and split it at the crossings,
     // so the seam arcs share endpoints EXACTLY with the open arcs.
-    let Some(seam_arcs) = build_seam_arcs(surface, boundary_edges, open_sections, tol) else {
+    let Some(seam_arcs) = build_seam_arcs_split(
+        surface,
+        boundary_edges,
+        open_sections,
+        tol,
+        SeamSplit::Halve,
+    ) else {
         return Vec::new();
     };
 
@@ -1147,19 +1157,37 @@ fn build_seam_arcs(
     open_sections: &[OrientedPCurveEdge],
     tol: f64,
 ) -> Option<Vec<OrientedPCurveEdge>> {
-    build_seam_arcs_split(surface, boundary_edges, open_sections, tol, false)
+    build_seam_arcs_split(
+        surface,
+        boundary_edges,
+        open_sections,
+        tol,
+        SeamSplit::AtCrossings,
+    )
 }
 
-/// [`build_seam_arcs`], with `halve_wide` also splitting each arc spanning
-/// half a turn or more into pieces under half a turn: two seam arcs of one
-/// face sharing both ends would otherwise be welded into one edge by the
-/// assembler's endpoint-keyed merge.
+/// Where [`build_seam_arcs_split`] splits the seam circle besides the
+/// crossings. The assembler merges edges by their ends, so two arcs sharing
+/// both ends would be welded into one edge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeamSplit {
+    AtCrossings,
+    /// Into pieces under half a turn, as two seam arcs of one face can
+    /// share both ends.
+    HalveWide,
+    /// At the middle of each arc, as a second ball whose seam lies in the
+    /// same plane meets the same crossings, its arcs between them lying on
+    /// another circle.
+    Halve,
+}
+
+/// [`build_seam_arcs`], with the seam circle also split as `split` says.
 fn build_seam_arcs_split(
     surface: &FaceSurface,
     boundary_edges: &[OrientedPCurveEdge],
     open_sections: &[OrientedPCurveEdge],
     tol: f64,
-    halve_wide: bool,
+    split: SeamSplit,
 ) -> Option<Vec<OrientedPCurveEdge>> {
     use brepkit_math::curves::Circle3D;
     use std::f64::consts::{PI, TAU};
@@ -1205,7 +1233,7 @@ fn build_seam_arcs_split(
         .map(|p| (seam_circle.project(p), p))
         .collect();
     by_angle.sort_by(|a, b| a.0.total_cmp(&b.0));
-    if halve_wide {
+    if split != SeamSplit::AtCrossings {
         for entry in &mut by_angle {
             entry.0 = entry.0.rem_euclid(TAU);
         }
@@ -1216,7 +1244,13 @@ fn build_seam_arcs_split(
             let span = (a1 - a0).rem_euclid(TAU);
             let span = if span <= 0.0 { TAU } else { span };
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pieces = (span / (0.999 * PI)).ceil().max(1.0) as usize;
+            let pieces = match split {
+                SeamSplit::HalveWide => (span / (0.999 * PI)).ceil().max(1.0) as usize,
+                // Halves of an arc too short to halve would fall under the
+                // closeness at which the arcs below are skipped.
+                SeamSplit::Halve if seam_radius * span >= tol * 400.0 => 2,
+                SeamSplit::Halve | SeamSplit::AtCrossings => 1,
+            };
             for k in 1..pieces {
                 #[allow(clippy::cast_precision_loss)]
                 let at = (a0 + span * k as f64 / pieces as f64).rem_euclid(TAU);
@@ -2416,19 +2450,20 @@ fn split_torus_by_tube_loops(
     if loops.len() < 2 {
         return None;
     }
-    // Order the loops around the ring along one latitude.
-    let v_ref = loops[0].walk[0].0;
-    let mut order: Vec<(f64, usize)> = loops
-        .iter()
-        .enumerate()
-        .map(|(i, l)| (l.u_at(v_ref).rem_euclid(TAU), i))
-        .collect();
-    order.sort_by(|a, b| a.0.total_cmp(&b.0));
-    if order.windows(2).any(|w| w[1].0 - w[0].0 < 1e-9)
-        || order[0].0 + TAU - order[order.len() - 1].0 < 1e-9
-    {
-        return None;
-    }
+    // Order the loops around the ring along one latitude, clear of any
+    // vertex two loops share.
+    let order = (0..8_u32).find_map(|j| {
+        let v_ref = loops[0].walk[0].0 + TAU * f64::from(j) / 8.0;
+        let mut order: Vec<(f64, usize)> = loops
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.u_at(v_ref).rem_euclid(TAU), i))
+            .collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (!(order.windows(2).any(|w| w[1].0 - w[0].0 < 1e-9)
+            || order[0].0 + TAU - order[order.len() - 1].0 < 1e-9))
+            .then_some(order)
+    })?;
     let loops: Vec<&TubeLoop> = order.iter().map(|&(_, i)| &loops[i]).collect();
     // The width of the sector past loop `i` at `v`.
     let width = |i: usize, v: f64| {
@@ -2507,6 +2542,38 @@ fn split_torus_by_tube_loops(
     let mut sectors = Vec::with_capacity(n);
     for i in 0..n {
         let (first, next) = (loops[i], loops[(i + 1) % n]);
+        // Loops that touch at a vertex (a plane tangent to the tube's inner
+        // side cuts two loops crossing at a node) close the sector between
+        // them where it narrows to that vertex: its inside is a disc already,
+        // and a seam would cut it in two.
+        let pinch = first.vertices().find_map(|(ka, a)| {
+            next.vertices()
+                .find(|&(_, b)| (b - a).length() < close_tol)
+                .map(|(kb, _)| (ka, kb, torus.project_point(a).1))
+        });
+        if let Some((ka, kb, v_node)) = pinch
+            && [v_node - 1e-3, v_node + 1e-3]
+                .iter()
+                .all(|&v| width(i, v) < PI)
+        {
+            if !held[i].is_empty() {
+                return None;
+            }
+            let mut wire = next.run_from(kb, true);
+            wire.extend(first.run_from(ka, false));
+            let v_far = v_node + PI;
+            let interior = torus.evaluate(first.u_at(v_far) + 0.5 * width(i, v_far), v_far);
+            sectors.push(SplitSubFace {
+                surface: surface.clone(),
+                outer_wire: wire,
+                inner_wires: Vec::new(),
+                reversed,
+                parent: face_id,
+                rank,
+                precomputed_interior: Some(interior),
+            });
+            continue;
+        }
         // The vertex pair nearest in tube angle whose straight seam stays
         // inside the sector and clear of its lobes; where a lobe lies on the
         // short way round, the seam can wind once around the tube instead.
@@ -3648,6 +3715,86 @@ fn torus_loop_interiors(
     Some((discs, best?.1))
 }
 
+/// The loops whose polygon may hold every point of a given set, in index
+/// order. An even-odd test reads a point outside a polygon's box as outside
+/// the polygon, bar rounding in its crossing abscissa, which scales with the
+/// polygon's own coordinates. So only loops whose box, widened by that
+/// rounding, holds the set's box can, and a box query finds them without
+/// testing every loop against every other.
+struct LoopEnclosers {
+    bvh: brepkit_math::bvh::Bvh,
+    /// Each loop's box widened by its slack; `None` for a loop with fewer
+    /// than one point or a coordinate that is not finite.
+    boxes: Vec<Option<brepkit_math::aabb::Aabb3>>,
+    /// The loops with no box, which every set is read against.
+    unboxed: Vec<usize>,
+}
+
+impl LoopEnclosers {
+    fn new(polygons: &[Vec<Point2>]) -> Self {
+        let boxes: Vec<_> = polygons
+            .iter()
+            .map(|p| Self::flat_box(p).map(|(b, slack)| b.expanded(slack)))
+            .collect();
+        let indexed: Vec<_> = boxes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.map(|b| (i, b)))
+            .collect();
+        let unboxed = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        Self {
+            bvh: brepkit_math::bvh::Bvh::build(&indexed),
+            boxes,
+            unboxed,
+        }
+    }
+
+    /// The points' box and the slack that covers rounding at their scale,
+    /// or `None` when there are none or a coordinate is not finite.
+    fn flat_box(points: &[Point2]) -> Option<(brepkit_math::aabb::Aabb3, f64)> {
+        if !points
+            .iter()
+            .all(|p| p.x().is_finite() && p.y().is_finite())
+        {
+            return None;
+        }
+        let b = brepkit_math::aabb::Aabb3::try_from_points(
+            points.iter().map(|p| Point3::new(p.x(), p.y(), 0.0)),
+        )?;
+        let reach = [b.min, b.max]
+            .iter()
+            .fold(1.0_f64, |m, p| m.max(p.x().abs()).max(p.y().abs()));
+        Some((b, 1e-9 * reach))
+    }
+
+    fn candidates(&self, points: &[Point2]) -> Vec<usize> {
+        let Some((inner, slack)) = Self::flat_box(points) else {
+            return (0..self.boxes.len()).collect();
+        };
+        let mut found: Vec<usize> = self
+            .bvh
+            .query_overlap(&inner.expanded(slack))
+            .into_iter()
+            .filter(|&i| {
+                self.boxes[i].is_some_and(|outer| {
+                    outer.min.x() - slack <= inner.min.x()
+                        && outer.min.y() - slack <= inner.min.y()
+                        && inner.max.x() <= outer.max.x() + slack
+                        && inner.max.y() <= outer.max.y() + slack
+                })
+            })
+            .collect();
+        found.extend_from_slice(&self.unboxed);
+        found.sort_unstable();
+        found
+    }
+}
+
 /// Split a face when ALL section edges are interior (don't touch the boundary).
 ///
 /// Groups section edges into closed loops by chaining shared 3D endpoints.
@@ -3662,6 +3809,11 @@ fn torus_loop_interiors(
 /// sphere caps). Cylinder/cone laterals are routed to
 /// [`split_periodic_face_into_bands`] first and only reach this fallback
 /// when the band preconditions don't hold.
+///
+/// `None` when a plane face's loop chained from open sections crosses one of
+/// the face's holes and could not be merged with it: the loop's disc and the
+/// hole would overlap, so the caller hands the sections to the general
+/// splitter, which trims them against the hole.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn split_face_with_internal_loops(
     surface: &FaceSurface,
@@ -3672,8 +3824,24 @@ pub(super) fn split_face_with_internal_loops(
     reversed: bool,
     face_id: FaceId,
     wire_pts: &[Point3],
-) -> Vec<SplitSubFace> {
+    clearance: f64,
+) -> Option<Vec<SplitSubFace>> {
     let tol_3d = brepkit_math::tolerance::Tolerance::new().linear;
+
+    // Stored UVs on section and hole wires can be fitted in a foreign frame;
+    // build ONE local frame and project every 3D endpoint through it for all
+    // 2D tests (the pcurve-convention lesson). This frame also decides the
+    // disc/hole winding normalization below: stored UVs from the FF phase
+    // live in the surface's own parameterization, whose handedness disagrees
+    // with the local frame on a down-facing plane, and a signed area taken in
+    // the wrong frame inverts the winding verdict (the z-interface pocket
+    // ring of #1538: the bottom cap's hole wound backwards while the top
+    // cap's was correct).
+    let plane_frame = if let FaceSurface::Plane { normal, .. } = surface {
+        Some(PlaneFrame::from_plane_face(*normal, wire_pts))
+    } else {
+        None
+    };
 
     // Convert each section edge to an OrientedPCurveEdge, preserving the
     // original EdgeCurve (NURBS, Circle, etc.) without polyline approximation.
@@ -3685,18 +3853,53 @@ pub(super) fn split_face_with_internal_loops(
             Rank::B => &section.pcurve_b,
         };
 
-        let (start_uv, end_uv) = match rank {
-            Rank::A => section.start_uv_a.zip(section.end_uv_a).unwrap_or_else(|| {
-                uv_endpoints_from_pcurve(pcurve_on_face, section.start, section.end, surface, &[])
-            }),
-            Rank::B => section.start_uv_b.zip(section.end_uv_b).unwrap_or_else(|| {
-                uv_endpoints_from_pcurve(pcurve_on_face, section.start, section.end, surface, &[])
-            }),
+        // A line on a plane comes with no UVs and, from a pave block, a
+        // placeholder pcurve at the frame's origin; its UVs read off that
+        // placeholder would all start there. Lay it out in the boundary's
+        // frame, where the curved sections' pcurves were fitted.
+        let line_on_plane = plane_frame
+            .as_ref()
+            .filter(|_| matches!(section.curve_3d, EdgeCurve::Line));
+        let (pcurve, start_uv, end_uv) = if let Some(frame) = line_on_plane {
+            (
+                super::super::pcurve_compute::compute_pcurve_on_surface(
+                    &section.curve_3d,
+                    section.start,
+                    section.end,
+                    surface,
+                    wire_pts,
+                    Some(frame),
+                ),
+                frame.project(section.start),
+                frame.project(section.end),
+            )
+        } else {
+            let (start_uv, end_uv) = match rank {
+                Rank::A => section.start_uv_a.zip(section.end_uv_a).unwrap_or_else(|| {
+                    uv_endpoints_from_pcurve(
+                        pcurve_on_face,
+                        section.start,
+                        section.end,
+                        surface,
+                        &[],
+                    )
+                }),
+                Rank::B => section.start_uv_b.zip(section.end_uv_b).unwrap_or_else(|| {
+                    uv_endpoints_from_pcurve(
+                        pcurve_on_face,
+                        section.start,
+                        section.end,
+                        surface,
+                        &[],
+                    )
+                }),
+            };
+            (pcurve_on_face.clone(), start_uv, end_uv)
         };
 
         forward_edges.push(OrientedPCurveEdge {
             curve_3d: section.curve_3d.clone(),
-            pcurve: pcurve_on_face.clone(),
+            pcurve,
             start_uv,
             end_uv,
             start_3d: section.start,
@@ -3786,20 +3989,6 @@ pub(super) fn split_face_with_internal_loops(
     // the hole plus the hole pieces inside the loop.
     let mut consumed_holes: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut union_hole_by_loop: Vec<Option<Vec<OrientedPCurveEdge>>> = vec![None; loops.len()];
-    // Stored UVs on section and hole wires can be fitted in a foreign frame;
-    // build ONE local frame and project every 3D endpoint through it for all
-    // 2D tests (the pcurve-convention lesson). This frame also decides the
-    // disc/hole winding normalization below: stored UVs from the FF phase
-    // live in the surface's own parameterization, whose handedness disagrees
-    // with the local frame on a down-facing plane, and a signed area taken in
-    // the wrong frame inverts the winding verdict (the z-interface pocket
-    // ring of #1538: the bottom cap's hole wound backwards while the top
-    // cap's was correct).
-    let plane_frame = if let FaceSurface::Plane { normal, .. } = surface {
-        Some(PlaneFrame::from_plane_face(*normal, wire_pts))
-    } else {
-        None
-    };
     if let Some(frame) = plane_frame.as_ref() {
         let frame = frame.clone();
         for (li, loop_edges) in loops.iter_mut().enumerate() {
@@ -4053,6 +4242,36 @@ pub(super) fn split_face_with_internal_loops(
         }
     }
 
+    // A loop that still crosses a hole after both unions bounds no region of
+    // this face: a slab bridging a boss's foot stamps its whole footprint on
+    // the plate's top, but the strip over the foot belongs to the boss, so the
+    // loop's disc would overlap the hole. The general splitter trims such
+    // sections against the hole. A closed section curve stays here, since that
+    // splitter leaves closed curves on a plane to this path.
+    if let Some(frame) = plane_frame.as_ref() {
+        let holes: Vec<Option<ChordOutline>> = original_inner_wires
+            .iter()
+            .enumerate()
+            .map(|(hi, hole)| (!consumed_holes.contains(&hi)).then(|| chord_outline(hole, frame)))
+            .collect();
+        for (li, loop_edges) in loops.iter().enumerate() {
+            if loop_edges.len() < 2 {
+                continue;
+            }
+            let outline = chord_outline(loop_edges, frame);
+            for (hi, hole) in holes.iter().enumerate() {
+                if let Some(hole) = hole
+                    && loop_crosses_hole(&outline, hole, tol_3d)
+                {
+                    log::debug!(
+                        "split_face_with_internal_loops: face {face_id:?} loop {li} crosses hole {hi}"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
     let mut result = Vec::new();
 
     // For each closed loop: create an "inside" sub-face.
@@ -4087,12 +4306,13 @@ pub(super) fn split_face_with_internal_loops(
                 .sum::<f64>()
                 .abs()
         };
+        let enclosers = LoopEnclosers::new(&polygons);
         for lj in 0..loops.len() {
             if polygons[lj].len() < 3 {
                 continue;
             }
             let mut best: Option<(f64, usize)> = None;
-            for li in 0..loops.len() {
+            for li in enclosers.candidates(&polygons[lj]) {
                 if li == lj || polygons[li].len() < 3 {
                     continue;
                 }
@@ -4129,7 +4349,8 @@ pub(super) fn split_face_with_internal_loops(
                 continue;
             }
             let mut best: Option<(f64, usize)> = None;
-            for (li, polygon) in polygons.iter().enumerate() {
+            for li in enclosers.candidates(&pts) {
+                let polygon = &polygons[li];
                 if polygon.len() < 3
                     || !pts
                         .iter()
@@ -4327,7 +4548,7 @@ pub(super) fn split_face_with_internal_loops(
                     let inner = super::super::classify_2d::sample_interior_point(&flat);
                     frame.evaluate(inner.x(), inner.y())
                 }
-                _ => centroid,
+                _ => curved_loop_interior(surface, &ring, centroid).unwrap_or(centroid),
             };
             // Offset along the face normal by a small amount to ensure
             // the point is clearly inside the opposing solid (not on the
@@ -4383,15 +4604,24 @@ pub(super) fn split_face_with_internal_loops(
                 None => Some(disc_interior),
             }
         };
-        result.push(SplitSubFace {
-            surface: surface.clone(),
-            outer_wire: loop_edges.clone(),
-            inner_wires: nested,
-            reversed,
-            parent: face_id,
-            rank,
-            precomputed_interior: interior,
-        });
+        // A loop winding a cylinder's axis separates the wall rather than
+        // bounding a region of it, so it has no disc: the two touching loops
+        // of equal crossing cylinders bound the pinched band between them.
+        if loop_winds_cylinder(surface, loop_edges) {
+            log::debug!(
+                "split_face_with_internal_loops: face {face_id:?} loop {li} winds the axis, no disc"
+            );
+        } else {
+            result.push(SplitSubFace {
+                surface: surface.clone(),
+                outer_wire: loop_edges.clone(),
+                inner_wires: nested,
+                reversed,
+                parent: face_id,
+                rank,
+                precomputed_interior: interior,
+            });
+        }
 
         // Build the outside sub-face's hole: the merged union outline when
         // this loop consumed an overlapping pre-existing hole, otherwise the
@@ -4545,7 +4775,7 @@ pub(super) fn split_face_with_internal_loops(
         )
         && !remainder.inner_wires.is_empty()
     {
-        remainder.precomputed_interior = cylinder_cone_remainder_interior(&remainder);
+        remainder.precomputed_interior = cylinder_cone_remainder_interior(&remainder, clearance);
     }
     // A sphere's holes can run through a pole, where their `(u, v)` has no
     // longitude and the generic hole test cannot read them: the face fails
@@ -4555,13 +4785,13 @@ pub(super) fn split_face_with_internal_loops(
         && !remainder.inner_wires.is_empty()
     {
         let Some(inside) = region_sample(surface, boundary_edges, &remainder.inner_wires) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         remainder.precomputed_interior = Some(inside);
     }
     result.push(remainder);
 
-    result
+    Some(result)
 }
 
 /// 3D samples along a wire's edges: two per line, 32 per curved edge, never
@@ -4589,6 +4819,78 @@ fn sample_edges_3d(edges: &[OrientedPCurveEdge]) -> Vec<Point3> {
         pts.extend(span);
     }
     pts
+}
+
+/// A point of a curved `surface` inside the loop through `ring` (its samples
+/// in traversal order) when the loop's `centroid` lies outside it, as it does
+/// in the notch of an L- or V-shaped loop. The point comes from the loop's
+/// own `(u, v)` polygon. `None` when the centroid already lies inside, or
+/// when the loop winds a periodic direction of the surface and so bounds no
+/// polygon in `(u, v)`.
+fn curved_loop_interior(
+    surface: &FaceSurface,
+    ring: &[Point3],
+    centroid: Point3,
+) -> Option<Point3> {
+    use super::super::classify_2d::{
+        boundary_eps, distance_to_polygon_boundary, point_in_polygon_2d, sample_interior_point,
+    };
+    let (u_period, v_period) = parameter_periods(surface);
+    let unwrap = |x: f64, prev: f64, period: Option<f64>| {
+        period.map_or(x, |p| x - ((x - prev) / p).round() * p)
+    };
+    let mut uv: Vec<Point2> = Vec::with_capacity(ring.len());
+    for &p in ring {
+        let (u, v) = surface.project_point(p)?;
+        let (u, v) = uv.last().map_or((u, v), |prev| {
+            (unwrap(u, prev.x(), u_period), unwrap(v, prev.y(), v_period))
+        });
+        uv.push(Point2::new(u, v));
+    }
+    let (Some(&first), Some(&last)) = (uv.first(), uv.last()) else {
+        return None;
+    };
+    let winds = |x: f64, prev: f64, period: Option<f64>| {
+        period.is_some_and(|p| (unwrap(x, prev, period) - x).abs() > 0.5 * p)
+    };
+    if uv.len() < 3 || winds(first.x(), last.x(), u_period) || winds(first.y(), last.y(), v_period)
+    {
+        return None;
+    }
+    let mid = |coord: fn(Point2) -> f64| {
+        let (lo, hi) = uv
+            .iter()
+            .copied()
+            .map(coord)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| {
+                (lo.min(x), hi.max(x))
+            });
+        f64::midpoint(lo, hi)
+    };
+    let (cu, cv) = surface.project_point(centroid)?;
+    let c = Point2::new(
+        unwrap(cu, mid(Point2::x), u_period),
+        unwrap(cv, mid(Point2::y), v_period),
+    );
+    if point_in_polygon_2d(c, &uv) && distance_to_polygon_boundary(c, &uv) > boundary_eps(&uv) {
+        return None;
+    }
+    let inner = sample_interior_point(&uv);
+    if !point_in_polygon_2d(inner, &uv) {
+        return None;
+    }
+    // Unwrapping can carry the point a period past the surface's domain,
+    // where a NURBS surface extrapolates its end spans instead of wrapping.
+    let (u_lo, v_lo) = match surface {
+        FaceSurface::Nurbs(n) => (n.domain_u().0, n.domain_v().0),
+        _ => (0.0, 0.0),
+    };
+    let wrap =
+        |x: f64, lo: f64, period: Option<f64>| period.map_or(x, |p| lo + (x - lo).rem_euclid(p));
+    surface.evaluate(
+        wrap(inner.x(), u_lo, u_period),
+        wrap(inner.y(), v_lo, v_period),
+    )
 }
 
 /// The parameter period of each periodic direction of a curved surface.
@@ -4663,6 +4965,99 @@ fn natural_endpoints(e: &OrientedPCurveEdge) -> (Point3, Point3) {
     } else {
         (e.end_3d, e.start_3d)
     }
+}
+
+/// [`edge_samples`], with a closed circle run from its vertex: its domain
+/// starts at its frame's parameter 0, which an outline would leave from its
+/// vertex and come back to.
+fn outline_samples(e: &OrientedPCurveEdge, n: usize) -> Vec<Point3> {
+    let EdgeCurve::Circle(c) = &e.curve_3d else {
+        return edge_samples(e, n);
+    };
+    if (e.start_3d - e.end_3d).length() >= 1e-9 {
+        return edge_samples(e, n);
+    }
+    let a0 = c.project(e.start_3d);
+    let mut pts: Vec<Point3> = (0..=n)
+        .map(|k| {
+            #[allow(clippy::cast_precision_loss)]
+            let t = std::f64::consts::TAU.mul_add(k as f64 / n as f64, a0);
+            c.evaluate(t)
+        })
+        .collect();
+    if !e.forward {
+        pts.reverse();
+    }
+    pts
+}
+
+/// Whether a loop on a cylinder turns once round its axis. Each edge's angle
+/// is followed from its knot spans by bisection until no step turns past an
+/// eighth of a turn, so a parameterization crowded into one end of an edge
+/// cannot hide a turn between two samples.
+fn loop_winds_cylinder(surface: &FaceSurface, loop_edges: &[OrientedPCurveEdge]) -> bool {
+    let FaceSurface::Cylinder(cyl) = surface else {
+        return false;
+    };
+    let turn = std::f64::consts::TAU;
+    let wrap = |d: f64| (d + turn / 2.0).rem_euclid(turn) - turn / 2.0;
+    let mut swept = 0.0;
+    for e in loop_edges {
+        let (from, to) = natural_endpoints(e);
+        let (t0, t1) = e.curve_3d.domain_with_endpoints(from, to);
+        let angle = |t: f64| {
+            cyl.project_point(e.curve_3d.evaluate_with_endpoints(t, from, to))
+                .0
+        };
+        // Start from four pieces of each knot span (sixteen of a curve with
+        // none): one span of a rational arc turns less than a half turn, so
+        // no piece can hide a whole turn between its ends however crowded
+        // the parameter is.
+        let (lo, hi) = (t0.min(t1), t0.max(t1));
+        let mut breaks: Vec<f64> = match &e.curve_3d {
+            EdgeCurve::NurbsCurve(n) => n
+                .knots()
+                .iter()
+                .copied()
+                .filter(|&k| k > lo && k < hi)
+                .collect(),
+            EdgeCurve::Line | EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => Vec::new(),
+        };
+        breaks.push(lo);
+        breaks.push(hi);
+        breaks.sort_by(f64::total_cmp);
+        breaks.dedup();
+        let per_span: u32 = if breaks.len() > 2 { 4 } else { 16 };
+        let mut stack = Vec::new();
+        for w in breaks.windows(2) {
+            for k in 0..per_span {
+                let a = w[0] + (w[1] - w[0]) * f64::from(k) / f64::from(per_span);
+                let b = w[0] + (w[1] - w[0]) * f64::from(k + 1) / f64::from(per_span);
+                stack.push((a, angle(a), b, angle(b), 0_u32));
+            }
+        }
+        // `lo` to `hi` runs with the curve's parameter; flip when its
+        // domain runs the other way.
+        let sense = if t1 >= t0 { 1.0 } else { -1.0 };
+        let mut along = 0.0;
+        while let Some((a, ua, b, ub, depth)) = stack.pop() {
+            let m = 0.5 * (a + b);
+            let um = angle(m);
+            let (first, second) = (wrap(um - ua), wrap(ub - um));
+            if depth >= 24 || (first.abs() <= turn / 8.0 && second.abs() <= turn / 8.0) {
+                along += first + second;
+            } else {
+                stack.push((a, ua, m, um, depth + 1));
+                stack.push((m, um, b, ub, depth + 1));
+            }
+        }
+        swept += if e.forward {
+            sense * along
+        } else {
+            -sense * along
+        };
+    }
+    swept.abs() > turn / 2.0
 }
 
 /// `n + 1` samples along an edge's own span, in traversal order.
@@ -5004,6 +5399,228 @@ fn internal_loop_hole_interact(
         || hp.iter().any(|&p| strictly_inside(p, &lp, &ls))
 }
 
+/// A wire's outline in a plane frame: its chord polygon, the most any chord
+/// sags from its curve (none when every edge is a line), the polygon's
+/// bounds, and the wire's own segments and arcs where no edge is a NURBS
+/// curve.
+struct ChordOutline {
+    poly: Vec<Point2>,
+    sag: f64,
+    lo: Point2,
+    hi: Point2,
+    exact: Option<Vec<brepkit_math::region2d::Boundary2>>,
+}
+
+fn chord_outline(edges: &[OrientedPCurveEdge], frame: &PlaneFrame) -> ChordOutline {
+    const CHORDS: usize = 64;
+    let mut poly = Vec::new();
+    let mut sag = 0.0_f64;
+    for e in edges {
+        let n = if matches!(e.curve_3d, EdgeCurve::Line) {
+            1
+        } else {
+            CHORDS
+        };
+        let pts: Vec<Point2> = edge_samples(e, 2 * n)
+            .into_iter()
+            .map(|p| frame.project(p))
+            .collect();
+        for k in 0..n {
+            let (a, mid, b) = (pts[2 * k], pts[2 * k + 1], pts[2 * k + 2]);
+            sag = sag.max(point_seg_dist_2d(mid, a, b));
+            poly.push(a);
+        }
+    }
+    let (lo, hi) = poly.iter().fold(
+        (
+            Point2::new(f64::INFINITY, f64::INFINITY),
+            Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY),
+        ),
+        |(lo, hi), p| {
+            (
+                Point2::new(lo.x().min(p.x()), lo.y().min(p.y())),
+                Point2::new(hi.x().max(p.x()), hi.y().max(p.y())),
+            )
+        },
+    );
+    let exact = super::containment::exact_hole(edges, frame);
+    ChordOutline {
+        poly,
+        sag,
+        lo,
+        hi,
+        exact,
+    }
+}
+
+impl ChordOutline {
+    /// Some(true) when `p` lies clearly inside, Some(false) clearly outside,
+    /// None within `clear` of the boundary. Read against the wire's own
+    /// curves where it has them, else against its chords less their sag.
+    fn side(&self, p: Point2, clear: f64) -> Option<bool> {
+        use super::super::classify_2d::{distance_to_polygon_boundary, point_in_polygon_2d};
+        use brepkit_math::region2d::{distance_to_boundary, point_in_region};
+        if let Some(pieces) = &self.exact {
+            return (distance_to_boundary(pieces, p) > clear)
+                .then(|| point_in_region(pieces, p, clear))?;
+        }
+        let clear = clear + self.sag;
+        (distance_to_polygon_boundary(p, &self.poly) > clear)
+            .then(|| point_in_polygon_2d(p, &self.poly))
+    }
+}
+
+/// Whether a section loop runs into a hole or holds part of one: a point of
+/// the loop lies clearly inside the hole, or the hole's rim lies partly
+/// clearly inside the loop and partly clearly outside it. A hole wholly
+/// inside the loop or wholly outside it, touching it or not, does not count.
+/// Each outline's chords are cut where they cross the other wire, on its own
+/// curves where it has them, and every piece between cuts, which lies wholly
+/// on one side, is read at its quarter points; a crossing between any fixed
+/// samples is found. A curved wire's chords stand off its curves by their
+/// sag, which joins the clearance for points read along them.
+fn loop_crosses_hole(lp: &ChordOutline, hole: &ChordOutline, tol: f64) -> bool {
+    if lp.poly.len() < 3 || hole.poly.len() < 3 {
+        return false;
+    }
+    let base = tol * 100.0;
+    let reach = base + lp.sag.max(hole.sag);
+    if lp.lo.x() > hole.hi.x() + reach
+        || hole.lo.x() > lp.hi.x() + reach
+        || lp.lo.y() > hole.hi.y() + reach
+        || hole.lo.y() > lp.hi.y() + reach
+    {
+        return false;
+    }
+    if crossing_witnesses(&lp.poly, hole)
+        .into_iter()
+        .any(|p| hole.side(p, base + lp.sag) == Some(true))
+    {
+        return true;
+    }
+    let rim: Vec<Option<bool>> = crossing_witnesses(&hole.poly, lp)
+        .into_iter()
+        .map(|p| lp.side(p, base + hole.sag))
+        .collect();
+    rim.contains(&Some(true)) && rim.contains(&Some(false))
+}
+
+/// Points along the closed polygon `path` that show which side of `region`
+/// each stretch of it lies on: each chord cut where it meets `region`, on
+/// its own segments and arcs where it has them, else on its chords, and
+/// every piece between cuts read at its quarter points.
+fn crossing_witnesses(path: &[Point2], region: &ChordOutline) -> Vec<Point2> {
+    let mut out = Vec::new();
+    for i in 0..path.len() {
+        let (a, b) = (path[i], path[(i + 1) % path.len()]);
+        let ab = Point2::new(b.x() - a.x(), b.y() - a.y());
+        let mut cuts = vec![0.0, 1.0];
+        let (lo_x, hi_x) = (a.x().min(b.x()), a.x().max(b.x()));
+        let (lo_y, hi_y) = (a.y().min(b.y()), a.y().max(b.y()));
+        let reach = region.sag;
+        if !(hi_x < region.lo.x() - reach
+            || lo_x > region.hi.x() + reach
+            || hi_y < region.lo.y() - reach
+            || lo_y > region.hi.y() + reach)
+        {
+            if let Some(pieces) = &region.exact {
+                for piece in pieces {
+                    cuts.extend(segment_piece_crossings(a, b, piece));
+                }
+            } else {
+                let ring = &region.poly;
+                for j in 0..ring.len() {
+                    let (c, d) = (ring[j], ring[(j + 1) % ring.len()]);
+                    if c.x().max(d.x()) < lo_x
+                        || c.x().min(d.x()) > hi_x
+                        || c.y().max(d.y()) < lo_y
+                        || c.y().min(d.y()) > hi_y
+                    {
+                        continue;
+                    }
+                    cuts.extend(segment_piece_crossings(
+                        a,
+                        b,
+                        &brepkit_math::region2d::Boundary2::Segment(c, d),
+                    ));
+                }
+            }
+        }
+        cuts.retain(|t| (0.0..=1.0).contains(t));
+        cuts.sort_by(f64::total_cmp);
+        for w in cuts.windows(2) {
+            for f in [0.25, 0.5, 0.75] {
+                let t = (w[1] - w[0]).mul_add(f, w[0]);
+                out.push(Point2::new(
+                    ab.x().mul_add(t, a.x()),
+                    ab.y().mul_add(t, a.y()),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The parameters along the segment from `a` to `b` where it meets `piece`.
+fn segment_piece_crossings(
+    a: Point2,
+    b: Point2,
+    piece: &brepkit_math::region2d::Boundary2,
+) -> Vec<f64> {
+    use brepkit_math::region2d::Boundary2;
+    let cross = |u: Vec2, v: Vec2| u.x().mul_add(v.y(), -(u.y() * v.x()));
+    let ab = Vec2::new(b.x() - a.x(), b.y() - a.y());
+    match *piece {
+        Boundary2::Segment(c, d) => {
+            let cd = Vec2::new(d.x() - c.x(), d.y() - c.y());
+            let denom = cross(ab, cd);
+            if denom.abs() <= f64::EPSILON * ab.length() * cd.length() {
+                return Vec::new();
+            }
+            let ac = Vec2::new(c.x() - a.x(), c.y() - a.y());
+            let (t, s) = (cross(ac, cd) / denom, cross(ac, ab) / denom);
+            if (0.0..=1.0).contains(&s) {
+                vec![t]
+            } else {
+                Vec::new()
+            }
+        }
+        Boundary2::Arc {
+            center,
+            u,
+            v,
+            a: ra,
+            b: rb,
+            t0,
+            t1,
+        } => {
+            // In the ellipse's own frame scaled to a unit circle the segment
+            // is still straight: |p + t q|^2 = 1.
+            let rel = Vec2::new(a.x() - center.x(), a.y() - center.y());
+            let p = Vec2::new(rel.dot(u) / ra, rel.dot(v) / rb);
+            let q = Vec2::new(ab.dot(u) / ra, ab.dot(v) / rb);
+            let (qa, qb, qc) = (q.dot(q), 2.0 * p.dot(q), p.dot(p) - 1.0);
+            if qa <= 0.0 {
+                return Vec::new();
+            }
+            let disc = qb.mul_add(qb, -4.0 * qa * qc);
+            if disc < 0.0 {
+                return Vec::new();
+            }
+            let root = disc.sqrt();
+            [(-qb - root) / (2.0 * qa), (-qb + root) / (2.0 * qa)]
+                .into_iter()
+                .filter(|&t| {
+                    let x = p + q * t;
+                    let angle = x.y().atan2(x.x());
+                    let off = (angle - t0).rem_euclid(std::f64::consts::TAU);
+                    off <= t1 - t0
+                })
+                .collect()
+        }
+    }
+}
+
 fn point_seg_dist_2d(p: Point2, a: Point2, b: Point2) -> f64 {
     let (dx, dy) = (b.x() - a.x(), b.y() - a.y());
     let len2 = dx.mul_add(dx, dy * dy);
@@ -5217,120 +5834,234 @@ fn chain_single_closed_loop(
 /// The generic UV hole-avoidance fails for these — each lens is a single closed
 /// edge whose start/end UV coincide, so it yields no point-in-polygon hole. This
 /// instead samples the wall on a `(u, v)` grid (`u` over the full revolution,
-/// `v` over the boundary's axial span) and returns the 3D point whose minimum
-/// distance to every hole loop is largest, which is guaranteed to lie on the
-/// kept wall well clear of every lens. Returns `None` if the surface evaluator
-/// or boundary v-range is unusable, so the caller keeps the unset interior.
-pub fn cylinder_cone_remainder_interior(remainder: &SplitSubFace) -> Option<Point3> {
-    use std::f64::consts::{PI, TAU};
-    // Densely sample every hole loop into 3D points AND project each to a (u, v)
-    // polyline so candidate interior points can be tested for face containment
-    // (outside every hole). Endpoint UVs are unusable here — a lens hole is one
-    // closed edge whose start/end UV coincide — so sample the curve.
-    let mut hole_pts: Vec<Point3> = Vec::new();
-    // Inner-loop (u, v) segments (split at the seam), for the even-odd
-    // vertical-ray hole-containment test below.
-    let mut hole_segs: Vec<(f64, f64, f64, f64)> = Vec::new();
-    let n = 48;
+/// `v` over the boundary's axial span) and returns the 3D point inside the
+/// outline and out of every lens whose minimum distance to the hole loops and
+/// the outline is largest: on the kept wall, well clear of its boundary.
+/// Returns `None` if the surface evaluator or boundary v-range is unusable,
+/// so the caller keeps the unset interior.
+pub fn cylinder_cone_remainder_interior(
+    remainder: &SplitSubFace,
+    clearance: f64,
+) -> Option<Point3> {
+    // Every hole loop, sampled along its curve: a lens hole is one closed edge
+    // whose start/end UV coincide, so its endpoint UVs bound nothing.
+    let mut holes = Vec::new();
     for hole in &remainder.inner_wires {
-        let mut prev_uv: Option<(f64, f64)> = None;
-        for edge in hole {
-            for p in edge_samples(edge, n as usize) {
-                hole_pts.push(p);
-                if let Some((u, v)) = remainder.surface.project_point(p) {
-                    if let Some((pu, pv)) = prev_uv {
-                        // Unwrap `u` relative to the previous sample so a
-                        // seam-crossing step is a single continuous segment in an
-                        // extended u-frame (`pu → pu + wrapped_delta`, |Δ| ≤ π)
-                        // instead of being dropped. `point_in_hole_loops_uv` tests
-                        // every 2π translate, so a segment living past the seam is
-                        // still matched for a query on the other side — the lens
-                        // boundary stays closed.
-                        let wrapped_delta = ((u - pu + PI).rem_euclid(TAU)) - PI;
-                        let u_unwrapped = pu + wrapped_delta;
-                        let (a_u, a_v, b_u, b_v) = if pu <= u_unwrapped {
-                            (pu, pv, u_unwrapped, v)
-                        } else {
-                            (u_unwrapped, v, pu, pv)
-                        };
-                        hole_segs.push((a_u, a_v, b_u, b_v));
-                    }
-                    prev_uv = Some((u, v));
-                }
-            }
-        }
+        holes.push(loop_chords(&remainder.surface, hole, 48, edge_samples)?);
     }
-    if hole_pts.is_empty() {
+    if holes.is_empty() {
         return None;
     }
-
-    // Angular (u) and axial (v) extent the boundary wire actually covers —
-    // densely sampled so a partial-arc face (e.g. a rounded-rect corner
-    // quarter-cylinder) is searched only over its OWN span, not the full
-    // revolution (a 0..TAU grid could pick an interior point off the sub-face,
-    // mis-classifying it). A full-revolution wall covers the whole period and
-    // its boundary samples span it.
-    let mut u_samples: Vec<f64> = Vec::new();
-    let mut v_min = f64::INFINITY;
-    let mut v_max = f64::NEG_INFINITY;
-    for e in &remainder.outer_wire {
-        for p in edge_samples(e, 16) {
-            if let Some((u, v)) = remainder.surface.project_point(p) {
-                u_samples.push(u);
-                v_min = v_min.min(v);
-                v_max = v_max.max(v);
-            }
-        }
-    }
-    if !v_min.is_finite() || !v_max.is_finite() || (v_max - v_min) <= 0.0 || u_samples.is_empty() {
-        return None;
-    }
-
-    // The covered u-interval `[u_lo, u_lo + u_span]`: the complement of the
-    // largest gap between sorted u-samples. `u_span ≈ TAU` is a full revolution
-    // (search the whole period); a smaller span restricts the grid to the arc
-    // the face occupies.
-    let (u_lo, u_span) = covered_u_interval(&u_samples);
+    let hole_pts: Vec<Point3> = holes.iter().flat_map(|l| l.pts.iter().copied()).collect();
+    let hole_chords: Vec<UvChord> = holes.into_iter().flat_map(|l| l.chords).collect();
+    let hole_segs: Vec<UvSegment> = hole_chords.iter().map(|c| c.segment).collect();
 
     // Grid-search (u, v) for the wall point maximising the minimum 3D distance
-    // to the hole loops, over the face's actual extent only, accepting ONLY
-    // candidates that are face-CONTAINED (inside the covered u/v extent — by
-    // construction — AND outside every lens hole). A point outside the sub-face
+    // to the hole loops and the outline, over the face's actual extent only,
+    // accepting ONLY candidates on the face: out of every hole and inside the
+    // outline where it closes, each by more than twice how far its curves
+    // stray from the chords that stand for them. A point outside the sub-face
     // fed to classification would drop valid curved wall faces, so an
-    // uncontained best is rejected.
-    let search = |n_u: u32, n_v: u32| -> Option<Point3> {
-        let mut best: Option<(f64, Point3)> = None;
-        for iu in 0..n_u {
-            #[allow(clippy::cast_precision_loss)]
-            let u = u_lo + u_span * f64::from(iu) / f64::from(n_u);
-            for iv in 1..n_v {
+    // uncontained best is rejected. A strip too thin for the outline's chords
+    // is searched again against finer ones.
+    for per_edge in [16, 64, 256] {
+        let outline = loop_chords(
+            &remainder.surface,
+            &remainder.outer_wire,
+            per_edge,
+            outline_samples,
+        )?;
+        // Angular (u) and axial (v) extent the boundary wire actually covers,
+        // so a partial-arc face (a rounded-rect corner quarter-cylinder) is
+        // searched only over its OWN span, not the full revolution. A
+        // full-revolution wall covers the whole period and its samples span it.
+        let (v_min, v_max) = outline.v_range;
+        if !v_min.is_finite()
+            || !v_max.is_finite()
+            || (v_max - v_min) <= 0.0
+            || outline.us.is_empty()
+        {
+            return None;
+        }
+        let (u_lo, u_span) = covered_u_interval(&outline.us);
+        // An outline winding the axis bounds no region in the unwrapped
+        // frame: only the box then holds the search in.
+        let outer_chords: &[UvChord] = if outline.closes { &outline.chords } else { &[] };
+        let outer_segs: Vec<UvSegment> = outer_chords.iter().map(|c| c.segment).collect();
+        let clear =
+            |u: f64, v: f64| stands_clear(hole_chords.iter().chain(outer_chords), u, v, clearance);
+        let search = |n_u: u32, n_v: u32| -> Option<Point3> {
+            let mut best: Option<(f64, Point3)> = None;
+            for iu in 0..n_u {
                 #[allow(clippy::cast_precision_loss)]
-                let v = v_min + (v_max - v_min) * f64::from(iv) / f64::from(n_v);
-                if point_in_hole_loops_uv(&hole_segs, u, v) {
-                    continue; // Inside a lens hole — not the kept region.
-                }
-                let Some(p) = remainder.surface.evaluate(u, v) else {
-                    continue;
-                };
-                let min_d = hole_pts
-                    .iter()
-                    .map(|h| (*h - p).length())
-                    .fold(f64::INFINITY, f64::min);
-                if best.is_none_or(|(bd, _)| min_d > bd) {
-                    best = Some((min_d, p));
+                let u = u_lo + u_span * f64::from(iu) / f64::from(n_u);
+                for iv in 1..n_v {
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = v_min + (v_max - v_min) * f64::from(iv) / f64::from(n_v);
+                    if point_in_hole_loops_uv(&hole_segs, u, v)
+                        || (!outer_segs.is_empty() && !point_in_hole_loops_uv(&outer_segs, u, v))
+                        || !clear(u, v)
+                    {
+                        continue;
+                    }
+                    let Some(p) = remainder.surface.evaluate(u, v) else {
+                        continue;
+                    };
+                    let min_d = hole_pts
+                        .iter()
+                        .chain(&outline.pts)
+                        .map(|h| (*h - p).length())
+                        .fold(f64::INFINITY, f64::min);
+                    if best.is_none_or(|(bd, _)| min_d > bd) {
+                        best = Some((min_d, p));
+                    }
                 }
             }
+            best.map(|(_, p)| p)
+        };
+        // The standard density first; a thin kept strip or a close pair of
+        // lens loops can leave nothing contained there, so one denser pass.
+        if let Some(p) = search(48, 5).or_else(|| search(256, 17)) {
+            return Some(p);
         }
-        best.map(|(_, p)| p)
-    };
+        if !outline.closes {
+            break;
+        }
+    }
+    // No contained point even dense: the caller aborts the analytic split
+    // rather than fall back to an uncontained generic interior point.
+    None
+}
 
-    // First pass at the standard density (the census finds a contained interior
-    // here). If a thin kept strip or a close pair of lens loops yields nothing
-    // contained at this resolution, take ONE refined denser pass before giving
-    // up — a present-but-narrow remainder strip then resolves. Returning `None`
-    // (no contained point even dense) signals the caller to abort the analytic
-    // split rather than fall back to an uncontained generic interior point.
-    search(48, 5).or_else(|| search(256, 17))
+/// A `(u, v)` segment, its lower-`u` end first.
+type UvSegment = (f64, f64, f64, f64);
+
+/// One chord of a loop sampled in an unwrapped `(u, v)` frame, with how far
+/// its curve strays from it: the farthest of the curve's own samples at a
+/// quarter, half and three quarters of the way between the chord's ends.
+/// Past an inflection the curve crosses its chord near the middle, and the
+/// quarter samples stand near its farthest.
+struct UvChord {
+    segment: UvSegment,
+    stray: f64,
+}
+
+/// Whether `(u, v)` stands off every chord by twice its stray and
+/// `clearance`, the caller's linear tolerance, so off a straight one too: a
+/// point on a ruling is not inside the wall.
+fn stands_clear<'a>(
+    chords: impl IntoIterator<Item = &'a UvChord>,
+    u: f64,
+    v: f64,
+    clearance: f64,
+) -> bool {
+    chords
+        .into_iter()
+        .all(|c| c.distance(u, v) > 2.0f64.mul_add(c.stray, clearance))
+}
+
+impl UvChord {
+    /// The distance from `(u, v)`, moved by whole turns of `u` nearest the
+    /// chord, to the chord.
+    fn distance(&self, u: f64, v: f64) -> f64 {
+        use std::f64::consts::TAU;
+        let (au, av, bu, bv) = self.segment;
+        let u = u + ((f64::midpoint(au, bu) - u) / TAU).round() * TAU;
+        segment_distance_2d((u, v), (au, av), (bu, bv))
+    }
+}
+
+/// A loop of edges sampled for a wall's interior search: its chords in one
+/// unwrapped `(u, v)` frame, its 3D samples, the `u` of each sample, its `v`
+/// range, and whether it closes in that frame (an outline winding the axis
+/// does not). `None` when a sample does not project onto the surface.
+struct LoopChords {
+    chords: Vec<UvChord>,
+    pts: Vec<Point3>,
+    us: Vec<f64>,
+    v_range: (f64, f64),
+    closes: bool,
+}
+
+fn loop_chords(
+    surface: &FaceSurface,
+    edges: &[OrientedPCurveEdge],
+    per_edge: usize,
+    samples_of: fn(&OrientedPCurveEdge, usize) -> Vec<Point3>,
+) -> Option<LoopChords> {
+    use std::f64::consts::{PI, TAU};
+    let ordered = |(au, av): (f64, f64), (bu, bv): (f64, f64)| {
+        if au <= bu {
+            (au, av, bu, bv)
+        } else {
+            (bu, bv, au, av)
+        }
+    };
+    let mut out = LoopChords {
+        chords: Vec::new(),
+        pts: Vec::new(),
+        us: Vec::new(),
+        v_range: (f64::INFINITY, f64::NEG_INFINITY),
+        closes: false,
+    };
+    let mut first: Option<(f64, f64)> = None;
+    let mut prev: Option<(f64, f64)> = None;
+    for e in edges {
+        // Four samples to a chord: the three between measure its stray.
+        let mut uvs = Vec::with_capacity(4 * per_edge + 1);
+        for p in samples_of(e, 4 * per_edge) {
+            let (u, v) = surface.project_point(p)?;
+            // Unwrapped against the previous sample, so a seam-crossing step
+            // is one continuous segment; the containment test tries every
+            // turn, so a loop living past the seam still closes.
+            let u = prev.map_or(u, |(pu, _)| pu + ((u - pu + PI).rem_euclid(TAU) - PI));
+            out.pts.push(p);
+            out.us.push(u);
+            out.v_range = (out.v_range.0.min(v), out.v_range.1.max(v));
+            first.get_or_insert((u, v));
+            if let Some(last) = prev
+                && uvs.is_empty()
+            {
+                out.chords.push(UvChord {
+                    segment: ordered(last, (u, v)),
+                    stray: 0.0,
+                });
+            }
+            uvs.push((u, v));
+            prev = Some((u, v));
+        }
+        for w in uvs.windows(5).step_by(4) {
+            let (a, b) = (w[0], w[4]);
+            out.chords.push(UvChord {
+                segment: ordered(a, b),
+                stray: w[1..4]
+                    .iter()
+                    .map(|&m| segment_distance_2d(m, a, b))
+                    .fold(0.0, f64::max),
+            });
+        }
+    }
+    let ((u0, v0), (u1, v1)) = first.zip(prev)?;
+    out.closes = (u1 - u0).abs() < PI;
+    if out.closes {
+        out.chords.push(UvChord {
+            segment: ordered((u1, v1), (u0, v0)),
+            stray: 0.0,
+        });
+    }
+    Some(out)
+}
+
+/// The distance from `p` to the segment `a`, `b`.
+fn segment_distance_2d(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx.mul_add(dx, dy * dy);
+    let t = if len2 > 0.0 {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p.0 - t.mul_add(dx, a.0)).hypot(p.1 - t.mul_add(dy, a.1))
 }
 
 /// Whether `(u, v)` lies inside the region bounded by the combined inner-loop
@@ -5447,6 +6178,10 @@ pub(super) fn chain_boundary_edges(
 }
 
 /// Split a plane face with crossing section edges into 4 quadrant sub-faces.
+///
+/// The quadrants are bounded by straight edges from the crossing to the
+/// sections' ends, so curved sections (the two lobes of a torus section
+/// crossing at a node) are left to the general arrangement.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn try_split_crossing_plane_face(
     surface: &FaceSurface,
@@ -5458,6 +6193,12 @@ pub(super) fn try_split_crossing_plane_face(
     frame: &PlaneFrame,
     tol: &brepkit_math::tolerance::Tolerance,
 ) -> Option<Vec<SplitSubFace>> {
+    if !sections
+        .iter()
+        .all(|s| super::edge_curve_is_straight(&s.curve_3d))
+    {
+        return None;
+    }
     let cross_3d;
     let section_endpoints: Vec<Point3>;
 
@@ -6279,8 +7020,10 @@ pub(super) fn try_split_disk_by_chords(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::{
-        FaceId, OrientedPCurveEdge, PlaneFrame, SectionEdge, arc_covers_segment,
-        between_loop_and_holes, point_in_hole_loops_uv,
+        ChordOutline, FaceId, OrientedPCurveEdge, PlaneFrame, SectionEdge, SplitSubFace, UvChord,
+        arc_covers_segment, between_loop_and_holes, curved_loop_interior,
+        cylinder_cone_remainder_interior, loop_chords, loop_crosses_hole, loop_winds_cylinder,
+        outline_samples, point_in_hole_loops_uv, segment_distance_2d, stands_clear,
     };
     use brepkit_math::curves::Circle3D;
     use brepkit_math::curves2d::{Curve2D, Line2D};
@@ -6292,6 +7035,323 @@ mod tests {
 
     fn dummy_pcurve() -> Curve2D {
         Curve2D::Line(Line2D::new(Point2::new(0.0, 0.0), Vec2::new(1.0, 0.0)).unwrap())
+    }
+
+    fn wall_edge(
+        curve_3d: EdgeCurve,
+        start_3d: Point3,
+        end_3d: Point3,
+        forward: bool,
+    ) -> OrientedPCurveEdge {
+        OrientedPCurveEdge {
+            curve_3d,
+            pcurve: dummy_pcurve(),
+            start_uv: Point2::new(0.0, 0.0),
+            end_uv: Point2::new(0.0, 0.0),
+            start_3d,
+            end_3d,
+            forward,
+            source_edge_idx: None,
+            pave_block_id: None,
+        }
+    }
+
+    /// The ellipse where the plane z = `height` + x meets the unit cylinder
+    /// about z, starting at (1, 0, `height` + 1).
+    fn slanted_rim(height: f64) -> brepkit_math::curves::Ellipse3D {
+        let slant = std::f64::consts::SQRT_2;
+        brepkit_math::curves::Ellipse3D::with_axes(
+            Point3::new(0.0, 0.0, height),
+            Vec3::new(-1.0, 0.0, 1.0) * (1.0 / slant),
+            slant,
+            1.0,
+            Vec3::new(1.0, 0.0, 1.0) * (1.0 / slant),
+            Vec3::new(0.0, 1.0, 0.0),
+        )
+        .unwrap()
+    }
+
+    /// A straight chord, a ruling at u = 1, has no stray: a point on it is
+    /// not clear of it, one 1e-6 off is. A curved chord straying 0.01 needs
+    /// a point more than 0.02 off it.
+    #[test]
+    fn a_point_on_a_straight_chord_is_not_clear_of_it() {
+        let ruling = UvChord {
+            segment: (1.0, 0.0, 1.0, 10.0),
+            stray: 0.0,
+        };
+        assert!(!stands_clear([&ruling], 1.0, 5.0, 1e-7));
+        assert!(stands_clear([&ruling], 1.0 + 1e-6, 5.0, 1e-7));
+        let arc = UvChord {
+            segment: (0.0, 0.0, 1.0, 0.0),
+            stray: 0.01,
+        };
+        assert!(!stands_clear([&arc], 0.5, 0.015, 1e-7));
+        assert!(stands_clear([&arc], 0.5, 0.025, 1e-7));
+    }
+
+    /// The rim where the plane z = 2 + x meets the unit cylinder, seamed at
+    /// u = 1.369446786 so that a chord of 16 to the turn centres on the
+    /// inflection at u = 3pi/2, where the rim crosses the chord near its
+    /// middle. Twice each chord's stray covers how far its curve strays from
+    /// it, read at 32 points along each.
+    #[test]
+    fn a_wall_chords_stray_covers_its_curve() {
+        use std::f64::consts::PI;
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        let seam = 1.369_446_786_f64;
+        let start = Point3::new(seam.cos(), seam.sin(), 2.0 + seam.cos());
+        let rim = [wall_edge(
+            EdgeCurve::Ellipse(slanted_rim(2.0)),
+            start,
+            start,
+            true,
+        )];
+        let chords = loop_chords(&surface, &rim, 16, outline_samples).unwrap();
+        let fine: Vec<(f64, f64)> = outline_samples(&rim[0], 16 * 32)
+            .into_iter()
+            .map(|p| surface.project_point(p).unwrap())
+            .collect();
+        let mut prev = fine[0].0;
+        let fine: Vec<(f64, f64)> = fine
+            .into_iter()
+            .map(|(u, v)| {
+                prev += (u - prev + PI).rem_euclid(2.0 * PI) - PI;
+                (prev, v)
+            })
+            .collect();
+        for (k, c) in chords.chords.iter().take(16).enumerate() {
+            let (au, av, bu, bv) = c.segment;
+            let off = fine[32 * k..=32 * (k + 1)]
+                .iter()
+                .map(|&p| segment_distance_2d(p, (au, av), (bu, bv)))
+                .fold(0.0, f64::max);
+            assert!(
+                2.0 * c.stray >= off,
+                "chord {k}: stray {} for {off}",
+                c.stray
+            );
+        }
+    }
+
+    /// The unit cylinder's wall from u = 1 to 1.2 and z = 0 to 10, its sides
+    /// straight rulings, with a lens hole 9 tall and 0.16 wide down its
+    /// middle: the search finds a point between the lens and a side, off both
+    /// rulings.
+    #[test]
+    fn a_narrow_patch_point_stands_off_its_rulings() {
+        use brepkit_math::curves::Ellipse3D;
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        let at = |a: f64, z: f64| Point3::new(a.cos(), a.sin(), z);
+        let rim = |z: f64| {
+            Circle3D::new_with_ref(
+                Point3::new(0.0, 0.0, z),
+                Vec3::new(0.0, 0.0, 1.0),
+                1.0,
+                Vec3::new(1.0, 0.0, 0.0),
+            )
+            .unwrap()
+        };
+        let mid = 1.1_f64;
+        let lens = Ellipse3D::with_axes(
+            at(mid, 5.0),
+            Vec3::new(mid.cos(), mid.sin(), 0.0),
+            4.5,
+            0.08,
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(-mid.sin(), mid.cos(), 0.0),
+        )
+        .unwrap();
+        let lens_start = lens.evaluate(0.0);
+        let patch = SplitSubFace {
+            surface,
+            outer_wire: vec![
+                wall_edge(
+                    EdgeCurve::Circle(rim(0.0)),
+                    at(1.0, 0.0),
+                    at(1.2, 0.0),
+                    true,
+                ),
+                wall_edge(EdgeCurve::Line, at(1.2, 0.0), at(1.2, 10.0), true),
+                wall_edge(
+                    EdgeCurve::Circle(rim(10.0)),
+                    at(1.2, 10.0),
+                    at(1.0, 10.0),
+                    false,
+                ),
+                wall_edge(EdgeCurve::Line, at(1.0, 10.0), at(1.0, 0.0), true),
+            ],
+            inner_wires: vec![vec![wall_edge(
+                EdgeCurve::Ellipse(lens),
+                lens_start,
+                lens_start,
+                true,
+            )]],
+            reversed: false,
+            parent: dummy_face_id(),
+            rank: crate::ds::Rank::A,
+            precomputed_interior: None,
+        };
+        let p = cylinder_cone_remainder_interior(&patch, 1e-7).expect("a point on the patch");
+        let a = p.y().atan2(p.x());
+        assert!(a > 1.0 + 1e-7 && a < 1.2 - 1e-7, "{p:?} at angle {a}");
+        assert!(p.z() > 0.0 && p.z() < 10.0, "{p:?}");
+    }
+
+    /// The unit cylinder's wall between its rims at z = 0 and 1e-7, with a lens
+    /// hole of radius 1e-8 about (0, 1, 5e-8). At a tolerance of 1e-11 the
+    /// search finds a point on the band; at 1e-7 no point stands that far off
+    /// both rims, and it finds none.
+    #[test]
+    fn a_remainder_point_on_a_thin_band_honours_the_tolerance() {
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        let rim = |z: f64| {
+            Circle3D::new_with_ref(
+                Point3::new(0.0, 0.0, z),
+                Vec3::new(0.0, 0.0, 1.0),
+                1.0,
+                Vec3::new(1.0, 0.0, 0.0),
+            )
+            .unwrap()
+        };
+        let (low, high) = (Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 0.0, 1e-7));
+        let centre = Point3::new(0.0, 1.0, 5e-8);
+        let lens = Circle3D::new(centre, Vec3::new(0.0, 1.0, 0.0), 1e-8).unwrap();
+        let lens_start = lens.evaluate(0.0);
+        let band = SplitSubFace {
+            surface,
+            outer_wire: vec![
+                wall_edge(EdgeCurve::Circle(rim(0.0)), low, low, true),
+                wall_edge(EdgeCurve::Line, low, high, true),
+                wall_edge(EdgeCurve::Circle(rim(1e-7)), high, high, false),
+                wall_edge(EdgeCurve::Line, high, low, true),
+            ],
+            inner_wires: vec![vec![wall_edge(
+                EdgeCurve::Circle(lens),
+                lens_start,
+                lens_start,
+                true,
+            )]],
+            reversed: false,
+            parent: dummy_face_id(),
+            rank: crate::ds::Rank::A,
+            precomputed_interior: None,
+        };
+        let p = cylinder_cone_remainder_interior(&band, 1e-11).expect("a point on the band");
+        assert!(p.z() > 0.0 && p.z() < 1e-7, "{p:?} off the band");
+        assert!((p - centre).length() > 1e-8, "{p:?} in the lens");
+        assert!(cylinder_cone_remainder_interior(&band, 1e-7).is_none());
+    }
+
+    /// The unit cylinder's wall between the planes z = 2 + x and
+    /// z = 2.01 + x, with a lens hole of radius 0.002 about (0, 1, 2.005). A
+    /// chord of 16 to an edge sags 0.02 off the band's curves, twice its
+    /// width. The search finds a point on the band, off the lens.
+    #[test]
+    fn a_remainder_point_stays_on_a_thin_oblique_band() {
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        let (low, high) = (Point3::new(1.0, 0.0, 3.0), Point3::new(1.0, 0.0, 3.01));
+        let centre = Point3::new(0.0, 1.0, 2.005);
+        let lens = Circle3D::new(centre, Vec3::new(0.0, 1.0, 0.0), 0.002).unwrap();
+        let lens_start = lens.evaluate(0.0);
+        let band = SplitSubFace {
+            surface,
+            outer_wire: vec![
+                wall_edge(EdgeCurve::Ellipse(slanted_rim(2.0)), low, low, true),
+                wall_edge(EdgeCurve::Line, low, high, true),
+                wall_edge(EdgeCurve::Ellipse(slanted_rim(2.01)), high, high, false),
+                wall_edge(EdgeCurve::Line, high, low, true),
+            ],
+            inner_wires: vec![vec![wall_edge(
+                EdgeCurve::Circle(lens),
+                lens_start,
+                lens_start,
+                true,
+            )]],
+            reversed: false,
+            parent: dummy_face_id(),
+            rank: crate::ds::Rank::A,
+            precomputed_interior: None,
+        };
+        let p = cylinder_cone_remainder_interior(&band, 1e-7).expect("a point on the band");
+        assert!(
+            (p.x().hypot(p.y()) - 1.0).abs() < 1e-9,
+            "{p:?} off the wall"
+        );
+        assert!(
+            p.z() > 2.0 + p.x() && p.z() < 2.01 + p.x(),
+            "{p:?} off the band"
+        );
+        assert!((p - centre).length() > 0.002, "{p:?} in the lens");
+    }
+
+    /// A unit cylinder's wall from its bottom rim up to the plane
+    /// z = 2 + 1.5 x, seamed at (1, 0, 0), with a lens hole of radius 0.2
+    /// about (1, 0, 1). The wall's (u, v) box reaches z = 3.5 everywhere; the
+    /// point farthest from the hole in it stands above the plane on the far
+    /// side. The point returned lies on the wall, under the plane.
+    #[test]
+    fn a_remainder_point_stays_under_an_oblique_outline() {
+        use brepkit_math::curves::Ellipse3D;
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        let rim = Circle3D::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0).unwrap();
+        let slant = 3.25_f64.sqrt();
+        let top = Ellipse3D::with_axes(
+            Point3::new(0.0, 0.0, 2.0),
+            Vec3::new(-1.5, 0.0, 1.0) * (1.0 / slant),
+            slant,
+            1.0,
+            Vec3::new(1.0, 0.0, 1.5) * (1.0 / slant),
+            Vec3::new(0.0, 1.0, 0.0),
+        )
+        .unwrap();
+        let (low, high) = (Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 0.0, 3.5));
+        let lens =
+            Circle3D::new(Point3::new(1.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 0.0), 0.2).unwrap();
+        let lens_start = lens.evaluate(0.0);
+        let wall = SplitSubFace {
+            surface,
+            outer_wire: vec![
+                wall_edge(EdgeCurve::Circle(rim), low, low, true),
+                wall_edge(EdgeCurve::Line, low, high, true),
+                wall_edge(EdgeCurve::Ellipse(top), high, high, false),
+                wall_edge(EdgeCurve::Line, high, low, true),
+            ],
+            inner_wires: vec![vec![wall_edge(
+                EdgeCurve::Circle(lens),
+                lens_start,
+                lens_start,
+                true,
+            )]],
+            reversed: false,
+            parent: dummy_face_id(),
+            rank: crate::ds::Rank::A,
+            precomputed_interior: None,
+        };
+        let p = cylinder_cone_remainder_interior(&wall, 1e-7).unwrap();
+        assert!(
+            (p.x().hypot(p.y()) - 1.0).abs() < 1e-9,
+            "{p:?} off the wall"
+        );
+        assert!(
+            p.z() > 0.0 && p.z() < 1.5f64.mul_add(p.x(), 2.0),
+            "{p:?} outside the wall's outline"
+        );
     }
 
     fn arc_edge(
@@ -6325,6 +7385,104 @@ mod tests {
             source_edge_idx: None,
             pave_block_id: None,
         }
+    }
+
+    /// A whole circle round a cylinder's axis winds it however its parameter
+    /// is spread: an exact rational circle whose last three quarters crowd
+    /// into the last 3% of its knots, one whose first seven eighths crowd into
+    /// the first 35%, each read either way, and a circle of two arcs read
+    /// backwards. A loop beside the axis does not wind it.
+    #[test]
+    fn a_loop_round_the_axis_winds_whatever_its_parameterization() {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        let cyl = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let corners = [
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, 0.0),
+            (-1.0, -1.0),
+            (0.0, -1.0),
+            (1.0, -1.0),
+            (1.0, 0.0),
+        ];
+        let crowded = NurbsCurve::new(
+            2,
+            vec![
+                0.0, 0.0, 0.0, 0.97, 0.97, 0.98, 0.98, 0.99, 0.99, 1.0, 1.0, 1.0,
+            ],
+            corners
+                .iter()
+                .map(|&(x, y)| Point3::new(x, y, 0.5))
+                .collect(),
+            vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0],
+        )
+        .unwrap();
+        // Eight arcs of 45 degrees, the first seven in the first 35% of the
+        // parameter: at its middle the curve is already on its last arc.
+        let eighth = (PI / 8.0).cos();
+        let mut octants = Vec::new();
+        let mut octant_weights = Vec::new();
+        for k in 0..8 {
+            let a = f64::from(k) * PI / 4.0;
+            let m = a + PI / 8.0;
+            octants.push(Point3::new(a.cos(), a.sin(), 0.5));
+            octants.push(Point3::new(m.cos() / eighth, m.sin() / eighth, 0.5));
+            octant_weights.extend([1.0, eighth]);
+        }
+        octants.push(Point3::new(1.0, 0.0, 0.5));
+        octant_weights.push(1.0);
+        let mut octant_knots = vec![0.0, 0.0, 0.0];
+        for k in 1..8 {
+            let t = 0.05 * f64::from(k);
+            octant_knots.extend([t, t]);
+        }
+        octant_knots.extend([1.0, 1.0, 1.0]);
+        let late = NurbsCurve::new(2, octant_knots, octants, octant_weights).unwrap();
+        let start = Point3::new(1.0, 0.0, 0.5);
+        for (curve, forward) in [
+            (&crowded, true),
+            (&crowded, false),
+            (&late, true),
+            (&late, false),
+        ] {
+            let edge = OrientedPCurveEdge {
+                curve_3d: EdgeCurve::NurbsCurve(curve.clone()),
+                pcurve: dummy_pcurve(),
+                start_uv: Point2::new(0.0, 0.0),
+                end_uv: Point2::new(0.0, 0.0),
+                start_3d: start,
+                end_3d: start,
+                forward,
+                source_edge_idx: None,
+                pave_block_id: None,
+            };
+            assert!(
+                loop_winds_cylinder(&cyl, &[edge]),
+                "{} spans, forward {forward}",
+                curve.knots().len()
+            );
+        }
+        let circle =
+            Circle3D::new(Point3::new(0.0, 0.0, 0.5), Vec3::new(0.0, 0.0, 1.0), 1.0).unwrap();
+        let backwards = [
+            arc_edge(&circle, PI, TAU, false),
+            arc_edge(&circle, 0.0, PI, false),
+        ];
+        assert!(loop_winds_cylinder(&cyl, &backwards));
+        let p = |a: f64, z: f64| Point3::new(a.cos(), a.sin(), z);
+        let beside = [
+            line_chord(p(-0.2, 0.0), p(0.2, 0.0)),
+            line_chord(p(0.2, 0.0), p(0.2, 1.0)),
+            line_chord(p(0.2, 1.0), p(-0.2, 1.0)),
+            line_chord(p(-0.2, 1.0), p(-0.2, 0.0)),
+        ];
+        assert!(!loop_winds_cylinder(&cyl, &beside));
     }
 
     /// A circular hole closer to the outline than its own chords' sag: the
@@ -6690,7 +7848,7 @@ mod tests {
             precomputed_interior: None,
         };
 
-        let p = super::cylinder_cone_remainder_interior(&sub).unwrap();
+        let p = super::cylinder_cone_remainder_interior(&sub, 1e-7).unwrap();
         // The point is ON the cylinder (radius 3 from the axis).
         let radial = (p.x() * p.x() + p.y() * p.y()).sqrt();
         assert!((radial - 3.0).abs() < 1e-6, "interior point on the wall");
@@ -6748,7 +7906,7 @@ mod tests {
         };
 
         // The two-pass search must find a contained point in the thin kept strip.
-        let p = super::cylinder_cone_remainder_interior(&sub).unwrap();
+        let p = super::cylinder_cone_remainder_interior(&sub, 1e-7).unwrap();
         let radial = (p.x() * p.x() + p.y() * p.y()).sqrt();
         assert!((radial - 3.0).abs() < 1e-6, "interior point on the wall");
         assert!(
@@ -7308,5 +8466,242 @@ mod tests {
         .unwrap();
         let floor = arc_edge(&circle, 1e-8, 1.0, true);
         assert!(notch_a_rim(r, from, 1.0_f64.to_degrees(), floor).is_none());
+    }
+
+    /// Every loop whose polygon holds all of a point set must be among the
+    /// set's encloser candidates, in index order: nested rings, rings that
+    /// share a box edge, far-off coordinates and degenerate loops included.
+    #[test]
+    fn loop_enclosers_hold_every_enclosing_loop() {
+        use super::LoopEnclosers;
+        use crate::builder::classify_2d::point_in_polygon_2d;
+        use brepkit_math::vec::Point2;
+        let ring = |cx: f64, cy: f64, r: f64, n: u32| -> Vec<Point2> {
+            (0..n)
+                .map(|k| {
+                    let t = std::f64::consts::TAU * f64::from(k) / f64::from(n);
+                    Point2::new(r.mul_add(t.cos(), cx), r.mul_add(t.sin(), cy))
+                })
+                .collect()
+        };
+        let mut polygons = Vec::new();
+        for (i, base) in [0.0, 1.0e6].into_iter().enumerate() {
+            for k in 0..6 {
+                let c = base + f64::from(k) * 3.0;
+                // Nested rings, the inner two sharing a box edge with the
+                // outer square below them.
+                polygons.push(ring(c, c, 1.0, 32));
+                polygons.push(ring(c, c, 0.5, 16));
+                polygons.push(ring(c + 0.25, c, 0.25, 8));
+                let sq = vec![
+                    Point2::new(c - 1.0, c - 1.0),
+                    Point2::new(c + 1.0, c - 1.0),
+                    Point2::new(c + 1.0, c + 1.0),
+                    Point2::new(c - 1.0, c + 1.0),
+                ];
+                polygons.push(sq);
+            }
+            if i == 0 {
+                polygons.push(vec![Point2::new(0.0, 0.0), Point2::new(1.0, 1.0)]);
+                polygons.push(Vec::new());
+            }
+        }
+        // A thin triangle reaching a trillion units out, whose crossings
+        // round enough to take in a small box left of its own box, and a
+        // polygon with a vertex that is not a number, beside a square.
+        polygons.push(vec![
+            Point2::new(1e-5, 0.0),
+            Point2::new(1e12, 1e12),
+            Point2::new(1e-5, 1e12),
+        ]);
+        polygons.push(vec![
+            Point2::new(3e-6, 1e-6),
+            Point2::new(6e-6, 1e-6),
+            Point2::new(6e-6, 3e-6),
+            Point2::new(3e-6, 3e-6),
+        ]);
+        polygons.push(vec![
+            Point2::new(1.0, 0.0),
+            Point2::new(2.0, 0.0),
+            Point2::new(f64::NAN, f64::NAN),
+            Point2::new(2.0, 2.0),
+            Point2::new(1.0, 2.0),
+        ]);
+        polygons.push(vec![
+            Point2::new(0.2, 0.8),
+            Point2::new(0.4, 0.8),
+            Point2::new(0.4, 1.2),
+            Point2::new(0.2, 1.2),
+        ]);
+        let enclosers = LoopEnclosers::new(&polygons);
+        let mut nested = 0;
+        for (j, inner) in polygons.iter().enumerate() {
+            let got = enclosers.candidates(inner);
+            assert!(got.windows(2).all(|w| w[0] < w[1]));
+            for (i, outer) in polygons.iter().enumerate() {
+                if i == j || outer.len() < 3 || inner.is_empty() {
+                    continue;
+                }
+                if inner.iter().all(|p| point_in_polygon_2d(*p, outer)) {
+                    nested += 1;
+                    assert!(
+                        got.contains(&i),
+                        "loop {i} encloses loop {j} but is no candidate"
+                    );
+                }
+            }
+        }
+        assert!(nested >= 24, "too few nested pairs: {nested}");
+    }
+
+    /// An L-shaped loop on a periodic NURBS cylinder of radius 2 whose
+    /// notch holds its centroid and whose (u, v) polygon, unwrapped from a
+    /// sample just past the seam, runs below the domain's start. The point
+    /// inside it lies in the L: evaluated unwrapped, past the domain, the
+    /// end span's extrapolation put it at -0.218 of the u domain, outside.
+    #[test]
+    fn a_notched_loop_across_a_periodic_seam_samples_on_its_surface() {
+        let cyl =
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 2.0)
+                .unwrap();
+        let nurbs = cyl.to_nurbs(0.0, 10.0).unwrap();
+        assert!(nurbs.is_periodic_u());
+        let (u0, u1) = nurbs.domain_u();
+        let (v0, v1) = nurbs.domain_v();
+        let (du, dv) = (u1 - u0, v1 - v0);
+        // The L in (u, v), its first corner just past the seam so that the
+        // walk from it unwraps the rest below `u0`.
+        let corners = [
+            (0.02, 0.1),
+            (-0.45, 0.1),
+            (-0.45, 0.6),
+            (-0.35, 0.6),
+            (-0.35, 0.15),
+            (0.02, 0.15),
+        ];
+        let surface = FaceSurface::Nurbs(nurbs.clone());
+        let at = |(fu, fv): (f64, f64)| nurbs.evaluate(u0 + (fu * du).rem_euclid(du), v0 + fv * dv);
+        let mut ring = Vec::new();
+        for (i, &a) in corners.iter().enumerate() {
+            let b = corners[(i + 1) % corners.len()];
+            for k in 0..8 {
+                let f = f64::from(k) / 8.0;
+                ring.push(at((a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f)));
+            }
+        }
+        let n = f64::from(u32::try_from(ring.len()).unwrap());
+        let sum = ring.iter().fold(Vec3::new(0.0, 0.0, 0.0), |acc, p| {
+            acc + Vec3::new(p.x(), p.y(), p.z())
+        });
+        let centroid = Point3::new(sum.x() / n, sum.y() / n, sum.z() / n);
+        let inner = curved_loop_interior(&surface, &ring, centroid).expect("a point inside");
+        let radial = (inner.x() * inner.x() + inner.y() * inner.y()).sqrt();
+        assert!(
+            (radial - 2.0).abs() < 1e-9,
+            "the point lies {radial} from the axis, off the cylinder"
+        );
+        // Back in the L's own (u, v), as fractions of the domain about the
+        // seam.
+        let (u, v) = surface.project_point(inner).unwrap();
+        let fu = ((u - u0) / du + 0.5).rem_euclid(1.0) - 0.5;
+        let fv = (v - v0) / dv;
+        let mut inside = false;
+        for (i, &(ax, ay)) in corners.iter().enumerate() {
+            let (bx, by) = corners[(i + 1) % corners.len()];
+            if (ay > fv) != (by > fv) && fu < (bx - ax) * (fv - ay) / (by - ay) + ax {
+                inside = !inside;
+            }
+        }
+        assert!(inside, "the point at ({fu}, {fv}) lies outside the L");
+    }
+
+    fn outline_of(
+        poly: Vec<Point2>,
+        sag: f64,
+        exact: Option<Vec<brepkit_math::region2d::Boundary2>>,
+    ) -> ChordOutline {
+        let lo = Point2::new(
+            poly.iter().map(|p| p.x()).fold(f64::INFINITY, f64::min),
+            poly.iter().map(|p| p.y()).fold(f64::INFINITY, f64::min),
+        );
+        let hi = Point2::new(
+            poly.iter().map(|p| p.x()).fold(f64::NEG_INFINITY, f64::max),
+            poly.iter().map(|p| p.y()).fold(f64::NEG_INFINITY, f64::max),
+        );
+        ChordOutline {
+            poly,
+            sag,
+            lo,
+            hi,
+            exact,
+        }
+    }
+
+    fn rect(x0: f64, x1: f64, y0: f64, y1: f64) -> ChordOutline {
+        let poly = vec![
+            Point2::new(x0, y0),
+            Point2::new(x1, y0),
+            Point2::new(x1, y1),
+            Point2::new(x0, y1),
+        ];
+        let sides = (0..4)
+            .map(|k| brepkit_math::region2d::Boundary2::Segment(poly[k], poly[(k + 1) % 4]))
+            .collect();
+        outline_of(poly, 0.0, Some(sides))
+    }
+
+    /// A circle of 64 chords, clockwise as a hole runs.
+    fn circle(cx: f64, cy: f64, r: f64) -> ChordOutline {
+        let poly = (0..64)
+            .map(|k| {
+                let a = -TAU * f64::from(k) / 64.0;
+                Point2::new(r.mul_add(a.cos(), cx), r.mul_add(a.sin(), cy))
+            })
+            .collect();
+        let arc = brepkit_math::region2d::Boundary2::Arc {
+            center: Point2::new(cx, cy),
+            u: Vec2::new(1.0, 0.0),
+            v: Vec2::new(0.0, 1.0),
+            a: r,
+            b: r,
+            t0: 0.0,
+            t1: TAU,
+        };
+        outline_of(poly, r * (1.0 - (PI / 64.0).cos()), Some(vec![arc]))
+    }
+
+    /// A strip 0.01 tall about the top of a hole of radius 5, its lower
+    /// side 0.005 into the hole, less than the 0.006 its 64 chords sag: read
+    /// against the hole's own arc, the strip crosses it.
+    #[test]
+    fn a_strip_grazing_into_a_hole_by_less_than_its_chords_sag_crosses_it() {
+        let strip = rect(-50.0, 50.0, 4.995, 5.005);
+        assert!(loop_crosses_hole(&strip, &circle(3.125, 0.0, 5.0), 1e-7));
+    }
+
+    /// A strip 0.1 tall across the top of a hole of radius 5 about
+    /// (3.125, 0): its lower side runs inside the hole from x = 1.42 to
+    /// 4.83, between samples 6.25 apart along it, and none of the rim's 16
+    /// samples lands in the strip.
+    #[test]
+    fn a_thin_loop_across_a_holes_rim_crosses_it() {
+        let strip = rect(-50.0, 50.0, 4.7, 4.8);
+        assert!(loop_crosses_hole(&strip, &circle(3.125, 0.0, 5.0), 1e-7));
+    }
+
+    #[test]
+    fn a_hole_inside_or_clear_of_a_loop_does_not_cross_it() {
+        let hole = circle(3.125, 0.0, 5.0);
+        assert!(!loop_crosses_hole(
+            &rect(-10.0, 20.0, -10.0, 10.0),
+            &hole,
+            1e-7
+        ));
+        assert!(!loop_crosses_hole(
+            &rect(-10.0, 20.0, 5.5, 6.0),
+            &hole,
+            1e-7
+        ));
+        assert!(loop_crosses_hole(&rect(2.0, 4.0, -1.0, 1.0), &hole, 1e-7));
     }
 }

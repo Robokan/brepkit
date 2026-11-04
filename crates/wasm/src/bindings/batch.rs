@@ -791,13 +791,9 @@ impl BrepKernel {
                     .iter()
                     .map(|&h| self.resolve_edge(h).map_err(|e| e.to_string()))
                     .collect::<Result<Vec<_>, _>>()?;
-                let result = brepkit_operations::chamfer::chamfer(
-                    self.topo_mut(),
-                    solid_id,
-                    &edge_ids,
-                    dist,
-                )
-                .map_err(|e| e.to_string())?;
+                let result =
+                    crate::helpers::try_chamfer(self.topo_mut(), solid_id, &edge_ids, dist)
+                        .map_err(|e| e.to_string())?;
                 Ok(serde_json::json!(solid_id_to_u32(result)))
             }
             "fillet" => {
@@ -867,12 +863,9 @@ impl BrepKernel {
                     };
                     edge_laws.push((edge_id, law));
                 }
-                let result = brepkit_operations::fillet::fillet_variable(
-                    self.topo_mut(),
-                    solid_id,
-                    &edge_laws,
-                )
-                .map_err(|e| e.to_string())?;
+                let result =
+                    crate::helpers::try_fillet_variable(self.topo_mut(), solid_id, &edge_laws)
+                        .map_err(|e| e.to_string())?;
                 Ok(serde_json::json!(solid_id_to_u32(result)))
             }
             "filletV2" => {
@@ -898,7 +891,9 @@ impl BrepKernel {
                     radius,
                 )
                 .map_err(|e| e.to_string())?;
-                Ok(serde_json::json!(solid_id_to_u32(result.solid)))
+                let solid = brepkit_operations::blend_ops::all_blended(result)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!(solid_id_to_u32(solid)))
             }
             "chamferV2" => {
                 let s = get_u32(args, "solid")?;
@@ -925,7 +920,9 @@ impl BrepKernel {
                     d2,
                 )
                 .map_err(|e| e.to_string())?;
-                Ok(serde_json::json!(solid_id_to_u32(result.solid)))
+                let solid = brepkit_operations::blend_ops::all_blended(result)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!(solid_id_to_u32(solid)))
             }
             "chamferDistanceAngle" => {
                 let s = get_u32(args, "solid")?;
@@ -955,7 +952,9 @@ impl BrepKernel {
                     angle,
                 )
                 .map_err(|e| e.to_string())?;
-                Ok(serde_json::json!(solid_id_to_u32(result.solid)))
+                let solid = brepkit_operations::blend_ops::all_blended(result)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!(solid_id_to_u32(solid)))
             }
             "shell" => {
                 let s = get_u32(args, "solid")?;

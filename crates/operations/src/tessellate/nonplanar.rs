@@ -2772,12 +2772,15 @@ fn cdt_in_surface_frame(
     // across the dip Delaunay joins the loop's two sides. And so does any
     // patch a section bounds in part: raw `(u, v)` mixes radians with
     // lengths, and Delaunay there joins rim samples to section samples far
-    // round the wall, a sheared strip longer than the surface it spans. So
-    // does a wall stepped along its rim, whose reflex corner Delaunay fans to
-    // the far rim.
+    // round the wall, a sheared strip longer than the surface it spans. And
+    // so does a wall whose ruling a neighbour's vertex splits: Delaunay fans
+    // that vertex to rim samples a quarter turn away, a flat chord through
+    // the solid. So does a wall stepped along its rim, whose reflex corner
+    // Delaunay fans to the far rim.
     let notched_wall = is_notched_wall(topo, face_data)?
         || is_wound_wall(topo, face_data)?
         || is_section_bound(topo, face_data)?
+        || is_split_ruling_wall(topo, face_data)?
         || is_stepped_wall(topo, face_data)?;
     let holed_wall_radius = if holes.is_empty() && !notched_wall {
         None
@@ -2800,6 +2803,15 @@ fn cdt_in_surface_frame(
     // than span the face, so its slant (v, a length already) keeps its scale.
     let reaches_apex = matches!(face_data.surface(), FaceSurface::Cone(_))
         && v_min.abs().min(v_max.abs()) < 1e-9 * (v_max - v_min).abs().max(1.0);
+    // A NURBS face's iso-line divisions size both its metric and its interior
+    // grid: probed once.
+    let divisions = nurbs_iso_divisions(
+        face_data.surface(),
+        (u_min, du),
+        (v_min, dv),
+        deflection,
+        angular_tol,
+    );
     let (cdt_u_scale, cdt_v_scale) = match stripe_radius.or(holed_wall_radius) {
         Some(radius) if reaches_apex => (radius, 1.0),
         Some(radius) if du > 1e-15 && dv > 1e-15 => {
@@ -2815,7 +2827,10 @@ fn cdt_in_surface_frame(
             deflection,
             angular_tol,
         )
-        .or_else(|| nurbs_speeds(face_data.surface(), (u_min, du), (v_min, dv)))
+        .or_else(|| {
+            let speeds = nurbs_speeds(face_data.surface(), (u_min, du), (v_min, dv));
+            ruled_metric(speeds, divisions, du, dv).or(speeds)
+        })
         .unwrap_or((1.0, 1.0)),
     };
     let to_cdt = |point: Point2| Point2::new(point.x() * cdt_u_scale, point.y() * cdt_v_scale);
@@ -2934,6 +2949,7 @@ fn cdt_in_surface_frame(
             deflection,
             angular_tol,
             circle_floor,
+            divisions,
         );
 
         let boundary_uv_ref = &boundary_uv;
@@ -3482,6 +3498,18 @@ pub(super) fn tessellate_holed_face_local(
     let mut merged = TriangleMesh::default();
     let mut point_to_global: DetHashMap<(i64, i64, i64), u32> = DetHashMap::default();
     let mut pool: DetHashMap<usize, Vec<u32>> = DetHashMap::default();
+    // A twisted face's straight edges are sampled as finely as its grid, as
+    // the solid mesher samples them.
+    let mut straight: DetHashMap<usize, Vec<Point3>> =
+        super::edge_sampling::twisted_straight_edge_samples(
+            topo,
+            face_data,
+            deflection,
+            angular_tol,
+            circle_floor,
+        )?
+        .into_iter()
+        .collect();
     for wire_id in
         std::iter::once(face_data.outer_wire()).chain(face_data.inner_wires().iter().copied())
     {
@@ -3490,7 +3518,11 @@ pub(super) fn tessellate_holed_face_local(
                 continue;
             }
             let edge = topo.edge(oe.edge())?;
-            let gids = sample_edge(topo, edge, deflection, angular_tol, circle_floor)?
+            let points = match straight.remove(&oe.edge().index()) {
+                Some(points) => points,
+                None => sample_edge(topo, edge, deflection, angular_tol, circle_floor)?,
+            };
+            let gids = points
                 .into_iter()
                 .map(|pt| {
                     *point_to_global
@@ -4479,6 +4511,62 @@ fn extrusion_metric(
     }
 }
 
+/// The triangulation metric of a NURBS face whose iso-lines run straight one
+/// way without being one vector (a fillet band whose radius changes along
+/// its edge): as for an extrusion, the straight direction shrunk to one chord
+/// cell of the curved one. At their own speeds Delaunay joins the face's two
+/// long sides across the curve whenever those run along the straight way.
+fn ruled_metric(
+    speeds: Option<(f64, f64)>,
+    divisions: Option<(usize, usize)>,
+    du: f64,
+    dv: f64,
+) -> Option<(f64, f64)> {
+    let (speed_u, speed_v) = speeds?;
+    match divisions? {
+        (n_u, n_v) if n_u > 1 && n_v <= 1 => Some((speed_u, speed_u * du / n_u as f64 / dv)),
+        (n_u, n_v) if n_u <= 1 && n_v > 1 => Some((speed_v * dv / n_v as f64 / du, speed_v)),
+        _ => None,
+    }
+}
+
+pub(super) const NURBS_MAX_DIVISIONS: usize = 1024;
+
+/// The chord divisions of a NURBS face's iso-lines across its box, along `u`
+/// and along `v`. `None` for any other surface.
+fn nurbs_iso_divisions(
+    surface: &FaceSurface,
+    (u_min, du): (f64, f64),
+    (v_min, dv): (f64, f64),
+    deflection: f64,
+    angular_tol: f64,
+) -> Option<(usize, usize)> {
+    if !matches!(surface, FaceSurface::Nurbs(_)) {
+        return None;
+    }
+    let at = |u: f64, v: f64| eval_surface_point(surface, u, v);
+    let normal_at = |u: f64, v: f64| {
+        let (u, v) = wrap_to_domain(surface, u, v);
+        surface.normal(u, v)
+    };
+    let (u_span, v_span) = ((u_min, u_min + du), (v_min, v_min + dv));
+    let along = |along_u: bool, spans| {
+        super::nurbs::iso_divisions_over(
+            &at,
+            &normal_at,
+            along_u,
+            spans,
+            deflection,
+            angular_tol,
+            NURBS_MAX_DIVISIONS,
+        )
+    };
+    Some((
+        along(true, (u_span, v_span)),
+        along(false, (v_span, u_span)),
+    ))
+}
+
 fn nurbs_speeds(
     surface: &FaceSurface,
     (u_min, du): (f64, f64),
@@ -4950,6 +5038,45 @@ pub(super) fn is_section_tip(
     Ok(apex && section)
 }
 
+/// Whether a cylinder or cone wall's outer wire puts a vertex part way along
+/// a ruling: a line edge ending strictly between the wall's lowest and
+/// highest rim, as when same-domain faces stacked along the axis merge and
+/// keep the vertices their side neighbours are still split at.
+pub(super) fn is_split_ruling_wall(
+    topo: &Topology,
+    face_data: &brepkit_topology::face::Face,
+) -> Result<bool, crate::OperationsError> {
+    let surface = face_data.surface();
+    if !matches!(surface, FaceSurface::Cylinder(_) | FaceSurface::Cone(_)) {
+        return Ok(false);
+    }
+    let edges = topo.wire(face_data.outer_wire())?.edges();
+    if edges.len() <= 4 {
+        return Ok(false);
+    }
+    let v_at = |id| -> Result<f64, crate::OperationsError> {
+        let p = topo.vertex(id)?.point();
+        Ok(surface.project_point(p).map_or(f64::NAN, |(_, v)| v))
+    };
+    let (mut v_min, mut v_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut ruling_ends = Vec::new();
+    for oe in edges {
+        let edge = topo.edge(oe.edge())?;
+        let (va, vb) = (v_at(edge.start())?, v_at(edge.end())?);
+        v_min = v_min.min(va).min(vb);
+        v_max = v_max.max(va).max(vb);
+        if matches!(edge.curve(), EdgeCurve::Line) {
+            ruling_ends.extend([va, vb]);
+        }
+    }
+    // Scaled by the wall's own span: `v` is measured from the surface's
+    // origin, which can sit anywhere along the axis.
+    let tol = 1e-7 * (1.0 + (v_max - v_min));
+    Ok(ruling_ends
+        .iter()
+        .any(|&v| v > v_min + tol && v < v_max - tol))
+}
+
 /// Whether a cylinder or cone face is bounded in part by a section: a NURBS
 /// or ellipse edge in its outer wire.
 pub(super) fn is_section_bound(
@@ -5102,6 +5229,7 @@ fn interior_grid_resolution(
     deflection: f64,
     angular_tol: f64,
     circle_floor: bool,
+    nurbs_divisions: Option<(usize, usize)>,
 ) -> (usize, usize) {
     // This is the non-standard-boundary CDT fallback (boolean-result faces).
     // Watertightness comes from the explicit boundary samples, not from these
@@ -5154,38 +5282,46 @@ fn interior_grid_resolution(
             (n_u, 2)
         }
         // A NURBS face's parameters are knot values, not angles: size the
-        // grid by the chords of its own iso-lines across the face's box.
+        // grid by the chords of its own iso-lines across the face's box. The
+        // CDT inserts every interior sample, so the grid is bounded as a
+        // whole, not only per direction.
         FaceSurface::Nurbs(_) => {
-            const INTERIOR_MAX_DIVISIONS: usize = 1024;
+            let (n_u, n_v) = nurbs_divisions
+                .or_else(|| {
+                    nurbs_iso_divisions(surface, (u_min, du), (v_min, dv), deflection, angular_tol)
+                })
+                .unwrap_or((1, 1));
             let at = |u: f64, v: f64| eval_surface_point(surface, u, v);
             let normal_at = |u: f64, v: f64| {
                 let (u, v) = wrap_to_domain(surface, u, v);
                 surface.normal(u, v)
             };
             let (u_span, v_span) = ((u_min, u_min + du), (v_min, v_min + dv));
-            // The CDT inserts every interior sample, so the grid is bounded
-            // as a whole, not only per direction.
-            super::nurbs::cap_grid(
-                super::nurbs::iso_divisions_over(
+            let chords = |along_u: bool, n: usize| {
+                let spans = if along_u {
+                    (u_span, v_span)
+                } else {
+                    (v_span, u_span)
+                };
+                super::nurbs::iso_chords_hold(
                     &at,
                     &normal_at,
-                    true,
-                    (u_span, v_span),
+                    along_u,
+                    spans,
                     deflection,
                     angular_tol,
-                    INTERIOR_MAX_DIVISIONS,
-                ),
-                super::nurbs::iso_divisions_over(
-                    &at,
-                    &normal_at,
-                    false,
-                    (v_span, u_span),
-                    deflection,
-                    angular_tol,
-                    INTERIOR_MAX_DIVISIONS,
-                ),
-                super::nurbs::GRID_MAX_CELLS,
-            )
+                    n,
+                )
+            };
+            let (n_u, n_v) = super::nurbs::untwisted_grid(
+                &at,
+                (u_span, v_span),
+                (n_u, n_v),
+                deflection,
+                NURBS_MAX_DIVISIONS,
+                Some(&chords),
+            );
+            super::nurbs::cap_grid(n_u, n_v, super::nurbs::GRID_MAX_CELLS)
         }
         FaceSurface::Plane { .. } => {
             let r = estimate_surface_radius(surface);

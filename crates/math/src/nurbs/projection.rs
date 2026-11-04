@@ -438,13 +438,37 @@ pub fn project_point_to_surface(
     }
 }
 
+/// Project `point` onto `surface` by Newton from `(u, v)`, for a point
+/// known to lie near the surface there.
+///
+/// # Errors
+///
+/// Returns an error if Newton does not converge.
+pub fn project_point_to_surface_from(
+    surface: &NurbsSurface,
+    point: Point3,
+    (u, v): (f64, f64),
+    tolerance: f64,
+) -> Result<SurfaceProjection, MathError> {
+    let (u_min, u_max) = surface.domain_u();
+    let (v_min, v_max) = surface.domain_v();
+    let wraps = surface.is_periodic_u() || surface.is_periodic_v();
+    let (u, v, pt) = surface_newton_refine(
+        surface, point, u, v, u_min, u_max, v_min, v_max, tolerance, wraps,
+    )?;
+    Ok(SurfaceProjection {
+        u,
+        v,
+        point: pt,
+        distance: (pt - point).length(),
+    })
+}
+
 fn project_from_coarse_grid(
     surface: &NurbsSurface,
     point: Point3,
     tolerance: f64,
 ) -> Result<SurfaceProjection, MathError> {
-    let (u_guess, v_guess) = surface_coarse_search(surface, point);
-
     let knots_u = surface.knots_u();
     let knots_v = surface.knots_v();
     let pu = surface.degree_u();
@@ -458,18 +482,30 @@ fn project_from_coarse_grid(
     // the far copy of it; where the seam has a kink it can bounce across
     // without converging, so a failed wrapped solve retries clamped.
     let wraps = surface.is_periodic_u() || surface.is_periodic_v();
-    let coarse = surface_newton_refine(
-        surface, point, u_guess, v_guess, u_min, u_max, v_min, v_max, tolerance, wraps,
-    )
-    .or_else(|err| {
-        if wraps {
-            surface_newton_refine(
-                surface, point, u_guess, v_guess, u_min, u_max, v_min, v_max, tolerance, false,
-            )
+    let refine = |(u_guess, v_guess): (f64, f64)| {
+        surface_newton_refine(
+            surface, point, u_guess, v_guess, u_min, u_max, v_min, v_max, tolerance, wraps,
+        )
+        .or_else(|err| {
+            if wraps {
+                surface_newton_refine(
+                    surface, point, u_guess, v_guess, u_min, u_max, v_min, v_max, tolerance, false,
+                )
+            } else {
+                Err(err)
+            }
+        })
+    };
+    let (seed, beside_pole) = surface_coarse_search(surface, point);
+    let coarse = match (refine(seed), beside_pole.map(refine)) {
+        (Ok(a), Some(Ok(b))) => Ok(if (b.2 - point).length() < (a.2 - point).length() {
+            b
         } else {
-            Err(err)
-        }
-    });
+            a
+        }),
+        (Err(_), Some(Ok(b))) => Ok(b),
+        (found, _) => found,
+    };
     // A surface with more knot spans than the coarse grid samples (a fitted
     // loft with hundreds) can seed Newton in a span far from the point's
     // own, where it settles on a local nearest point tens of millimetres
@@ -477,14 +513,12 @@ fn project_from_coarse_grid(
     if let Some(found) = search_spans_unless_near(surface, point, tolerance, coarse.as_ref().ok()) {
         return Ok(found);
     }
-    let (u_final, v_final, pt_final) = coarse?;
-    let dist = (pt_final - point).length();
-
+    let (u, v, pt) = coarse?;
     Ok(SurfaceProjection {
-        u: u_final,
-        v: v_final,
-        point: pt_final,
-        distance: dist,
+        u,
+        v,
+        point: pt,
+        distance: (pt - point).length(),
     })
 }
 
@@ -533,8 +567,17 @@ fn search_spans_unless_near(
 
 /// Coarse search: evaluate surface on a uniform grid and find the closest
 /// grid point.
+///
+/// Every grid point on a pole's row (or column) is the same point, so which
+/// of them comes nearest is down to rounding, and from a pole Newton cannot
+/// turn toward the point (the partial along the pole's row vanishes there).
+/// When the nearest point lies on such a row, the nearest point of the row
+/// beside it gives a second seed, for whichever refines nearer.
 #[allow(clippy::cast_precision_loss)]
-fn surface_coarse_search(surface: &NurbsSurface, point: Point3) -> (f64, f64) {
+fn surface_coarse_search(
+    surface: &NurbsSurface,
+    point: Point3,
+) -> ((f64, f64), Option<(f64, f64)>) {
     let knots_u = surface.knots_u();
     let knots_v = surface.knots_v();
     let pu = surface.degree_u();
@@ -544,26 +587,57 @@ fn surface_coarse_search(surface: &NurbsSurface, point: Point3) -> (f64, f64) {
     let v_min = knots_v[pv];
     let v_max = knots_v[knots_v.len() - pv - 1];
 
-    let mut best_u = u_min;
-    let mut best_v = v_min;
-    let mut best_dist_sq = f64::INFINITY;
-
     let n = SURFACE_GRID_SIZE;
+    let us: Vec<f64> = (0..=n)
+        .map(|i| (i as f64 / n as f64).mul_add(u_max - u_min, u_min))
+        .collect();
+    let vs: Vec<f64> = (0..=n)
+        .map(|j| (j as f64 / n as f64).mul_add(v_max - v_min, v_min))
+        .collect();
+    let grid: Vec<Vec<Point3>> = us
+        .iter()
+        .map(|&u| vs.iter().map(|&v| surface.evaluate(u, v)).collect())
+        .collect();
+    let dist_sq = |i: usize, j: usize| (grid[i][j] - point).length_squared();
+
+    let (mut best_i, mut best_j) = (0, 0);
     for i in 0..=n {
-        let u = (i as f64 / n as f64).mul_add(u_max - u_min, u_min);
         for j in 0..=n {
-            let v = (j as f64 / n as f64).mul_add(v_max - v_min, v_min);
-            let pt = surface.evaluate(u, v);
-            let d_sq = (pt - point).length_squared();
-            if d_sq < best_dist_sq {
-                best_dist_sq = d_sq;
-                best_u = u;
-                best_v = v;
+            if dist_sq(i, j) < dist_sq(best_i, best_j) {
+                (best_i, best_j) = (i, j);
             }
         }
     }
 
-    (best_u, best_v)
+    let extent = grid
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |m, p| m.max((*p - grid[0][0]).length()));
+    let one_point = |pts: &mut dyn Iterator<Item = Point3>| {
+        let mut pts = pts.peekable();
+        let first = pts.peek().copied();
+        first.is_some_and(|f| pts.all(|p| (p - f).length() <= 1e-9 * extent))
+    };
+    let beside = |k: usize| match k {
+        0 => Some(1),
+        k if k == n => n.checked_sub(1),
+        _ => None,
+    };
+    let beside_pole = if one_point(&mut grid[best_i].iter().copied())
+        && let Some(inner) = beside(best_i)
+        && let Some(j) = (0..=n).min_by(|&a, &b| dist_sq(inner, a).total_cmp(&dist_sq(inner, b)))
+    {
+        Some((us[best_i], vs[j]))
+    } else if one_point(&mut grid.iter().map(|row| row[best_j]))
+        && let Some(inner) = beside(best_j)
+        && let Some(i) = (0..=n).min_by(|&a, &b| dist_sq(a, inner).total_cmp(&dist_sq(b, inner)))
+    {
+        Some((us[i], vs[best_j]))
+    } else {
+        None
+    };
+
+    ((us[best_i], vs[best_j]), beside_pole)
 }
 
 /// 2D Newton–Raphson refinement for surface point projection.
@@ -628,6 +702,26 @@ fn surface_newton_refine(
         // Convergence check 3: parameter step negligible.
         let step = (deriv_u * step_u + deriv_v * step_v).length();
         if step < tolerance {
+            // Where a partial vanishes along a whole iso-line (the curves
+            // across it stand still there), the distance has a critical
+            // point that is not its least: no Newton step leaves it, though
+            // a short step off the line comes nearer, and Newton carries on
+            // from there. Elsewhere a negligible step is the answer, a
+            // clamped one included.
+            if dist > tolerance
+                && du_len.min(dv_len) <= 1e-9 * du_len.max(dv_len)
+                && let Some((u_near, v_near)) = nearer_beside(
+                    surface,
+                    point,
+                    (u, v),
+                    [u_min, u_max, v_min, v_max],
+                    (closed_u, closed_v),
+                )
+            {
+                u = u_near;
+                v = v_near;
+                continue;
+            }
             let pt = surface.evaluate(u_new, v_new);
             return Ok((u_new, v_new, pt));
         }
@@ -639,6 +733,36 @@ fn surface_newton_refine(
     Err(MathError::ConvergenceFailure {
         iterations: MAX_ITERATIONS,
     })
+}
+
+/// The nearest to `point` of the parameters a thousandth of the domain along
+/// u or v from `(u, v)`, if it is nearer than `(u, v)` itself. A step the
+/// domain's end clamps to nothing is no candidate, and every distance is
+/// read by one evaluator, so rounding alone never counts as coming nearer.
+fn nearer_beside(
+    surface: &NurbsSurface,
+    point: Point3,
+    (u, v): (f64, f64),
+    [u_min, u_max, v_min, v_max]: [f64; 4],
+    (closed_u, closed_v): (bool, bool),
+) -> Option<(f64, f64)> {
+    let here = (surface.evaluate(u, v) - point).length();
+    let (h_u, h_v) = (1e-3 * (u_max - u_min), 1e-3 * (v_max - v_min));
+    let along_u = |h: f64| {
+        let (next, step) = advance_param(u, h, u_min, u_max, closed_u);
+        ((next, v), step)
+    };
+    let along_v = |h: f64| {
+        let (next, step) = advance_param(v, h, v_min, v_max, closed_v);
+        ((u, next), step)
+    };
+    [along_u(h_u), along_u(-h_u), along_v(h_v), along_v(-h_v)]
+        .into_iter()
+        .filter(|&(_, step)| step != 0.0)
+        .map(|((a, b), _)| ((a, b), (surface.evaluate(a, b) - point).length()))
+        .filter(|&(_, d)| d < here)
+        .min_by(|x, y| x.1.total_cmp(&y.1))
+        .map(|(uv, _)| uv)
 }
 
 /// Along a closed direction the step wraps across the seam instead of
@@ -1505,5 +1629,198 @@ mod tests {
         assert!(project_point_to_surface(&wall, nan, 1e-6).is_err());
         let off = Point3::new(70.0, 0.0, 5.0);
         let _ = project_point_to_surface(&wall, off, 0.0);
+    }
+
+    /// A quarter of a ball of radius 5 stretched to 7.5 along z, between two
+    /// meridians, pole to pole in u, its v knots `scale` apart: one of the
+    /// lunes a ball written as one face is read as.
+    fn ball_lune(quarter: u8, scale: f64) -> NurbsSurface {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let (r, h) = (5.0, 7.5);
+        let meridian = [
+            (0.0, -h, 1.0),
+            (r, -h, w),
+            (r, 0.0, 1.0),
+            (r, h, w),
+            (0.0, h, 1.0),
+        ];
+        let round = [
+            (1.0, 0.0, 1.0),
+            (1.0, 1.0, w),
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, w),
+            (-1.0, 0.0, 1.0),
+            (-1.0, -1.0, w),
+            (0.0, -1.0, 1.0),
+            (1.0, -1.0, w),
+            (1.0, 0.0, 1.0),
+        ];
+        let cols = &round[2 * usize::from(quarter)..=2 * usize::from(quarter) + 2];
+        let points = meridian
+            .iter()
+            .map(|&(x, z, _)| {
+                cols.iter()
+                    .map(|&(cx, cy, _)| Point3::new(x * cx, x * cy, z))
+                    .collect()
+            })
+            .collect();
+        let weights = meridian
+            .iter()
+            .map(|&(_, _, wm)| cols.iter().map(|&(_, _, wc)| wm * wc).collect())
+            .collect();
+        let (a, b) = (f64::from(quarter) * scale, f64::from(quarter + 1) * scale);
+        NurbsSurface::new(
+            2,
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            vec![a, a, a, b, b, b],
+            points,
+            weights,
+        )
+        .expect("lune")
+    }
+
+    /// A point beside a pole on either meridian of a lune projects onto the
+    /// lune, whichever v of the grid's pole row rounding puts nearest.
+    #[test]
+    fn a_point_beside_a_pole_projects_along_its_own_meridian() {
+        for scale in [1.0, 1e-9, 1e-10, 1e-13] {
+            for quarter in 0..4 {
+                let lune = ball_lune(quarter, scale);
+                let (v0, v1) = lune.domain_v();
+                for (u, v) in [(1.88, v0), (1.88, v1), (0.12, v0), (0.12, v1)] {
+                    let target = lune.evaluate(u, v);
+                    let found = project_point_to_surface(&lune, target, 1e-6).expect("projection");
+                    assert!(
+                        found.distance < 1e-6,
+                        "scale {scale} quarter {quarter} at ({u}, {v:e}): {} off at ({}, {:e})",
+                        found.distance,
+                        found.u,
+                        found.v
+                    );
+                }
+            }
+        }
+    }
+
+    /// A bilinear patch between rows `a` (u = 0) and `b` (u = 1).
+    fn bilinear(a: [Point3; 2], b: [Point3; 2]) -> NurbsSurface {
+        NurbsSurface::new(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![a.to_vec(), b.to_vec()],
+            vec![vec![1.0; 2]; 2],
+        )
+        .expect("patch")
+    }
+
+    /// A row short beside the patch reads as one point to the pole test,
+    /// but the grid point on it nearest the target is exact.
+    #[test]
+    fn a_point_on_a_short_row_keeps_its_exact_seed() {
+        let patch = bilinear(
+            [Point3::new(0.0, 0.0, 0.0), Point3::new(5e-7, 0.0, 0.0)],
+            [Point3::new(0.0, 1000.0, 0.0), Point3::new(1.0, 1000.0, 0.0)],
+        );
+        let found = project_point_to_surface(&patch, Point3::new(2.5e-7, 0.0, 0.0), 1e-9)
+            .expect("projection");
+        assert!(found.distance < 1e-9, "{found:?}");
+    }
+
+    /// Beside a pole whose generators differ in length, the row beside it
+    /// can point to the wrong one; the seed on the pole's own row still
+    /// reaches the point.
+    #[test]
+    fn a_point_beside_a_pole_with_unequal_generators_projects_onto_it() {
+        let patch = bilinear(
+            [Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 0.0, 0.0)],
+            [Point3::new(100.0, 0.0, 0.0), Point3::new(-1.0, 0.0, 1.0)],
+        );
+        let found =
+            project_point_to_surface(&patch, Point3::new(0.1, 0.0, 0.0), 1e-6).expect("projection");
+        assert!(found.distance < 1e-6, "{found:?}");
+    }
+
+    /// A patch swept 10 up from the cubic over (-20, -20), (-20, 20),
+    /// (-20, -20), (-20, 20): the line x = -20, y = 20 (2v - 1)³, whose
+    /// partial along v vanishes on the whole row v = 1/2. A point on the
+    /// patch 0.147 beside that row, nearest the coarse grid's point on it,
+    /// still projects onto itself, at v = (1 + ∛(-0.147 / 20)) / 2.
+    #[test]
+    fn a_point_beside_a_row_where_the_surface_stands_still_projects_onto_it() {
+        let row = |z: f64| {
+            [-20.0, 20.0, -20.0, 20.0]
+                .map(|y| Point3::new(-20.0, y, z))
+                .to_vec()
+        };
+        let patch = NurbsSurface::new(
+            1,
+            3,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            vec![row(0.0), row(10.0)],
+            vec![vec![1.0; 4]; 2],
+        )
+        .expect("patch");
+        assert!(patch.derivatives(0.5, 0.5, 1)[0][1].length() < 1e-12);
+        let on = Point3::new(-20.0, -0.147, 5.0);
+        let found = project_point_to_surface(&patch, on, 1e-9).expect("projection");
+        assert!(found.distance < 1e-9, "{found:?}");
+        let v = 0.5 * (1.0 + (-0.147_f64 / 20.0).cbrt());
+        assert!((found.v - v).abs() < 1e-6, "{found:?} for v {v}");
+    }
+
+    /// A rational patch, quadratic by cubic over the unit grid (i, j) with
+    /// z = (i j mod 3) / 2 and weights 1 + ((i + 2 j) mod 3) / 2. A point
+    /// straight out from its u = 0 edge projects onto that edge: Newton's
+    /// step there clamps to nothing, which settles it rather than reading as
+    /// a still iso-line to step off, round and round until its iterations
+    /// run out.
+    #[test]
+    fn a_point_beyond_a_rational_patchs_edge_projects_onto_the_edge() {
+        let net = (0..3_u32)
+            .map(|i| {
+                (0..4_u32)
+                    .map(|j| Point3::new(f64::from(i), f64::from(j), f64::from(i * j % 3) * 0.5))
+                    .collect()
+            })
+            .collect();
+        let weights = (0..3_u32)
+            .map(|i| {
+                (0..4_u32)
+                    .map(|j| 1.0 + f64::from((i + 2 * j) % 3) * 0.5)
+                    .collect()
+            })
+            .collect();
+        let patch = NurbsSurface::new(
+            2,
+            3,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            net,
+            weights,
+        )
+        .expect("patch");
+        for v in [0.14, 0.5, 0.86] {
+            for beyond in [0.3, 1.0] {
+                let ders = patch.derivatives(0.0, v, 1);
+                let out = ders[1][0] * -beyond;
+                let q = Point3::new(
+                    ders[0][0].x() + out.x(),
+                    ders[0][0].y() + out.y(),
+                    ders[0][0].z() + out.z(),
+                );
+                let found = project_point_to_surface_from(&patch, q, (0.5, 0.5), 1e-9);
+                assert!(found.is_ok(), "v {v}, beyond {beyond}: {found:?}");
+                let found = found.expect("projection");
+                assert!(found.u.abs() < 1e-12, "v {v}, beyond {beyond}: {found:?}");
+                assert!(
+                    found.distance <= out.length() + 1e-9,
+                    "v {v}, beyond {beyond}: {found:?}"
+                );
+            }
+        }
     }
 }

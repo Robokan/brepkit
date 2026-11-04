@@ -1149,6 +1149,113 @@ mod batch_tests {
         assert!(parsed[1]["ok"].is_number());
     }
 
+    /// A 10 cube less a 3 cube cavity at `corner`, its top edge along x at
+    /// y = 0, and the batch result of filleting that edge at radius 1.
+    fn fillet_hollow_block(
+        kernel: &mut BrepKernel,
+        corner: (f64, f64, f64),
+    ) -> (brepkit_topology::solid::SolidId, serde_json::Value) {
+        use crate::handles::{edge_id_to_u32, solid_id_to_u32};
+        use brepkit_operations::boolean::{BooleanOp, boolean};
+        let topo = kernel.topo_mut();
+        let block = brepkit_operations::primitives::make_box(topo, 10.0, 10.0, 10.0).unwrap();
+        let cube = brepkit_operations::primitives::make_box(topo, 3.0, 3.0, 3.0).unwrap();
+        brepkit_operations::transform::transform_solid(
+            topo,
+            cube,
+            &brepkit_math::mat::Mat4::translation(corner.0, corner.1, corner.2),
+        )
+        .unwrap();
+        let hollow = boolean(topo, BooleanOp::Cut, block, cube).unwrap();
+        let edge = brepkit_topology::explorer::solid_edges(kernel.topo(), hollow)
+            .unwrap()
+            .into_iter()
+            .find(|&e| {
+                let edge = kernel.topo().edge(e).unwrap();
+                [edge.start(), edge.end()].iter().all(|&v| {
+                    let p = kernel.topo().vertex(v).unwrap().point();
+                    p.y().abs() < 1e-9 && (p.z() - 10.0).abs() < 1e-9
+                })
+            })
+            .unwrap();
+        let result = kernel.execute_batch(&format!(
+            r#"[{{"op": "fillet", "args": {{"solid": {}, "edges": [{}], "radius": 1.0}}}}]"#,
+            solid_id_to_u32(hollow),
+            edge_id_to_u32(edge),
+        ));
+        (hollow, serde_json::from_str(&result).unwrap())
+    }
+
+    /// The default fillet of an outer edge of a block with an enclosed
+    /// cavity keeps the cavity.
+    #[test]
+    fn batch_fillet_keeps_a_cavity() {
+        let mut kernel = BrepKernel::new();
+        let (hollow, parsed) = fillet_hollow_block(&mut kernel, (3.5, 3.5, 3.5));
+        assert!(parsed[0]["ok"].is_u64(), "{parsed}");
+        let handle = parsed[0]["ok"].as_u64().unwrap();
+        let filleted = kernel
+            .resolve_solid(u32::try_from(handle).unwrap())
+            .unwrap();
+        assert_ne!(filleted, hollow);
+        assert_eq!(
+            kernel.topo().solid(filleted).unwrap().inner_shells().len(),
+            1
+        );
+    }
+
+    /// A cavity 0.05 behind the front face, where the fillet would cut into
+    /// it: the walking engine refuses it, and so does the flat bevel it
+    /// falls back to, so the default fillet errors rather than fill it.
+    #[test]
+    fn batch_fillet_refuses_to_reach_a_cavity() {
+        let mut kernel = BrepKernel::new();
+        let (hollow, parsed) = fillet_hollow_block(&mut kernel, (3.5, 0.05, 6.5));
+        assert!(parsed[0]["error"].is_string(), "{parsed}");
+        assert_eq!(kernel.topo().solid(hollow).unwrap().inner_shells().len(), 1);
+    }
+
+    /// A v2 chamfer of an edge the blend engine leaves out (a cylinder's
+    /// rim) is an error, not the input solid handed back as the result.
+    #[test]
+    fn batch_chamfer_v2_reports_an_edge_it_could_not_blend() {
+        use crate::handles::{edge_id_to_u32, solid_id_to_u32};
+        let mut kernel = BrepKernel::new();
+        let cylinder =
+            brepkit_operations::primitives::make_cylinder(kernel.topo_mut(), 2.0, 5.0).unwrap();
+        let rim = brepkit_topology::explorer::solid_edges(kernel.topo(), cylinder)
+            .unwrap()
+            .into_iter()
+            .find(|&e| matches!(kernel.topo().edge(e).unwrap().curve(), EdgeCurve::Circle(_)))
+            .unwrap();
+        let block =
+            brepkit_operations::primitives::make_box(kernel.topo_mut(), 2.0, 2.0, 2.0).unwrap();
+        let side = brepkit_topology::explorer::solid_edges(kernel.topo(), block).unwrap()[0];
+        let result = kernel.execute_batch(&format!(
+            r#"[
+                {{"op": "chamferV2", "args": {{"solid": {}, "edges": [{}], "d1": 0.5, "d2": 0.5}}}},
+                {{"op": "chamferV2", "args": {{"solid": {}, "edges": [{}], "d1": 0.5, "d2": 0.5}}}}
+            ]"#,
+            solid_id_to_u32(cylinder),
+            edge_id_to_u32(rim),
+            solid_id_to_u32(block),
+            edge_id_to_u32(side),
+        ));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed[0]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("could not be blended")),
+            "{parsed}"
+        );
+        assert!(
+            parsed[1]["ok"]
+                .as_u64()
+                .is_some_and(|s| s != u64::from(solid_id_to_u32(block))),
+            "{parsed}"
+        );
+    }
+
     #[test]
     fn batch_invalid_json() {
         let mut kernel = BrepKernel::new();

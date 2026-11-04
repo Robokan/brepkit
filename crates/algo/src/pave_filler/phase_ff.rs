@@ -1691,7 +1691,7 @@ enum FaceExtent {
         /// included, however they wind round a closed patch. It replaces the
         /// window, gap and polygon, which a patch with hundreds of spans
         /// defeats (its points project far off from a coarse grid's seed).
-        nurbs: Option<Box<crate::classifier::NurbsTrim>>,
+        nurbs: Option<Box<crate::classifier::SpanTrim>>,
         /// The last point `nurbs` placed, the start for the next.
         hint: std::cell::Cell<Option<(f64, f64)>>,
     },
@@ -1883,7 +1883,7 @@ impl FaceExtent {
                 None => (nurbs_face_uv_polygon(topo, face_id, surface), Vec::new()),
             };
             let uv_poly = uv_poly.map(|(poly, sag)| (poly, 2.0f64.mul_add(sag, 1e-7)));
-            let nurbs = crate::classifier::NurbsTrim::of_face(topo, face_id)
+            let nurbs = crate::classifier::SpanTrim::of_face(topo, face_id)
                 .ok()
                 .flatten()
                 .map(Box::new);
@@ -3997,6 +3997,10 @@ fn section_lies_off_face(
             let (sp, ep) = (sv.point(), ev.point());
             let hits = if matches!(edge.curve(), EdgeCurve::Line) {
                 line_segment_surface_crossings(sp, ep, analytic_surf)
+            } else if edge_lies_on_surface(edge.curve(), sp, ep, analytic_surf, tol.linear) {
+                // The section may run along the hole's rim, partly on the
+                // face: no crossings here proves nothing.
+                return false;
             } else {
                 edge_surface_crossings(edge.curve(), sp, ep, analytic_surf, tol.linear)
             };
@@ -4282,7 +4286,7 @@ fn edge_surface_crossings(
     let f = |t: f64| analytic_signed_distance(surface, at(t));
     let (t0, t1) = curve.domain_with_endpoints(sp, ep);
     // An edge lying on the surface crosses nothing; its distance is noise.
-    if (0..=32).all(|k| f((t1 - t0).mul_add(f64::from(k) / 32.0, t0)).abs() <= 4.0 * tol) {
+    if edge_lies_on_surface(curve, sp, ep, surface, tol) {
         return Vec::new();
     }
     let mut budget = 4096_u32;
@@ -4387,6 +4391,23 @@ fn edge_surface_crossings(
     }
     flush(&mut group, &mut out);
     out
+}
+
+/// Whether a curved edge lies on a cylinder or cone to within its distance
+/// noise at every sample, so that where it crosses the surface is unknown.
+fn edge_lies_on_surface(
+    curve: &EdgeCurve,
+    sp: Point3,
+    ep: Point3,
+    surface: &FaceSurface,
+    tol: f64,
+) -> bool {
+    let (t0, t1) = curve.domain_with_endpoints(sp, ep);
+    (0..=32).all(|k| {
+        let t = (t1 - t0).mul_add(f64::from(k) / 32.0, t0);
+        analytic_signed_distance(surface, curve.evaluate_with_endpoints(t, sp, ep)).abs()
+            <= 4.0 * tol
+    })
 }
 
 /// Points along a curved edge in wire order, its end left out, no chord
@@ -4738,7 +4759,151 @@ fn trim_open_curve_to_plane_face_lines(
         };
         (p - (a + ab * w)).length() <= tol.linear * 10.0
     };
-    if straight_crossings_only
+    // A face with curved edges, none of them NURBS, has its boundary taken
+    // as its own segments and conic arcs: a piece is read against the curves
+    // themselves rather than their chords, whose sag holds a sliver the face
+    // does not (a half-ellipse cap grazing a cone by less than that sag).
+    let exact_region = if has_curved_boundary {
+        brepkit_topology::planar::face_boundary_2d(
+            topo,
+            plane_face,
+            frame.origin(),
+            frame.u_axis(),
+            frame.v_axis(),
+        )
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let inside_exact = |q: Point3| {
+        exact_region.as_ref().and_then(|region| {
+            brepkit_math::region2d::point_in_region(region, frame.project(q), tol.linear * 10.0)
+        })
+    };
+    // With the boundary exact, the section's crossings of its curved edges
+    // are found on the curves, where the inside test flips: a crossing of an
+    // arc can lie in its chord's sag, past every chord, and a crossing of a
+    // chord is not one of the face. Crossings of straight edges stay as the
+    // polygon scan found them.
+    if exact_region.is_some() {
+        // A chord crossing not on a straight edge witnesses an arc crossing
+        // near it; two arc crossings between neighbouring samples flip no
+        // inside state, and the witness is all that shows them.
+        let witnesses: Vec<f64> = crossings
+            .iter()
+            .copied()
+            .filter(|&t| !straight.iter().any(|&seg| on_segment(eval_at(t), seg)))
+            .collect();
+        crossings.retain(|&t| straight.iter().any(|&seg| on_segment(eval_at(t), seg)));
+        let states: Vec<(f64, bool)> = (0..=n_samples)
+            .filter_map(|i| inside_exact(eval_at(sample_t(i))).map(|s| (sample_t(i), s)))
+            .collect();
+        for w in states.windows(2) {
+            let ((mut lo, side), (mut hi, other)) = (w[0], w[1]);
+            if side == other {
+                continue;
+            }
+            for _ in 0..60 {
+                let mid = f64::midpoint(lo, hi);
+                match inside_exact(eval_at(mid)) {
+                    Some(s) if s == side => lo = mid,
+                    Some(_) => hi = mid,
+                    None => {
+                        // The piece the section meets here, read alone, so no
+                        // probe crosses another: across it, the bracket's
+                        // crossing; touching it from one side, a tangency,
+                        // which leaves the state as it was, and past which
+                        // the bisection goes on toward the state the region
+                        // holds on the section's side of the piece. Off every
+                        // piece (each trial ray grazing one), or where pieces
+                        // meet, there is nothing to read it by.
+                        let region = exact_region.as_ref()?;
+                        let band = tol.linear * 10.0;
+                        let q = frame.project(eval_at(mid));
+                        let mut touched = region.iter().filter(|piece| {
+                            brepkit_math::region2d::distance_to_piece(piece, q) <= band
+                        });
+                        let (Some(piece), None) = (touched.next(), touched.next()) else {
+                            return None;
+                        };
+                        let (t_lo, t_hi) = (
+                            raw.t_range.0.min(raw.t_range.1),
+                            raw.t_range.0.max(raw.t_range.1),
+                        );
+                        let h = (t_hi - t_lo) * 1e-6;
+                        let (a, b) = ((mid - h).max(t_lo), (mid + h).min(t_hi));
+                        let speed = (eval_at(b) - eval_at(a)).length() / (b - a);
+                        if !speed.is_finite() || speed <= 0.0 {
+                            return None;
+                        }
+                        let step = tol.linear * 100.0;
+                        let nudge = step / speed;
+                        if mid - nudge < t_lo || mid + nudge > t_hi {
+                            return None;
+                        }
+                        let side_at = |t: f64| piece_side(piece, frame.project(eval_at(t))).0;
+                        let (before, after) = (side_at(mid - nudge), side_at(mid + nudge));
+                        if before * after < 0.0 {
+                            (lo, hi) = (mid, mid);
+                            break;
+                        }
+                        if before * after <= 0.0 {
+                            return None;
+                        }
+                        // The probe off the piece reads the whole region, so it
+                        // stops halfway to any other piece, or it would read
+                        // that one's side; too close to clear the touched
+                        // piece's band, there is nothing to read.
+                        let room = region
+                            .iter()
+                            .filter(|other| !std::ptr::eq(*other, piece))
+                            .map(|other| brepkit_math::region2d::distance_to_piece(other, q))
+                            .fold(f64::INFINITY, f64::min);
+                        let reach = step.min((room - band) / 2.0);
+                        if reach <= 2.0 * band {
+                            return None;
+                        }
+                        let normal = piece_side(piece, q).1;
+                        let off = q + normal * (reach * before.signum());
+                        match brepkit_math::region2d::point_in_region(region, off, band) {
+                            Some(s) if s == side => lo = mid,
+                            Some(_) => hi = mid,
+                            None => return None,
+                        }
+                    }
+                }
+            }
+            let t_star = f64::midpoint(lo, hi);
+            // A straight edge's crossing stays the polygon scan's own: the
+            // bisection stops short of the edge, a second root beside it.
+            if straight.iter().any(|&seg| on_segment(eval_at(t_star), seg)) {
+                continue;
+            }
+            if !crossings.iter().any(|&c| (c - t_star).abs() < 1e-9) {
+                crossings.push(t_star);
+            }
+        }
+        // Each witness is answered by its own exact crossing off the straight
+        // edges within a sample of it; a straight edge's crossing nearby, or
+        // one curved crossing near two witnesses, leaves a crossing unfound.
+        let step = (raw.t_range.1 - raw.t_range.0).abs()
+            / f64::from(u32::try_from(n_samples).unwrap_or(u32::MAX));
+        let mut curved: Vec<f64> = crossings
+            .iter()
+            .copied()
+            .filter(|&t| !straight.iter().any(|&seg| on_segment(eval_at(t), seg)))
+            .collect();
+        for &w in &witnesses {
+            let nearest = curved
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| (c - w).abs() <= step)
+                .min_by(|a, b| (a.1 - w).abs().total_cmp(&(b.1 - w).abs()))
+                .map(|(k, _)| k)?;
+            curved.swap_remove(nearest);
+        }
+    } else if straight_crossings_only
         && !crossings
             .iter()
             .all(|&t| straight.iter().any(|&seg| on_segment(eval_at(t), seg)))
@@ -5101,28 +5266,6 @@ fn trim_open_curve_to_plane_face_lines(
             dense_loops.push(loop_uv);
         }
     }
-    // A face with curved edges, none of them NURBS, has its boundary taken
-    // as its own segments and conic arcs: a piece is read against the curves
-    // themselves rather than their chords, whose sag holds a sliver the face
-    // does not (a half-ellipse cap grazing a cone by less than that sag).
-    let exact_region = if has_curved_boundary {
-        brepkit_topology::planar::face_boundary_2d(
-            topo,
-            plane_face,
-            frame.origin(),
-            frame.u_axis(),
-            frame.v_axis(),
-        )
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
-    let inside_exact = |q: Point3| {
-        exact_region.as_ref().and_then(|region| {
-            brepkit_math::region2d::point_in_region(region, frame.project(q), tol.linear * 10.0)
-        })
-    };
     let inside_dense = |q: Point3| {
         let uv = frame.project(q);
         dense_loops.split_first().is_none_or(|(outer, holes)| {
@@ -5557,7 +5700,7 @@ fn compute_face_bbox(topo: &Topology, face_id: FaceId, tol: Tolerance) -> Result
         _ => None,
     };
 
-    Ok(match (points.is_empty(), surface_bbox) {
+    let bounds = match (points.is_empty(), surface_bbox) {
         (false, Some(sb)) => Aabb3::from_points(points).union(sb),
         (false, None) => Aabb3::from_points(points),
         (true, Some(sb)) => sb,
@@ -5566,7 +5709,11 @@ fn compute_face_bbox(topo: &Topology, face_id: FaceId, tol: Tolerance) -> Result
             min: Point3::new(0.0, 0.0, 0.0),
             max: Point3::new(0.0, 0.0, 0.0),
         },
-    })
+    };
+    match topo.face(face_id)?.surface() {
+        FaceSurface::Nurbs(n) => super::helpers::nurbs_face_box(topo, face_id, n, bounds, tol),
+        _ => Ok(bounds),
+    }
 }
 
 /// Pole-side axis of a spherical face, from its boundary winding: the summed
@@ -5914,6 +6061,7 @@ fn compute_raw_curves(
             // dense chain around such a loop made its fit a dense solve over
             // thousands of points.
             match analytic_intersection::exact_torus_torus(t1, t2)? {
+                Some(exacts) if exacts.len() == 1 => Ok(Vec::new()),
                 Some(exacts) => Ok(exact_raw_curves(exacts)),
                 None => {
                     if let (Some(aa), Some(ab)) = (surf_a.as_analytic(), surf_b.as_analytic()) {
@@ -5945,11 +6093,34 @@ fn compute_raw_curves(
             }
         }
 
+        (FaceSurface::Sphere(s1), FaceSurface::Sphere(s2)) => {
+            // Two spheres meet in a circle on their radical plane. A fitted
+            // curve's ends land on the true equator, off a faceted sphere's
+            // chords, and no face can take it; the circle crosses the chords
+            // where the closed-circle path splits it.
+            match analytic_intersection::exact_sphere_sphere(s1, s2)? {
+                Some(exacts) => Ok(exact_raw_curves(exacts)),
+                None => {
+                    if let (Some(aa), Some(ab)) = (surf_a.as_analytic(), surf_b.as_analytic()) {
+                        analytic_analytic_intersection(
+                            &aa, &ab, v_range_a, v_range_b, bbox_a, bbox_b,
+                        )
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
+            }
+        }
+
         (FaceSurface::Sphere(sphere), FaceSurface::Torus(torus))
         | (FaceSurface::Torus(torus), FaceSurface::Sphere(sphere)) => {
             // A sphere centred on a torus's axis meets it in circles about
-            // that axis; marching one took minutes to fit.
+            // that axis; marching one took minutes to fit. Their sections
+            // through the axis cross twice or touch once, so a lone circle
+            // is where the surfaces touch: a graze, which splits neither
+            // face (two coaxial tori alike).
             match analytic_intersection::exact_sphere_torus(sphere, torus)? {
+                Some(exacts) if exacts.len() == 1 => Ok(Vec::new()),
                 Some(exacts) => Ok(exact_raw_curves(exacts)),
                 None => {
                     if let (Some(aa), Some(ab)) = (surf_a.as_analytic(), surf_b.as_analytic()) {
@@ -6146,7 +6317,7 @@ fn compute_raw_curves(
 
         (FaceSurface::Plane { normal, d }, FaceSurface::Nurbs(nurbs))
         | (FaceSurface::Nurbs(nurbs), FaceSurface::Plane { normal, d }) => {
-            plane_nurbs_intersection(*normal, *d, nurbs, bbox_a, bbox_b)
+            plane_nurbs_intersection_in(*normal, *d, nurbs, bbox_a, bbox_b)
         }
 
         (analytic_surf, FaceSurface::Nurbs(nurbs)) if analytic_surf.as_analytic().is_some() => {
@@ -6378,6 +6549,12 @@ fn plane_analytic_intersection(
     let mut results = Vec::new();
     for exact in exact_curves {
         match exact {
+            // A plane within 1e-10 of touching a sphere only grazes it.
+            analytic_intersection::ExactIntersectionCurve::Circle(_)
+                if matches!(analytic, analytic_intersection::AnalyticSurface::Sphere(sphere)
+                    if sphere.radius()
+                        - (normal.dot(sphere.center() - Point3::new(0.0, 0.0, 0.0)) - d).abs()
+                        < 1e-10) => {}
             analytic_intersection::ExactIntersectionCurve::Circle(circle) => {
                 let bbox = circle_bbox(&circle);
                 let domain = (0.0, std::f64::consts::TAU);
@@ -6941,11 +7118,220 @@ fn analytic_analytic_intersection(
     Ok(results)
 }
 
-/// Plane-NURBS intersection.
+/// Whether every point lies on one edge of `nurbs`'s parameter domain, as
+/// a section does where the plane holds that edge of the face.
+fn runs_along_an_edge(
+    nurbs: &brepkit_math::nurbs::surface::NurbsSurface,
+    points: &[nurbs_isect::IntersectionPoint],
+) -> bool {
+    let (u_lo, u_hi) = nurbs.domain_u();
+    let (v_lo, v_hi) = nurbs.domain_v();
+    let (du, dv) = (1e-9 * (u_hi - u_lo), 1e-9 * (v_hi - v_lo));
+    let along = |at: fn(&nurbs_isect::IntersectionPoint) -> f64, edge: f64, slack: f64| {
+        points.iter().all(|p| (at(p) - edge).abs() <= slack)
+    };
+    along(|p| p.param1.0, u_lo, du)
+        || along(|p| p.param1.0, u_hi, du)
+        || along(|p| p.param1.1, v_lo, dv)
+        || along(|p| p.param1.1, v_hi, dv)
+}
+
+/// How far, in spans of the domain, `mid` lies from the nearest of the
+/// section's `curves` other than the one at `index`, measured round a closed
+/// direction's seam the shorter way. A contact along the seam itself comes
+/// back as two curves, one at each of its sides: the curve at the other
+/// side is the same one, not a neighbour.
+fn gap_to_others(
+    curves: &[nurbs_isect::IntersectionCurve],
+    index: usize,
+    mid: (f64, f64),
+    ((u_lo, u_hi), (v_lo, v_hi)): ((f64, f64), (f64, f64)),
+    (u_closed, v_closed): (bool, bool),
+) -> f64 {
+    let (wide, tall) = (u_hi - u_lo, v_hi - v_lo);
+    let short = |x: f64, closed: bool| if closed { x - x.round() } else { x };
+    let from = |q: &nurbs_isect::IntersectionPoint| {
+        (
+            short((q.param1.0 - mid.0) / wide, u_closed),
+            short((q.param1.1 - mid.1) / tall, v_closed),
+        )
+    };
+    // Which side of a closed direction's seam all of a curve lies on.
+    let side = |c: &[nurbs_isect::IntersectionPoint],
+                (lo, hi): (f64, f64),
+                at: fn(&nurbs_isect::IntersectionPoint) -> f64| {
+        let on = |edge: f64| c.iter().all(|q| (at(q) - edge).abs() <= 1e-12 * (hi - lo));
+        if on(lo) {
+            Some(false)
+        } else if on(hi) {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let ours = &curves[index].points;
+    let copy = |c: &[nurbs_isect::IntersectionPoint]| {
+        let across = |closed: bool,
+                      range: (f64, f64),
+                      at: fn(&nurbs_isect::IntersectionPoint) -> f64| {
+            closed
+                && matches!((side(ours, range, at), side(c, range, at)), (Some(a), Some(b)) if a != b)
+        };
+        across(u_closed, (u_lo, u_hi), |q| q.param1.0)
+            || across(v_closed, (v_lo, v_hi), |q| q.param1.1)
+    };
+    curves
+        .iter()
+        .enumerate()
+        .filter(|&(j, c)| j != index && !copy(&c.points))
+        .map(|(_, c)| {
+            let single = (c.points.len() == 1).then(|| {
+                let (x, y) = from(&c.points[0]);
+                x.hypot(y)
+            });
+            let spans = c.points.windows(2).map(|pair| {
+                // The segment's far end on the near end's side of a seam.
+                let (ax, ay) = from(&pair[0]);
+                let (bx, by) = (
+                    ax + short((pair[1].param1.0 - pair[0].param1.0) / wide, u_closed),
+                    ay + short((pair[1].param1.1 - pair[0].param1.1) / tall, v_closed),
+                );
+                let (dx, dy) = (bx - ax, by - ay);
+                let length = dx.mul_add(dx, dy * dy);
+                let t = if length > 0.0 {
+                    (-ax.mul_add(dx, ay * dy) / length).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                t.mul_add(dx, ax).hypot(t.mul_add(dy, ay))
+            });
+            single
+                .into_iter()
+                .chain(spans)
+                .fold(f64::INFINITY, f64::min)
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Whether the plane only touches `nurbs` along the section through
+/// `points`, without crossing it.
+///
+/// The surface's normal lies along the plane's at every point, and across
+/// the curve at its middle point the surface stays on one side of the
+/// plane. Where the surface crosses with its normal along the plane's, as
+/// `z = x³` crosses `z = 0`, the curve parts the regions either side. Each
+/// side's probe starts a billionth of the domain across and widens tenfold
+/// while the surface stays within rounding of the plane, as across
+/// `z = x⁷`, but stops short of halfway to the section's nearest other
+/// curve, so that it tells the side before another branch comes between;
+/// a curve whose sides no probe tells stays. On a closed surface the probes
+/// wrap round its seam.
+fn touches_along(
+    nurbs: &brepkit_math::nurbs::surface::NurbsSurface,
+    normal: Vec3,
+    d: f64,
+    curves: &[nurbs_isect::IntersectionCurve],
+    index: usize,
+) -> bool {
+    let points = &curves[index].points;
+    let tangent = |p: &nurbs_isect::IntersectionPoint| {
+        nurbs
+            .normal(p.param1.0, p.param1.1)
+            .is_ok_and(|n| n.cross(normal).length() <= 1e-9 * normal.length())
+    };
+    if points.len() < 2 || !points.iter().all(tangent) {
+        return false;
+    }
+    let (u_lo, u_hi) = nurbs.domain_u();
+    let (v_lo, v_hi) = nurbs.domain_v();
+    let (wide, tall) = (u_hi - u_lo, v_hi - v_lo);
+    let k = points.len() / 2;
+    let (a, b) = (
+        points[k - 1].param1,
+        points[(k + 1).min(points.len() - 1)].param1,
+    );
+    // Across the curve in parameters scaled to the domain.
+    let (tu, tv) = ((b.0 - a.0) / wide, (b.1 - a.1) / tall);
+    let len = tu.hypot(tv);
+    if len == 0.0 {
+        return false;
+    }
+    let mid = points[k].param1;
+    let rounding = 4.0
+        * f64::EPSILON
+        * nurbs
+            .control_points()
+            .iter()
+            .flatten()
+            .map(|p| {
+                (normal.x() * p.x()).abs()
+                    + (normal.y() * p.y()).abs()
+                    + (normal.z() * p.z()).abs()
+                    + d.abs()
+            })
+            .fold(0.0, f64::max);
+    // Round a closed direction's seam, onto the domain's far side.
+    let wrap = |x: f64, lo: f64, hi: f64, closed: bool| {
+        if closed {
+            (x - lo).rem_euclid(hi - lo) + lo
+        } else {
+            x.clamp(lo, hi)
+        }
+    };
+    let (u_closed, v_closed) = (nurbs.is_periodic_u(), nurbs.is_periodic_v());
+    let side = |reach: f64| {
+        let u = wrap(
+            (reach * wide).mul_add(-tv / len, mid.0),
+            u_lo,
+            u_hi,
+            u_closed,
+        );
+        let v = wrap(
+            (reach * tall).mul_add(tu / len, mid.1),
+            v_lo,
+            v_hi,
+            v_closed,
+        );
+        let p = nurbs.evaluate(u, v);
+        normal.dot(Vec3::new(p.x(), p.y(), p.z())) - d
+    };
+    // No probe reaches halfway to another curve of the section, so that
+    // none passes beyond it.
+    let gap = gap_to_others(
+        curves,
+        index,
+        mid,
+        ((u_lo, u_hi), (v_lo, v_hi)),
+        (u_closed, v_closed),
+    );
+    let nearest = |sign: f64| {
+        [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+            .into_iter()
+            .take_while(|&reach| reach < 0.5 * gap)
+            .map(|reach| side(sign * reach))
+            .find(|f| f.abs() > rounding)
+    };
+    match (nearest(1.0), nearest(-1.0)) {
+        (Some(left), Some(right)) => left * right > 0.0,
+        _ => false,
+    }
+}
+
+/// Plane-NURBS intersection over the whole surface.
+#[cfg(test)]
+fn plane_nurbs_intersection(
+    normal: Vec3,
+    d: f64,
+    nurbs: &brepkit_math::nurbs::surface::NurbsSurface,
+) -> Result<Vec<RawCurve>, AlgoError> {
+    plane_nurbs_section(normal, d, nurbs, None)
+}
+
+/// Plane-NURBS intersection between two faces.
 ///
 /// Only the section within both faces' boxes can lie on both faces, so only
 /// its runs there are kept, refined to hold to the true section.
-fn plane_nurbs_intersection(
+fn plane_nurbs_intersection_in(
     normal: Vec3,
     d: f64,
     nurbs: &brepkit_math::nurbs::surface::NurbsSurface,
@@ -6965,16 +7351,30 @@ fn plane_nurbs_intersection(
         ),
     }
     .expanded(Tolerance::new().linear * 10.0);
-    let isect_curves = nurbs_isect::intersect_plane_nurbs_in_region(
-        nurbs,
-        normal,
-        d,
-        NURBS_SAMPLES,
-        Some(region),
-    )?;
+    plane_nurbs_section(normal, d, nurbs, Some(region))
+}
+
+/// The section of `nurbs` by the plane, kept within `region` if given.
+fn plane_nurbs_section(
+    normal: Vec3,
+    d: f64,
+    nurbs: &brepkit_math::nurbs::surface::NurbsSurface,
+    region: Option<Aabb3>,
+) -> Result<Vec<RawCurve>, AlgoError> {
+    let isect_curves =
+        nurbs_isect::intersect_plane_nurbs_in_region(nurbs, normal, d, NURBS_SAMPLES, region)?;
 
     let mut results = Vec::new();
-    for ic in isect_curves {
+    let touching: Vec<bool> = (0..isect_curves.len())
+        .map(|k| touches_along(nurbs, normal, d, &isect_curves, k))
+        .collect();
+    for (ic, touches) in isect_curves.into_iter().zip(touching) {
+        // A point where the plane touches the surface splits neither face,
+        // nor a curve along which the surface touches the plane from one
+        // side, and a curve along one of the face's own edges is that edge.
+        if ic.points.len() < 2 || touches || runs_along_an_edge(nurbs, &ic.points) {
+            continue;
+        }
         let domain = ic.curve.domain();
         let bbox = nurbs_curve_bbox(&ic.curve);
         let p_start = ParametricCurve::evaluate(&ic.curve, domain.0);
@@ -7000,6 +7400,10 @@ fn nurbs_nurbs_intersection(
 
     let mut results = Vec::new();
     for ic in isect_curves {
+        // A point where the patches touch splits neither face.
+        if ic.points.len() < 2 {
+            continue;
+        }
         let domain = ic.curve.domain();
         let bbox = nurbs_curve_bbox(&ic.curve);
         let p_start = ParametricCurve::evaluate(&ic.curve, domain.0);
@@ -7016,10 +7420,9 @@ fn nurbs_nurbs_intersection(
     Ok(results)
 }
 
-/// Quadric × NURBS intersection: convert the analytic surface to its NURBS
-/// representation over the face's v-range (exact rational for the cylinder;
-/// cone, sphere and torus use their sampled conversions) and march it
-/// against the partner. This arm used to return no curves ("deferred to
+/// Quadric × NURBS intersection: convert the analytic surface to its exact
+/// rational NURBS (over the face's v-range for a cylinder or cone) and march
+/// it against the partner. This arm used to return no curves ("deferred to
 /// later phases" — no such phase existed), so any boolean pairing a quadric
 /// with a NURBS face silently never split either side: the NURBS solid's
 /// kept pieces and the quadric's kept pieces shared no seam and the result
@@ -7046,16 +7449,30 @@ fn analytic_nurbs_intersection(
         let pad = (hi - lo).abs().mul_add(0.1, 1.0);
         (lo - pad, hi + pad)
     };
+    // The partner's control points hold it, so they bound where along the
+    // axis it can meet the surface; a band much longer than that leaves the
+    // intersector seeding a long patch for a short crossing near one end.
+    let band = |near: (f64, f64)| v_range.map_or(near, |(v0, v1)| (v0.max(near.0), v1.min(near.1)));
     let converted = match surf {
         FaceSurface::Cylinder(c) => {
-            let (v0, v1) = v_range.unwrap_or_else(|| axial_range(c.origin(), c.axis()));
+            let (v0, v1) = band(axial_range(c.origin(), c.axis()));
+            if v0 >= v1 {
+                return Ok(Vec::new());
+            }
             c.to_nurbs(v0, v1)
         }
         FaceSurface::Cone(c) => {
-            let (v0, v1) = v_range.unwrap_or_else(|| axial_range(c.apex(), c.axis()));
+            // A cone's `v` runs along its generator, `sin(half_angle)` of it
+            // along the axis.
+            let (h0, h1) = axial_range(c.apex(), c.axis());
+            let along = c.half_angle().sin();
+            let (v0, v1) = band((h0 / along, h1 / along));
+            if v0 >= v1 {
+                return Ok(Vec::new());
+            }
             c.to_rational_nurbs(v0, v1)
         }
-        FaceSurface::Sphere(s) => s.to_nurbs(),
+        FaceSurface::Sphere(s) => s.to_rational_nurbs(),
         FaceSurface::Torus(t) => t.to_rational_nurbs(),
         _ => return Ok(Vec::new()),
     };
@@ -9057,10 +9474,504 @@ fn clip_line_to_polygon_general(
     Some((lo.max(0.0), hi.min(1.0)))
 }
 
+/// Which side of `piece`'s curve `p` lies, by sign, and the curve's unit
+/// normal there toward the positive side: a segment's left, an arc's outside.
+fn piece_side(
+    piece: &brepkit_math::region2d::Boundary2,
+    p: brepkit_math::vec::Point2,
+) -> (f64, brepkit_math::vec::Vec2) {
+    use brepkit_math::region2d::Boundary2;
+    use brepkit_math::vec::Vec2;
+    let unit = |n: Vec2| {
+        let len = n.length();
+        if len > 0.0 { n * (1.0 / len) } else { n }
+    };
+    match *piece {
+        Boundary2::Segment(a, b) => {
+            let d = b - a;
+            let normal = unit(Vec2::new(-d.y(), d.x()));
+            ((p - a).dot(normal), normal)
+        }
+        Boundary2::Arc {
+            center, u, v, a, b, ..
+        } => {
+            let q = p - center;
+            let (x, y) = (q.dot(u) / a, q.dot(v) / b);
+            (x.mul_add(x, y * y) - 1.0, unit(u * (x / a) + v * (y / b)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// A cone about z with half-angle π/6 from its radial plane, stored over
+    /// its generator from 18 to 22, meets the flat NURBS rectangle x = 16 to
+    /// 19, y = -1 to 1 at z = 10, the height 20 along its generator reaches.
+    /// The crossing is found, on the cone and in the plane z = 10 to its
+    /// fit's 1e-5.
+    #[test]
+    fn a_nurbs_face_meets_a_cone_where_its_generator_reaches_it() {
+        use brepkit_math::nurbs::surface::NurbsSurface;
+        use brepkit_math::surfaces::ConicalSurface;
+        let cone = ConicalSurface::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_6,
+        )
+        .unwrap();
+        let knots = vec![0.0, 0.0, 1.0, 1.0];
+        let at = |x: f64, y: f64| Point3::new(x, y, 10.0);
+        let plate = NurbsSurface::new(
+            1,
+            1,
+            knots.clone(),
+            knots,
+            vec![
+                vec![at(16.0, -1.0), at(16.0, 1.0)],
+                vec![at(19.0, -1.0), at(19.0, 1.0)],
+            ],
+            vec![vec![1.0; 2]; 2],
+        )
+        .unwrap();
+        let wall = FaceSurface::Cone(cone);
+        let curves = analytic_nurbs_intersection(&wall, Some((18.0, 22.0)), &plate).unwrap();
+        assert!(!curves.is_empty(), "no crossing");
+        let radius = 20.0 * std::f64::consts::FRAC_PI_6.cos();
+        for raw in &curves {
+            let (t0, t1) = raw.t_range;
+            for k in 0..=8 {
+                let t = (t1 - t0).mul_add(f64::from(k) / 8.0, t0);
+                let p = raw.curve.evaluate_with_endpoints(t, raw.p_start, raw.p_end);
+                // A marched section, fitted through its points.
+                assert!(
+                    (p.x().hypot(p.y()) - radius).abs() < 1e-5 && (p.z() - 10.0).abs() < 1e-5,
+                    "{p:?}"
+                );
+            }
+        }
+    }
+
+    /// The line x = -100 + 200 t on a NURBS face standing in the plane y = 0,
+    /// trimmed to the plane face `plane_face` in z = 0.
+    fn trim_line_across(topo: &mut Topology, plane_face: FaceId) -> Option<Vec<RawCurve>> {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        use brepkit_math::nurbs::surface::NurbsSurface;
+        use brepkit_topology::builder::make_polygon_wire;
+        use brepkit_topology::face::Face;
+        let tol = Tolerance::new();
+        let corners = [
+            Point3::new(-100.0, 0.0, -1.0),
+            Point3::new(100.0, 0.0, -1.0),
+            Point3::new(100.0, 0.0, 1.0),
+            Point3::new(-100.0, 0.0, 1.0),
+        ];
+        let knots = vec![0.0, 0.0, 1.0, 1.0];
+        let wall = NurbsSurface::new(
+            1,
+            1,
+            knots.clone(),
+            knots.clone(),
+            vec![vec![corners[0], corners[3]], vec![corners[1], corners[2]]],
+            vec![vec![1.0; 2]; 2],
+        )
+        .unwrap();
+        let wire = make_polygon_wire(topo, &corners, 1e-7).unwrap();
+        let wall_face = topo.add_face(Face::new(wire, vec![], FaceSurface::Nurbs(wall)));
+        let (a, b) = (Point3::new(-100.0, 0.0, 0.0), Point3::new(100.0, 0.0, 0.0));
+        let line = NurbsCurve::new(1, knots, vec![a, b], vec![1.0; 2]).unwrap();
+        let raw = RawCurve {
+            curve: EdgeCurve::NurbsCurve(line),
+            bbox: Aabb3::from_points([a, b]),
+            t_range: (0.0, 1.0),
+            p_start: a,
+            p_end: b,
+        };
+        let plane_surface = topo.face(plane_face).unwrap().surface().clone();
+        let wall_surface = topo.face(wall_face).unwrap().surface().clone();
+        let ext_plane = FaceExtent::new(topo, plane_face, &plane_surface, None, tol).unwrap();
+        let wall_range = face_v_range(topo, wall_face, &wall_surface);
+        let ext_wall = FaceExtent::new(topo, wall_face, &wall_surface, wall_range, tol).unwrap();
+        trim_open_curve_to_plane_face_lines(
+            topo,
+            plane_face,
+            &plane_surface,
+            wall_face,
+            &wall_surface,
+            &raw,
+            &ext_plane,
+            &ext_wall,
+            tol,
+            &JunctionRegistry::default(),
+        )
+    }
+
+    /// That line crosses the unit disc about (1.5, 0, 0) at t = 0.5025 and
+    /// 0.5125, both between the trim's neighbouring samples. The trim keeps
+    /// the span across the disc or leaves the section to the generic trim;
+    /// it never drops the section.
+    #[test]
+    fn a_section_crossing_an_arc_twice_between_samples_is_kept() {
+        use brepkit_topology::builder::{make_circle_edge, make_face_from_wire};
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let mut topo = Topology::new();
+        let rim = make_circle_edge(
+            &mut topo,
+            Point3::new(1.5, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            1.0,
+            1e-7,
+        )
+        .unwrap();
+        let rim = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        let disc = make_face_from_wire(&mut topo, rim).unwrap();
+        if let Some(pieces) = trim_line_across(&mut topo, disc) {
+            assert!(
+                !pieces.is_empty(),
+                "the section across the disc was dropped"
+            );
+            for piece in &pieces {
+                assert!(
+                    piece.p_start.x() > 0.5 - 1e-6 && piece.p_end.x() < 2.5 + 1e-6,
+                    "{:?}..{:?}",
+                    piece.p_start,
+                    piece.p_end
+                );
+            }
+        }
+    }
+
+    /// A thread's flank between two tooth sections, a twisted bilinear patch
+    /// from z = -0.3 to 0.7, crosses a cylinder of radius 7 stored from z = 0
+    /// up to 2, 20 or 127 only over its last 0.041 above z = 0. However long
+    /// the cylinder, the crossing is found, on the cylinder and above z = 0.
+    #[test]
+    fn a_short_crossing_near_a_long_cylinders_end_is_found() {
+        use brepkit_math::nurbs::surface::NurbsSurface;
+        use brepkit_math::surfaces::CylindricalSurface;
+        let at = |turn: f64, r: f64, z: f64| Point3::new(r * turn.cos(), r * turn.sin(), z);
+        let (t7, t8) = (126.0_f64.to_radians(), 144.0_f64.to_radians());
+        let knots = vec![0.0, 0.0, 1.0, 1.0];
+        let flank = NurbsSurface::new(
+            1,
+            1,
+            knots.clone(),
+            knots,
+            vec![
+                vec![at(t7, 6.7, -0.3), at(t8, 6.7, -0.1)],
+                vec![at(t7, 8.4, 0.5), at(t8, 8.4, 0.7)],
+            ],
+            vec![vec![1.0; 2]; 2],
+        )
+        .unwrap();
+        let wall = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 7.0)
+                .unwrap(),
+        );
+        for top in [2.0, 20.0, 127.0] {
+            let curves = analytic_nurbs_intersection(&wall, Some((0.0, top)), &flank).unwrap();
+            assert!(!curves.is_empty(), "stored up to {top}: no crossing");
+            for raw in &curves {
+                let (t0, t1) = raw.t_range;
+                for k in 0..=8 {
+                    let t = (t1 - t0).mul_add(f64::from(k) / 8.0, t0);
+                    let p = raw.curve.evaluate_with_endpoints(t, raw.p_start, raw.p_end);
+                    let r = p.x().hypot(p.y());
+                    assert!(
+                        (r - 7.0).abs() < 1e-6 && p.z() > -1e-6 && p.z() < 0.05,
+                        "stored up to {top}: {p:?} at radius {r}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// That line across the half disc of radius 2 about (0, -5e-6), its flat
+    /// side 5e-6 under the line, with a hole of radius 0.25 about
+    /// (1.5625, 0.25) the line touches at x = 1.5625. Off the hole's touch,
+    /// toward the line, the flat side lies 5e-6 away, within a probe's reach
+    /// of the region. The trim keeps the line to the disc's edge.
+    #[test]
+    fn a_section_touching_a_hole_by_another_side_keeps_its_span() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_topology::builder::make_circle_edge_with_ref;
+        use brepkit_topology::edge::Edge;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let mut topo = Topology::new();
+        let low = -5e-6;
+        let (a, b) = (Point3::new(-2.0, low, 0.0), Point3::new(2.0, low, 0.0));
+        let (va, vb) = (
+            topo.add_vertex(Vertex::new(a, 1e-9)),
+            topo.add_vertex(Vertex::new(b, 1e-9)),
+        );
+        let flat = topo.add_edge(Edge::new(va, vb, EdgeCurve::Line));
+        let dome =
+            Circle3D::new(Point3::new(0.0, low, 0.0), Vec3::new(0.0, 0.0, 1.0), 2.0).unwrap();
+        let dome = topo.add_edge(Edge::new(vb, va, EdgeCurve::Circle(dome)));
+        let outer = topo.add_wire(
+            Wire::new(
+                vec![OrientedEdge::new(flat, true), OrientedEdge::new(dome, true)],
+                true,
+            )
+            .unwrap(),
+        );
+        let start = 7.0_f64.to_radians();
+        let hole = make_circle_edge_with_ref(
+            &mut topo,
+            Point3::new(1.5625, 0.25, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            0.25,
+            Vec3::new(start.cos(), start.sin(), 0.0),
+            1e-9,
+        )
+        .unwrap();
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(hole, true)], true).unwrap());
+        let half = topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        let pieces = trim_line_across(&mut topo, half).expect("a trimmed section");
+        let end = pieces
+            .iter()
+            .map(|p| p.p_start.x().max(p.p_end.x()))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((end - 2.0).abs() < 1e-6, "ends at {end}");
+    }
+
+    /// That line across the disc of radius 1.5625 + 6e-6 about the origin with
+    /// a hole of radius 4e-6 about (1.5625, 4e-6), which the line touches at
+    /// x = 1.5625, 6e-6 short of the disc's edge. Bisecting lands on the
+    /// touch, and a point 1e-5 along the line past it is off the disc: read
+    /// against the region, the touch would pass for the line's exit. The
+    /// trim keeps the line to the disc's edge.
+    #[test]
+    fn a_section_touching_a_hole_by_the_edge_keeps_its_span_to_the_edge() {
+        use brepkit_topology::builder::{make_circle_edge, make_circle_edge_with_ref};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let radius = 1.5625 + 6e-6;
+        let mut topo = Topology::new();
+        let rim = make_circle_edge(
+            &mut topo,
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            radius,
+            1e-9,
+        )
+        .unwrap();
+        let start = 7.0_f64.to_radians();
+        let hole = make_circle_edge_with_ref(
+            &mut topo,
+            Point3::new(1.5625, 4e-6, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            4e-6,
+            Vec3::new(start.cos(), start.sin(), 0.0),
+            1e-9,
+        )
+        .unwrap();
+        let rim = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(hole, true)], true).unwrap());
+        let disc = topo.add_face(Face::new(
+            rim,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        let pieces = trim_line_across(&mut topo, disc).expect("a trimmed section");
+        let end = pieces
+            .iter()
+            .map(|p| p.p_start.x().max(p.p_end.x()))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (end - radius).abs() < 1e-6,
+            "ends at {end}, the edge at {radius}"
+        );
+    }
+
+    /// That line across the disc of radius 2 about the origin with a hole of
+    /// radius 0.25 about (1.5625, 0.25), which the line touches at x = 1.5625
+    /// without crossing, the hole's samples starting 7 degrees round so that
+    /// none lands on the touch. Bisecting the samples about x = 0 and 3.125
+    /// lands on the touch first. The trim keeps the line from -2 to 2.
+    #[test]
+    fn a_section_touching_a_hole_keeps_its_span_past_it() {
+        use brepkit_topology::builder::{make_circle_edge, make_circle_edge_with_ref};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let mut topo = Topology::new();
+        let rim = make_circle_edge(
+            &mut topo,
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            2.0,
+            1e-7,
+        )
+        .unwrap();
+        let start = 7.0_f64.to_radians();
+        let hole = make_circle_edge_with_ref(
+            &mut topo,
+            Point3::new(1.5625, 0.25, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            0.25,
+            Vec3::new(start.cos(), start.sin(), 0.0),
+            1e-7,
+        )
+        .unwrap();
+        let rim = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(hole, true)], true).unwrap());
+        let disc = topo.add_face(Face::new(
+            rim,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        let pieces = trim_line_across(&mut topo, disc).expect("a trimmed section");
+        let mut spans: Vec<(f64, f64)> = pieces
+            .iter()
+            .map(|p| {
+                (
+                    p.p_start.x().min(p.p_end.x()),
+                    p.p_start.x().max(p.p_end.x()),
+                )
+            })
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let covered = spans.first().is_some_and(|s| (s.0 + 2.0).abs() < 1e-6)
+            && spans.last().is_some_and(|s| (s.1 - 2.0).abs() < 1e-6)
+            && spans.windows(2).all(|w| (w[0].1 - w[1].0).abs() < 1e-6);
+        assert!(covered, "{spans:?}");
+    }
+
+    /// That line across the rectangle x = -0.5 to 2.5, y = -2 to 2 with a
+    /// hole of radius 0.25 about (1, 1), off the line: the hole gives the face
+    /// a curved boundary, and the line crosses only its straight edges. The
+    /// trim keeps the one span from -0.5 to 2.5, with no sliver beside an
+    /// edge, or leaves the section to the generic trim.
+    #[test]
+    fn a_section_crossing_only_straight_edges_keeps_one_span() {
+        use brepkit_topology::builder::{make_circle_edge, make_polygon_wire};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let mut topo = Topology::new();
+        let outer = make_polygon_wire(
+            &mut topo,
+            &[
+                Point3::new(-0.5, -2.0, 0.0),
+                Point3::new(2.5, -2.0, 0.0),
+                Point3::new(2.5, 2.0, 0.0),
+                Point3::new(-0.5, 2.0, 0.0),
+            ],
+            1e-7,
+        )
+        .unwrap();
+        let rim = make_circle_edge(
+            &mut topo,
+            Point3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            0.25,
+            1e-7,
+        )
+        .unwrap();
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        let plate = topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        if let Some(pieces) = trim_line_across(&mut topo, plate) {
+            let spans: Vec<(f64, f64)> = pieces
+                .iter()
+                .map(|p| {
+                    (
+                        p.p_start.x().min(p.p_end.x()),
+                        p.p_start.x().max(p.p_end.x()),
+                    )
+                })
+                .collect();
+            assert_eq!(spans.len(), 1, "{spans:?}");
+            assert!(
+                (spans[0].0 + 0.5).abs() < 1e-6 && (spans[0].1 - 2.5).abs() < 1e-6,
+                "{spans:?}"
+            );
+        }
+    }
+
+    /// That line across the rectangle x = -0.5 to 2.5, y = -2 to 2 with a
+    /// hole of radius 0.25 about (1, 0): the hole's crossings at x = 0.75
+    /// and 1.25 lie between samples, each within a sample of a straight
+    /// edge's. The trim keeps the spans either side of the hole and nothing
+    /// through it, or leaves the section to the generic trim.
+    #[test]
+    fn a_section_crossing_a_small_hole_between_samples_keeps_its_spans() {
+        use brepkit_topology::builder::{make_circle_edge, make_polygon_wire};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let mut topo = Topology::new();
+        let outer = make_polygon_wire(
+            &mut topo,
+            &[
+                Point3::new(-0.5, -2.0, 0.0),
+                Point3::new(2.5, -2.0, 0.0),
+                Point3::new(2.5, 2.0, 0.0),
+                Point3::new(-0.5, 2.0, 0.0),
+            ],
+            1e-7,
+        )
+        .unwrap();
+        let rim = make_circle_edge(
+            &mut topo,
+            Point3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            0.25,
+            1e-7,
+        )
+        .unwrap();
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        let plate = topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        if let Some(pieces) = trim_line_across(&mut topo, plate) {
+            let mut spans: Vec<(f64, f64)> = pieces
+                .iter()
+                .map(|p| {
+                    (
+                        p.p_start.x().min(p.p_end.x()),
+                        p.p_start.x().max(p.p_end.x()),
+                    )
+                })
+                .collect();
+            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(spans.len(), 2, "{spans:?}");
+            let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+            assert!(
+                close(spans[0].0, -0.5)
+                    && close(spans[0].1, 0.75)
+                    && close(spans[1].0, 1.25)
+                    && close(spans[1].1, 2.5),
+                "{spans:?}"
+            );
+        }
+    }
 
     fn boxes(
         a: ([f64; 3], [f64; 3]),
@@ -9569,6 +10480,64 @@ mod tests {
     /// a quarter patch of its outer upper tube holds none of the inner one:
     /// the box face holding that circle whole does not make it a section.
     /// (The outer circle passes whole; closed circles split downstream.)
+    /// A plane face round a hole of `hole_radius` centred `offset` along x,
+    /// and the section of a unit cylinder about z: whether that section is
+    /// judged wholly off the face, read at its point (1, 0, 0).
+    fn unit_section_lies_off_face(hole_radius: f64, offset: f64) -> bool {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::CylindricalSurface;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+        let mut topo = Topology::default();
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let corners: Vec<_> = [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)]
+            .iter()
+            .map(|&(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), 1e-7)))
+            .collect();
+        let sides: Vec<_> = (0..4)
+            .map(|i| {
+                let e = topo.add_edge(Edge::new(corners[i], corners[(i + 1) % 4], EdgeCurve::Line));
+                OrientedEdge::new(e, true)
+            })
+            .collect();
+        let outer = topo.add_wire(Wire::new(sides, true).unwrap());
+        let rim = Circle3D::new(Point3::new(offset, 0.0, 0.0), up, hole_radius).unwrap();
+        let v = topo.add_vertex(Vertex::new(rim.evaluate(0.0), 1e-7));
+        let rim_edge = topo.add_edge(Edge::new(v, v, EdgeCurve::Circle(rim)));
+        let hole =
+            topo.add_wire(Wire::new(vec![OrientedEdge::new(rim_edge, false)], true).unwrap());
+        let face = topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane { normal: up, d: 0.0 },
+        ));
+        let cylinder = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), up, 1.0).unwrap(),
+        );
+        section_lies_off_face(
+            &topo,
+            face,
+            up,
+            Point3::new(1.0, 0.0, 0.0),
+            &cylinder,
+            Tolerance::default(),
+        )
+    }
+
+    #[test]
+    fn a_section_well_inside_a_hole_lies_off_the_face() {
+        assert!(unit_section_lies_off_face(2.0, 0.0));
+    }
+
+    /// A rim within distance noise of the cylinder crosses it nowhere that
+    /// can be told, though here it crosses twice and the section runs on the
+    /// face beyond them: the section is kept.
+    #[test]
+    fn a_section_along_a_hole_rim_is_not_judged_off_the_face() {
+        let tol = Tolerance::default().linear;
+        assert!(!unit_section_lies_off_face(1.0 + tol, 2.5 * tol));
+    }
+
     #[test]
     fn a_torus_patch_takes_no_plane_circle_lying_off_it() {
         use brepkit_math::curves::Circle3D;
@@ -10325,5 +11294,399 @@ mod tests {
             w.p_end.y()
         );
         assert!(w.p_start.y().abs() < 1e-9 || w.p_end.y().abs() < 1e-9);
+    }
+
+    /// A plane cutting a sphere 1e-8 inside tangency, a billion units from
+    /// the origin, keeps its circle; only one within 1e-10 of touching is
+    /// left out as a graze.
+    #[test]
+    fn a_far_sphere_cut_a_hair_inside_keeps_its_circle() {
+        let center = Point3::new(1e9, 1e9, 0.0);
+        let sphere = brepkit_math::surfaces::SphericalSurface::new(center, 1.0).unwrap();
+        let analytic = analytic_intersection::AnalyticSurface::Sphere(&sphere);
+        let normal = Vec3::new(0.5_f64.sqrt(), -(0.5_f64.sqrt()), 0.0);
+        let along = normal.dot(center - Point3::new(0.0, 0.0, 0.0));
+        let (a, b) = boxes(
+            ([1e9 - 2.0, 1e9 - 2.0, -2.0], [1e9 + 2.0, 1e9 + 2.0, 2.0]),
+            ([1e9 - 2.0, 1e9 - 2.0, -2.0], [1e9 + 2.0, 1e9 + 2.0, 2.0]),
+        );
+        let cut = |depth: f64| {
+            plane_analytic_intersection(normal, along - (1.0 - depth), &analytic, &a, &b)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(cut(1e-8), 1);
+        assert_eq!(cut(1e-11), 0);
+    }
+
+    /// A ball sitting in a ring's hole touches its inner equator: a graze,
+    /// with no curve to split either face by. A wider ball cuts the tube in
+    /// two circles.
+    #[test]
+    fn a_ball_touching_a_rings_hole_grazes_it() {
+        let ring = FaceSurface::Torus(
+            brepkit_math::surfaces::ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 3.0, 1.0)
+                .unwrap(),
+        );
+        let (a, b) = boxes(
+            ([-4.0, -4.0, -1.0], [4.0, 4.0, 1.0]),
+            ([-4.0, -4.0, -4.0], [4.0, 4.0, 4.0]),
+        );
+        let sections = |radius: f64| {
+            let ball = FaceSurface::Sphere(
+                brepkit_math::surfaces::SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), radius)
+                    .unwrap(),
+            );
+            compute_raw_curves(&ring, &ball, &a, &b, None, None)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(sections(2.0), 0);
+        assert_eq!(sections(3.0), 2);
+    }
+
+    /// A ball off a ring's axis touching its outer equator grazes it too.
+    #[test]
+    fn a_ball_touching_a_ring_off_its_axis_grazes_it() {
+        let ring = FaceSurface::Torus(
+            brepkit_math::surfaces::ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 3.0, 1.0)
+                .unwrap(),
+        );
+        let ball = FaceSurface::Sphere(
+            brepkit_math::surfaces::SphericalSurface::new(Point3::new(5.0, 0.0, 0.0), 1.0).unwrap(),
+        );
+        let (a, b) = boxes(
+            ([-4.0, -4.0, -1.0], [4.0, 4.0, 1.0]),
+            ([4.0, -1.0, -1.0], [6.0, 1.0, 1.0]),
+        );
+        assert!(
+            compute_raw_curves(&ring, &ball, &a, &b, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A flat NURBS sheet at height 0.5 cuts a ball of radius 2 in a circle
+    /// of radius √3.75, which the section follows on the ball itself, not
+    /// on a faceted stand-in for it.
+    #[test]
+    fn a_ball_meets_a_nurbs_sheet_on_the_ball() {
+        let corner = |x: f64, y: f64| Point3::new(x, y, 0.5);
+        let sheet = brepkit_math::nurbs::surface::NurbsSurface::new(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                vec![corner(-2.5, -2.5), corner(-2.5, 2.5)],
+                vec![corner(2.5, -2.5), corner(2.5, 2.5)],
+            ],
+            vec![vec![1.0; 2]; 2],
+        )
+        .unwrap();
+        let ball = FaceSurface::Sphere(
+            brepkit_math::surfaces::SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 2.0).unwrap(),
+        );
+        let raw = analytic_nurbs_intersection(&ball, None, &sheet).unwrap();
+        assert!(!raw.is_empty());
+        let mut far = 0.0_f64;
+        for curve in &raw {
+            let EdgeCurve::NurbsCurve(c) = &curve.curve else {
+                unreachable!("a marched section is a NURBS curve")
+            };
+            let (t0, t1) = c.domain();
+            for i in 0..=400 {
+                let p = c.evaluate(t0 + (t1 - t0) * f64::from(i) / 400.0);
+                let on_ball = ((p - Point3::new(0.0, 0.0, 0.0)).length() - 2.0).abs();
+                far = far.max(on_ball).max((p.z() - 0.5).abs());
+            }
+        }
+        assert!(far < 1e-5, "section strays {far:.2e} off the ball");
+    }
+    /// A plane touching a NURBS bowl at its vertex grazes it: the touching
+    /// point splits neither face.
+    #[test]
+    fn a_plane_touching_a_nurbs_bowl_at_a_point_grazes_it() {
+        let row = |x: f64, z: [f64; 3]| {
+            vec![
+                Point3::new(x, -1.0, z[0]),
+                Point3::new(x, 0.0, z[1]),
+                Point3::new(x, 1.0, z[2]),
+            ]
+        };
+        let bowl = brepkit_math::nurbs::surface::NurbsSurface::new(
+            2,
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![
+                row(-1.0, [2.0, 0.0, 2.0]),
+                row(0.0, [0.0, -2.0, 0.0]),
+                row(1.0, [2.0, 0.0, 2.0]),
+            ],
+            vec![vec![1.0; 3]; 3],
+        )
+        .unwrap();
+        let raw = plane_nurbs_intersection(Vec3::new(0.0, 0.0, 1.0), 0.0, &bowl).unwrap();
+        assert!(raw.is_empty());
+    }
+
+    /// A plane touching a NURBS trough along its floor grazes it as well:
+    /// the section the surface lies on splits neither face.
+    #[test]
+    fn a_plane_touching_a_nurbs_trough_along_a_line_grazes_it() {
+        let row = |x: f64, z: f64| vec![Point3::new(x, -1.0, z), Point3::new(x, 1.0, z)];
+        let trough = brepkit_math::nurbs::surface::NurbsSurface::new(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![row(-1.0, 1.0), row(0.0, -1.0), row(1.0, 1.0)],
+            vec![vec![1.0; 2]; 3],
+        )
+        .unwrap();
+        let raw = plane_nurbs_intersection(Vec3::new(0.0, 0.0, 1.0), 0.0, &trough).unwrap();
+        assert!(raw.is_empty());
+    }
+
+    /// A sheet `z = (x − a)³(x − b)` crossing `z = 0` along `x = a` with its
+    /// normal along the plane's and along `x = b` 0.0008 away splits along
+    /// both: the side test's probes start close enough not to reach past
+    /// `x = b`.
+    #[test]
+    fn a_plane_crossing_a_nurbs_sheet_flat_beside_another_crossing_splits_it_twice() {
+        // Round a node of the 32-sample grid, so that the grid sees both.
+        let (a, b) = (15.0 / 31.0 - 0.0004, 15.0 / 31.0 + 0.0004);
+        let power = [
+            a * a * a * b,
+            -a * a * (a + 3.0 * b),
+            3.0 * a * (a + b),
+            -(3.0 * a + b),
+            1.0,
+        ];
+        // The quartic's Bernstein coefficients.
+        let choose =
+            |n: u32, k: u32| (0..k).fold(1.0, |c, m| c * f64::from(n - m) / f64::from(m + 1));
+        let rows = (0..=4_u32)
+            .map(|i| {
+                let z: f64 = (0..=i)
+                    .map(|k| choose(i, k) / choose(4, k) * power[k as usize])
+                    .sum();
+                let x = f64::from(i) / 4.0;
+                vec![Point3::new(x, -1.0, z), Point3::new(x, 1.0, z)]
+            })
+            .collect();
+        let sheet = brepkit_math::nurbs::surface::NurbsSurface::new(
+            4,
+            1,
+            [vec![0.0; 5], vec![1.0; 5]].concat(),
+            vec![0.0, 0.0, 1.0, 1.0],
+            rows,
+            vec![vec![1.0; 2]; 5],
+        )
+        .unwrap();
+        let raw = plane_nurbs_intersection(Vec3::new(0.0, 0.0, 1.0), 0.0, &sheet).unwrap();
+        assert_eq!(raw.len(), 2);
+    }
+
+    /// A sheet stretched a thousandfold along `x`, `z = (u − a)(u − b)` with
+    /// `x = 1000u`, crosses `z = 0` along two lines 8e-7 apart in `u`, where
+    /// it lies within 1e-9 of flat: no probe of the side test reaches past
+    /// the other line, and the sheet splits along both.
+    #[test]
+    fn a_plane_crossing_a_nearly_flat_nurbs_sheet_twice_close_by_splits_it_twice() {
+        // Round a node of the 32-sample grid, so that the grid sees both.
+        let (a, b) = (15.0 / 31.0 - 4e-7, 15.0 / 31.0 + 4e-7);
+        let heights = [
+            a * b,
+            0.5f64.mul_add(-(a + b), a * b),
+            1.0 - (a + b) + a * b,
+        ];
+        let rows = heights
+            .iter()
+            .zip([0.0, 500.0, 1000.0])
+            .map(|(&z, x)| vec![Point3::new(x, -1.0, z), Point3::new(x, 1.0, z)])
+            .collect();
+        let sheet = brepkit_math::nurbs::surface::NurbsSurface::new(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            rows,
+            vec![vec![1.0; 2]; 3],
+        )
+        .unwrap();
+        let raw = plane_nurbs_intersection(Vec3::new(0.0, 0.0, 1.0), 0.0, &sheet).unwrap();
+        assert_eq!(raw.len(), 2);
+    }
+
+    /// Across a closed direction's seam, the side test's gap to another
+    /// curve of the section is measured the shorter way round, passing over
+    /// a curve's own copy across the seam but not a close neighbour.
+    #[test]
+    fn the_gap_to_another_curve_runs_round_a_closed_seam() {
+        use nurbs_isect::{IntersectionCurve as IC, IntersectionPoint as IP};
+        // Two lines of the section on either side of a seam at `u = 0`, at
+        // `u = 0.9996` and `u = 0.0004`.
+        let line = |u: f64| {
+            let points: Vec<_> = [0.2, 0.5, 0.8]
+                .map(|v| IP {
+                    point: Point3::new(u, v, 0.0),
+                    param1: (u, v),
+                    param2: (0.0, 0.0),
+                })
+                .to_vec();
+            IC {
+                curve: brepkit_math::nurbs::curve::NurbsCurve::new(
+                    1,
+                    vec![0.0, 0.0, 1.0, 1.0],
+                    vec![points[0].point, points[2].point],
+                    vec![1.0, 1.0],
+                )
+                .unwrap(),
+                points,
+            }
+        };
+        let curves = [line(0.9996), line(0.0004)];
+        let round = gap_to_others(
+            &curves,
+            0,
+            (0.9996, 0.5),
+            ((0.0, 1.0), (0.0, 1.0)),
+            (true, false),
+        );
+        let open = gap_to_others(
+            &curves,
+            0,
+            (0.9996, 0.5),
+            ((0.0, 1.0), (0.0, 1.0)),
+            (false, false),
+        );
+        assert!((round - 0.0008).abs() < 1e-12, "{round}");
+        assert!((open - 0.9992).abs() < 1e-12, "{open}");
+        // A line along the seam comes back at `u = 1` as well as `u = 0`,
+        // and that copy is no neighbour; lines 8e-10 apart are, astride the
+        // seam or on an open surface.
+        let copy = [line(0.0), line(1.0)];
+        let gap = gap_to_others(
+            &copy,
+            0,
+            (0.0, 0.5),
+            ((0.0, 1.0), (0.0, 1.0)),
+            (true, false),
+        );
+        assert!(gap.is_infinite(), "{gap}");
+        let astride = [line(4e-10), line(1.0 - 4e-10)];
+        let gap = gap_to_others(
+            &astride,
+            0,
+            (4e-10, 0.5),
+            ((0.0, 1.0), (0.0, 1.0)),
+            (true, false),
+        );
+        assert!((gap - 8e-10).abs() < 1e-15, "{gap}");
+        let close = [line(0.5), line(0.5 + 8e-10)];
+        let gap = gap_to_others(
+            &close,
+            0,
+            (0.5, 0.5),
+            ((0.0, 1.0), (0.0, 1.0)),
+            (false, false),
+        );
+        assert!((gap - 8e-10).abs() < 1e-15, "{gap}");
+    }
+
+    /// A flat NURBS sheet at `z = 0` touches the NURBS bowl `z = x² + y²`
+    /// only at its lowest point, which splits neither face.
+    #[test]
+    fn a_flat_nurbs_sheet_touching_a_nurbs_bowl_at_a_point_grazes_it() {
+        use brepkit_math::nurbs::surface::NurbsSurface;
+        // `(2u − 1)²` has Bernstein coefficients 1, −1, 1.
+        let fall = [1.0, -1.0, 1.0];
+        let bowl = NurbsSurface::new(
+            2,
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            (0..3)
+                .map(|i| {
+                    (0..3)
+                        .map(|j| {
+                            let at = |k: usize| f64::from(u8::try_from(k).unwrap()) - 1.0;
+                            Point3::new(at(i), at(j), fall[i] + fall[j])
+                        })
+                        .collect()
+                })
+                .collect(),
+            vec![vec![1.0; 3]; 3],
+        )
+        .unwrap();
+        let at = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        let sheet = NurbsSurface::new(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                vec![at(-2.0, -2.0), at(-2.0, 2.0)],
+                vec![at(2.0, -2.0), at(2.0, 2.0)],
+            ],
+            vec![vec![1.0; 2]; 2],
+        )
+        .unwrap();
+        let raw = nurbs_nurbs_intersection(&sheet, &bowl).unwrap();
+        assert!(raw.is_empty(), "{} curves", raw.len());
+    }
+
+    /// A plane crossing a NURBS sheet where the sheet's normal lies along
+    /// its own, as `z = x³` and `z = x⁷` cross `z = 0` along `x = 0`, still
+    /// splits it; across `x⁷` the sheet stays within rounding of the plane
+    /// a thousandth of the way.
+    #[test]
+    fn a_plane_crossing_a_nurbs_sheet_where_it_lies_flat_splits_it() {
+        for power in [3_u32, 7] {
+            // `(2u − 1)ⁿ` has Bernstein coefficients `(−1)ⁿ⁻ᵏ`.
+            let rows = (0..=power)
+                .map(|k| {
+                    let x = 2.0f64.mul_add(f64::from(k) / f64::from(power), -1.0);
+                    let z = if (power - k) % 2 == 0 { 1.0 } else { -1.0 };
+                    vec![Point3::new(x, -1.0, z), Point3::new(x, 1.0, z)]
+                })
+                .collect::<Vec<_>>();
+            let order = rows.len();
+            let sheet = brepkit_math::nurbs::surface::NurbsSurface::new(
+                order - 1,
+                1,
+                [vec![0.0; order], vec![1.0; order]].concat(),
+                vec![0.0, 0.0, 1.0, 1.0],
+                rows,
+                vec![vec![1.0; 2]; order],
+            )
+            .unwrap();
+            let raw = plane_nurbs_intersection(Vec3::new(0.0, 0.0, 1.0), 0.0, &sheet).unwrap();
+            assert_eq!(raw.len(), 1, "x^{power}");
+        }
+    }
+
+    /// A plane holding one edge of a NURBS sheet that lies on its negative
+    /// side meets the sheet only along that edge, which already bounds the
+    /// face: no section.
+    #[test]
+    fn a_plane_holding_a_nurbs_faces_edge_adds_no_section() {
+        let at = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        let sheet = brepkit_math::nurbs::surface::NurbsSurface::new(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                vec![at(-1.0, 0.0), at(-1.0, 1.0)],
+                vec![at(0.0, 0.0), at(0.0, 1.0)],
+            ],
+            vec![vec![1.0; 2]; 2],
+        )
+        .unwrap();
+        let raw = plane_nurbs_intersection(Vec3::new(1.0, 0.0, 0.0), 0.0, &sheet).unwrap();
+        assert!(raw.is_empty());
     }
 }

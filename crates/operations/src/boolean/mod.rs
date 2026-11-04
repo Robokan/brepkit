@@ -447,8 +447,8 @@ fn boolean_inner(
     // The boxes are conservative outer bounds, so box non-overlap implies
     // solid non-overlap. Symmetric in A and B by construction.
     if op == BooleanOp::Intersect {
-        let bb_a = crate::measure::solid_bounding_box(topo, a).ok();
-        let bb_b = crate::measure::solid_bounding_box(topo, b).ok();
+        let bb_a = crate::measure::solid_outer_bounds(topo, a).ok();
+        let bb_b = crate::measure::solid_outer_bounds(topo, b).ok();
         if let Some((a_box, b_box)) = bb_a.zip(bb_b)
             && aabbs_separated(&a_box, &b_box, tol.linear)
         {
@@ -649,8 +649,32 @@ fn boolean_inner(
                         (false, None)
                     }
                 };
-                let needs_unify =
-                    !(euler_balanced_pre || multi_balanced_pre) || manifold_pre == Some(false);
+                // A boundary that touches itself at a vertex balances once
+                // that vertex counts once per sheet of faces meeting there (as
+                // the gate below reads it), and `unify_faces` would merge
+                // faces across the point where the sheets meet.
+                let (pinched_pre, manifold_pre) = if euler_balanced_pre || multi_balanced_pre {
+                    (false, manifold_pre)
+                } else {
+                    let manifold = match manifold_pre {
+                        Some(m) => m,
+                        None => is_closed_manifold(topo, result)?,
+                    };
+                    let balanced = manifold && {
+                        let faces = brepkit_topology::explorer::solid_faces(topo, result)?;
+                        let fans = crate::validate::extra_vertex_fans(topo, &faces)?;
+                        let pieces = crate::boolean::assembly::face_components(topo, result).len();
+                        fans > 0
+                            && euler_balanced(
+                                euler_pre2 - inner_shell_surplus + fans,
+                                inner_wire_count_pre,
+                                i64::try_from(pieces.max(1)).unwrap_or(i64::MAX),
+                            )
+                    };
+                    (balanced, Some(manifold))
+                };
+                let needs_unify = !(euler_balanced_pre || multi_balanced_pre || pinched_pre)
+                    || manifold_pre == Some(false);
                 let mut unified = false;
                 if needs_unify {
                     for _ in 0..3 {
@@ -707,9 +731,32 @@ fn boolean_inner(
                 // inner-shell surplus and balance Euler by accident.
                 let hollow_ok = inner_shell_surplus == 0 || closed_manifold;
                 let euler_eff = euler - inner_shell_surplus;
-                let euler_ok = hollow_ok
+                let mut euler_ok = hollow_ok
                     && (euler_eff == 2
                         || (euler_balanced(euler_eff, inner_wire_count, 1) && closed_manifold));
+                // A hole whose rim shares a vertex with another of its face's
+                // wires (a tilted hole running along a wall, its rim touching
+                // the wall's edge) leaves the face's boundary in one piece, so
+                // it adds nothing to V-E+F. A boundary that touches itself at
+                // a vertex (a ring cut where its two ends meet at a point, two
+                // pieces sharing a corner) balances once that vertex counts
+                // once per sheet of faces meeting there. `validate_solid`
+                // counts both ways, and must find no error, as the gates
+                // below only log its errors. Counted only when the plain
+                // balance fails, so they add acceptances and remove none.
+                let extra_fans = if euler_ok || !closed_manifold {
+                    0
+                } else {
+                    let faces = brepkit_topology::explorer::solid_faces(topo, result)?;
+                    crate::validate::extra_vertex_fans(topo, &faces)?
+                };
+                if !euler_ok && hollow_ok && closed_manifold {
+                    euler_ok =
+                        (euler_balanced(euler_eff, solid_separate_inner_loops(topo, result)?, 1)
+                            || (extra_fans > 0
+                                && euler_balanced(euler_eff + extra_fans, inner_wire_count, 1)))
+                            && crate::validate::validate_solid(topo, result)?.is_valid();
+                }
                 if euler_ok && open_shell_ok && validate_boolean_result(topo, result).is_ok() {
                     log::info!(
                         "GFA boolean succeeded in {:.1}ms ({result_faces} faces)",
@@ -802,7 +849,17 @@ fn boolean_inner(
                 // legitimately yields N disjoint chunks.
                 if matches!(op, BooleanOp::Cut | BooleanOp::Fuse | BooleanOp::Intersect)
                     && components >= 2
-                    && euler_balanced(euler, inner_wire_count, i64::try_from(components).unwrap_or(i64::MAX))
+                    && (euler_balanced(
+                        euler,
+                        inner_wire_count,
+                        i64::try_from(components).unwrap_or(i64::MAX),
+                    ) || (extra_fans > 0
+                        && euler_balanced(
+                            euler + extra_fans,
+                            inner_wire_count,
+                            i64::try_from(components).unwrap_or(i64::MAX),
+                        )
+                        && crate::validate::validate_solid(topo, result)?.is_valid()))
                     && components_are_disjoint_pieces(topo, &components_vec)
                     && cut_safe
                     && intersect_safe
@@ -2424,7 +2481,11 @@ fn solids_provably_disjoint(topo: &Topology, a: SolidId, b: SolidId, margin: f64
     let boxes = |comps: &[Vec<FaceId>]| -> Option<Vec<brepkit_math::aabb::Aabb3>> {
         comps
             .iter()
-            .map(|faces| crate::measure::face_set_bounding_box(topo, faces).ok())
+            .map(|faces| {
+                crate::measure::face_set_bounding_box(topo, faces)
+                    .and_then(|b| crate::measure::hold_nurbs_faces(topo, faces, b))
+                    .ok()
+            })
             .collect()
     };
     let (Some(boxes_a), Some(boxes_b)) = (boxes(&comps_a), boxes(&comps_b)) else {
@@ -2622,9 +2683,9 @@ fn detect_trivial_relation(
     // volume witnesses this is a sample, not a proof of containment.
     let boundary_probe_outside =
         |topo: &Topology, inner: SolidId, outer: SolidId, bb: &Option<(Point3, Point3)>| -> bool {
-            let Some((lo, hi)) = *bb else { return false };
-            let (dx, dy, dz) = (hi.x() - lo.x(), hi.y() - lo.y(), hi.z() - lo.z());
-            let defl = (dx.mul_add(dx, dy.mul_add(dy, dz * dz)).sqrt() * 0.01).max(1e-6);
+            if bb.is_none() {
+                return false;
+            }
             let Ok(s) = topo.solid(inner) else {
                 return false;
             };
@@ -2645,16 +2706,43 @@ fn detect_trivial_relation(
                     }
                 }
             }
+            // One classifier for every probe: its face index is built once.
+            let Ok(classifier) = brepkit_check::classify::SolidClassifier::new(topo, outer) else {
+                return false;
+            };
+            let options = brepkit_check::classify::ClassifyOptions {
+                tolerance: tol.linear,
+                ..brepkit_check::classify::ClassifyOptions::default()
+            };
             let clear_outside = |p: Point3| {
                 matches!(
-                    crate::classify::classify_point(topo, outer, p, defl, tol.linear),
-                    Ok(crate::classify::PointClassification::Outside)
+                    classifier.classify(p, &options),
+                    Ok(brepkit_check::classify::PointClassification::Outside)
                 ) && crate::distance::point_to_solid_distance(topo, p, outer)
                     .is_ok_and(|d| d.distance > tol.linear * 10.0)
             };
             let planes = outward_planes(topo, outer);
-            let stride = edges.len().div_ceil(24).max(1);
-            edges.iter().step_by(stride).any(|&eid| {
+            // Every edge is probed, the longest first: an edge that leaves the
+            // outer solid can lie among sides split into many short collinear
+            // edges, which a sample of the edges can skip over.
+            let reach_of = |eid: brepkit_topology::edge::EdgeId| {
+                let Ok(e) = topo.edge(eid) else { return 0.0 };
+                let (Ok(vs), Ok(ve)) = (topo.vertex(e.start()), topo.vertex(e.end())) else {
+                    return 0.0;
+                };
+                let (ps, pe) = (vs.point(), ve.point());
+                let (t0, t1) = e.curve().domain_with_endpoints(ps, pe);
+                let at = |k: u8| {
+                    let f = f64::from(k) / 4.0;
+                    e.curve()
+                        .evaluate_with_endpoints((t1 - t0).mul_add(f, t0), ps, pe)
+                };
+                (0..4).map(|k| (at(k + 1) - at(k)).length()).sum::<f64>()
+            };
+            let mut edges: Vec<(f64, brepkit_topology::edge::EdgeId)> =
+                edges.into_iter().map(|eid| (reach_of(eid), eid)).collect();
+            edges.sort_by(|a, b| b.0.total_cmp(&a.0));
+            edges.iter().map(|&(_, eid)| eid).any(|eid| {
                 let Ok(e) = topo.edge(eid) else { return false };
                 let (Ok(vs), Ok(ve)) = (topo.vertex(e.start()), topo.vertex(e.end())) else {
                     return false;
@@ -2728,26 +2816,128 @@ fn detect_trivial_relation(
             })
         };
 
+    // A torus's axis lies outside it, `sqrt(R^2 + t^2) - r` clear at `t`
+    // along it (a horn torus touches it at its pinch), so a solid holding a
+    // point of the axis clear of the torus is not inside it, though every
+    // vertex, edge probe and its centre lie in the tube: a box spanning the
+    // torus's hole. The axis enters and leaves the solid only where it
+    // meets one of the solid's surfaces, so the stretches between those
+    // meetings are probed, however thin the solid is along the axis.
+    let axis_outside = |topo: &Topology,
+                        inner: SolidId,
+                        outer: Option<&brepkit_algo::classifier::AnalyticClassifier>,
+                        bb: &Option<(Point3, Point3)>|
+     -> bool {
+        let (
+            Some(brepkit_algo::classifier::AnalyticClassifier::Torus {
+                center,
+                axis,
+                major_radius,
+                minor_radius,
+            }),
+            Some((lo, hi)),
+        ) = (outer, *bb)
+        else {
+            return false;
+        };
+        let (mut t0, mut t1) = (f64::NEG_INFINITY, f64::INFINITY);
+        for (o, d, l, h) in [
+            (center.x(), axis.x(), lo.x(), hi.x()),
+            (center.y(), axis.y(), lo.y(), hi.y()),
+            (center.z(), axis.z(), lo.z(), hi.z()),
+        ] {
+            if d.abs() < 1e-12 {
+                if o < l || o > h {
+                    return false;
+                }
+            } else {
+                let (a, b) = ((l - o) / d, (h - o) / d);
+                t0 = t0.max(a.min(b));
+                t1 = t1.min(a.max(b));
+            }
+        }
+        if t0 > t1 {
+            return false;
+        }
+        let Ok(faces) = brepkit_topology::explorer::solid_faces(topo, inner) else {
+            return false;
+        };
+        let from = *center + *axis * t0;
+        let mut cuts = vec![t0, t1];
+        for fid in faces {
+            use brepkit_check::classify::ray_surface as ray;
+            let Ok(face) = topo.face(fid) else {
+                return false;
+            };
+            let hits: Vec<f64> = match face.surface() {
+                FaceSurface::Plane { normal, d } => ray::ray_plane(from, *axis, *normal, *d)
+                    .into_iter()
+                    .collect(),
+                FaceSurface::Cylinder(c) => ray::ray_cylinder(from, *axis, c).to_vec(),
+                FaceSurface::Cone(c) => ray::ray_cone(from, *axis, c).to_vec(),
+                FaceSurface::Sphere(s) => ray::ray_sphere(from, *axis, s).to_vec(),
+                FaceSurface::Torus(t) => ray::ray_torus(from, *axis, t).to_vec(),
+                FaceSurface::Nurbs(n) => match ray::ray_nurbs(from, *axis, n, 20) {
+                    Ok(hits) => hits.into_iter().map(|(t, _, _)| t).collect(),
+                    Err(_) => return false,
+                },
+            };
+            cuts.extend(
+                hits.into_iter()
+                    .map(|t| t + t0)
+                    .filter(|&t| t > t0 && t < t1),
+            );
+        }
+        cuts.sort_by(f64::total_cmp);
+        // One classifier for every probe: its face index is built once. A
+        // probe on the solid's boundary counts too (the axis lying in one of
+        // its faces): that point of the solid is just as clear of the torus.
+        let Ok(classifier) = brepkit_check::classify::SolidClassifier::new(topo, inner) else {
+            return false;
+        };
+        let options = brepkit_check::classify::ClassifyOptions {
+            tolerance: tol.linear,
+            ..brepkit_check::classify::ClassifyOptions::default()
+        };
+        cuts.windows(2).any(|w| {
+            [0.25, 0.5, 0.75].into_iter().any(|f| {
+                let t = (w[1] - w[0]).mul_add(f, w[0]);
+                major_radius.hypot(t) - minor_radius > tol.linear * 10.0
+                    && matches!(
+                        classifier.classify(*center + *axis * t, &options),
+                        Ok(brepkit_check::classify::PointClassification::Inside
+                            | brepkit_check::classify::PointClassification::OnBoundary)
+                    )
+            })
+        })
+    };
+
     // The boundary witness guards both terms: the analytic term tests the
     // tool's VERTICES, and a round tool (two seam vertices on a cylinder)
     // can hold every vertex inside the blank while its rims leave it. A
     // container with a cavity holds nothing trivially: the other solid can
     // swallow the cavity with every vertex, probe and its centre in material.
+    // A NURBS face can bulge out of the other solid between every vertex,
+    // probe and sampled box corner, so it is held inside only when proved.
     let hollow = |s: SolidId| topo.solid(s).is_ok_and(|s| !s.inner_shells().is_empty());
     let b_in_a = !hollow(a)
         && ((all_b_verts_in_a && aabb_encloses(&aabb_b, &aabb_a))
             || (ca.is_none()
                 && aabb_strictly_contains(&aabb_b, &aabb_a)
                 && !volume_refutes(topo, b, a)))
+        && nurbs_faces_proved_inside(topo, b, a, tol)
         && !center_outside(topo, b, a, &aabb_b)
-        && !boundary_probe_outside(topo, b, a, &aabb_b);
+        && !boundary_probe_outside(topo, b, a, &aabb_b)
+        && !axis_outside(topo, b, ca, &aabb_b);
     let a_in_b = !hollow(b)
         && ((all_a_verts_in_b && aabb_encloses(&aabb_a, &aabb_b))
             || (cb.is_none()
                 && aabb_strictly_contains(&aabb_a, &aabb_b)
                 && !volume_refutes(topo, a, b)))
+        && nurbs_faces_proved_inside(topo, a, b, tol)
         && !center_outside(topo, a, b, &aabb_a)
-        && !boundary_probe_outside(topo, a, b, &aabb_a);
+        && !boundary_probe_outside(topo, a, b, &aabb_a)
+        && !axis_outside(topo, a, cb, &aabb_a);
 
     TrivialRelation {
         identical: aabbs_match && all_b_verts_in_a && all_a_verts_in_b,
@@ -2866,6 +3056,78 @@ fn outward_planes(topo: &Topology, solid: SolidId) -> Vec<(Vec3, f64)> {
             })
         })
         .collect()
+}
+
+/// Whether every NURBS face of `inner` provably lies in `outer`: true with
+/// none, and otherwise only when `outer` is a convex polyhedron and each
+/// face's control points lie inside every one of its planes, which holds a
+/// surface with positive weights in their hull.
+fn nurbs_faces_proved_inside(
+    topo: &Topology,
+    inner: SolidId,
+    outer: SolidId,
+    tol: brepkit_math::tolerance::Tolerance,
+) -> bool {
+    let Ok(faces) = brepkit_topology::explorer::solid_faces(topo, inner) else {
+        return false;
+    };
+    let mut surfaces = Vec::new();
+    for fid in faces {
+        let Ok(face) = topo.face(fid) else {
+            return false;
+        };
+        if let FaceSurface::Nurbs(surface) = face.surface() {
+            surfaces.push(surface);
+        }
+    }
+    if surfaces.is_empty() {
+        return true;
+    }
+    let Some(planes) = convex_planes(topo, outer, tol.linear) else {
+        return false;
+    };
+    let origin = Point3::new(0.0, 0.0, 0.0);
+    surfaces.iter().all(|surface| {
+        surface
+            .weights()
+            .iter()
+            .flatten()
+            .all(|&w| w.is_finite() && w > 0.0)
+            && surface.control_points().iter().flatten().all(|&p| {
+                planes
+                    .iter()
+                    .all(|&(n, offset)| n.dot(p - origin) - offset <= tol.linear)
+            })
+    })
+}
+
+/// The outward planes of `solid` when it is a convex polyhedron: every face
+/// planar, with every vertex inside each face's plane. `None` otherwise.
+fn convex_planes(topo: &Topology, solid: SolidId, tol: f64) -> Option<Vec<(Vec3, f64)>> {
+    let faces = brepkit_topology::explorer::solid_faces(topo, solid).ok()?;
+    let mut vertices = Vec::new();
+    for &fid in &faces {
+        let face = topo.face(fid).ok()?;
+        if !matches!(face.surface(), FaceSurface::Plane { .. }) {
+            return None;
+        }
+        for oe in topo.wire(face.outer_wire()).ok()?.edges() {
+            let edge = topo.edge(oe.edge()).ok()?;
+            if !matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line) {
+                return None;
+            }
+            vertices.push(topo.vertex(edge.start()).ok()?.point());
+        }
+    }
+    let planes = outward_planes(topo, solid);
+    let origin = Point3::new(0.0, 0.0, 0.0);
+    let convex = planes.len() == faces.len()
+        && vertices.iter().all(|&v| {
+            planes
+                .iter()
+                .all(|&(n, offset)| n.dot(v - origin) - offset <= tol)
+        });
+    convex.then_some(planes)
 }
 
 /// Check whether every boundary vertex of `solid` is classified as
@@ -3354,33 +3616,12 @@ fn component_interior_point(topo: &Topology, comp: &[FaceId]) -> Option<Point3> 
 }
 
 /// A face component's vertex AABB, or `None` for an empty component.
+/// The box of a face component, curved faces bounded along their edges: a
+/// piece bounded by closed curves can have a single vertex, whose box alone
+/// is a point.
 fn component_aabb(topo: &Topology, comp: &[FaceId]) -> Option<(Point3, Point3)> {
-    let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-    let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for &fid in comp {
-        let Ok(face) = topo.face(fid) else { continue };
-        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
-            let Ok(wire) = topo.wire(wid) else { continue };
-            for oe in wire.edges() {
-                let Ok(edge) = topo.edge(oe.edge()) else {
-                    continue;
-                };
-                for vid in [edge.start(), edge.end()] {
-                    if let Ok(v) = topo.vertex(vid) {
-                        let p = v.point();
-                        min =
-                            Point3::new(min.x().min(p.x()), min.y().min(p.y()), min.z().min(p.z()));
-                        max =
-                            Point3::new(max.x().max(p.x()), max.y().max(p.y()), max.z().max(p.z()));
-                    }
-                }
-            }
-        }
-    }
-    if min.x() > max.x() {
-        return None;
-    }
-    Some((min, max))
+    let aabb = crate::measure::face_set_bounding_box(topo, comp).ok()?;
+    Some((aabb.min, aabb.max))
 }
 
 /// Does the closed surface made of `faces` enclose `p`?
@@ -3729,6 +3970,22 @@ fn solid_inner_wire_count(topo: &Topology, solid: SolidId) -> Result<i64, crate:
     Ok(count)
 }
 
+/// Count a solid's inner loops as `validate_solid` does: a face's wires that
+/// share a vertex form one boundary piece, and each piece past the first is
+/// an inner loop.
+fn solid_separate_inner_loops(
+    topo: &Topology,
+    solid: SolidId,
+) -> Result<i64, crate::OperationsError> {
+    let mut count: i64 = 0;
+    for fid in brepkit_topology::explorer::solid_faces(topo, solid)? {
+        if !topo.face(fid)?.inner_wires().is_empty() {
+            count += i64::try_from(crate::validate::boundary_pieces(topo, fid)?).unwrap_or(1) - 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Genus-aware Euler balance for `components` closed orientable surfaces with
 /// holed faces.
 ///
@@ -3820,7 +4077,10 @@ fn shell_is_closed_manifold(
 /// one wire occurrence. A free edge means the shell is open (e.g. a phantom
 /// membrane face left a circle edge unmatched), which is never a valid
 /// boolean result even when Euler accidentally balances.
-fn has_free_edges(topo: &Topology, solid: SolidId) -> Result<bool, crate::OperationsError> {
+pub(crate) fn has_free_edges(
+    topo: &Topology,
+    solid: SolidId,
+) -> Result<bool, crate::OperationsError> {
     let counts = solid_edge_use_counts(topo, solid)?;
     Ok(counts.values().any(|&c| c == 1))
 }

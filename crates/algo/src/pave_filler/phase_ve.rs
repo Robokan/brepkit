@@ -22,15 +22,10 @@ fn edge_aabb(topo: &Topology, eid: EdgeId, margin: f64) -> Result<Option<Aabb3>,
     let edge = topo.edge(eid)?;
     let start_pos = topo.vertex(edge.start())?.point();
     let end_pos = topo.vertex(edge.end())?.point();
-    if matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line) {
-        return Ok(Aabb3::try_from_points([start_pos, end_pos]).map(|a| a.expanded(margin)));
-    }
-    let (t0, t1) = edge.curve().domain_with_endpoints(start_pos, end_pos);
-    let pts = (0..=N_AABB_SAMPLES).map(|i| {
-        let t = t0 + (t1 - t0) * (i as f64 / N_AABB_SAMPLES as f64);
-        edge.curve().evaluate_with_endpoints(t, start_pos, end_pos)
-    });
-    Ok(Aabb3::try_from_points(pts).map(|a| a.expanded(margin)))
+    Ok(Some(
+        super::helpers::edge_span_box(edge.curve(), start_pos, end_pos, N_AABB_SAMPLES)
+            .expanded(margin),
+    ))
 }
 
 /// Detect vertices lying on edges between the two solids.
@@ -135,10 +130,12 @@ fn check_vertex_edge_pairs(
                 if let Some(pb_ids) = arena.edge_pave_blocks.get(&eid) {
                     let pb_ids_copy: Vec<_> = pb_ids.clone();
                     for pb_id in pb_ids_copy {
-                        if let Some(pb) = arena.pave_blocks.get_mut(pb_id)
-                            && pb.spans_interior(param)
+                        if arena
+                            .pave_blocks
+                            .get(pb_id)
+                            .is_some_and(|pb| pb.spans_interior(param))
                         {
-                            pb.add_extra_pave(pave);
+                            arena.add_extra_pave(topo, pb_id, pave);
                         }
                     }
                 }

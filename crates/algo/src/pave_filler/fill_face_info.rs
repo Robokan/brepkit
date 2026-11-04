@@ -423,14 +423,19 @@ fn fill_ef_in(topo: &Topology, arena: &mut GfaArena) {
                     // between a lattice strut edge's crossings of a wall and
                     // a notch ceiling stands 0.0026 off the ceiling at 20% of
                     // its chord, crossing it at 11 degrees.
+                    //
+                    // A conic on a quadric is exact geometry on an exact
+                    // surface, as a line on a plane is: it lies in the face
+                    // only within the weld scale. One that only touches it
+                    // (a cap's rim arc tangent to a wall at one end, leaving
+                    // it quadratically) can hug it within the ratio at any
+                    // size.
                     let straight = matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line);
                     //
-                    // An analytic curved face takes no leaf a macroscopic
-                    // distance off it either: the grazes the ratio was calibrated on lie
-                    // against plane walls, and a cylinder's rim arc that
+                    // Any other leaf on an analytic curved face stays within
+                    // the absolute ceiling too: a cylinder's rim arc that
                     // crosses another cylinder at its two ends (a pipe's end
                     // circle across a post) stands 18% of its chord off it.
-                    let plane = matches!(surface, FaceSurface::Plane { .. });
                     let quadric = matches!(
                         surface,
                         FaceSurface::Cylinder(_)
@@ -438,7 +443,15 @@ fn fill_ef_in(topo: &Topology, arena: &mut GfaArena) {
                             | FaceSurface::Sphere(_)
                             | FaceSurface::Torus(_)
                     );
-                    let band = if straight && plane {
+                    let conic_on_quadric = quadric
+                        && matches!(
+                            edge.curve(),
+                            brepkit_topology::edge::EdgeCurve::Circle(_)
+                                | brepkit_topology::edge::EdgeCurve::Ellipse(_)
+                        );
+                    let band = if straight && matches!(surface, FaceSurface::Plane { .. })
+                        || conic_on_quadric
+                    {
                         (IN_FACE_MAX_DEVIATION_RATIO * chord).min(crate::ds::shape_store::MAX_WIDEN)
                     } else if straight || quadric {
                         (IN_FACE_MAX_DEVIATION_RATIO * chord).min(IN_FACE_MAX_DEVIATION_ABS)

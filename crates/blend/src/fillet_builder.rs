@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use brepkit_math::aabb::Aabb3;
 use brepkit_math::curves::Circle3D;
 use brepkit_math::vec::{Point3, Vec3};
 use brepkit_topology::Topology;
@@ -14,12 +15,14 @@ use brepkit_topology::face::{Face, FaceId, FaceSurface};
 use brepkit_topology::shell::{Shell, ShellId};
 use brepkit_topology::solid::{Solid, SolidId};
 use brepkit_topology::vertex::{Vertex, VertexId};
-use brepkit_topology::wire::{OrientedEdge, Wire, WireId};
+use brepkit_topology::wire::{OrientedEdge, Wire};
 
 use crate::analytic;
 use crate::blend_func::{ConstRadBlend, EvolRadBlend};
 use crate::boundary_registry::{BoundaryKey, BoundaryOwner, BoundaryRegistry, PlannedVertex};
-use crate::builder_utils::{FlippedNormalSurface, sample_nurbs_endpoints, surface_ref_or_adapter};
+use crate::builder_utils::{
+    FlippedNormalSurface, SolidSnapshot, sample_nurbs_endpoints, surface_ref_or_adapter,
+};
 
 use crate::corner;
 use crate::fillet_plan::FilletPlan;
@@ -186,7 +189,10 @@ impl<'a> FilletBuilder<'a> {
 
         let topo = self.topo;
         let adjacency = topo.build_adjacency(self.solid)?;
-        let shell_id = topo.solid(self.solid)?.outer_shell();
+        let source = topo.solid(self.solid)?;
+        // Only the outer shell's edges are blended (the adjacency reads no
+        // other), so the cavities carry over as they are.
+        let (shell_id, inner_shells) = (source.outer_shell(), source.inner_shells().to_vec());
         let original_faces: Vec<FaceId> = topo.shell(shell_id)?.faces().to_vec();
         let mut touched_faces: HashSet<FaceId> = HashSet::new();
         let mut failed: Vec<(EdgeId, BlendError)> = Vec::new();
@@ -259,6 +265,35 @@ impl<'a> FilletBuilder<'a> {
                 is_partial: false,
             });
         }
+        // The cavities carry over untouched, so the material a stripe takes
+        // off must stay clear of them: a fillet reaching one would leave the
+        // new outer shell running through it.
+        if !inner_shells.is_empty() {
+            let cavities = inner_shells
+                .iter()
+                .map(|&shell| shell_bounds(topo, shell))
+                .collect::<Result<Vec<_>, _>>()?;
+            for sr in &stripe_results {
+                let removed = removed_material_bounds(topo, &sr.stripe)?;
+                if cavities.iter().any(|cavity| cavity.intersects(removed)) {
+                    for edge_id in succeeded_candidates(plan.as_ref(), &stripe_results, &all_edges)
+                    {
+                        failed.push((
+                            edge_id,
+                            BlendError::PlanningFailure {
+                                reason: "the fillet reaches a cavity".to_owned(),
+                            },
+                        ));
+                    }
+                    return Ok(BlendResult {
+                        solid: self.solid,
+                        succeeded: Vec::new(),
+                        failed,
+                        is_partial: true,
+                    });
+                }
+            }
+        }
         let setback_edges = if let Some(plan) = plan.as_ref() {
             // `original_faces` is this build's own solid's shell, captured
             // before any mutation: the correct scope for "incident to this
@@ -281,18 +316,55 @@ impl<'a> FilletBuilder<'a> {
             std::collections::HashMap::new();
         let mut regular_results: Vec<&StripeResult> = Vec::new();
 
-        for (stripe_index, sr) in stripe_results.iter().enumerate() {
-            // The closed-rim rebuild owns its cap: a cap another stripe also
-            // runs along (a hole's rim filleted in the same call) takes the
-            // normal path.
-            let cap_shared = |cap: FaceId| {
-                stripe_results.iter().enumerate().any(|(other, o)| {
-                    other != stripe_index && (o.stripe.face1 == cap || o.stripe.face2 == cap)
+        let recognized = stripe_results
+            .iter()
+            .map(|sr| closed_rim_info(topo, &sr.stripe))
+            .collect::<Result<Vec<_>, BlendError>>()?;
+        // Each rim's wall contact is checked against the wall alone, so two
+        // rims of one wall must also leave wall between their contacts, or
+        // their bands overlap, whichever path below builds them.
+        let rims: Vec<&ClosedRimInfo> = recognized.iter().flatten().collect();
+        let crossing = rims.iter().enumerate().any(|(i, a)| {
+            rims[i + 1..]
+                .iter()
+                .any(|b| a.wall_face == b.wall_face && !contacts_leave_wall_between(a, b))
+        });
+        if crossing {
+            for edge_id in succeeded_candidates(plan.as_ref(), &stripe_results, &all_edges) {
+                failed.push((
+                    edge_id,
+                    BlendError::PlanningFailure {
+                        reason: "two rim fillets' wall contacts meet on their shared wall"
+                            .to_owned(),
+                    },
+                ));
+            }
+            return Ok(BlendResult {
+                solid: self.solid,
+                succeeded: Vec::new(),
+                failed,
+                is_partial: true,
+            });
+        }
+
+        // The closed-rim rebuild owns its cap: a cap another stripe also runs
+        // along (a hole's rim filleted in the same call) takes the normal path.
+        let closed_rims: Vec<Option<ClosedRimInfo>> = recognized
+            .into_iter()
+            .enumerate()
+            .map(|(stripe_index, rim)| {
+                rim.filter(|rim| {
+                    !stripe_results.iter().enumerate().any(|(other, o)| {
+                        other != stripe_index
+                            && (o.stripe.face1 == rim.plane_face
+                                || o.stripe.face2 == rim.plane_face)
+                    })
                 })
-            };
-            if let Some(rim) =
-                closed_rim_info(topo, &sr.stripe)?.filter(|rim| !cap_shared(rim.plane_face))
-            {
+            })
+            .collect();
+        let mut closed_rim_supports: HashSet<FaceId> = HashSet::new();
+        for (stripe_index, (sr, closed_rim)) in stripe_results.iter().zip(closed_rims).enumerate() {
+            if let Some(rim) = closed_rim {
                 let contour_id =
                     plan.as_ref()
                         .and_then(|fillet_plan| {
@@ -309,7 +381,14 @@ impl<'a> FilletBuilder<'a> {
                     &mut boundary_registry,
                     &mut face_replacements,
                 ) {
-                    Ok(band) => blend_face_ids.push(band),
+                    Ok(band) => {
+                        blend_face_ids.push(band);
+                        closed_rim_supports.extend(
+                            [rim.plane_face, rim.wall_face]
+                                .iter()
+                                .filter_map(|support| face_replacements.get(support)),
+                        );
+                    }
                     Err(e) => {
                         // Closed-rim geometry is authoritative; do not hide
                         // an assembly failure behind a sequential fallback.
@@ -462,19 +541,22 @@ impl<'a> FilletBuilder<'a> {
                 ) {
                     continue;
                 }
-                let notchable = junction
+                let contour = junction
                     .incident_contours
                     .first()
-                    .and_then(|&contour| fillet_plan.contours.get(contour))
-                    .is_some_and(|contour| {
-                        let stripe = regular_results
-                            .iter()
-                            .map(|result| &result.stripe)
-                            .find(|stripe| stripe.spine_edges() == contour.spine.edges());
-                        stripe.is_some_and(|stripe| {
-                            terminal_cap_is_notchable(topo, junction, contour, stripe)
-                        })
-                    });
+                    .and_then(|&contour| fillet_plan.contours.get(contour));
+                let stripe = contour.and_then(|contour| {
+                    regular_results
+                        .iter()
+                        .map(|result| &result.stripe)
+                        .find(|stripe| stripe.spine_edges() == contour.spine.edges())
+                });
+                let notchable = match (contour, stripe) {
+                    (Some(contour), Some(stripe)) => {
+                        terminal_cap_is_notchable(topo, junction, contour, stripe)?
+                    }
+                    _ => false,
+                };
                 log::debug!(
                     "terminal {:?}: notchable={notchable} contours={:?} fan={:?}",
                     junction.vertex,
@@ -1441,10 +1523,17 @@ impl<'a> FilletBuilder<'a> {
         // convention like the untouched face it replaced. Without it a prism
         // whose every face was rebuilt has no seed, and the pairing walk
         // inverts the two mirrored corner bands it reaches through a
-        // clockwise-wound neighbour.
+        // clockwise-wound neighbour. A closed rim's rebuilt cap and wall keep
+        // their sources' surfaces and reversal flags, and take their new
+        // circles' senses from the rim's against the axis, so they anchor it
+        // too: a frustum with both rims filleted has no other face to.
         let seeds: Vec<FaceId> = result_faces
             .iter()
-            .filter(|f| original_set.contains(f) || notched_caps.contains(f))
+            .filter(|f| {
+                original_set.contains(f)
+                    || notched_caps.contains(f)
+                    || closed_rim_supports.contains(f)
+            })
             .copied()
             .collect();
         let seed_set: std::collections::HashSet<FaceId> = seeds.iter().copied().collect();
@@ -1460,12 +1549,20 @@ impl<'a> FilletBuilder<'a> {
         brepkit_topology::orientation::normalize_face_normals(topo, &new_faces, &seeds)?;
         brepkit_topology::orientation::propagate_orientation(topo, &result_faces, &seeds)?;
         boundary_registry.refresh_owner_orientations(topo)?;
-        // The post-assembly shell may come out globally inverted (every
-        // face's effective normal pointing inward) while still passing the
+        // Without a seed the propagation anchors on an arbitrary face, so the
+        // post-assembly shell may come out globally inverted (every face's
+        // effective normal pointing inward) while still passing the
         // incidence and closure gates. Detect that via the signed volume of
         // the result shell and flip the whole shell when negative, then
-        // re-run the orientation passes so consistency is restored.
-        let signed_volume = crate::signed_volume::signed_shell_volume(topo, &result_faces)?;
+        // re-run the orientation passes so consistency is restored. Seeds
+        // carry the input's orientation, which the propagation never flips,
+        // and the estimate reads curved faces over their whole parameter
+        // domain, so it is not asked to overrule them.
+        let signed_volume = if seeds.is_empty() {
+            crate::signed_volume::signed_shell_volume(topo, &result_faces)?
+        } else {
+            1.0
+        };
         if signed_volume < 0.0 {
             log::debug!("orientation flip: signed shell volume {signed_volume} < 0");
             for &face_id in &result_faces {
@@ -1522,7 +1619,8 @@ impl<'a> FilletBuilder<'a> {
             }
         };
         let new_shell_id = topo.add_shell(new_shell);
-        let new_solid = Solid::new(new_shell_id, Vec::new());
+        let cavities = crate::builder_utils::copy_shells(topo, &inner_shells)?;
+        let new_solid = Solid::new(new_shell_id, cavities);
         let new_solid_id = topo.add_solid(new_solid);
         // A requested edge is successful only after every support, blend, and
         // shell-incidence step above has completed. Geometry-only success is
@@ -1723,238 +1821,6 @@ fn build_in_place(
     .build_in_place()
 }
 
-struct SolidGraph {
-    solid_id: SolidId,
-    shell_ids: Vec<ShellId>,
-    face_ids: Vec<FaceId>,
-    wire_ids: Vec<WireId>,
-    edge_ids: Vec<EdgeId>,
-    vertex_ids: Vec<VertexId>,
-    pcurves: Vec<(EdgeId, FaceId, brepkit_topology::pcurve::PCurve)>,
-}
-
-impl SolidGraph {
-    fn capture(topo: &Topology, solid: SolidId) -> Result<Self, BlendError> {
-        let source = topo.solid(solid)?;
-        let mut shell_ids = vec![source.outer_shell()];
-        shell_ids.extend_from_slice(source.inner_shells());
-        shell_ids.sort_unstable();
-        shell_ids.dedup();
-
-        let mut face_ids = Vec::new();
-        let mut seen_faces = HashSet::new();
-        for &shell_id in &shell_ids {
-            for &face_id in topo.shell(shell_id)?.faces() {
-                if seen_faces.insert(face_id) {
-                    face_ids.push(face_id);
-                }
-            }
-        }
-
-        let mut wire_ids = Vec::new();
-        let mut seen_wires = HashSet::new();
-        for &face_id in &face_ids {
-            let face = topo.face(face_id)?;
-            for wire_id in
-                std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied())
-            {
-                if seen_wires.insert(wire_id) {
-                    wire_ids.push(wire_id);
-                }
-            }
-        }
-
-        let mut edge_ids = Vec::new();
-        let mut seen_edges = HashSet::new();
-        for &wire_id in &wire_ids {
-            for oriented_edge in topo.wire(wire_id)?.edges() {
-                if seen_edges.insert(oriented_edge.edge()) {
-                    edge_ids.push(oriented_edge.edge());
-                }
-            }
-        }
-
-        let mut vertex_ids = Vec::new();
-        let mut seen_vertices = HashSet::new();
-        for &edge_id in &edge_ids {
-            let edge = topo.edge(edge_id)?;
-            for vertex_id in [edge.start(), edge.end()] {
-                if seen_vertices.insert(vertex_id) {
-                    vertex_ids.push(vertex_id);
-                }
-            }
-        }
-
-        let mut pcurves = Vec::new();
-        for &face_id in &face_ids {
-            for (edge_id, pcurve) in topo.pcurves().pcurves_for_face(face_id) {
-                if seen_edges.contains(&edge_id) {
-                    pcurves.push((edge_id, face_id, pcurve.clone()));
-                }
-            }
-        }
-
-        Ok(Self {
-            solid_id: solid,
-            shell_ids,
-            face_ids,
-            wire_ids,
-            edge_ids,
-            vertex_ids,
-            pcurves,
-        })
-    }
-}
-struct SolidSnapshot {
-    graph: SolidGraph,
-    vertices: Vec<Vertex>,
-    edges: Vec<Edge>,
-    wires: Vec<Wire>,
-    faces: Vec<Face>,
-    shells: Vec<Shell>,
-    solid: Solid,
-}
-
-impl SolidSnapshot {
-    fn capture(topo: &Topology, solid: SolidId) -> Result<Self, BlendError> {
-        let graph = SolidGraph::capture(topo, solid)?;
-        let vertices = graph
-            .vertex_ids
-            .iter()
-            .map(|&id| topo.vertex(id).cloned())
-            .collect::<Result<_, _>>()?;
-        let edges = graph
-            .edge_ids
-            .iter()
-            .map(|&id| topo.edge(id).cloned())
-            .collect::<Result<_, _>>()?;
-        let wires = graph
-            .wire_ids
-            .iter()
-            .map(|&id| topo.wire(id).cloned())
-            .collect::<Result<_, _>>()?;
-        let faces = graph
-            .face_ids
-            .iter()
-            .map(|&id| topo.face(id).cloned())
-            .collect::<Result<_, _>>()?;
-        let shells = graph
-            .shell_ids
-            .iter()
-            .map(|&id| topo.shell(id).cloned())
-            .collect::<Result<_, _>>()?;
-        let solid = topo.solid(solid)?.clone();
-        Ok(Self {
-            graph,
-            vertices,
-            edges,
-            wires,
-            faces,
-            shells,
-            solid,
-        })
-    }
-
-    fn restore(&self, topo: &mut Topology) -> Result<(), BlendError> {
-        for (&id, value) in self.graph.vertex_ids.iter().zip(&self.vertices) {
-            *topo.vertex_mut(id)? = value.clone();
-        }
-        for (&id, value) in self.graph.edge_ids.iter().zip(&self.edges) {
-            *topo.edge_mut(id)? = value.clone();
-        }
-        for (&id, value) in self.graph.wire_ids.iter().zip(&self.wires) {
-            *topo.wire_mut(id)? = value.clone();
-        }
-        for (&id, value) in self.graph.face_ids.iter().zip(&self.faces) {
-            *topo.face_mut(id)? = value.clone();
-        }
-        for (&id, value) in self.graph.shell_ids.iter().zip(&self.shells) {
-            *topo.shell_mut(id)? = value.clone();
-        }
-        *topo.solid_mut(self.graph.solid_id)? = self.solid.clone();
-
-        for &edge_id in &self.graph.edge_ids {
-            for &face_id in &self.graph.face_ids {
-                topo.pcurves_mut().remove(edge_id, face_id);
-            }
-        }
-        for (edge_id, face_id, pcurve) in &self.graph.pcurves {
-            topo.pcurves_mut().set(*edge_id, *face_id, pcurve.clone());
-        }
-        Ok(())
-    }
-    /// Clone source faces that the result shell still references before the
-    /// source graph is restored. Trimming propagates boundary splits through
-    /// every wire using the split edge, so a result that carries an
-    /// untrimmed source face must retain that face's current wire while the
-    /// original face and wire are put back for the caller.
-    fn clone_result_source_faces(
-        &self,
-        topo: &mut Topology,
-        result_solid: SolidId,
-    ) -> Result<(), BlendError> {
-        if result_solid == self.graph.solid_id {
-            return Ok(());
-        }
-
-        let shell_id = topo.solid(result_solid)?.outer_shell();
-        let result_faces = topo.shell(shell_id)?.faces().to_vec();
-        let source_faces: HashSet<FaceId> = self.graph.face_ids.iter().copied().collect();
-        let mut replacements = std::collections::HashMap::new();
-
-        for face_id in result_faces {
-            if !source_faces.contains(&face_id) || replacements.contains_key(&face_id) {
-                continue;
-            }
-
-            let source_face = topo.face(face_id)?.clone();
-            let source_wires: Vec<WireId> = std::iter::once(source_face.outer_wire())
-                .chain(source_face.inner_wires().iter().copied())
-                .collect();
-            let wire_ids: Vec<WireId> = source_wires
-                .iter()
-                .map(|&wire_id| topo.wire(wire_id).cloned())
-                .collect::<Result<Vec<Wire>, _>>()?
-                .into_iter()
-                .map(|wire| topo.add_wire(wire))
-                .collect();
-            let (&outer_wire, inner_wires) =
-                wire_ids
-                    .split_first()
-                    .ok_or(brepkit_topology::TopologyError::Empty {
-                        entity: "face wires",
-                    })?;
-
-            let mut replacement = Face::new(
-                outer_wire,
-                inner_wires.to_vec(),
-                source_face.surface().clone(),
-            );
-            replacement.set_reversed(source_face.is_reversed());
-            let replacement_id = topo.add_face(replacement);
-
-            let pcurves: Vec<(EdgeId, brepkit_topology::pcurve::PCurve)> = topo
-                .pcurves()
-                .pcurves_for_face(face_id)
-                .into_iter()
-                .map(|(edge_id, pcurve)| (edge_id, pcurve.clone()))
-                .collect();
-            for (edge_id, pcurve) in pcurves {
-                topo.pcurves_mut().set(edge_id, replacement_id, pcurve);
-            }
-            replacements.insert(face_id, replacement_id);
-        }
-
-        let shell = topo.shell_mut(shell_id)?;
-        for face_id in shell.faces_mut() {
-            if let Some(&replacement_id) = replacements.get(face_id) {
-                *face_id = replacement_id;
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Geometry of a full-revolution rim fillet (a closed circular edge between a
 /// bounded disc cap and an axisymmetric wall), recovered from a stripe whose
 /// blend surface is a torus.
@@ -1971,6 +1837,79 @@ struct ClosedRimInfo {
     /// Contact circle on the wall (radius `r_c` for a cylinder), one fillet
     /// radius along the axis from the plate.
     wall_circle: Circle3D,
+    /// The rim is one of the cap's holes (a post standing on a plate), not
+    /// its whole outer wire (a disc cap).
+    rim_is_hole: bool,
+}
+
+/// The lowest height along `toward`, from `base`, of the wall boundary that
+/// `assemble_closed_rim` keeps: every edge but the rim, and the far end of
+/// each seam leaving the rim's vertex. A conic counts its whole curve's
+/// lowest point and a NURBS edge its control hull's, so the value never sits
+/// above the boundary's own; a NURBS edge whose weights are not all positive
+/// has no hull bound and counts as reaching the base.
+fn kept_wall_boundary_height(
+    topo: &Topology,
+    wall_face: FaceId,
+    rim_edge: EdgeId,
+    base: Point3,
+    toward: Vec3,
+) -> Result<f64, BlendError> {
+    let height = |p: Point3| (p - base).dot(toward);
+    let rim_vertex = topo.edge(rim_edge)?.start();
+    let face = topo.face(wall_face)?;
+    let mut lowest = f64::INFINITY;
+    for wire in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+        for oriented in topo.wire(wire)?.edges() {
+            if oriented.edge() == rim_edge {
+                continue;
+            }
+            let edge = topo.edge(oriented.edge())?;
+            let ends = [edge.start(), edge.end()];
+            if ends.contains(&rim_vertex) {
+                for v in ends.into_iter().filter(|&v| v != rim_vertex) {
+                    lowest = lowest.min(height(topo.vertex(v)?.point()));
+                }
+                continue;
+            }
+            let edge_lowest = match edge.curve() {
+                EdgeCurve::Line => {
+                    height(topo.vertex(ends[0])?.point()).min(height(topo.vertex(ends[1])?.point()))
+                }
+                EdgeCurve::Circle(c) => {
+                    let across = (1.0 - c.normal().dot(toward).powi(2)).max(0.0).sqrt();
+                    height(c.center()) - c.radius() * across
+                }
+                EdgeCurve::Ellipse(el) => {
+                    let u = el.semi_major() * el.u_axis().dot(toward);
+                    let v = el.semi_minor() * el.v_axis().dot(toward);
+                    height(el.center()) - u.hypot(v)
+                }
+                EdgeCurve::NurbsCurve(n) => {
+                    if n.weights().iter().all(|&w| w.is_finite() && w > 0.0) {
+                        n.control_points()
+                            .iter()
+                            .map(|&p| height(p))
+                            .fold(f64::INFINITY, f64::min)
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            lowest = lowest.min(edge_lowest);
+        }
+    }
+    Ok(lowest)
+}
+
+/// Two rims of one wall: each wall contact moves from its rim toward the
+/// other's, and the pair must keep that order with some wall left between.
+fn contacts_leave_wall_between(a: &ClosedRimInfo, b: &ClosedRimInfo) -> bool {
+    let span = b.plate_circle.center() - a.plate_circle.center();
+    let Ok(along) = span.normalize() else {
+        return false;
+    };
+    (b.wall_circle.center() - a.wall_circle.center()).dot(along) > 1e-7
 }
 
 /// Project a point onto the infinite axis line through `origin` with unit
@@ -2031,18 +1970,27 @@ fn closed_rim_info(topo: &Topology, stripe: &Stripe) -> Result<Option<ClosedRimI
         _ => return Ok(None),
     };
 
-    // The annular rebuild replaces the cap's whole outer wire with the
-    // plate-contact circle, so it only applies when the cap's outer wire is
-    // this rim alone. Its holes are kept, which is checked below once the
-    // contact radius is known.
-    let cap_holes = {
+    // The annular rebuild replaces the wire that is this rim alone with the
+    // plate-contact circle: the cap's outer wire (a disc cap) or one of its
+    // holes (a post on a plate). The cap's other wires are kept, which is
+    // checked below once the contact radius is known.
+    let is_rim_wire = |wire: brepkit_topology::wire::WireId| {
+        topo.wire(wire)
+            .is_ok_and(|w| w.edges().len() == 1 && w.edges()[0].edge() == rim_edge)
+    };
+    let (rim_is_hole, kept_wires) = {
         let cap = topo.face(plane_face)?;
-        let cap_wire = topo.wire(cap.outer_wire())?;
-        let edges = cap_wire.edges();
-        if edges.len() != 1 || edges[0].edge() != rim_edge {
+        if is_rim_wire(cap.outer_wire()) {
+            (false, cap.inner_wires().to_vec())
+        } else if cap.inner_wires().iter().any(|&w| is_rim_wire(w)) {
+            let kept: Vec<_> = std::iter::once(cap.outer_wire())
+                .chain(cap.inner_wires().iter().copied())
+                .filter(|&w| !is_rim_wire(w))
+                .collect();
+            (true, kept)
+        } else {
             return Ok(None);
         }
-        cap.inner_wires().to_vec()
     };
 
     // The plane-side contact curve is the one whose face is the plane.
@@ -2073,9 +2021,64 @@ fn closed_rim_info(topo: &Topology, stripe: &Stripe) -> Result<Option<ClosedRimI
     let wall_center = project_onto_axis(wall_pt, axis_origin, axis);
     let wall_radius = radial_distance(wall_pt, axis_origin, axis);
 
+    // The wall contact circle must land on the wall, short of every point of
+    // the boundary the rebuild keeps: a fillet wider than a plate is thick, or
+    // a post whose sloped top dips below the contact, would carry it past.
+    let rise = wall_center - plate_center;
+    if let Ok(toward) = rise.normalize()
+        && rise.length()
+            >= kept_wall_boundary_height(topo, wall_face, rim_edge, plate_center, toward)? - 1e-7
+    {
+        return Err(BlendError::PlanningFailure {
+            reason: format!(
+                "the fillet's wall contact would land past the wall bounding rim {rim_edge:?}"
+            ),
+        });
+    }
+
+    if rim_is_hole {
+        // Every kept wire must stay outside the plate contact, or the band
+        // would run over it.
+        let clearance = |a: Point3, b: Point3| {
+            let ab = b - a;
+            let len2 = ab.length_squared();
+            let t = if len2 <= 1e-24 {
+                0.0
+            } else {
+                ((plate_center - a).dot(ab) / len2).clamp(0.0, 1.0)
+            };
+            (a + ab * t - plate_center).length()
+        };
+        for &wire in &kept_wires {
+            for oe in topo.wire(wire)?.edges() {
+                let e = topo.edge(oe.edge())?;
+                let near = match e.curve() {
+                    EdgeCurve::Line => clearance(
+                        topo.vertex(e.start())?.point(),
+                        topo.vertex(e.end())?.point(),
+                    ),
+                    EdgeCurve::Circle(c) => {
+                        ((c.center() - plate_center).length() - c.radius()).abs()
+                    }
+                    // Every point of an ellipse lies between its semi-axes
+                    // from its centre.
+                    EdgeCurve::Ellipse(el) => {
+                        let d = (el.center() - plate_center).length();
+                        (d - el.semi_major()).max(el.semi_minor() - d)
+                    }
+                    EdgeCurve::NurbsCurve(_) => return Ok(None),
+                };
+                if near <= plate_radius + 1e-7 {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     // A hole reaching the plate contact would meet the blend; the normal trim
     // path handles that.
-    for &hole in &cap_holes {
+    let cap_holes: &[brepkit_topology::wire::WireId] = if rim_is_hole { &[] } else { &kept_wires };
+    for &hole in cap_holes {
         for oe in topo.wire(hole)?.edges() {
             let e = topo.edge(oe.edge())?;
             let reach = match e.curve() {
@@ -2110,6 +2113,7 @@ fn closed_rim_info(topo: &Topology, stripe: &Stripe) -> Result<Option<ClosedRimI
         rim_edge,
         plate_circle,
         wall_circle,
+        rim_is_hole,
     }))
 }
 
@@ -2153,10 +2157,24 @@ fn assemble_closed_rim(
             .copied()
             .unwrap_or(rim.plane_face),
     )?;
-    let cap_orig_wire_id = cap_orig_wire.outer_wire();
+    let cap_outer = cap_orig_wire.outer_wire();
     let cap_holes = cap_orig_wire.inner_wires().to_vec();
+    let rim_wire = if rim.rim_is_hole {
+        cap_holes
+            .iter()
+            .copied()
+            .find(|&w| {
+                topo.wire(w)
+                    .is_ok_and(|w| w.edges().iter().any(|oe| oe.edge() == rim.rim_edge))
+            })
+            .ok_or(BlendError::TrimmingFailure {
+                face: rim.plane_face,
+            })?
+    } else {
+        cap_outer
+    };
     let cap_forward = topo
-        .wire(cap_orig_wire_id)?
+        .wire(rim_wire)?
         .edges()
         .iter()
         .find(|oe| oe.edge() == rim.rim_edge)
@@ -2176,20 +2194,24 @@ fn assemble_closed_rim(
             });
         }
     };
-    let band_reversed = torus_band_needs_reversal(&torus, rim);
+    let band_reversed = torus_band_needs_reversal(&torus, rim, (&wall_surf, wall_reversed));
     let wall_forward = wall_oriented
         .iter()
         .find(|oe| oe.edge() == rim.rim_edge)
         .is_some_and(OrientedEdge::is_forward);
     let plane_side = usize::from(stripe.face2 == rim.plane_face);
     let wall_side = usize::from(stripe.face2 == rim.wall_face);
-    let cap_sense = if matches!(&wall_surf, FaceSurface::Cylinder(_)) {
-        cap_forward
-    } else {
-        !cap_forward
+    // Both contact circles turn about the wall's axis; the cap and the wall
+    // keep their traversal direction whichever way the rim circle's own
+    // normal runs, and the band runs each circle against its neighbour.
+    let rim_turns_with_axis = match topo.edge(rim.rim_edge)?.curve() {
+        EdgeCurve::Circle(c) => c.normal().dot(rim.plate_circle.normal()) > 0.0,
+        _ => true,
     };
-    let plate_sense = (cap_forward == plane_reversed) != band_reversed;
-    let wall_sense = (wall_forward == wall_reversed) != band_reversed;
+    let cap_sense = cap_forward == rim_turns_with_axis;
+    let wall_support_sense = wall_forward == rim_turns_with_axis;
+    let plate_sense = (cap_sense == plane_reversed) != band_reversed;
+    let wall_sense = (wall_support_sense == wall_reversed) != band_reversed;
     let plate_handle = registry.register(
         BoundaryKey::contact(contour_id, 0, plane_side as u8),
         PlannedVertex::new(plate_v),
@@ -2197,8 +2219,6 @@ fn assemble_closed_rim(
         EdgeCurve::Circle(rim.plate_circle.clone()),
         (0.0, std::f64::consts::TAU),
         [
-            // Result-face orientation propagation determines the final cap
-            // use; cylinders retain the source sense while cones reverse it.
             BoundaryOwner::planned("closed-rim support cap", cap_sense),
             BoundaryOwner::planned("closed-rim torus band", plate_sense),
         ],
@@ -2210,7 +2230,7 @@ fn assemble_closed_rim(
         EdgeCurve::Circle(rim.wall_circle.clone()),
         (0.0, std::f64::consts::TAU),
         [
-            BoundaryOwner::planned("closed-rim support wall", wall_forward),
+            BoundaryOwner::planned("closed-rim support wall", wall_support_sense),
             BoundaryOwner::planned("closed-rim torus band", wall_sense),
         ],
     )?;
@@ -2218,7 +2238,16 @@ fn assemble_closed_rim(
     let cap_boundary = registry.oriented_edge(topo, plate_handle, 0)?;
     let cap_wire = Wire::new(vec![cap_boundary], true)?;
     let cap_wire_id = topo.add_wire(cap_wire);
-    let mut cap_face = Face::new(cap_wire_id, cap_holes, plane_surf);
+    let (cap_outer, cap_holes) = if rim.rim_is_hole {
+        let holes = cap_holes
+            .iter()
+            .map(|&w| if w == rim_wire { cap_wire_id } else { w })
+            .collect();
+        (cap_outer, holes)
+    } else {
+        (cap_wire_id, cap_holes)
+    };
+    let mut cap_face = Face::new(cap_outer, cap_holes, plane_surf);
     cap_face.set_reversed(plane_reversed);
     let cap_face_id = topo.add_face(cap_face);
     registry.set_owner_face(plate_handle, 0, cap_face_id)?;
@@ -2325,7 +2354,7 @@ fn terminal_cap_is_notchable(
     junction: &crate::fillet_plan::VertexJunction,
     contour: &crate::fillet_plan::FilletContour,
     stripe: &Stripe,
-) -> bool {
+) -> Result<bool, BlendError> {
     let caps: Vec<FaceId> = junction
         .face_fan
         .iter()
@@ -2333,39 +2362,43 @@ fn terminal_cap_is_notchable(
         .filter(|&face| face != contour.side1 && face != contour.side2)
         .collect();
     let [cap] = caps.as_slice() else {
-        return false;
+        return Ok(false);
     };
     let Ok(face) = topo.face(*cap) else {
-        return false;
+        return Ok(false);
     };
-    if !face.surface().is_planar() || !face.inner_wires().is_empty() {
-        return false;
+    if !face.surface().is_planar() {
+        return Ok(false);
     }
-    let Ok(wire) = topo.wire(face.outer_wire()) else {
-        return false;
-    };
     let Ok(vertex) = topo.vertex(junction.vertex) else {
-        return false;
+        return Ok(false);
     };
     let vertex = vertex.point();
+    // The corner sits on the cap's outer wire (a convex fillet) or on one of
+    // its holes (a concave one ending on a cup's rim); the notch replaces it
+    // on whichever wire holds it.
     let mut corner_edges: Vec<(Point3, Point3)> = Vec::new();
-    for oriented in wire.edges() {
+    let wires = std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied());
+    for oriented in wires
+        .filter_map(|wire| topo.wire(wire).ok())
+        .flat_map(|wire| wire.edges().iter())
+    {
         let Ok(edge) = topo.edge(oriented.edge()) else {
-            return false;
+            return Ok(false);
         };
         if edge.start() != junction.vertex && edge.end() != junction.vertex {
             continue;
         }
         if !matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line) {
-            return false;
+            return Ok(false);
         }
         let (Ok(a), Ok(b)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
-            return false;
+            return Ok(false);
         };
         corner_edges.push((a.point(), b.point()));
     }
     if corner_edges.len() != 2 {
-        return false;
+        return Ok(false);
     }
     // Both contacts must end on those corner edges, or the split lands on
     // the cap's edge while the notch can never match its corner path.
@@ -2380,17 +2413,222 @@ fn terminal_cap_is_notchable(
             (a + ab * t - point).length() <= 1e-5
         })
     };
-    [&stripe.contact1, &stripe.contact2]
+    let near_ends: Vec<Point3> = [&stripe.contact1, &stripe.contact2]
         .into_iter()
-        .all(|contact| {
+        .map(|contact| {
             let (t0, t1) = contact.domain();
             let (start, end) = (contact.evaluate(t0), contact.evaluate(t1));
-            let near = if (start - vertex).length() <= (end - vertex).length() {
+            if (start - vertex).length() <= (end - vertex).length() {
                 start
             } else {
                 end
-            };
-            on_segment(near)
+            }
+        })
+        .collect();
+    if !near_ends.iter().all(|&point| on_segment(point)) {
+        return Ok(false);
+    }
+    // The arc that replaces the corner path lies in the triangle between its
+    // ends and the corner, so no other boundary of the cap may reach into
+    // that triangle (a fillet wider than a cup's wall would cross its mouth).
+    let FaceSurface::Plane { normal, .. } = face.surface() else {
+        return Ok(false);
+    };
+    let Ok(frame) = brepkit_math::frame::Frame3::from_normal(vertex, *normal) else {
+        return Ok(false);
+    };
+    let flat = |p: Point3| {
+        let d = p - vertex;
+        (d.dot(frame.x), d.dot(frame.y))
+    };
+    let triangle = [flat(near_ends[0]), (0.0, 0.0), flat(near_ends[1])];
+    let wires = std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied());
+    for oriented in wires
+        .filter_map(|wire| topo.wire(wire).ok())
+        .flat_map(|wire| wire.edges().iter())
+    {
+        let Ok(edge) = topo.edge(oriented.edge()) else {
+            return Ok(false);
+        };
+        if edge.start() == junction.vertex || edge.end() == junction.vertex {
+            continue;
+        }
+        let (Ok(a), Ok(b)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+            return Ok(false);
+        };
+        let (a, b) = (a.point(), b.point());
+        if cap_edge_reaches_triangle(edge, a, b, &flat, triangle) {
+            return Err(BlendError::PlanningFailure {
+                reason: format!(
+                    "the fillet's end at {:?} would cross another boundary of its cap",
+                    junction.vertex
+                ),
+            });
+        }
+    }
+    Ok(true)
+}
+
+/// Whether a cap edge may pass inside the notch triangle, certified: a line
+/// exactly, a circle or ellipse by a polyline held to the triangle widened by
+/// its chords' sag, and a NURBS curve by the hull of its control points, which
+/// holds the whole curve however narrow a knot span is.
+fn cap_edge_reaches_triangle(
+    edge: &brepkit_topology::edge::Edge,
+    a: Point3,
+    b: Point3,
+    flat: &impl Fn(Point3) -> (f64, f64),
+    triangle: [(f64, f64); 3],
+) -> bool {
+    use brepkit_topology::edge::EdgeCurve;
+    const SAMPLES: u32 = 64;
+    let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+    let polyline = || -> Vec<(f64, f64)> {
+        (0..=SAMPLES)
+            .map(|k| {
+                let t = t0 + (t1 - t0) * f64::from(k) / f64::from(SAMPLES);
+                flat(edge.curve().evaluate_with_endpoints(t, a, b))
+            })
+            .collect()
+    };
+    let step = (t1 - t0).abs() / f64::from(SAMPLES);
+    match edge.curve() {
+        EdgeCurve::Line => path_enters_triangle(&[flat(a), flat(b)], triangle),
+        EdgeCurve::Circle(circle) => {
+            let sag = circle.radius() * step * step / 8.0;
+            path_within_of_triangle(&polyline(), triangle, sag * 1.01)
+        }
+        EdgeCurve::Ellipse(ellipse) => {
+            let (major, minor) = (ellipse.semi_major(), ellipse.semi_minor());
+            let sag = major.powi(3) / (minor * minor) * step * step / 8.0;
+            path_within_of_triangle(&polyline(), triangle, sag * 1.01)
+        }
+        // The hull bounds a rational curve only while every weight is
+        // positive; any other curve cannot be certified clear.
+        EdgeCurve::NurbsCurve(curve) => {
+            if !curve.weights().iter().all(|w| w.is_finite() && *w > 0.0) {
+                return true;
+            }
+            let hull: Vec<(f64, f64)> = curve.control_points().iter().map(|&p| flat(p)).collect();
+            hull_overlaps_triangle(&hull, triangle)
+        }
+    }
+}
+
+/// Whether a polyline comes within `margin` of a triangle, its inside
+/// included.
+fn path_within_of_triangle(path: &[(f64, f64)], triangle: [(f64, f64); 3], margin: f64) -> bool {
+    let to_segment = |p: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx.mul_add(dx, dy * dy);
+        let t = if len2 <= 0.0 {
+            0.0
+        } else {
+            ((p.0 - a.0).mul_add(dx, (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+        };
+        (p.0 - t.mul_add(dx, a.0)).hypot(p.1 - t.mul_add(dy, a.1))
+    };
+    let sides = [
+        (triangle[0], triangle[1]),
+        (triangle[1], triangle[2]),
+        (triangle[2], triangle[0]),
+    ];
+    path_enters_triangle(path, triangle)
+        || path.windows(2).any(|pair| {
+            sides.iter().any(|&(a, b)| {
+                to_segment(pair[0], a, b) <= margin
+                    || to_segment(pair[1], a, b) <= margin
+                    || to_segment(a, pair[0], pair[1]) <= margin
+                    || to_segment(b, pair[0], pair[1]) <= margin
+            })
+        })
+}
+
+/// Whether the convex hull of `points` overlaps the triangle by more than a
+/// rounding of their sizes (touching alone does not count).
+fn hull_overlaps_triangle(points: &[(f64, f64)], triangle: [(f64, f64); 3]) -> bool {
+    let mut sorted = points.to_vec();
+    sorted.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.1.total_cmp(&q.1)));
+    sorted.dedup();
+    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    let mut hull: Vec<(f64, f64)> = Vec::new();
+    for pass in 0..2 {
+        let start = hull.len();
+        let ordered: Box<dyn Iterator<Item = &(f64, f64)>> = if pass == 0 {
+            Box::new(sorted.iter())
+        } else {
+            Box::new(sorted.iter().rev())
+        };
+        for &p in ordered {
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+            {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    if hull.is_empty() {
+        return false;
+    }
+    let scale = points
+        .iter()
+        .chain(triangle.iter())
+        .map(|&(x, y)| x.abs().max(y.abs()))
+        .fold(0.0_f64, f64::max);
+    let eps = 1e-9 * scale.max(1.0);
+    let polygons: [&[(f64, f64)]; 2] = [&hull, &triangle];
+    for polygon in polygons {
+        let n = polygon.len();
+        for i in 0..n {
+            let (a, b) = (polygon[i], polygon[(i + 1) % n]);
+            let axis = (b.1 - a.1, a.0 - b.0);
+            let len = axis.0.hypot(axis.1);
+            if len <= eps {
+                continue;
+            }
+            let project = |p: &(f64, f64)| (p.0 * axis.0 + p.1 * axis.1) / len;
+            let (h0, h1) = hull
+                .iter()
+                .map(project)
+                .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+            let (t0, t1) = triangle
+                .iter()
+                .map(project)
+                .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+            if h1 <= t0 + eps || t1 <= h0 + eps {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether a polyline in the plane passes inside a triangle: a point strictly
+/// inside it, or a segment crossing one of its sides.
+fn path_enters_triangle(path: &[(f64, f64)], triangle: [(f64, f64); 3]) -> bool {
+    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    let scale = triangle
+        .iter()
+        .map(|&(x, y)| x.abs().max(y.abs()))
+        .fold(0.0_f64, f64::max);
+    let eps = 1e-9 * scale * scale;
+    let area = cross(triangle[0], triangle[1], triangle[2]);
+    let inside = |p: (f64, f64)| {
+        (0..3).all(|i| cross(triangle[i], triangle[(i + 1) % 3], p) * area.signum() > eps)
+    };
+    let opposite = |x: f64, y: f64| (x > eps && y < -eps) || (x < -eps && y > eps);
+    let crosses = |p: (f64, f64), q: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        opposite(cross(a, b, p), cross(a, b, q)) && opposite(cross(p, q, a), cross(p, q, b))
+    };
+    path.iter().any(|&p| inside(p))
+        || path.windows(2).any(|pair| {
+            (0..3).any(|i| crosses(pair[0], pair[1], triangle[i], triangle[(i + 1) % 3]))
         })
 }
 
@@ -2421,6 +2659,167 @@ fn succeeded_candidates(
     result.dedup_by_key(|edge| edge.index());
     result
 }
+
+/// Two corners of the cube of half-width `half` about `center`.
+fn cube_about(center: Point3, half: f64) -> [Point3; 2] {
+    let d = Vec3::new(half, half, half);
+    [center - d, center + d]
+}
+
+/// Points whose box holds a NURBS curve: its control points, whose hull
+/// holds it while every weight is positive, or an unbounded box.
+fn nurbs_curve_hull(curve: &brepkit_math::nurbs::curve::NurbsCurve) -> Vec<Point3> {
+    if curve.weights().iter().all(|&w| w > 0.0) {
+        curve.control_points().to_vec()
+    } else {
+        cube_about(Point3::new(0.0, 0.0, 0.0), f64::INFINITY).to_vec()
+    }
+}
+
+/// Two corners of the box of the whole conic `center + a cos t u + b sin t
+/// v`, which reaches `hypot(a u_i, b v_i)` either side along each axis.
+fn conic_box(center: Point3, (a, u): (f64, Vec3), (b, v): (f64, Vec3)) -> [Point3; 2] {
+    let d = Vec3::new(
+        (a * u.x()).hypot(b * v.x()),
+        (a * u.y()).hypot(b * v.y()),
+        (a * u.z()).hypot(b * v.z()),
+    );
+    [center - d, center + d]
+}
+
+/// Points whose box holds an edge: a line's ends, the box of the whole
+/// circle or ellipse it runs along, a NURBS curve's hull.
+fn edge_hull_points(topo: &Topology, edge_id: EdgeId) -> Result<Vec<Point3>, BlendError> {
+    let edge = topo.edge(edge_id)?;
+    Ok(match edge.curve() {
+        EdgeCurve::Line => vec![
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        ],
+        EdgeCurve::Circle(c) => conic_box(
+            c.center(),
+            (c.radius(), c.u_axis()),
+            (c.radius(), c.v_axis()),
+        )
+        .to_vec(),
+        EdgeCurve::Ellipse(e) => conic_box(
+            e.center(),
+            (e.semi_major(), e.u_axis()),
+            (e.semi_minor(), e.v_axis()),
+        )
+        .to_vec(),
+        EdgeCurve::NurbsCurve(n) => nurbs_curve_hull(n),
+    })
+}
+
+/// A box holding every face of `shell`. A plane, cylinder or cone face lies
+/// within the hull of its boundary (each of its points is on a straight
+/// segment between two boundary points), a sphere or torus face within its
+/// whole surface's extent, a NURBS face within its control points.
+fn shell_bounds(topo: &Topology, shell: ShellId) -> Result<Aabb3, BlendError> {
+    let mut points = Vec::new();
+    for &face_id in topo.shell(shell)?.faces() {
+        let face = topo.face(face_id)?;
+        match face.surface() {
+            FaceSurface::Plane { .. } | FaceSurface::Cylinder(_) | FaceSurface::Cone(_) => {}
+            FaceSurface::Sphere(s) => points.extend(cube_about(s.center(), s.radius())),
+            FaceSurface::Torus(t) => {
+                points.extend(cube_about(t.center(), t.major_radius() + t.minor_radius()));
+            }
+            FaceSurface::Nurbs(n) => {
+                if n.weights().iter().flatten().all(|&w| w > 0.0) {
+                    points.extend(n.control_points().iter().flatten().copied());
+                } else {
+                    points.extend(cube_about(Point3::new(0.0, 0.0, 0.0), f64::INFINITY));
+                }
+            }
+        }
+        for wire in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(wire)?.edges() {
+                points.extend(edge_hull_points(topo, oe.edge())?);
+            }
+        }
+    }
+    Ok(Aabb3::from_points(points))
+}
+
+/// Distance from `p` to the stretch of curve an edge spans: exact for a
+/// line, the curve's own projection for a circle, ellipse or NURBS curve,
+/// or the nearer end where that falls outside the edge's span.
+fn distance_to_edge(topo: &Topology, edge_id: EdgeId, p: Point3) -> Result<f64, BlendError> {
+    let edge = topo.edge(edge_id)?;
+    let (sp, ep) = (
+        topo.vertex(edge.start())?.point(),
+        topo.vertex(edge.end())?.point(),
+    );
+    let curve = edge.curve();
+    let ends = (p - sp).length().min((p - ep).length());
+    let (t0, t1) = curve.domain_with_endpoints(sp, ep);
+    let on_arc = |t: f64| {
+        let t = t0 + (t - t0).rem_euclid(std::f64::consts::TAU);
+        if t <= t1 {
+            (p - curve.evaluate_with_endpoints(t, sp, ep)).length()
+        } else {
+            ends
+        }
+    };
+    Ok(match curve {
+        EdgeCurve::Line => {
+            let d = ep - sp;
+            let len2 = d.dot(d);
+            let s = if len2 > 0.0 {
+                ((p - sp).dot(d) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (p - (sp + d * s)).length()
+        }
+        EdgeCurve::Circle(c) => on_arc(c.project(p)),
+        EdgeCurve::Ellipse(e) => on_arc(e.project(p)),
+        // A foot on the stored curve beyond the edge's span would read a
+        // stretch the edge does not run along.
+        EdgeCurve::NurbsCurve(n) => {
+            let (lo, hi) = (t0.min(t1), t0.max(t1));
+            brepkit_math::nurbs::projection::project_point_to_curve(n, p, 1e-9)
+                .ok()
+                .filter(|found| (lo..=hi).contains(&found.parameter))
+                .map_or(ends, |found| found.distance.min(ends))
+        }
+    })
+}
+
+/// A box holding the material a stripe takes off. Across the stripe that
+/// material lies between the spine, the two neighbours' curves out to the
+/// contacts and the blend arc, each turning less than half a circle and so
+/// lying within its chord's length of its ends: the box of the spine and
+/// contact curves, grown by twice the farthest contact's distance from the
+/// spine (a chord across a curved spine runs a little longer than that
+/// distance). The distance is read from points on the contact curves to
+/// the spine edges' own curves, as a rational curve's control points can
+/// stand well off it.
+fn removed_material_bounds(topo: &Topology, stripe: &Stripe) -> Result<Aabb3, BlendError> {
+    const CONTACT_SAMPLES: u32 = 64;
+    let mut points = Vec::new();
+    for &edge_id in stripe.spine.edges() {
+        points.extend(edge_hull_points(topo, edge_id)?);
+    }
+    let mut reach = 0.0_f64;
+    for contact in [&stripe.contact1, &stripe.contact2] {
+        points.extend(nurbs_curve_hull(contact));
+        let (t0, t1) = contact.domain();
+        for k in 0..=CONTACT_SAMPLES {
+            let c =
+                contact.evaluate((t1 - t0).mul_add(f64::from(k) / f64::from(CONTACT_SAMPLES), t0));
+            let mut near = f64::INFINITY;
+            for &edge_id in stripe.spine.edges() {
+                near = near.min(distance_to_edge(topo, edge_id, c)?);
+            }
+            reach = reach.max(near);
+        }
+    }
+    Ok(Aabb3::from_points(points).expanded(2.0 * reach))
+}
+
 /// Check the geometric constraints retained by a computed stripe.
 ///
 /// The walking solver already checks its Newton residual while marching. This
@@ -2471,16 +2870,29 @@ fn check_stripe_residuals(topo: &Topology, stripe: &Stripe) -> Result<(), BlendE
 /// Decide whether a rim-fillet torus band must carry `reversed` so its outward
 /// normal points away from the solid.
 ///
-/// The band's mid-arc geometric normal points radially out from the tube; we
-/// need it to also point to the *empty* side along the axis. The empty side is
-/// opposite the wall material: for a non-reversed cylinder/cone wall the
-/// material is on the axis-interior side, and the band sits one fillet radius
-/// from the plate toward the material — so the band's outward axial direction is
-/// the one pointing from the wall-contact circle back toward the plate.
+/// The band is tangent to the wall along the wall-contact circle, so there its
+/// outward normal is the wall's: the band is reversed when the torus's own
+/// normal (out of the tube) opposes it. That holds for a convex rim, whose
+/// tube lies in the material (a rod's top, a bore's mouth), and a concave one,
+/// whose tube lies in the air (a post's foot, a round pocket's floor). Without
+/// a wall normal, the band is taken as convex: its axial direction at mid-arc
+/// points from the wall contact back toward the plate.
 fn torus_band_needs_reversal(
     torus: &brepkit_math::surfaces::ToroidalSurface,
     rim: &ClosedRimInfo,
+    wall: (&FaceSurface, bool),
 ) -> bool {
+    let (wall_surface, wall_reversed) = wall;
+    let contact = rim.wall_circle.evaluate(0.0);
+    if let Some((u, v)) = wall_surface.project_point(contact) {
+        let wall_out = wall_surface.normal(u, v);
+        let wall_out = if wall_reversed { -wall_out } else { wall_out };
+        let (tu, tv) = torus.project_point(contact);
+        let along = torus.normal(tu, tv).dot(wall_out);
+        if along.abs() > 0.5 {
+            return along < 0.0;
+        }
+    }
     // The torus geometric normal at the mid-arc point (halfway between the two
     // contacts) should point away from the segment plate→wall along the axis.
     // The "away from material" axial direction is plate_center → (plate_center −
@@ -2570,6 +2982,46 @@ fn compute_stripe_for_contour(
     )
 }
 
+/// The direction from the middle of `edge` into `face`, across it in the
+/// face's tangent plane: the left of the edge as the face's wire runs along
+/// it. `None` when no wire of the face runs along the edge or the direction
+/// degenerates.
+fn into_face_from_edge(
+    topo: &Topology,
+    face: FaceId,
+    edge: brepkit_topology::edge::EdgeId,
+) -> Result<Option<Vec3>, BlendError> {
+    let f = topo.face(face)?;
+    let mut forward = None;
+    for wid in std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied()) {
+        if let Some(oe) = topo.wire(wid)?.edges().iter().find(|oe| oe.edge() == edge) {
+            forward = Some(oe.is_forward());
+            break;
+        }
+    }
+    let Some(forward) = forward else {
+        return Ok(None);
+    };
+    let e = topo.edge(edge)?;
+    let (ps, pe) = (
+        topo.vertex(e.start())?.point(),
+        topo.vertex(e.end())?.point(),
+    );
+    let (t0, t1) = e.curve().domain_with_endpoints(ps, pe);
+    let t = f64::midpoint(t0, t1);
+    let middle = e.curve().evaluate_with_endpoints(t, ps, pe);
+    // The curve's derivative runs backward along an edge whose domain runs down.
+    let mut along = e.curve().tangent_with_endpoints(t, ps, pe);
+    if (t1 < t0) == forward {
+        along = -along;
+    }
+    // A wire winds about its surface's normal, and a reversed face flips
+    // both, so the face lies on the left about the surface normal either way.
+    let surface = f.surface();
+    let (u, v) = surface.project_point(middle).unwrap_or((0.0, 0.0));
+    Ok(surface.normal(u, v).cross(along).normalize().ok())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_stripe_for_spine(
     topo: &Topology,
@@ -2626,16 +3078,31 @@ fn compute_stripe_for_spine(
     // we negate the normal. For analytic/NURBS surfaces the ParametricSurface
     // impl already returns the geometric normal; the walker uses the sign
     // convention from the face orientation.
-    let oriented_surf1 = if face1_reversed {
-        orient_plane_surface(&surf1)
-    } else {
-        surf1
+    // The walker rolls its ball on the side each normal points to, so a plane
+    // faces the ball: into the material at a convex edge, where the other
+    // face reaches into that side of its plane, and out of it at a concave
+    // one.
+    let p0 = spine.evaluate(topo, 0.0)?;
+    let toward_ball = |surf: brepkit_topology::face::FaceSurface,
+                       reversed: bool,
+                       other: FaceId|
+     -> Result<brepkit_topology::face::FaceSurface, BlendError> {
+        let brepkit_topology::face::FaceSurface::Plane { normal, .. } = &surf else {
+            return Ok(surf);
+        };
+        let outward = if reversed { -*normal } else { *normal };
+        let convex = match into_face_from_edge(topo, other, spine.edges()[0])? {
+            Some(into_other) => into_other.dot(-outward) > 0.0,
+            None => analytic::material_side_witness(topo, other, -outward, p0)? > 1e-9,
+        };
+        Ok(if reversed == convex {
+            surf
+        } else {
+            orient_plane_surface(&surf)
+        })
     };
-    let oriented_surf2 = if face2_reversed {
-        orient_plane_surface(&surf2)
-    } else {
-        surf2
-    };
+    let oriented_surf1 = toward_ball(surf1, face1_reversed, face2)?;
+    let oriented_surf2 = toward_ball(surf2, face2_reversed, face1)?;
     let mut adapter1 = None;
     let mut adapter2 = None;
 
@@ -2659,10 +3126,12 @@ fn compute_stripe_for_spine(
     };
 
     let blend_surface = approximate_blend_surface(&walk_result.sections)?;
+    // The band's sides are its own boundary rows: a polyline through the
+    // sections' contact points leaves the band wherever they do not lie on a
+    // line, since the band takes them as control points.
+    let contact1 = band_side(&blend_surface, 0)?;
+    let contact2 = band_side(&blend_surface, blend_surface.control_points().len() - 1)?;
     let blend_face_surface = brepkit_topology::face::FaceSurface::Nurbs(blend_surface);
-
-    let contact1 = sections_to_contact_curve(&walk_result.sections, |s| s.p1)?;
-    let contact2 = sections_to_contact_curve(&walk_result.sections, |s| s.p2)?;
 
     let pcurve1 = build_pcurve_from_contact(ps1, &contact1, face_u_period(&oriented_surf1))?;
     let pcurve2 = build_pcurve_from_contact(ps2, &contact2, face_u_period(&oriented_surf2))?;
@@ -2841,28 +3310,26 @@ fn mirror_law(law: &RadiusLaw) -> RadiusLaw {
     }
 }
 
-/// Build a degree-1 NURBS curve from section contact points.
-fn sections_to_contact_curve(
-    sections: &[crate::section::CircSection],
-    pick: impl Fn(&crate::section::CircSection) -> brepkit_math::vec::Point3,
+/// The side of a blend band at its `row`-th row of control points, along `v`:
+/// the band's own boundary curve there.
+fn band_side(
+    band: &brepkit_math::nurbs::surface::NurbsSurface,
+    row: usize,
 ) -> Result<brepkit_math::nurbs::curve::NurbsCurve, BlendError> {
-    let pts: Vec<brepkit_math::vec::Point3> = sections.iter().map(&pick).collect();
-    if pts.len() < 2 {
-        return Err(BlendError::Math(brepkit_math::MathError::EmptyInput));
-    }
-    let n = pts.len();
-    let degree = 1.min(n - 1);
-    let mut knots = vec![0.0; degree + 1];
-    if n > 2 {
-        for i in 1..n - 1 {
-            #[allow(clippy::cast_precision_loss)]
-            knots.push(i as f64 / (n - 1) as f64);
-        }
-    }
-    knots.extend(vec![1.0; degree + 1]);
-    let weights = vec![1.0; n];
-    let curve = brepkit_math::nurbs::curve::NurbsCurve::new(degree, knots, pts, weights)?;
-    Ok(curve)
+    let points = band
+        .control_points()
+        .get(row)
+        .ok_or(BlendError::Math(brepkit_math::MathError::EmptyInput))?;
+    let weights = band
+        .weights()
+        .get(row)
+        .ok_or(BlendError::Math(brepkit_math::MathError::EmptyInput))?;
+    Ok(brepkit_math::nurbs::curve::NurbsCurve::new(
+        band.degree_v(),
+        band.knots_v().to_vec(),
+        points.clone(),
+        weights.clone(),
+    )?)
 }
 
 fn face_u_period(surface: &FaceSurface) -> Option<f64> {
@@ -3472,6 +3939,125 @@ mod tests {
     use brepkit_topology::vertex::Vertex;
     use brepkit_topology::wire::{OrientedEdge, Wire};
 
+    /// The notch triangle at a corner filleted r 6: the arc's ends on the two
+    /// corner edges and the corner itself.
+    const NOTCH: [(f64, f64); 3] = [(6.0, 0.0), (0.0, 0.0), (0.0, 6.0)];
+
+    #[test]
+    fn a_spike_inside_a_narrow_knot_span_reaches_the_notch_triangle() {
+        // A degree-1 boundary whose excursion to (1, 1) lies in knot spans
+        // 0.001 wide, between two of 64 evenly spaced samples.
+        let points = [
+            (12.0, 2.0),
+            (4.0, 4.0),
+            (1.0, 1.0),
+            (4.0, 4.01),
+            (2.0, 12.0),
+        ];
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            1,
+            vec![0.0, 0.0, 0.5, 0.501, 0.502, 1.0, 1.0],
+            points
+                .iter()
+                .map(|&(x, y)| Point3::new(x, y, 0.0))
+                .collect(),
+            vec![1.0; 5],
+        )
+        .unwrap();
+        let samples: Vec<(f64, f64)> = (0..=64)
+            .map(|k| {
+                let p = curve.evaluate(f64::from(k) / 64.0);
+                (p.x(), p.y())
+            })
+            .collect();
+        assert!(
+            !path_enters_triangle(&samples, NOTCH),
+            "the samples step over the spike"
+        );
+        assert!(hull_overlaps_triangle(&points, NOTCH));
+    }
+
+    #[test]
+    fn a_curve_with_a_negative_weight_is_never_certified_clear() {
+        // Its control hull lies outside the triangle, yet the curve passes
+        // through (1, 1).
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![
+                Point3::new(4.0, 4.0, 0.0),
+                Point3::new(7.0, 8.0, 0.0),
+                Point3::new(4.0, 5.0, 0.0),
+            ],
+            vec![1.0, -0.5, 1.0],
+        )
+        .unwrap();
+        let middle = curve.evaluate(0.5);
+        assert!((middle.x() - 1.0).abs() < 1e-9 && (middle.y() - 1.0).abs() < 1e-9);
+        assert!(!hull_overlaps_triangle(
+            &[(4.0, 4.0), (7.0, 8.0), (4.0, 5.0)],
+            NOTCH
+        ));
+
+        let mut topo = Topology::new();
+        let a = topo.add_vertex(Vertex::new(Point3::new(4.0, 4.0, 0.0), 1e-7));
+        let b = topo.add_vertex(Vertex::new(Point3::new(4.0, 5.0, 0.0), 1e-7));
+        let edge_id = topo.add_edge(Edge::new(a, b, EdgeCurve::NurbsCurve(curve)));
+        let edge = topo.edge(edge_id).unwrap();
+        let flat = |p: Point3| (p.x(), p.y());
+        assert!(cap_edge_reaches_triangle(
+            edge,
+            Point3::new(4.0, 4.0, 0.0),
+            Point3::new(4.0, 5.0, 0.0),
+            &flat,
+            NOTCH,
+        ));
+    }
+
+    #[test]
+    fn a_hull_touching_the_notch_chord_does_not_reach_it() {
+        let touching = [(3.0, 3.0), (10.0, 3.0), (10.0, 10.0), (3.0, 10.0)];
+        assert!(!hull_overlaps_triangle(&touching, NOTCH));
+        let clear = [(20.0, 20.0), (30.0, 20.0), (25.0, 30.0)];
+        assert!(!hull_overlaps_triangle(&clear, NOTCH));
+        let crossing = [(2.0, 2.0), (10.0, 2.0), (10.0, 10.0), (2.0, 10.0)];
+        assert!(hull_overlaps_triangle(&crossing, NOTCH));
+    }
+
+    #[test]
+    fn a_circle_within_its_chords_sag_of_the_notch_reaches_it() {
+        // A polyline that stays just outside the triangle reaches it once
+        // widened by the sag of the arc it stands for.
+        let outside = [(4.0, 2.0005), (2.0005, 4.0)];
+        assert!(!path_within_of_triangle(&outside, NOTCH, 1e-4));
+        assert!(path_within_of_triangle(&outside, NOTCH, 1e-3));
+    }
+
+    /// A NURBS edge running along the first half of a 10 long line, forward
+    /// and reversed: a point over the unused half reads its distance to the
+    /// edge's own end, not to the curve beyond it.
+    #[test]
+    fn a_trimmed_nurbs_edge_reads_distance_within_its_span() {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        let line = NurbsCurve::new(
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0)],
+            vec![1.0, 1.0],
+        )
+        .unwrap();
+        let mut topo = Topology::new();
+        let a = topo.add_vertex(Vertex::new(Point3::new(0.0, 0.0, 0.0), 1e-7));
+        let b = topo.add_vertex(Vertex::new(Point3::new(5.0, 0.0, 0.0), 1e-7));
+        let p = Point3::new(8.0, 1.0, 0.0);
+        let want = (p - Point3::new(5.0, 0.0, 0.0)).length();
+        for (start, end) in [(a, b), (b, a)] {
+            let edge = topo.add_edge(Edge::new(start, end, EdgeCurve::NurbsCurve(line.clone())));
+            let d = distance_to_edge(&topo, edge, p).unwrap();
+            assert!((d - want).abs() < 1e-9, "{d} vs {want}");
+        }
+    }
+
     #[test]
     fn fillet_builder_empty_edges_error() {
         let mut topo = Topology::new();
@@ -3480,6 +4066,82 @@ mod tests {
         let builder = FilletBuilder::new(&mut topo, solid);
         let result = builder.build();
         assert!(result.is_err(), "empty edge set should produce an error");
+    }
+
+    /// The plate z = 0 from -20 to 20, with the foot of a boss over
+    /// [-5, 5]² as its hole, and the boss's wall x = 5 up to 10. The plate
+    /// reaches farther behind the wall than in front of it, but the round
+    /// along the foot rolls on the exposed plate in front: its contacts lie
+    /// at x = 5 + r on the plate and z = r on the wall.
+    #[test]
+    fn a_variable_round_at_a_boss_foot_rolls_on_the_exposed_plate() {
+        let mut topo = Topology::new();
+        let mut vertex =
+            |x: f64, y: f64, z: f64| topo.add_vertex(Vertex::new(Point3::new(x, y, z), 1e-7));
+        let plate_corners = [(-20.0, -20.0), (20.0, -20.0), (20.0, 20.0), (-20.0, 20.0)]
+            .map(|(x, y)| vertex(x, y, 0.0));
+        let foot =
+            [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)].map(|(x, y)| vertex(x, y, 0.0));
+        let (top_front, top_back) = (vertex(5.0, 5.0, 10.0), vertex(5.0, -5.0, 10.0));
+        let mut loop_of = |vs: &[VertexId]| {
+            (0..vs.len())
+                .map(|i| {
+                    let e =
+                        topo.add_edge(Edge::new(vs[i], vs[(i + 1) % vs.len()], EdgeCurve::Line));
+                    OrientedEdge::new(e, true)
+                })
+                .collect::<Vec<_>>()
+        };
+        let plate_outer = loop_of(&plate_corners);
+        let foot_loop = loop_of(&foot);
+        let foot_edge = foot_loop[1].edge();
+        let wall_rest = loop_of(&[foot[2], top_front, top_back, foot[1]]);
+        // The hole runs clockwise about +z, so the foot backward; the wall
+        // runs it forward, up the wall on its left.
+        let hole: Vec<_> = foot_loop
+            .iter()
+            .rev()
+            .map(|oe| OrientedEdge::new(oe.edge(), false))
+            .collect();
+        let wall: Vec<_> = std::iter::once(OrientedEdge::new(foot_edge, true))
+            .chain(wall_rest[..3].iter().copied())
+            .collect();
+        let outer = topo.add_wire(Wire::new(plate_outer, true).unwrap());
+        let hole = topo.add_wire(Wire::new(hole, true).unwrap());
+        let wall = topo.add_wire(Wire::new(wall, true).unwrap());
+        let plate = topo.add_face(Face::new(
+            outer,
+            vec![hole],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        let wall = topo.add_face(Face::new(
+            wall,
+            vec![],
+            FaceSurface::Plane {
+                normal: Vec3::new(1.0, 0.0, 0.0),
+                d: 5.0,
+            },
+        ));
+        let law = RadiusLaw::Linear {
+            start: 1.0,
+            end: 2.0,
+        };
+        for (face1, face2) in [(wall, plate), (plate, wall)] {
+            let spine = Spine::from_single_edge(&topo, foot_edge).unwrap();
+            let result = compute_stripe_for_spine(&topo, face1, face2, spine, &law).unwrap();
+            for contact in [&result.stripe.contact1, &result.stripe.contact2] {
+                let (t0, t1) = contact.domain();
+                for k in 0..=8 {
+                    let p = contact.evaluate((t1 - t0).mul_add(f64::from(k) / 8.0, t0));
+                    let on_plate = p.z().abs() < 1e-6 && (5.9..7.1).contains(&p.x());
+                    let on_wall = (p.x() - 5.0).abs() < 1e-6 && (0.9..2.1).contains(&p.z());
+                    assert!(on_plate || on_wall, "a contact at {p:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -3828,9 +4490,12 @@ mod tests {
                 .faces()
                 .iter()
                 .any(|&face| {
-                    matches!(topo.face(face).unwrap().surface(), FaceSurface::Sphere(_))
+                    matches!(
+                        topo.face(face).unwrap().surface(),
+                        FaceSurface::Sphere(sphere) if (sphere.radius() - 0.1).abs() < 1e-12
+                    )
                 }),
-            "three-stripe junction must publish the rolling ball's patch"
+            "three-stripe junction must publish a patch of the ball's sphere"
         );
         assert_shell_edges_are_closed(&topo, result.solid);
     }
