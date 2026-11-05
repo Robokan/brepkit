@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793035165858,
+  "lastUpdate": 1793901620259,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1079,6 +1079,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 30627500,
             "range": "± 305840",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "2f7a83efa34c9747785d88e70f098449410285f7",
+          "message": "chore(scripts): corpus sync skips the cases thinned out of the corpus\n\nThe corpus repo lists the near-repeat cases and unused shapes it removed in\nthinned.txt (its tools/thin_corpus.py).  The sync copies a machine's own\nrecordings into the repo, so without this every machine would bring them\nback on its next sync.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T09:55:43-08:00",
+          "tree_id": "7aaeca7c3f33061e1678fb35fd3ed761d80981f9",
+          "url": "https://github.com/Robokan/brepkit/commit/2f7a83efa34c9747785d88e70f098449410285f7"
+        },
+        "date": 1793901619548,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1108788,
+            "range": "± 22242",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1203072,
+            "range": "± 18736",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 14448,
+            "range": "± 100",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 702278,
+            "range": "± 8197",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 51426563,
+            "range": "± 577277",
             "unit": "ns/iter"
           }
         ]
