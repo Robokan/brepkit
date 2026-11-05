@@ -1494,6 +1494,65 @@ fn excise_out_and_back_spurs(
     }
 }
 
+/// The seam of a face whose outer wire is its one closed rim and a single
+/// edge from the rim's vertex run out and back to one of `poles`: a dome
+/// opened along a seam to its pole.
+fn dome_seam(
+    topo: &Topology,
+    face: &brepkit_topology::face::Face,
+    poles: &[Point3],
+) -> Option<brepkit_topology::edge::EdgeId> {
+    let wire = topo.wire(face.outer_wire()).ok()?;
+    let [a, b, c] = wire.edges() else {
+        return None;
+    };
+    let closed = |oe: &OrientedEdge| topo.edge(oe.edge()).is_ok_and(|e| e.start() == e.end());
+    // The rim sits between the seam's two runs, wherever the wire starts.
+    let (rim, out, back) = [(b, c, a), (c, a, b), (a, b, c)]
+        .into_iter()
+        .find(|(rim, _, _)| closed(rim))?;
+    let seam = topo.edge(out.edge()).ok()?;
+    let rim_vertex = topo.edge(rim.edge()).ok()?.start();
+    let tip = if seam.start() == rim_vertex {
+        seam.end()
+    } else if seam.end() == rim_vertex {
+        seam.start()
+    } else {
+        return None;
+    };
+    let tip = topo.vertex(tip).ok()?.point();
+    (out.edge() == back.edge()
+        && out.is_forward() != back.is_forward()
+        && tip != topo.vertex(rim_vertex).ok()?.point()
+        && poles.iter().any(|&p| (tip - p).length() < MERGE_TOL))
+    .then_some(out.edge())
+}
+
+/// The points a B-spline surface collapses to: each boundary row or column
+/// of its control net whose points all coincide.
+fn nurbs_poles(surface: &brepkit_math::nurbs::surface::NurbsSurface) -> Vec<Point3> {
+    let net = surface.control_points();
+    let (Some(first), Some(last)) = (net.first(), net.last()) else {
+        return Vec::new();
+    };
+    let column = |j: usize| net.iter().filter_map(move |row| row.get(j).copied());
+    let width = first.len();
+    let rows: [Vec<Point3>; 4] = [
+        first.clone(),
+        last.clone(),
+        column(0).collect(),
+        column(width.saturating_sub(1)).collect(),
+    ];
+    rows.into_iter()
+        .filter_map(|row| {
+            let p = *row.first()?;
+            row.iter()
+                .all(|&q| (q - p).length() < MERGE_TOL)
+                .then_some(p)
+        })
+        .collect()
+}
+
 /// A pointed cone face's seam, or a spherical cap's: the line or meridian
 /// its outer wire runs up to the apex or pole and straight back down, which
 /// reads like a spur but is the cut the surface is opened along.
@@ -1508,6 +1567,9 @@ fn pointed_cone_seam(topo: &Topology, fid: FaceId) -> Option<brepkit_topology::e
             let pole = sphere.z_axis() * sphere.radius();
             vec![sphere.center() + pole, sphere.center() - pole]
         }
+        // A B-spline dome read from a file: one closed rim, its seam run up
+        // to the pole and back down.
+        FaceSurface::Nurbs(surface) => return dome_seam(topo, face, &nurbs_poles(surface)),
         _ => return None,
     };
     topo.wire(face.outer_wire())
@@ -3157,7 +3219,24 @@ fn project_angle_on_curve(curve: &brepkit_topology::edge::EdgeCurve, p: Point3) 
 }
 
 /// An edge's middle and size, as `merge_duplicate_edges` compares copies.
-type EdgeMiddle = Option<(Point3, f64)>;
+type EdgeMiddle = Option<(Point3, f64, u64)>;
+
+/// A fitted curve's identity: its control points, weights and knots, so
+/// edges cut from one curve key alike (never 0, which marks an exact curve).
+fn nurbs_key(nc: &brepkit_math::nurbs::curve::NurbsCurve) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in nc.control_points() {
+        [p.x(), p.y(), p.z()].map(f64::to_bits).hash(&mut h);
+    }
+    for w in nc.weights() {
+        w.to_bits().hash(&mut h);
+    }
+    for k in nc.knots() {
+        k.to_bits().hash(&mut h);
+    }
+    h.finish().max(1)
+}
 
 /// Merge duplicate edges across selected faces by quantized endpoint position.
 ///
@@ -3265,38 +3344,54 @@ fn merge_duplicate_edges(topo: &mut Topology, face_ids: &mut [FaceId]) -> Result
         // it (a box's top crossing the hole) join the same two points, and
         // merged they give the arc's wall and the box's strip one edge set,
         // which then reads as a doubled face and drops both.
-        // The middle of a line, circle or ellipse edge, with the edge's size;
-        // `None` where it cannot be trusted: a closed edge's middle hangs on
-        // its own parameter origin, and a fitted curve's span may resolve to
-        // its whole parent curve. Those keep matching by their ends alone.
-        let middle = |e: EdgeId| -> Result<Option<(Point3, f64)>, AlgoError> {
+        // The middle of an edge, with the edge's size and, for a fitted
+        // curve, its curve (0 for an exact one); `None` where it cannot be
+        // trusted: a closed edge's middle hangs on its own parameter origin,
+        // and a fitted curve's span may resolve to its whole parent curve.
+        // Those keep matching by their ends alone. Fitted edges compare
+        // middles only on the very same curve, where two pieces between the
+        // same two points (a closed section's two halves) are two edges; two
+        // fits of one section, one per face, read their spans each its own
+        // way and still match by their ends.
+        let middle = |e: EdgeId| -> Result<EdgeMiddle, AlgoError> {
             let edge = topo.edge(e)?;
             let sp = topo.vertex(edge.start())?.point();
             let ep = topo.vertex(edge.end())?.point();
-            if matches!(edge.curve(), EdgeCurve::NurbsCurve(_))
-                || quantize_point(sp, tol) == quantize_point(ep, tol)
-            {
+            if quantize_point(sp, tol) == quantize_point(ep, tol) {
                 return Ok(None);
             }
             let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
+            let curve_key = if let EdgeCurve::NurbsCurve(nc) = edge.curve() {
+                let (d0, d1) = nc.domain();
+                if (t1 - t0).abs() >= (d1 - d0) * (1.0 - 1e-9) {
+                    return Ok(None);
+                }
+                nurbs_key(nc)
+            } else {
+                0
+            };
             let mid = edge
                 .curve()
                 .evaluate_with_endpoints(0.5 * (t0 + t1), sp, ep);
-            Ok(Some((mid, (ep - sp).length().max((mid - sp).length()))))
+            Ok(Some((
+                mid,
+                (ep - sp).length().max((mid - sp).length()),
+                curve_key,
+            )))
         };
         // How far apart two copies' middles may lie: a quarter of the edge's
         // size, so a faceted ball's chord still joins the exact arc it stands
         // for (2.5% apart at 32 segments), while an arc over a hole and the
         // straight edge across it (98%) stay apart.
-        let alongside = |a: Option<(Point3, f64)>, b: Option<(Point3, f64)>| match (a, b) {
-            (Some((ma, sa)), Some((mb, sb))) => {
+        let alongside = |a: EdgeMiddle, b: EdgeMiddle| match (a, b) {
+            (Some((ma, sa, ka)), Some((mb, sb, kb))) if ka == kb => {
                 (ma - mb).length() <= 0.25 * sa.max(sb) + 10.0 * tol
             }
             _ => true,
         };
         // Copies of one edge share their middle outright.
-        let same = |a: Option<(Point3, f64)>, b: Option<(Point3, f64)>| match (a, b) {
-            (Some((ma, sa)), Some((mb, sb))) => {
+        let same = |a: EdgeMiddle, b: EdgeMiddle| match (a, b) {
+            (Some((ma, sa, ka)), Some((mb, sb, kb))) if ka == kb => {
                 (ma - mb).length() <= 1e-4 * sa.max(sb) + 10.0 * tol
             }
             _ => true,

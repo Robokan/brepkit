@@ -7,7 +7,7 @@
 //! face census next to Open CASCADE's.
 //!
 //! ```sh
-//! LOG=1 cargo run --release -p brepkit-io \
+//! LOG=1 (or LOG=trace) cargo run --release -p brepkit-io \
 //!   --example corpus_case -- <case dir>
 //! ```
 //!
@@ -316,7 +316,7 @@ fn read(dir: &Path, name: &str, topo: &mut Topology) -> Vec<SolidId> {
 struct Stderr;
 impl log::Log for Stderr {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        m.target().starts_with("brepkit") && m.level() <= log::Level::Debug
+        m.target().starts_with("brepkit") && m.level() <= log::max_level()
     }
     fn log(&self, r: &log::Record) {
         if self.enabled(r.metadata()) {
@@ -329,7 +329,11 @@ impl log::Log for Stderr {
 fn main() {
     if std::env::var("LOG").is_ok() {
         log::set_logger(&Stderr).unwrap();
-        log::set_max_level(log::LevelFilter::Debug);
+        log::set_max_level(if std::env::var("LOG").is_ok_and(|v| v == "trace") {
+            log::LevelFilter::Trace
+        } else {
+            log::LevelFilter::Debug
+        });
     }
     let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("case dir"));
     if dir.extension().is_some_and(|e| e == "step") {

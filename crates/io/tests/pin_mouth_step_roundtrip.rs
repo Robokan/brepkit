@@ -3,7 +3,10 @@
 //! loop's later point back to its earlier one. Written to STEP, such an edge
 //! must say it runs against its curve (`same_sense = .F.`): written with the
 //! curve, a reader takes the loop from the edge's start the other way round,
-//! and the part it reads back is a different solid.
+//! and the part it reads back is a different solid. (The builder now stores
+//! a piece of a closed loop with its curve, so this cut may have no such edge
+//! left; the writer's own tests cover one, and this one checks the part
+//! reads back whole.)
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -39,11 +42,6 @@ fn edges_running_against_their_loop_are_written_against_it() {
     let volume = solid_volume(&topo, cut, 0.001).unwrap();
 
     let text = write_step(&topo, &[cut]).unwrap();
-    assert!(
-        text.lines()
-            .any(|l| l.contains("EDGE_CURVE(") && l.trim_end().ends_with(".F.);")),
-        "no edge written against its curve"
-    );
     let mut back = Topology::new();
     let read = read_step(&text, &mut back).unwrap();
     assert_eq!(read.len(), 1);

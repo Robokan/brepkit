@@ -2581,6 +2581,14 @@ fn build_section_edges(
                     continue;
                 }
 
+                // A section in pieces, each sharing its edge with one of this
+                // face's own boundary edges, lies on the boundary: the face
+                // already has those edges, which the whole curve would trace
+                // again beside them.
+                if section_pieces_on_face_boundary(topo, arena, curve_ds, face_id) {
+                    continue;
+                }
+
                 // Find start/end 3D points by evaluating the curve at its
                 // parametric endpoints. For closed curves (circles), start ≈ end.
                 let (start, end) = curve_endpoints(topo, arena, curve_ds);
@@ -2796,121 +2804,98 @@ fn build_section_edges(
                     Err(_) => continue,
                 };
 
-                let intervals: Vec<(Point3, Point3)> = if matches!(
-                    edge.curve(),
-                    brepkit_topology::edge::EdgeCurve::Line
-                ) {
-                    // An edge of a wall on this face's very cylinder (a
-                    // coaxial rod's seam, turned off this wall's own) lies on
-                    // the stretch the walls share, which it does not cut.
-                    let same_wall = match face.surface() {
-                        FaceSurface::Cylinder(here) => adjacency.get(topo).is_some_and(|adj| {
-                            adj.faces_for_edge(pb.original_edge).iter().any(|&f| {
-                                f != face_id
-                                    && topo.face(f).is_ok_and(|f| {
-                                        matches!(f.surface(),
-                                            FaceSurface::Cylinder(other) if same_cylinder(here, other, tol))
-                                    })
-                            })
-                        }),
-                        _ => false,
-                    };
-                    let Some(clipped_list) = clip_line_to_face_boundary_with(
-                        topo,
-                        face_id,
-                        (raw_start, raw_end),
-                        tol,
-                        face_loops,
-                        None,
-                        !same_wall,
-                    ) else {
-                        continue;
-                    };
-                    // Also clip each piece to the OPPOSING FF face so a wide
-                    // face does not extend the section past the narrower
-                    // face's boundary. Adopt an opposing-clip endpoint ONLY
-                    // where it genuinely tightens (moves by > tol): a
-                    // flush/coincident opposing face re-derives the SAME
-                    // endpoint with sub-tolerance float noise, and snapping
-                    // to that noisy value shifts the section off the shared
-                    // corner vertex this face's clip landed on exactly (the
-                    // stacking-lip fuse regression). Interior split points
-                    // from a multi-window opposing clip are genuine and kept
-                    // as-is.
-                    // A ruling split at a notch's mouth arrives in
-                    // windows along the curved face's whole band; a
-                    // window the planar partner's outline does not reach
-                    // belongs to no section of the pair.
-                    let windowed = clipped_list.len() > 1
-                        && matches!(
-                            face.surface(),
-                            FaceSurface::Cylinder(_) | FaceSurface::Cone(_)
-                        )
-                        && opposing_face.is_some_and(|of| {
-                            topo.face(of).is_ok_and(|f| {
-                                matches!(f.surface(), FaceSurface::Plane { .. })
-                                    && f.inner_wires().is_empty()
-                            })
-                        });
-                    let mut finals = Vec::new();
-                    for (cs, ce) in clipped_list {
-                        match opposing_face.and_then(|of| {
-                            // A run along the opposing face's own
-                            // edge is still a section where the face
-                            // across that edge lies on this curved face
-                            // (a knuckle's cylinder on a bracket's cove,
-                            // beside the tilted face that meets it): no
-                            // phase traces where a curved coincident
-                            // pair parts, while the coplanar phase does
-                            // for planes.
-                            let curved = !matches!(face.surface(), FaceSurface::Plane { .. });
-                            let across_on_this = |e: EdgeId| {
-                                curved
-                                    && adjacency.get(topo).is_some_and(|adj| {
-                                        face_across_lies_on(
-                                            topo,
-                                            adj,
-                                            e,
-                                            of,
-                                            face.surface(),
-                                            op_tol,
-                                        )
-                                    })
-                            };
-                            clip_line_to_face_boundary(
-                                topo,
-                                of,
-                                cs,
-                                ce,
-                                tol,
-                                face_loops,
-                                Some(&across_on_this),
+                let intervals: Vec<(Point3, Point3)> =
+                    if matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line) {
+                        let Some(clipped_list) = clip_line_to_face_boundary(
+                            topo, face_id, raw_start, raw_end, tol, face_loops, None,
+                        ) else {
+                            continue;
+                        };
+                        // Also clip each piece to the OPPOSING FF face so a wide
+                        // face does not extend the section past the narrower
+                        // face's boundary. Adopt an opposing-clip endpoint ONLY
+                        // where it genuinely tightens (moves by > tol): a
+                        // flush/coincident opposing face re-derives the SAME
+                        // endpoint with sub-tolerance float noise, and snapping
+                        // to that noisy value shifts the section off the shared
+                        // corner vertex this face's clip landed on exactly (the
+                        // stacking-lip fuse regression). Interior split points
+                        // from a multi-window opposing clip are genuine and kept
+                        // as-is.
+                        // A ruling split at a notch's mouth arrives in
+                        // windows along the curved face's whole band; a
+                        // window the planar partner's outline does not reach
+                        // belongs to no section of the pair.
+                        let windowed = clipped_list.len() > 1
+                            && matches!(
+                                face.surface(),
+                                FaceSurface::Cylinder(_) | FaceSurface::Cone(_)
                             )
-                        }) {
-                            Some(subs) => {
-                                let n = subs.len();
-                                for (i, (ss, ee)) in subs.into_iter().enumerate() {
-                                    let s = if i == 0 && (ss - cs).length() <= tol {
-                                        cs
-                                    } else {
-                                        ss
-                                    };
-                                    let e = if i + 1 == n && (ee - ce).length() <= tol {
-                                        ce
-                                    } else {
-                                        ee
-                                    };
-                                    finals.push((s, e));
+                            && opposing_face.is_some_and(|of| {
+                                topo.face(of).is_ok_and(|f| {
+                                    matches!(f.surface(), FaceSurface::Plane { .. })
+                                        && f.inner_wires().is_empty()
+                                })
+                            });
+                        let mut finals = Vec::new();
+                        for (cs, ce) in clipped_list {
+                            match opposing_face.and_then(|of| {
+                                // A run along the opposing face's own
+                                // edge is still a section where the face
+                                // across that edge lies on this curved face
+                                // (a knuckle's cylinder on a bracket's cove,
+                                // beside the tilted face that meets it): no
+                                // phase traces where a curved coincident
+                                // pair parts, while the coplanar phase does
+                                // for planes.
+                                let curved = !matches!(face.surface(), FaceSurface::Plane { .. });
+                                let across_on_this = |e: EdgeId| {
+                                    curved
+                                        && adjacency.get(topo).is_some_and(|adj| {
+                                            face_across_lies_on(
+                                                topo,
+                                                adj,
+                                                e,
+                                                of,
+                                                face.surface(),
+                                                op_tol,
+                                            )
+                                        })
+                                };
+                                clip_line_to_face_boundary(
+                                    topo,
+                                    of,
+                                    cs,
+                                    ce,
+                                    tol,
+                                    face_loops,
+                                    Some(&across_on_this),
+                                )
+                            }) {
+                                Some(subs) => {
+                                    let n = subs.len();
+                                    for (i, (ss, ee)) in subs.into_iter().enumerate() {
+                                        let s = if i == 0 && (ss - cs).length() <= tol {
+                                            cs
+                                        } else {
+                                            ss
+                                        };
+                                        let e = if i + 1 == n && (ee - ce).length() <= tol {
+                                            ce
+                                        } else {
+                                            ee
+                                        };
+                                        finals.push((s, e));
+                                    }
                                 }
+                                None if windowed => {}
+                                None => finals.push((cs, ce)),
                             }
-                            None if windowed => {}
-                            None => finals.push((cs, ce)),
                         }
-                    }
-                    finals
-                } else {
-                    vec![(raw_start, raw_end)]
-                };
+                        finals
+                    } else {
+                        vec![(raw_start, raw_end)]
+                    };
                 let mut work: Vec<(Point3, Point3)> = intervals;
                 let mut work_i = 0;
                 while work_i < work.len() {
@@ -3192,6 +3177,46 @@ fn closed_curve_coincides_with_boundary(
         }
     }
     false
+}
+
+/// Whether a section curve is split into two or more pieces that each share
+/// their edge with an edge of `face_id`'s own boundary (a rim shared by two
+/// coincident walls, which the pave filler split at a vertex of one).
+fn section_pieces_on_face_boundary(
+    topo: &Topology,
+    arena: &GfaArena,
+    curve_ds: &crate::ds::IntersectionCurveDS,
+    face_id: FaceId,
+) -> bool {
+    let Ok(face) = topo.face(face_id) else {
+        return false;
+    };
+    let own: Vec<EdgeId> = std::iter::once(face.outer_wire())
+        .chain(face.inner_wires().iter().copied())
+        .filter_map(|wid| topo.wire(wid).ok())
+        .flat_map(|wire| {
+            wire.edges()
+                .iter()
+                .map(brepkit_topology::wire::OrientedEdge::edge)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let leaves = arena.collect_leaf_pave_blocks(&curve_ds.pave_blocks);
+    leaves.len() >= 2
+        && leaves.iter().all(|pb| {
+            arena
+                .pb_to_cb
+                .get(pb)
+                .and_then(|&cb| arena.common_blocks.get(cb))
+                .is_some_and(|cb| {
+                    cb.pave_blocks.iter().any(|&other| {
+                        arena
+                            .pave_blocks
+                            .get(other)
+                            .is_some_and(|o| own.contains(&o.original_edge))
+                    })
+                })
+        })
 }
 
 /// Whether a section sampled as `section_pts` (3D points along its interior)
@@ -4005,22 +4030,6 @@ struct BoundaryArc {
     forward: bool,
 }
 
-/// Whether two cylinders are one surface: the same radius about the same
-/// axis line.
-fn same_cylinder(
-    a: &brepkit_math::surfaces::CylindricalSurface,
-    b: &brepkit_math::surfaces::CylindricalSurface,
-    tol: f64,
-) -> bool {
-    let (Ok(axis), Ok(other)) = (a.axis().normalize(), b.axis().normalize()) else {
-        return false;
-    };
-    let w = b.origin() - a.origin();
-    (a.radius() - b.radius()).abs() <= tol * 100.0
-        && axis.cross(other).length() <= 1e-9
-        && (w - axis * w.dot(axis)).length() <= tol * 100.0
-}
-
 /// A straight section along a whole cylinder wall's axis (a wall with no
 /// holes, bounded by its two rims and the seam): `Some(true)` when both
 /// ends lie between the rims, so the line lies on the wall end to end;
@@ -4093,33 +4102,10 @@ fn clip_line_to_face_boundary(
     face_loops: &FaceLoopsCache,
     keep_run_along: Option<&dyn Fn(EdgeId) -> bool>,
 ) -> Option<Vec<(Point3, Point3)>> {
-    clip_line_to_face_boundary_with(
-        topo,
-        face_id,
-        (line_start, line_end),
-        tol,
-        face_loops,
-        keep_run_along,
-        true,
-    )
-}
-
-/// [`clip_line_to_face_boundary`], reading a ruling inside a cylinder band
-/// as on the wall (see [`ruling_inside_band`]) only when `rulings` is set.
-#[allow(clippy::too_many_lines)]
-fn clip_line_to_face_boundary_with(
-    topo: &Topology,
-    face_id: FaceId,
-    (line_start, line_end): (Point3, Point3),
-    tol: f64,
-    face_loops: &FaceLoopsCache,
-    keep_run_along: Option<&dyn Fn(EdgeId) -> bool>,
-    rulings: bool,
-) -> Option<Vec<(Point3, Point3)>> {
     let face = topo.face(face_id).ok()?;
     let wire = topo.wire(face.outer_wire()).ok()?;
 
-    if rulings && let Some(inside) = ruling_inside_band(topo, face, line_start, line_end, tol) {
+    if let Some(inside) = ruling_inside_band(topo, face, line_start, line_end, tol) {
         return inside.then(|| vec![(line_start, line_end)]);
     }
 
@@ -5338,18 +5324,24 @@ fn hole_key(inner: &[super::split_types::OrientedPCurveEdge]) -> Vec<HoleEdgeKey
 /// aligned with the curve parameterization — an open arc edge implicitly
 /// spans the CCW range from its start vertex to its end vertex, so storing
 /// traversal order for a reverse-traversed arc would flip the geometry to
-/// the complementary arc. Closed curved edges (start == end) cannot encode
-/// direction via vertices and keep the pcurve flag for winding.
+/// the complementary arc. A piece of a closed NURBS curve is the same: its
+/// vertices in traversal order would read the rest of the loop. Closed
+/// curved edges (start == end) cannot encode direction via vertices and
+/// keep the pcurve flag for winding.
 fn instantiate_wire_edge(
     topo: &mut Topology,
     start_vid: brepkit_topology::vertex::VertexId,
     end_vid: brepkit_topology::vertex::VertexId,
     pcurve_edge: &super::split_types::OrientedPCurveEdge,
 ) -> (brepkit_topology::edge::EdgeId, bool) {
-    let is_arc = matches!(
-        pcurve_edge.curve_3d,
-        EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_)
-    );
+    let is_arc = match &pcurve_edge.curve_3d {
+        EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => true,
+        EdgeCurve::NurbsCurve(n) => {
+            let (d0, d1) = n.domain();
+            (n.evaluate(d0) - n.evaluate(d1)).length() < 1e-5
+        }
+        EdgeCurve::Line => false,
+    };
     if is_arc && start_vid != end_vid && !pcurve_edge.forward {
         let edge_id = topo.add_edge(Edge::new(end_vid, start_vid, pcurve_edge.curve_3d.clone()));
         (edge_id, false)

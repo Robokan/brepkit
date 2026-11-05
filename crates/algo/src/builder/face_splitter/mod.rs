@@ -5761,6 +5761,75 @@ fn rejoin_untouched_rims(
     if rims.is_empty() || n < 3 {
         return wire;
     }
+    // A rim cut into several pieces that run round it from its start back to
+    // it, touched by no section, is the rim whole. Joined a pair at a time,
+    // the pieces would pass through half a turn, which the rule below keeps
+    // split.
+    for i in 0..n {
+        let first = &wire[i];
+        if first.source_edge_idx.is_some() {
+            continue;
+        }
+        let Some(rim) = rims.iter().find(|r| {
+            same_circle(&r.curve_3d, &first.curve_3d) && near(r.start_3d, first.start_3d)
+        }) else {
+            continue;
+        };
+        let mut last = i;
+        let mut count = 1;
+        while count < n - 1 {
+            let next = &wire[(last + 1) % n];
+            if next.source_edge_idx.is_some()
+                || !same_circle(&rim.curve_3d, &next.curve_3d)
+                || !near(wire[last].end_3d, next.start_3d)
+            {
+                break;
+            }
+            last = (last + 1) % n;
+            count += 1;
+            if near(next.end_3d, first.start_3d) {
+                break;
+            }
+        }
+        if count < 3 || !near(wire[last].end_3d, first.start_3d) {
+            continue;
+        }
+        // A joint another edge of the loop meets (a section ending on the
+        // rim) is a real vertex of the rim.
+        let run: Vec<usize> = (0..count).map(|k| (i + k) % n).collect();
+        let met = run[..count - 1].iter().any(|&k| {
+            let joint = wire[k].end_3d;
+            (0..n)
+                .filter(|j| !run.contains(j))
+                .any(|j| near(wire[j].start_3d, joint) || near(wire[j].end_3d, joint))
+        });
+        if met {
+            continue;
+        }
+        let Ok(line) = Line2D::new(first.start_uv, wire[last].end_uv - first.start_uv) else {
+            continue;
+        };
+        let joined = OrientedPCurveEdge {
+            curve_3d: rim.curve_3d.clone(),
+            pcurve: Curve2D::Line(line),
+            start_uv: first.start_uv,
+            end_uv: wire[last].end_uv,
+            start_3d: first.start_3d,
+            end_3d: first.start_3d,
+            forward: first.forward,
+            source_edge_idx: None,
+            pave_block_id: rim.pave_block_id,
+        };
+        let mut out: Vec<OrientedPCurveEdge> = Vec::with_capacity(n - count + 1);
+        for k in 0..n {
+            if k == i {
+                out.push(joined.clone());
+            } else if !run.contains(&k) {
+                out.push(wire[k].clone());
+            }
+        }
+        return rejoin_untouched_rims(out, rims, trace_splits, tol);
+    }
     for i in 0..n {
         let (first, second) = (&wire[i], &wire[(i + 1) % n]);
         if first.source_edge_idx.is_some() || second.source_edge_idx.is_some() {
@@ -6121,9 +6190,16 @@ fn split_face_2d_impl(
     let deduped_sections: Option<Vec<SectionEdge>> = {
         let band = tol.linear * 10.0;
         let same_pt = |p: Point3, q: Point3| (p - q).length() <= band;
+        // Each section's own middle: a NURBS piece shares its parent's
+        // parameters, so one raw parameter is one point for every piece of a
+        // loop (the two halves of a closed section then read as twins).
         let mids: Vec<Point3> = sections
             .iter()
-            .map(|s| s.curve_3d.evaluate_with_endpoints(0.5, s.start, s.end))
+            .map(|s| {
+                let (t0, t1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+                s.curve_3d
+                    .evaluate_with_endpoints(f64::midpoint(t0, t1), s.start, s.end)
+            })
             .collect();
         let mut keep = vec![true; sections.len()];
         let mut any_dup = false;
