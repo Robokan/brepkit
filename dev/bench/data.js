@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793901620259,
+  "lastUpdate": 1793922368756,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1133,6 +1133,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 51426563,
             "range": "± 577277",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "409e265ecfe4d12dfa37a59cb70d6ddf3b2befed",
+          "message": "docs(buzzcad): progress for 2026-11-05, PR bodies, corpus pointer\n\nToday's row (thinned corpus, replay 20261105-123124, the algo fixes and\n#15's fillet fixes), the open PRs #2289, #2290 and #2295 with their\nbodies, and the corpus at its latest sync.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T15:28:51-08:00",
+          "tree_id": "d4f52f775f8bfc49e4ec13de0c55011fa1ef3811",
+          "url": "https://github.com/Robokan/brepkit/commit/409e265ecfe4d12dfa37a59cb70d6ddf3b2befed"
+        },
+        "date": 1793922367823,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1142439,
+            "range": "± 6957",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1246248,
+            "range": "± 9527",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13455,
+            "range": "± 55",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 740306,
+            "range": "± 745",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29560288,
+            "range": "± 38710",
             "unit": "ns/iter"
           }
         ]
