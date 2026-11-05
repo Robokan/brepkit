@@ -41,8 +41,13 @@ git -C "$DEST" checkout -q main
 git -C "$DEST" pull -q --rebase
 mkdir -p "$DEST/cases" "$DEST/shapes" "$DEST/replays"
 
-rsync -a "$SRC/cases/" "$DEST/cases/"
-rsync -a "$SRC/shapes/" "$DEST/shapes/"
+# Cases and shapes thinned out of the corpus (its tools/thin_corpus.py:
+# near-repeats of one step) are listed in its thinned.txt and never copied
+# back from a machine's own recordings.
+THINNED=()
+[ -f "$DEST/thinned.txt" ] && THINNED=(--exclude-from="$DEST/thinned.txt")
+rsync -a "${THINNED[@]}" "$SRC/cases/" "$DEST/cases/"
+rsync -a "${THINNED[@]}" "$SRC/shapes/" "$DEST/shapes/"
 
 newest=""
 for dir in "$SRC"/replays/*/; do
