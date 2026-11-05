@@ -1,0 +1,285 @@
+//! Replay one BuzzCAD corpus fillet case natively.
+//!
+//! Takes a replay's `failures/fillet/<key>/` directory (`case.json`,
+//! `input0.step`), picks each recorded edge as the solid's edge passing
+//! nearest the case's point on it, runs `fillet_v2` as the bridge does,
+//! and reports each edge's failure or the result's faces, volume, open
+//! edges and validity next to the case's reference answer.
+//!
+//! ```sh
+//! cargo run --release -p brepkit-io --example corpus_fillet -- <case dir> [radius]
+//! ```
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic
+)]
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use brepkit_math::vec::Point3;
+use brepkit_topology::Topology;
+use brepkit_topology::edge::EdgeId;
+use brepkit_topology::explorer::{face_edges, solid_edges, solid_faces};
+use brepkit_topology::solid::SolidId;
+
+fn json_f64(v: &serde_json::Value) -> f64 {
+    v.as_f64().unwrap_or(f64::NAN)
+}
+
+/// The edge of `sid` passing nearest `p`, and how near.
+fn nearest_edge(topo: &Topology, sid: SolidId, p: Point3) -> (EdgeId, f64) {
+    let mut best = (None, f64::INFINITY);
+    for eid in solid_edges(topo, sid).unwrap() {
+        let e = topo.edge(eid).unwrap();
+        let (a, b) = (
+            topo.vertex(e.start()).unwrap().point(),
+            topo.vertex(e.end()).unwrap().point(),
+        );
+        let (t0, t1) = e.curve().domain_with_endpoints(a, b);
+        for k in 0..=256 {
+            let t = t0 + (t1 - t0) * f64::from(k) / 256.0;
+            let d = (e.curve().evaluate_with_endpoints(t, a, b) - p).length();
+            if d < best.1 {
+                best = (Some(eid), d);
+            }
+        }
+    }
+    (best.0.unwrap(), best.1)
+}
+
+/// Edges used by one face, or by more than two.
+fn bad_edges(topo: &Topology, sid: SolidId) -> (usize, usize) {
+    let mut uses: BTreeMap<usize, usize> = BTreeMap::new();
+    for fid in solid_faces(topo, sid).unwrap() {
+        let face = topo.face(fid).unwrap();
+        for w in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(w).unwrap().edges() {
+                *uses.entry(oe.edge().index()).or_default() += 1;
+            }
+        }
+    }
+    (
+        uses.values().filter(|&&n| n == 1).count(),
+        uses.values().filter(|&&n| n > 2).count(),
+    )
+}
+
+/// For each face along `eid`: the direction into the face that the blend
+/// engine reads (normal x the edge's direction along the face's wire), next
+/// to the direction from the edge's middle toward the face's mesh centroid.
+fn sides(topo: &Topology, sid: SolidId, eid: EdgeId) {
+    let e = topo.edge(eid).unwrap();
+    let (ps, pe) = (
+        topo.vertex(e.start()).unwrap().point(),
+        topo.vertex(e.end()).unwrap().point(),
+    );
+    let (t0, t1) = e.curve().domain_with_endpoints(ps, pe);
+    let t = f64::midpoint(t0, t1);
+    let mid = e.curve().evaluate_with_endpoints(t, ps, pe);
+    for fid in solid_faces(topo, sid).unwrap() {
+        let f = topo.face(fid).unwrap();
+        for w in std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied()) {
+            for oe in topo.wire(w).unwrap().edges() {
+                if oe.edge() != eid {
+                    continue;
+                }
+                let mut along = e.curve().tangent_with_endpoints(t, ps, pe);
+                if (t1 < t0) == oe.is_forward() {
+                    along = -along;
+                }
+                let (u, v) = f.surface().project_point(mid).unwrap_or((0.0, 0.0));
+                let n = f.surface().normal(u, v);
+                let n = if f.is_reversed() { -n } else { n };
+                let left = n.cross(along).normalize().unwrap();
+                let mesh = brepkit_operations::tessellate::tessellate(topo, fid, 0.1).unwrap();
+                let c = mesh
+                    .positions
+                    .iter()
+                    .fold(Point3::new(0.0, 0.0, 0.0), |a, p| {
+                        a + (*p - Point3::new(0.0, 0.0, 0.0)) * (1.0 / mesh.positions.len() as f64)
+                    });
+                let toward = (c - mid).normalize().unwrap();
+                println!(
+                    "    face {} {} rev={} fwd={} dom=({t0:.3},{t1:.3}) along={along:?} left.toward={:.3}",
+                    fid.index(),
+                    f.surface().type_tag(),
+                    u8::from(f.is_reversed()),
+                    oe.is_forward(),
+                    left.dot(toward)
+                );
+            }
+        }
+    }
+}
+
+fn census(topo: &Topology, sid: SolidId) -> String {
+    let mut mix: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for fid in solid_faces(topo, sid).unwrap() {
+        *mix.entry(topo.face(fid).unwrap().surface().type_tag())
+            .or_default() += 1;
+    }
+    mix.iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Prints brepkit log records (`LOG=1` debug, `LOG=trace`).
+struct Stderr;
+impl log::Log for Stderr {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.target().starts_with("brepkit") && m.level() <= log::max_level()
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("[{} {}] {}", r.level(), r.target(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn main() {
+    if std::env::var("LOG").is_ok() {
+        log::set_logger(&Stderr).unwrap();
+        log::set_max_level(if std::env::var("LOG").is_ok_and(|v| v == "trace") {
+            log::LevelFilter::Trace
+        } else {
+            log::LevelFilter::Debug
+        });
+    }
+    let dir = std::env::args().nth(1).expect("case directory");
+    let dir = Path::new(&dir);
+    let case: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("case.json")).unwrap()).unwrap();
+    let radius = std::env::args().nth(2).map_or_else(
+        || json_f64(&case["params"]["radius"]),
+        |r| r.parse().unwrap(),
+    );
+    let mut topo = Topology::new();
+    let text = std::fs::read_to_string(dir.join("input0.step")).unwrap();
+    let sid = brepkit_io::step::read_step(&text, &mut topo).unwrap()[0];
+    let n_faces = solid_faces(&topo, sid).unwrap().len();
+    println!("input: {} faces ({})", n_faces, census(&topo, sid));
+    let mut edges = Vec::new();
+    for pick in case["picks"]["edges"].as_array().unwrap() {
+        let p = pick["point"].as_array().unwrap();
+        let p = Point3::new(json_f64(&p[0]), json_f64(&p[1]), json_f64(&p[2]));
+        let (eid, d) = nearest_edge(&topo, sid, p);
+        let e = topo.edge(eid).unwrap();
+        let faces: Vec<&str> = solid_faces(&topo, sid)
+            .unwrap()
+            .into_iter()
+            .filter(|&f| face_edges(&topo, f).unwrap().contains(&eid))
+            .map(|f| topo.face(f).unwrap().surface().type_tag())
+            .collect();
+        println!(
+            "pick {} -> edge {} {} (off {d:.2e}) between {faces:?}",
+            pick["index"],
+            eid.index(),
+            e.curve().type_tag()
+        );
+        if std::env::var("SIDES").is_ok() {
+            sides(&topo, sid, eid);
+        }
+        edges.push(eid);
+    }
+    edges.dedup();
+    let t = std::time::Instant::now();
+    match brepkit_operations::blend_ops::fillet_v2(&mut topo, sid, &edges, radius) {
+        Err(e) => println!("fillet r={radius}: error: {e}"),
+        Ok(r) => {
+            for (eid, why) in &r.failed {
+                println!("  failed edge {}: {why}", eid.index());
+            }
+            let (open, over) = bad_edges(&topo, r.solid);
+            if std::env::var("VOL05").is_ok() {
+                let t = std::time::Instant::now();
+                let v = brepkit_operations::measure::solid_volume(&topo, r.solid, 0.05);
+                println!("volume(0.05) {v:?} in {:.2}s; faces {}", t.elapsed().as_secs_f64(), census(&topo, r.solid));
+                return;
+            }
+            if let Ok(d) = std::env::var("TESS") {
+                for d in d.split(',').map(|d| d.parse::<f64>().unwrap()) {
+                    let t = std::time::Instant::now();
+                    let m = brepkit_operations::tessellate::tessellate_solid_grouped_with_tolerance(&topo, r.solid, d, 0.5);
+                    if let Ok((mesh, offs)) = &m { for (i, w) in offs.windows(2).enumerate() { println!("   group {i}: {} tris", (w[1] - w[0]) / 3); } let _ = mesh; }
+                    println!("tess {d}: {:.2}s {:?}", t.elapsed().as_secs_f64(), m.map(|(m, _)| (m.indices.len() / 3, brepkit_operations::tessellate::boundary_edge_count(&m))).map_err(|e| e.to_string()));
+                }
+                return;
+            }
+            if std::env::var("NOMEASURE").is_ok() {
+                println!("faces {} ({}), {open} open / {over} over-used", solid_faces(&topo, r.solid).unwrap().len(), census(&topo, r.solid));
+                for fid in solid_faces(&topo, r.solid).unwrap() {
+                    let f = topo.face(fid).unwrap();
+                    let n: usize = topo.wire(f.outer_wire()).unwrap().edges().len();
+                    let bb = brepkit_operations::measure::solid_bounding_box(&topo, r.solid).ok().map(|b| (b.min, b.max));
+                    let es: Vec<String> = topo.wire(f.outer_wire()).unwrap().edges().iter().map(|oe| { let e = topo.edge(oe.edge()).unwrap(); format!("e{}{}{}", oe.edge().index(), if oe.is_forward() {"+"} else {"-"}, &e.curve().type_tag()[..1]) }).collect();
+                    let sz = if let brepkit_topology::face::FaceSurface::Nurbs(s) = f.surface() { format!("{}x{} deg {}x{} pu {} pv {}", s.control_points().len(), s.control_points()[0].len(), s.degree_u(), s.degree_v(), s.is_periodic_u(), s.is_periodic_v()) } else { String::new() };
+                    println!("  face {} {} rev={} edges {n} {es:?} {sz}", fid.index(), f.surface().type_tag(), u8::from(f.is_reversed()));
+                    let _ = bb;
+                }
+                return;
+            }
+            let vol = brepkit_operations::measure::solid_volume(&topo, r.solid, 0.001)
+                .unwrap_or(f64::NAN);
+            let area = brepkit_operations::measure::solid_surface_area(&topo, r.solid, 0.001)
+                .unwrap_or(f64::NAN);
+            let valid = brepkit_operations::validate::validate_solid(&topo, r.solid)
+                .map(|v| format!("{} errors", v.error_count()))
+                .unwrap_or_else(|e| format!("{e}"));
+            if let Ok(out) = std::env::var("OUT") {
+                std::fs::write(
+                    &out,
+                    brepkit_io::step::write_step(&topo, &[r.solid]).unwrap(),
+                )
+                .unwrap();
+            }
+            if std::env::var("FACES").is_ok() {
+                for fid in solid_faces(&topo, r.solid).unwrap() {
+                    let face = topo.face(fid).unwrap();
+                    let exact = brepkit_operations::measure::face_area(&topo, fid, 0.01)
+                        .unwrap_or(f64::NAN);
+                    let mesh =
+                        brepkit_operations::tessellate::tessellate(&topo, fid, 0.01).unwrap();
+                    let mut area = 0.0;
+                    for t in mesh.indices.chunks_exact(3) {
+                        let [a, b, c] = [0, 1, 2].map(|k| mesh.positions[t[k] as usize]);
+                        area += (b - a).cross(c - a).length() / 2.0;
+                    }
+                    let n_edges: usize = std::iter::once(face.outer_wire())
+                        .chain(face.inner_wires().iter().copied())
+                        .map(|w| topo.wire(w).unwrap().edges().len())
+                        .sum();
+                    println!(
+                        "  face {} {} rev={} loops={} edges={n_edges} area exact={exact:.3} mesh={area:.3}",
+                        fid.index(),
+                        face.surface().type_tag(),
+                        u8::from(face.is_reversed()),
+                        1 + face.inner_wires().len()
+                    );
+                }
+            }
+            println!(
+                "fillet r={radius} in {:.2}s: {} faces ({}), volume {vol:.4}, area {area:.4}, \
+                 {open} open / {over} over-used edges, {valid}",
+                t.elapsed().as_secs_f64(),
+                solid_faces(&topo, r.solid).unwrap().len(),
+                census(&topo, r.solid)
+            );
+        }
+    }
+    let rf = &case["reference"];
+    if !rf.is_null() {
+        println!(
+            "reference ({}): volume {:.4}, area {:.4}, faces {}",
+            rf["by"],
+            json_f64(&rf["volume"]),
+            json_f64(&rf["area"]),
+            rf["faces"]
+        );
+    }
+}
