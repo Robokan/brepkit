@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793955424486,
+  "lastUpdate": 1794005170967,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1781,6 +1781,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29863424,
             "range": "± 75392",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "9ce3c86a7e1379c2b8665bb2b76a972f762ac210",
+          "message": "docs(buzzcad): progress, tilted end faces and spoke spurs (#15)\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-06T14:42:54-08:00",
+          "tree_id": "2a7dfbdf700c5b4132bce954853d7e96c9b14c11",
+          "url": "https://github.com/Robokan/brepkit/commit/9ce3c86a7e1379c2b8665bb2b76a972f762ac210"
+        },
+        "date": 1794005170491,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1141663,
+            "range": "± 36752",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1229538,
+            "range": "± 2735",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13600,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 733118,
+            "range": "± 2624",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29658451,
+            "range": "± 83035",
             "unit": "ns/iter"
           }
         ]
