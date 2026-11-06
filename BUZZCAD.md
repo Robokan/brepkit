@@ -216,7 +216,7 @@ scripts/check-pr-text.sh <branch> <pr-body.md>
 Its word list is private (in the corpus submodule); a missing list fails the
 check rather than passing it.
 
-**In flight.** As of 2026-11-05, every PR of batches one to three (#2045-#2073) is merged upstream (batch three on 2026-10-27); the touching-pieces fix (#2289), the edge-merge fix (#2290) and the closed-rim fillet (#2295), the closed-band seam (#2296), the hole guard (#2297, review fixes pushed) the square-corner mitre (#2298) and the seedless orientation vote (#2299) are open. Seven PR branches are pushed to `origin` (Robokan/brepkit),
+**In flight.** As of 2026-11-05, every PR of batches one to three (#2045-#2073) is merged upstream (batch three on 2026-10-27); the touching-pieces fix (#2289), the edge-merge fix (#2290) and the closed-rim fillet (#2295), the closed-band seam (#2296), the hole guard (#2297, review fixes pushed) the square-corner mitre (#2298) and the seedless orientation vote (#2299) and the tilted end faces (#2300) are open. Seven PR branches are pushed to `origin` (Robokan/brepkit),
 each `upstream/main` plus one fix, and all seven PRs were opened on
 2026-10-22 (#2045-#2051), without auto-merge. Their descriptions are in
 `buzzcad-prs/`.
@@ -249,6 +249,7 @@ each `upstream/main` plus one fix, and all seven PRs were opened on
 | fix/fillet-contact-across-hole | contact-across-hole.md | [#2297](https://github.com/andymai/brepkit/pull/2297) open (2026-11-05); a closed contact on a plane face is refused unless the face's holes lie wholly on the kept side; tested with `fillet_round_rims.rs`; review fixes pushed 2026-11-05 (a `Side` contact's kept side, the exemption per contact, polylines compared with their sag, closed contacts checked against each other, unit tests) |
 | fix/fillet-mitre-file-corners | mitre-file-corners.md | [#2298](https://github.com/andymai/brepkit/pull/2298) open (2026-11-05); a slab rounded round both outlines: the trim splits a mitre's retained edge and a smooth edge two stripes share a section on, and the mitre takes planes square to 1e-7; tested with `fillet_slab_outlines.rs` |
 | fix/orient-vote-without-seeds | orient-vote.md | [#2299](https://github.com/andymai/brepkit/pull/2299) open (2026-11-05); `normalize_face_normals` with no seed lets the faces vote on the convention; unit tests on the cube |
+| fix/fillet-tilted-end-faces | tilted-end-faces.md | [#2300](https://github.com/andymai/brepkit/pull/2300) open (2026-11-06); a straight round ending on a tilted end face runs on to it and notches it with the cylinder's ellipse; tested with `fillet_tilted_end_caps.rs` (fails on upstream at the incidence audit). Held back: the spoke-spur fold and the passing-contacts refusal (`ef3a6119`), which use #2298's split policy; on upstream the narrow-ridge test passes without the refusal, so the two go together once #2298 lands |
 
 "Tested" means clippy clean and `cargo test -p brepkit-algo -p
 brepkit-operations --lib` passing (1197 tests) on that branch alone; for
