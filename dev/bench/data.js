@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793938440146,
+  "lastUpdate": 1793941502817,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1403,6 +1403,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29800146,
             "range": "± 124501",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "f5e7f56285626fa39fa8437697c92bf316df6b67",
+          "message": "fix(blend): refuse a closed contact on a plane face that a hole crosses\n\nA closed contact on a plane face kept every hole of the face whole. A hole\nthe contact runs through, or one between the contact and the rim, then\ncrosses the trimmed outline or lies outside it, its wall standing through\nthe band; the result validated and brepkit's own volume read right, but\nanother reader read the solid 6% light. Each hole other than the rounded\nrim must now lie wholly on the kept side, or the trim is refused.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T21:01:49-08:00",
+          "tree_id": "089947461377cc4b134b580071bc29972cbdc08f",
+          "url": "https://github.com/Robokan/brepkit/commit/f5e7f56285626fa39fa8437697c92bf316df6b67"
+        },
+        "date": 1793941502342,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1146237,
+            "range": "± 2712",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1235139,
+            "range": "± 3463",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13564,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 742969,
+            "range": "± 1709",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29759870,
+            "range": "± 73871",
             "unit": "ns/iter"
           }
         ]
