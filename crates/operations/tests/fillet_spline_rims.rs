@@ -187,6 +187,7 @@ fn assert_rims_round_off(zs: &[f64], r: f64) {
     assert_ne!(result.solid, solid, "r = {r}: the fillet changed nothing");
     let report = validate_solid(&topo, result.solid).unwrap();
     assert!(report.is_valid(), "r = {r}: {:?}", report.issues);
+    assert_edges_lie_on_their_faces(&topo, result.solid, r);
     let mesh = tessellate_solid(&topo, result.solid, 0.01).unwrap();
     assert!(
         is_watertight(&mesh),
@@ -206,6 +207,42 @@ fn assert_rims_round_off(zs: &[f64], r: f64) {
         (after - truth).abs() < 1e-3 * truth,
         "r = {r}, z = {zs:?}: volume {after}, expected {truth} (removed {removed})"
     );
+}
+
+/// Every edge of `solid` lies on each face that uses it, sampled at three
+/// points inside it. A closed band's seam runs across the round as its
+/// section's arc: a straight seam would stand off the band by
+/// `r (1 - cos 45°)`, and another reader then meshes the band up to it.
+fn assert_edges_lie_on_their_faces(topo: &Topology, solid: SolidId, r: f64) {
+    let faces_of = brepkit_topology::explorer::edge_to_face_map(topo, solid).unwrap();
+    for edge_id in solid_edges(topo, solid).unwrap() {
+        let edge = topo.edge(edge_id).unwrap();
+        let (a, b) = (
+            topo.vertex(edge.start()).unwrap().point(),
+            topo.vertex(edge.end()).unwrap().point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+        for face_id in &faces_of[&edge_id.index()] {
+            let surface = topo.face(*face_id).unwrap().surface();
+            for f in [0.25, 0.5, 0.75] {
+                let p = edge
+                    .curve()
+                    .evaluate_with_endpoints((t1 - t0).mul_add(f, t0), a, b);
+                let off = if let FaceSurface::Plane { normal, d } = surface {
+                    (normal.dot(p - Point3::new(0.0, 0.0, 0.0)) - d).abs()
+                } else {
+                    let (u, v) = surface.project_point(p).unwrap();
+                    (surface.evaluate(u, v).unwrap() - p).length()
+                };
+                assert!(
+                    off < 1e-3,
+                    "r = {r}: a {} edge stands {off} off its {} face",
+                    edge.curve().type_tag(),
+                    surface.type_tag()
+                );
+            }
+        }
+    }
 }
 
 fn crate_faces(topo: &Topology, solid: SolidId) -> Vec<FaceSurface> {
