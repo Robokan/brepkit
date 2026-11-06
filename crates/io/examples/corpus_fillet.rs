@@ -223,6 +223,46 @@ fn main() {
                         for (i, w) in offs.windows(2).enumerate() {
                             println!("   group {i}: {} tris", (w[1] - w[0]) / 3);
                         }
+                        // Each open mesh edge (positions welded at 1e-5, as a
+                        // consumer would) with the group (face) it is in.
+                        let faces = solid_faces(&topo, r.solid).unwrap();
+                        let q = |v: f64| (v * 1e5).round() as i64;
+                        let mut weld = std::collections::HashMap::new();
+                        let vid: Vec<usize> = mesh
+                            .positions
+                            .iter()
+                            .map(|p| {
+                                let n = weld.len();
+                                *weld.entry((q(p.x()), q(p.y()), q(p.z()))).or_insert(n)
+                            })
+                            .collect();
+                        let mut uses: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+                        for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
+                            let g = offs.iter().rposition(|&o| o as usize <= 3 * t).unwrap_or(0);
+                            for (i, j) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                                let (a, b) = (vid[i as usize], vid[j as usize]);
+                                if a != b {
+                                    uses.entry((a.min(b), a.max(b))).or_default().push(g);
+                                }
+                            }
+                        }
+                        let mut pos = vec![None; weld.len()];
+                        for (&k, p) in vid.iter().zip(&mesh.positions) {
+                            pos[k] = Some(*p);
+                        }
+                        for ((a, b), gs) in &uses {
+                            if gs.len() != 2 {
+                                println!(
+                                    "   open x{} face {:?}: {:?} -> {:?}",
+                                    gs.len(),
+                                    gs.iter()
+                                        .map(|&g| faces.get(g).map(|f| f.index()))
+                                        .collect::<Vec<_>>(),
+                                    pos[*a],
+                                    pos[*b]
+                                );
+                            }
+                        }
                         let _ = mesh;
                     }
                     println!(
