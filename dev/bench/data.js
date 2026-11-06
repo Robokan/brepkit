@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793934633837,
+  "lastUpdate": 1793934829028,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1295,6 +1295,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29446097,
             "range": "± 37439",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "97f73b471b3ce93b96a04fef7884e47966c3e0c5",
+          "message": "docs(buzzcad): the edge matching is BuzzCAD e6ad9f4\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T19:07:49-08:00",
+          "tree_id": "ddf7f43a0142f980c19db627bcd5e5af0156aea9",
+          "url": "https://github.com/Robokan/brepkit/commit/97f73b471b3ce93b96a04fef7884e47966c3e0c5"
+        },
+        "date": 1793934828098,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1146383,
+            "range": "± 3042",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1233203,
+            "range": "± 10240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13570,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 734841,
+            "range": "± 1959",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29448610,
+            "range": "± 62663",
             "unit": "ns/iter"
           }
         ]
