@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793934829028,
+  "lastUpdate": 1793938440146,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1349,6 +1349,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29448610,
             "range": "± 62663",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "cf5ae289dceb2367270ad8e1dac25c76280ee75b",
+          "message": "fix(blend): a closed fillet band's seam is its round's arc, not a chord\n\nBoth closed-band paths minted the band's seam as a straight line between\nits contact points, standing off the band by up to r(1 - cos(θ/2)); a\nreader meshing the band out to its edges read it short. The seam is now\nthe torus band's tube circle, or the walked band's section arc, through\nboth points. The round-rim and spline-rim tests check every edge lies on\nits faces. Progress and the PR body for #2296.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T20:10:37-08:00",
+          "tree_id": "d06f9176b219c372ce67a8c2fbff6e20ae263834",
+          "url": "https://github.com/Robokan/brepkit/commit/cf5ae289dceb2367270ad8e1dac25c76280ee75b"
+        },
+        "date": 1793938439212,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1144630,
+            "range": "± 3506",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1232808,
+            "range": "± 4593",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13476,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 737021,
+            "range": "± 1860",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29800146,
+            "range": "± 124501",
             "unit": "ns/iter"
           }
         ]
