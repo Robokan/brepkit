@@ -1497,8 +1497,9 @@ pub enum BoundarySplitPolicy<'a> {
     /// A face with several contacts splits only edges touching a
     /// `notchable` terminal vertex, whose planar cap takes the arc; its
     /// contacts elsewhere already close through shared junction edges.
-    /// Either face also splits a straight piece of an edge in `spokes`,
-    /// listed by its two ends, where a contact ends on it: a sharp mitre's
+    /// A face with several contacts also splits a straight piece of an edge
+    /// in `spokes`, listed by its two ends, where a contact ends on it (unless
+    /// the piece touches an `unsplit` vertex): a sharp mitre's
     /// retained edge, which the mitre shortens to there, and a smooth edge
     /// two stripes run on round on one section, which their shared section
     /// then ends on. Both need the split on a side face that a second
@@ -1512,11 +1513,22 @@ pub enum BoundarySplitPolicy<'a> {
 
 impl BoundarySplitPolicy<'_> {
     /// Whether the straight edge from `start` to `end` lies along one of the
-    /// policy's spokes.
-    fn on_spoke(self, start: Point3, end: Point3) -> bool {
-        let Self::Selective { spokes, .. } = self else {
+    /// policy's spokes and touches no `unsplit` terminal vertex, whose runout
+    /// closure expects the whole edge.
+    fn on_spoke(
+        self,
+        (start_id, start): (VertexId, Point3),
+        (end_id, end): (VertexId, Point3),
+    ) -> bool {
+        let Self::Selective {
+            spokes, unsplit, ..
+        } = self
+        else {
             return false;
         };
+        if unsplit.contains(&start_id) || unsplit.contains(&end_id) {
+            return false;
+        }
         let on = |p: Point3, (a, b): (Point3, Point3)| {
             let ab = b - a;
             let length = ab.length();
@@ -1718,7 +1730,9 @@ fn rebuild_mapped_parametric_face(
                     let sp = topo.vertex(s)?.point();
                     let tp = topo.vertex(t)?.point();
                     let curve = edge.curve();
-                    let spoke = matches!(curve, EdgeCurve::Line) && split_policy.on_spoke(sp, tp);
+                    let spoke = !single_contact
+                        && matches!(curve, EdgeCurve::Line)
+                        && split_policy.on_spoke((s, sp), (t, tp));
                     if !(own_seam || spoke || split_policy.allows(single_contact, s, t)) {
                         continue;
                     }
@@ -2110,8 +2124,11 @@ type Flat = (f64, f64);
 const HOLE_SAMPLES: u32 = 64;
 
 /// A curve sampled in a plane face's frame: its polyline, and how far the
-/// curve can stray from it (the largest gap between the curve's middle and
-/// the chord of any one span, doubled to cover the span).
+/// curve can stray from it (the largest gap between the curve, read at a
+/// span's quarter points and middle, and that span's chord, doubled for what
+/// falls between them). The bound is sampled, not proven: it takes spans
+/// short against the curve's bends, as a closed contact sampled at 1024
+/// points and a hole's edge at 64 are.
 struct FlatPolyline {
     points: Vec<Flat>,
     sag: f64,
@@ -2237,14 +2254,15 @@ fn check_holes_clear_of_closed_contacts(
             flat(curve.evaluate_with_endpoints((t1 - t0).mul_add(k / f64::from(n), t0), a, b))
         };
         for k in 0..n {
-            let (p, middle, q) = (
-                at(f64::from(k)),
-                at(f64::from(k) + 0.5),
-                at(f64::from(k + 1)),
-            );
-            line.sag = line
-                .sag
-                .max(2.0 * flat_segment_distance(p, q, middle, middle));
+            let (p, q) = (at(f64::from(k)), at(f64::from(k + 1)));
+            // The span's deviation from its chord, read at its quarter
+            // points and middle, doubled for what falls between them.
+            for f in [0.25, 0.5, 0.75] {
+                let inner = at(f64::from(k) + f);
+                line.sag = line
+                    .sag
+                    .max(2.0 * flat_segment_distance(p, q, inner, inner));
+            }
             line.points.push(p);
         }
     };
@@ -4273,7 +4291,9 @@ mod tests {
             pcurve: None,
             source_edges: edges,
         };
-        assert!(check_holes_clear_of_closed_contacts(&topo, face, std::slice::from_ref(&own)).is_ok());
+        assert!(
+            check_holes_clear_of_closed_contacts(&topo, face, std::slice::from_ref(&own)).is_ok()
+        );
         assert!(check_holes_clear_of_closed_contacts(&topo, face, &[rim, own]).is_err());
     }
 
