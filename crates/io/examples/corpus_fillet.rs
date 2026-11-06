@@ -347,6 +347,33 @@ fn main() {
                         u8::from(face.is_reversed()),
                         1 + face.inner_wires().len()
                     );
+                    if std::env::var("SURF").is_ok_and(|t| t == face.surface().type_tag()) {
+                        println!("    {:?} wire rev={}", face.surface(), face.is_reversed());
+                        for w in std::iter::once(face.outer_wire())
+                            .chain(face.inner_wires().iter().copied())
+                        {
+                            for oe in topo.wire(w).unwrap().edges() {
+                                let e = topo.edge(oe.edge()).unwrap();
+                                let (s, t) = if oe.is_forward() {
+                                    (e.start(), e.end())
+                                } else {
+                                    (e.end(), e.start())
+                                };
+                                let [ps, pt] = [s, t].map(|v| topo.vertex(v).unwrap().point());
+                                let uv = |p| face.surface().project_point(p);
+                                println!(
+                                    "    edge {} {} fwd={} {:?} -> {:?}  uv {:?} -> {:?}",
+                                    oe.edge().index(),
+                                    e.curve().type_tag(),
+                                    oe.is_forward(),
+                                    ps,
+                                    pt,
+                                    uv(ps),
+                                    uv(pt)
+                                );
+                            }
+                        }
+                    }
                 }
             }
             println!(
