@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793942374226,
+  "lastUpdate": 1793943048638,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1511,6 +1511,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 30536633,
             "range": "± 1064999",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "8b7b627a9f6e115a465948eee67577b3a4649618",
+          "message": "test(blend): unit tests for a closed band's seam curve\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T21:27:52-08:00",
+          "tree_id": "11820bd6bf42690933424ca982db560119361bd3",
+          "url": "https://github.com/Robokan/brepkit/commit/8b7b627a9f6e115a465948eee67577b3a4649618"
+        },
+        "date": 1793943047833,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 944212,
+            "range": "± 23242",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1028197,
+            "range": "± 8329",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 10949,
+            "range": "± 135",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 629086,
+            "range": "± 3533",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 24015247,
+            "range": "± 123021",
             "unit": "ns/iter"
           }
         ]
