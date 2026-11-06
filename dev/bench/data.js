@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793949300179,
+  "lastUpdate": 1793953081147,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1673,6 +1673,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19038574,
             "range": "± 82964",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "18020fc518d4a88edb6d1ec70499968ab72c1aa6",
+          "message": "docs(buzzcad): self-crossing trimmed plane faces found; gate tried and reverted\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-06T00:14:46-08:00",
+          "tree_id": "374cabc9045be8c9205bfbd282961b109e443234",
+          "url": "https://github.com/Robokan/brepkit/commit/18020fc518d4a88edb6d1ec70499968ab72c1aa6"
+        },
+        "date": 1793953080194,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1143565,
+            "range": "± 2411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1231358,
+            "range": "± 13676",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13469,
+            "range": "± 392",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 741868,
+            "range": "± 1990",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29599795,
+            "range": "± 81256",
             "unit": "ns/iter"
           }
         ]
