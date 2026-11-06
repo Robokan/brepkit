@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793922368756,
+  "lastUpdate": 1793928619279,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1187,6 +1187,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29560288,
             "range": "± 38710",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "1af64dc312446f8f53485bbfe9d5a244f9ef95ef",
+          "message": "fix(blend): closed contacts cut their face's seam; refuse crossing rim rounds\n\nA closed contact's vertex now cuts the face's own seam whatever the split\npolicy, so both rims of a wall can be rounded at once; the walker's\nfinite-difference probes wrap at a closed surface's seam; a curved face's\nextent includes its surface's own bound; and rounds on both rims of a wall\nthat cross are refused. corpus_fillet gains face, edge, tessellation and\nvolume-timing modes. Progress and PR body updated.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T17:27:06-08:00",
+          "tree_id": "4828af0df2adb87a4150c8667b9b866ad18c2f87",
+          "url": "https://github.com/Robokan/brepkit/commit/1af64dc312446f8f53485bbfe9d5a244f9ef95ef"
+        },
+        "date": 1793928618630,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1134413,
+            "range": "± 4808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1219827,
+            "range": "± 6128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13566,
+            "range": "± 290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 733616,
+            "range": "± 1292",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29449926,
+            "range": "± 55317",
             "unit": "ns/iter"
           }
         ]
