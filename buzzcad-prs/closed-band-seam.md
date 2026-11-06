@@ -21,6 +21,12 @@ The arc is the shorter one from the first point to the second, as `cross_section
 ## Tests
 
 - `fillet_round_rims.rs`'s checker now also requires every edge of the result to lie on each face that uses it, to `1e-6`, at three points inside the edge. This covers the rods, tubes, posts, bores, pockets and frustums there. Without the change it fails on the rod, tube and frustum rims: their straight seams stand 0.10 to 0.21 off their tori.
+- `builder_utils` unit tests check `seam_curve` itself:
+  - a section through both points gives its quarter arc;
+  - a torus gives its tube circle;
+  - a seam that no section passes through stays a line.
+
+  A closed walked band cannot be built end to end yet: the spine measures a closed edge by its chord, so the walk gets no length. With that fixed, a fillet along a closed B-spline rim exercises this path.
 - `cargo test -p brepkit-blend -p brepkit-operations` passes, and clippy is clean.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
