@@ -216,7 +216,7 @@ scripts/check-pr-text.sh <branch> <pr-body.md>
 Its word list is private (in the corpus submodule); a missing list fails the
 check rather than passing it.
 
-**In flight.** As of 2026-11-05, every PR of batches one to three (#2045-#2073) is merged upstream (batch three on 2026-10-27); the touching-pieces fix (#2289), the edge-merge fix (#2290) and the closed-rim fillet (#2295), the closed-band seam (#2296), the hole guard (#2297, review fixes pushed) the square-corner mitre (#2298) and the seedless orientation vote (#2299), the tilted end faces (#2300), the unequal-stripe set-back (#2301), the tangent-kink contact ends (#2302) and the B-spline cap notch (#2303) are open. Seven PR branches are pushed to `origin` (Robokan/brepkit),
+**In flight.** As of 2026-11-05, every PR of batches one to three (#2045-#2073) is merged upstream (batch three on 2026-10-27); the touching-pieces fix (#2289), the edge-merge fix (#2290) and the closed-rim fillet (#2295), the closed-band seam (#2296), the hole guard (#2297, review fixes pushed) the square-corner mitre (#2298) and the seedless orientation vote (#2299), the tilted end faces (#2300), the unequal-stripe set-back (#2301), the tangent-kink contact ends (#2302), the B-spline cap notch (#2303, review fixes pushed) and the mitre limit to a file's digits (#2304) are open. Seven PR branches are pushed to `origin` (Robokan/brepkit),
 each `upstream/main` plus one fix, and all seven PRs were opened on
 2026-10-22 (#2045-#2051), without auto-merge. Their descriptions are in
 `buzzcad-prs/`.
@@ -253,7 +253,7 @@ each `upstream/main` plus one fix, and all seven PRs were opened on
 | fix/trihedral-setback-unequal-stripes | trihedral-setback.md | [#2301](https://github.com/andymai/brepkit/pull/2301) open (2026-11-06); a corner whose stripes differ widely in length is set back to the ball; tested with `fillet_long_box_corners.rs` (on upstream the box with one edge left sharp also needs #2298's mitre; that test is held back) |
 | fix/fillet-contact-ends-tangent-kink | tangent-kink.md | [#2302](https://github.com/andymai/brepkit/pull/2302) open (2026-11-06); contact ends a file's kink apart share one vertex; tested with `fillet_tangent_kink.rs` |
 | fix/fillet-cap-spline-rim | cap-spline-rim.md | [#2303](https://github.com/andymai/brepkit/pull/2303) open (2026-11-06); a cap notch splits a B-spline rim; tested with `fillet_spline_cap_corners.rs` (fails on upstream with the caps open) |
-| fix/mitre-limit-file-digits | mitre-limit-digits.md | not yet opened; a radius past a mitre's limit by a file's digits builds as the limit; tested with `regress_two_edge_exact_limit.rs`. Held back: `fix/fillet-ruling-ball-corners` (`8cdf375b`, stacked on #2301), whose tests need #2300 and `9a3fcb91` upstream first |
+| fix/mitre-limit-file-digits | mitre-limit-digits.md | [#2304](https://github.com/andymai/brepkit/pull/2304) open (2026-11-06); a radius past a mitre's limit by a file's digits builds as the limit; tested with `regress_two_edge_exact_limit.rs`. Held back: `fix/fillet-ruling-ball-corners` (`8cdf375b`, stacked on #2301), whose tests need #2300 and `9a3fcb91` upstream first |
 
 "Tested" means clippy clean and `cargo test -p brepkit-algo -p
 brepkit-operations --lib` passing (1197 tests) on that branch alone; for
