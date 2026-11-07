@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794072098463,
+  "lastUpdate": 1794072353417,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2429,6 +2429,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 27270522,
             "range": "± 82885",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "65cd4e70a029c91efc4e71c91a4dde2757091430",
+          "message": "chore(fork): commit hooks keep private names out of main\n\nRobokan/brepkit is public, main and BUZZCAD.md included. The fork's\npre-commit and commit-msg hooks now run scripts/check-commit-words.sh on\nevery commit: staged lines, file names and the message, against the\nnames above the marker in the corpus's private word list (a missing list\nfails). BUZZCAD.md states the engine naming rule.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-07T09:22:23-08:00",
+          "tree_id": "3029a75f3e2bb3f891886ece4bf266d1f51ae7b3",
+          "url": "https://github.com/Robokan/brepkit/commit/65cd4e70a029c91efc4e71c91a4dde2757091430"
+        },
+        "date": 1794072352777,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1099250,
+            "range": "± 1518",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1191752,
+            "range": "± 3946",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13309,
+            "range": "± 53",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 711371,
+            "range": "± 1699",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29178129,
+            "range": "± 262268",
             "unit": "ns/iter"
           }
         ]
