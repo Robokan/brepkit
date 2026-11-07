@@ -411,7 +411,20 @@ impl<'a, F: BlendFunction> Walker<'a, F> {
                 step_count -= 1;
                 continue;
             }
-            if let Some(converged) = self.newton_solve(predicted, &ctx_next) {
+            // A contact leaping far along its face while the spine moves a
+            // little is the solve landing on another branch (a ball too big
+            // for a hollow of a face, wedged where the contact runs away):
+            // not a step either, so it halves like a solve that fails.
+            let solved = self.newton_solve(predicted, &ctx_next).filter(|converged| {
+                sections.last().is_none_or(|last| {
+                    let sec = self
+                        .func
+                        .section(self.surf1, self.surf2, converged, &ctx_next);
+                    let moved = (sec.p1 - last.p1).length().max((sec.p2 - last.p2).length());
+                    moved <= MAX_CONTACT_SPEED * clamped_step
+                })
+            });
+            if let Some(converged) = solved {
                 nplan = ctx_next.nplan;
                 prev_params = Some(params);
                 prev_s = s;
@@ -443,6 +456,10 @@ impl<'a, F: BlendFunction> Walker<'a, F> {
         })
     }
 }
+
+/// How far a contact may move along its face for each unit the spine moves:
+/// past it, a step has jumped to another solution (see [`Walker::walk`]).
+const MAX_CONTACT_SPEED: f64 = 100.0;
 
 /// The shortest step, as a share of the spine, that a turn of the spine's
 /// direction can refuse (a kink in a G1 chain read from a file must not

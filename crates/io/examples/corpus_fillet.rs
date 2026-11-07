@@ -229,6 +229,21 @@ fn main() {
                 );
                 return;
             }
+            if let Ok(d) = std::env::var("TESSF") {
+                let d: f64 = d.parse().unwrap();
+                for f in solid_faces(&topo, r.solid).unwrap() {
+                    let t = std::time::Instant::now();
+                    let m = brepkit_operations::tessellate::tessellate(&topo, f, d);
+                    println!(
+                        "   face {} {}: {:.2}s {:?}",
+                        f.index(),
+                        topo.face(f).unwrap().surface().type_tag(),
+                        t.elapsed().as_secs_f64(),
+                        m.map(|m| m.indices.len() / 3).map_err(|e| e.to_string())
+                    );
+                }
+                return;
+            }
             if let Ok(d) = std::env::var("TESS") {
                 for d in d.split(',').map(|d| d.parse::<f64>().unwrap()) {
                     let t = std::time::Instant::now();
