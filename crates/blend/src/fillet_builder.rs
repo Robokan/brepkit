@@ -868,7 +868,16 @@ impl<'a> FilletBuilder<'a> {
                             )
                         }
                         (Some(&RunOnCap::Plane(normal, d)), FaceSurface::Torus(torus)) => {
-                            torus_meets_plane(torus, normal, d, start_point, end_point)
+                            torus_meets_cap(torus, start_point, end_point, |v, near| {
+                                torus_parallel_meets_plane(torus, normal, d, v, near)
+                            })
+                        }
+                        (Some(&RunOnCap::Face(cap)), FaceSurface::Torus(torus)) => {
+                            let cap = topo.face(cap)?.surface();
+                            let tol = 1e-7 * torus.major_radius().max(1.0);
+                            torus_meets_cap(torus, start_point, end_point, |v, near| {
+                                torus_parallel_meets_surface(torus, cap, v, near, tol)
+                            })
                         }
                         (Some(&RunOnCap::Face(cap)), FaceSurface::Cylinder(cylinder)) => {
                             cylinder_meets_cap(
@@ -2733,6 +2742,18 @@ fn point_on_edge(
     point: Point3,
     tol: f64,
 ) -> Result<bool, BlendError> {
+    Ok(edge_distance(topo, edge_id, point, None)? <= tol)
+}
+
+/// `point`'s distance from an edge, or from its trace on `onto` (each of
+/// its points projected on to that surface): its nearest sample, refined
+/// by golden section between the sample's neighbours.
+fn edge_distance(
+    topo: &Topology,
+    edge_id: EdgeId,
+    point: Point3,
+    onto: Option<&FaceSurface>,
+) -> Result<f64, BlendError> {
     const SAMPLES: usize = 64;
     let edge = topo.edge(edge_id)?;
     let (a, b) = (
@@ -2741,7 +2762,22 @@ fn point_on_edge(
     );
     let curve = edge.curve();
     let (t0, t1) = curve.domain_with_endpoints(a, b);
-    let at = |t: f64| (curve.evaluate_with_endpoints(t, a, b) - point).length();
+    let at = |t: f64| {
+        let on = curve.evaluate_with_endpoints(t, a, b);
+        let on = match onto {
+            Some(FaceSurface::Plane { normal, d }) => {
+                on - *normal
+                    * ((normal.dot(Vec3::new(on.x(), on.y(), on.z())) - d)
+                        / normal.length_squared())
+            }
+            Some(surface) => surface
+                .project_point(on)
+                .and_then(|(u, v)| surface.evaluate(u, v))
+                .unwrap_or(on),
+            None => on,
+        };
+        (on - point).length()
+    };
     #[allow(clippy::cast_precision_loss)]
     let param = |k: usize| t0 + (t1 - t0) * (k as f64) / (SAMPLES as f64);
     let nearest = (0..=SAMPLES)
@@ -2761,7 +2797,7 @@ fn point_on_edge(
             lo = x1;
         }
     }
-    Ok(at(f64::midpoint(lo, hi)) <= tol)
+    Ok(at(f64::midpoint(lo, hi)))
 }
 
 /// Where the line `origin + run * s` meets `surface`, by Newton steps from
@@ -2912,7 +2948,7 @@ fn run_stripes_to_tilted_caps(
                         "terminal {:?}: torus round runs on to its tilted cap",
                         junction.vertex
                     );
-                    caps.insert((edge, run.end), RunOnCap::Plane(run.normal, run.d));
+                    caps.insert((edge, run.end), run.cap);
                 }
                 continue;
             }
@@ -3050,7 +3086,7 @@ fn run_stripes_to_tilted_caps(
     Ok(caps)
 }
 
-/// A torus round's end run on to a tilted plane cap.
+/// A torus round's end run on to a tilted or curved cap.
 struct TorusRunOn {
     /// Which end of the stripe (0 at the spine's start, 1 at its end).
     end: usize,
@@ -3059,8 +3095,7 @@ struct TorusRunOn {
     contact2: brepkit_math::nurbs::curve::NurbsCurve,
     p2: Point3,
     centre: Point3,
-    normal: Vec3,
-    d: f64,
+    cap: RunOnCap,
 }
 
 /// Where the parallel of `torus` at tube angle `v` meets the plane
@@ -3098,7 +3133,85 @@ fn wrapped(angle: f64) -> f64 {
     angle - tau * (angle / tau).round()
 }
 
-/// Runs a torus round's end on to a tilted planar cap.
+/// Where the parallel of `torus` at tube angle `v` meets a curved cap's
+/// surface: Newton round the axis from `near`, each step the point's offset
+/// along the surface normal over the parallel's slope across it. `None`
+/// where it runs along the surface or misses it.
+fn torus_parallel_meets_surface(
+    torus: &brepkit_math::surfaces::ToroidalSurface,
+    surface: &FaceSurface,
+    v: f64,
+    near: f64,
+    tol: f64,
+) -> Option<f64> {
+    let rho = torus.minor_radius().mul_add(v.cos(), torus.major_radius());
+    if rho <= 0.0 {
+        return None;
+    }
+    let mut u = near;
+    for _ in 0..60 {
+        let p = torus.evaluate(u, v);
+        let (su, sv) = surface.project_point(p)?;
+        let q = surface.evaluate(su, sv)?;
+        let n = surface.normal(su, sv).normalize().ok()?;
+        let along = (torus.y_axis() * u.cos() - torus.x_axis() * u.sin()) * rho;
+        let slope = along.dot(n);
+        if slope.abs() <= 1e-12 * rho {
+            return None;
+        }
+        let step = (p - q).dot(n) / slope;
+        u -= step;
+        if (step * rho).abs() <= 1e-3 * tol {
+            let p = torus.evaluate(u, v);
+            let (su, sv) = surface.project_point(p)?;
+            return ((surface.evaluate(su, sv)? - p).length() <= tol).then_some(u);
+        }
+    }
+    None
+}
+
+/// Where the parallel of `torus` at tube angle `v` passes closest to
+/// `edge`'s trace on `support` (the face the parallel lies on) within a
+/// twentieth of a radian of `near` round the axis: the angle and the gap,
+/// by a scan and golden-section refinement. `None` where the nearest pass
+/// is at the window's end (the parallel does not cross the edge there).
+fn parallel_meets_edge(
+    topo: &Topology,
+    torus: &brepkit_math::surfaces::ToroidalSurface,
+    v: f64,
+    (edge, support): (EdgeId, &FaceSurface),
+    near: f64,
+) -> Result<Option<(f64, f64)>, BlendError> {
+    const WINDOW: f64 = 0.05;
+    const SAMPLES: usize = 40;
+    let gap = |u: f64| edge_distance(topo, edge, torus.evaluate(u, v), Some(support));
+    #[allow(clippy::cast_precision_loss)]
+    let at = |k: usize| near - WINDOW + 2.0 * WINDOW * (k as f64) / (SAMPLES as f64);
+    let mut best = (0, f64::MAX);
+    for k in 0..=SAMPLES {
+        let g = gap(at(k))?;
+        if g < best.1 {
+            best = (k, g);
+        }
+    }
+    if best.0 == 0 || best.0 == SAMPLES {
+        return Ok(None);
+    }
+    let (mut lo, mut hi) = (at(best.0 - 1), at(best.0 + 1));
+    let ratio = 0.5 * (5.0_f64.sqrt() - 1.0);
+    for _ in 0..80 {
+        let (x1, x2) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+        if gap(x1)? <= gap(x2)? {
+            hi = x2;
+        } else {
+            lo = x1;
+        }
+    }
+    let u = f64::midpoint(lo, hi);
+    Ok(Some((u, gap(u)?)))
+}
+
+/// Runs a torus round's end on to a tilted planar cap, or a curved one.
 ///
 /// A round of an arc between a plane and a coaxial wall (or of a circle on
 /// a revolved part) is a torus whose sections are its tube circles, square
@@ -3108,7 +3221,10 @@ fn wrapped(angle: f64) -> f64 {
 /// of the torus, is run on (or back) round the axis to where it meets the
 /// cap's plane, which lies on that support face's corner edge with the
 /// cap, and the band ends on its section by the cap's plane: each parallel
-/// between the two contacts cut by it.
+/// between the two contacts cut by it. A curved cap (a fitted face the arc
+/// ends on) is taken the same way: each contact runs to where its parallel
+/// meets the cap's surface, on the cap's corner edges, and the band ends on
+/// its intersection with that surface.
 fn torus_run_on(
     topo: &Topology,
     junction: &crate::fillet_plan::VertexJunction,
@@ -3133,35 +3249,40 @@ fn torus_run_on(
     let [cap] = fan.as_slice() else {
         return Ok(None);
     };
-    let Some((normal, d)) = outward_plane(topo, *cap)? else {
-        return Ok(None);
-    };
+    let plane = outward_plane(topo, *cap)?;
+    let cap_surface = topo.face(*cap)?.surface();
+    // The cap's two edges at the corner: straight on a plane, any curve on
+    // a curved cap.
     let corner_edges = cap_corner_edges(topo, *cap, junction.vertex)?;
     if corner_edges.len() != 2
-        || corner_edges.iter().any(|&edge| {
-            !topo
-                .edge(edge)
-                .is_ok_and(|e| matches!(e.curve(), EdgeCurve::Line))
-        })
+        || (plane.is_some()
+            && corner_edges.iter().any(|&edge| {
+                !topo
+                    .edge(edge)
+                    .is_ok_and(|e| matches!(e.curve(), EdgeCurve::Line))
+            }))
     {
         return Ok(None);
     }
     let vertex = topo.vertex(junction.vertex)?.point();
     let end = usize::from(spine_ends_at(topo, stripe, vertex)?);
     let section = &stripe.sections[end];
-    let (u_end, _) = torus.project_point(section.center);
-    let tangent = torus.y_axis() * u_end.cos() - torus.x_axis() * u_end.sin();
-    let tilt = normal.dot(tangent).abs();
-    if tilt >= 1.0 - SQUARE || tilt <= OBLIQUE {
-        return Ok(None);
+    if let Some((normal, _)) = plane {
+        let (u_end, _) = torus.project_point(section.center);
+        let tangent = torus.y_axis() * u_end.cos() - torus.x_axis() * u_end.sin();
+        let tilt = normal.dot(tangent).abs();
+        if tilt >= 1.0 - SQUARE || tilt <= OBLIQUE {
+            return Ok(None);
+        }
     }
     let scale = (section.p1 - section.p2).length();
     let tol = 1e-6 * scale.max(1.0);
     let mut contacts = Vec::with_capacity(2);
-    for (contact, at) in [
-        (&stripe.contact1, section.p1),
-        (&stripe.contact2, section.p2),
+    for (contact, at, support) in [
+        (&stripe.contact1, section.p1, stripe.face1),
+        (&stripe.contact2, section.p2, stripe.face2),
     ] {
+        let support = topo.face(support)?.surface();
         let (t0, t1) = contact.domain();
         let (_, at_end) = contact_end_at(contact, at);
         let (from, to) = if at_end { (t0, t1) } else { (t1, t0) };
@@ -3187,21 +3308,36 @@ fn torus_run_on(
         if !parallel {
             break;
         }
-        let Some(u_new) = torus_parallel_meets_plane(torus, normal, d, v, u_far + sweep) else {
+        let u_new = match plane {
+            Some((normal, d)) => torus_parallel_meets_plane(torus, normal, d, v, u_far + sweep),
+            None => torus_parallel_meets_surface(torus, cap_surface, v, u_far + sweep, tol),
+        };
+        let Some(u_new) = u_new else {
             break;
+        };
+        // A fitted cap need not hold its corner edges to more than a file's
+        // tolerance, nor a fitted edge its support face (one stood 8e-5 off
+        // its plane on a 500 mm part), so the contact lands where its
+        // parallel crosses a corner edge's trace on the contact's support
+        // face, near where it meets the cap's surface; the trim then finds
+        // it on that edge.
+        let mut landing = None;
+        for &edge in &corner_edges {
+            if let Some((u, gap)) = parallel_meets_edge(topo, torus, v, (edge, support), u_new)?
+                && landing.is_none_or(|(_, best)| gap < best)
+            {
+                landing = Some((u, gap));
+            }
+        }
+        let u_new = match landing {
+            Some((u, gap)) if gap <= tol => u,
+            _ => break,
         };
         let new_sweep = u_new - u_far;
         if new_sweep * sweep <= 0.0 || new_sweep.abs() <= 0.05 * sweep.abs() {
             break;
         }
         let reached = torus.evaluate(u_new, v);
-        let mut on_corner = false;
-        for &edge in &corner_edges {
-            on_corner |= point_on_edge(topo, edge, reached, tol)?;
-        }
-        if !on_corner {
-            break;
-        }
         let rho = torus.minor_radius().mul_add(v.cos(), torus.major_radius());
         if rho <= 0.0 {
             break;
@@ -3235,21 +3371,22 @@ fn torus_run_on(
         contact2,
         p2,
         centre,
-        normal,
-        d,
+        cap: plane.map_or(RunOnCap::Face(*cap), |(normal, d)| {
+            RunOnCap::Plane(normal, d)
+        }),
     }))
 }
 
-/// The curve where a torus band meets the plane `normal . p = d` between
-/// the contact ends `a` and `b`: each parallel of the band, the shorter way
-/// round its tube from `a` to `b`, cut by the plane, and a cubic through
-/// those points. `None` where a parallel misses the plane.
-fn torus_meets_plane(
+/// The curve where a torus band meets its cap between the contact ends `a`
+/// and `b`: each parallel of the band, the shorter way round its tube from
+/// `a` to `b`, cut by the cap (`hit` takes a parallel's tube angle and a
+/// guess round the axis to where it meets the cap), and a cubic through
+/// those points. `None` where a parallel misses the cap.
+fn torus_meets_cap(
     torus: &brepkit_math::surfaces::ToroidalSurface,
-    normal: Vec3,
-    d: f64,
     a: Point3,
     b: Point3,
+    hit: impl Fn(f64, f64) -> Option<f64>,
 ) -> Option<EdgeCurve> {
     const SAMPLES: usize = 32;
     let (ua, va) = torus.project_point(a);
@@ -3261,7 +3398,7 @@ fn torus_meets_plane(
         #[allow(clippy::cast_precision_loss)]
         let f = k as f64 / SAMPLES as f64;
         let v = va + dv * f;
-        let u = torus_parallel_meets_plane(torus, normal, d, v, ua + du * f)?;
+        let u = hit(v, ua + du * f)?;
         points.push(torus.evaluate(u, v));
     }
     points.push(b);

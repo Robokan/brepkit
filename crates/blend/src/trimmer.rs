@@ -1803,14 +1803,48 @@ fn rebuild_mapped_parametric_face(
                         }
                     }
                     let tt = 0.5 * (lo + hi);
-                    if dist_at(tt) > 1e-6 {
+                    // A file's edge may stand off its face by its digits
+                    // (8e-5 off a plane on a 500 mm part, a fitted section
+                    // 3e-5 off a cylinder): a contact on the face ends on it
+                    // where it meets the edge's trace on the face, the edge
+                    // itself within a file's tolerance.
+                    let on_face = |q: Point3| match &surface {
+                        FaceSurface::Plane { normal, d } => {
+                            q - *normal
+                                * ((normal.dot(brepkit_math::vec::Vec3::new(q.x(), q.y(), q.z()))
+                                    - d)
+                                    / normal.length_squared())
+                        }
+                        other => other
+                            .project_point(q)
+                            .and_then(|(u, v)| other.evaluate(u, v))
+                            .unwrap_or(q),
+                    };
+                    let on_edge = curve.evaluate_with_endpoints(tt, sp, tp);
+                    let gap = dist_at(tt);
+                    if gap > 1e-6 && (gap > 1e-4 || (on_face(on_edge) - point).length() > 1e-6) {
                         continue;
                     }
                     let f = (tt - d0) / (d1 - d0);
                     if f <= 1e-9 || f >= 1.0 - 1e-9 {
                         continue;
                     }
-                    let (e1, e2) = split_edge_at(topo, &oriented, vertex_id)?;
+                    // A vertex off a B-spline's curve reads no parameter of
+                    // its own there, so a piece that kept the whole curve
+                    // would span all of it: the curve is cut at the split.
+                    let (e1, e2) = match curve {
+                        EdgeCurve::NurbsCurve(nurbs) if gap > 1e-6 => {
+                            let (left, right) =
+                                brepkit_math::nurbs::knot_ops::curve_split(nurbs, tt)?;
+                            let (first, second) = if d0 <= d1 {
+                                (left, right)
+                            } else {
+                                (right, left)
+                            };
+                            split_edge_at_with_curves(topo, &oriented, vertex_id, first, second)?
+                        }
+                        _ => split_edge_at(topo, &oriented, vertex_id)?,
+                    };
                     if let Some(owner) = restriction_for_edge.get(&oriented.edge()).copied() {
                         restriction_for_edge.insert(e1.edge(), owner);
                         restriction_for_edge.insert(e2.edge(), owner);
