@@ -3028,8 +3028,9 @@ fn run_stripes_to_tilted_caps(
 }
 
 /// Whether a stripe's terminal vertex sits on a planar cap whose two edges
-/// at the vertex are straight or circular arcs: the end-cap notch can
-/// replace that corner path with the stripe's cross-section arc.
+/// at the vertex are straight, circular arcs or B-splines (a spline
+/// profile's rim): the end-cap notch can replace that corner path with the
+/// stripe's cross-section arc.
 fn terminal_cap_is_notchable(
     topo: &Topology,
     junction: &crate::fillet_plan::VertexJunction,
@@ -3077,12 +3078,14 @@ fn terminal_cap_is_notchable(
         if edge.start() != junction.vertex && edge.end() != junction.vertex {
             continue;
         }
-        // A straight corner edge, or an arc (a cap whose outline runs on
-        // round a curved wall at the corner): the trim splits either where
-        // the contact ends on it.
+        // A straight corner edge, an arc (a cap whose outline runs on round
+        // a curved wall at the corner) or a B-spline (a spline wall's rim):
+        // the trim splits any of them where the contact ends on it.
         if !matches!(
             edge.curve(),
-            brepkit_topology::edge::EdgeCurve::Line | brepkit_topology::edge::EdgeCurve::Circle(_)
+            brepkit_topology::edge::EdgeCurve::Line
+                | brepkit_topology::edge::EdgeCurve::Circle(_)
+                | brepkit_topology::edge::EdgeCurve::NurbsCurve(_)
         ) {
             return Ok(false);
         }
@@ -3110,6 +3113,14 @@ fn terminal_cap_is_notchable(
                 return [t - tau, t, t + tau]
                     .iter()
                     .any(|&t| (low..=high).contains(&t));
+            }
+            if let brepkit_topology::edge::EdgeCurve::NurbsCurve(nurbs) = curve {
+                let (t0, t1) = curve.domain_with_endpoints(a, b);
+                let (low, high) = (t0.min(t1) - 1e-9, t0.max(t1) + 1e-9);
+                return brepkit_math::nurbs::projection::project_point_to_curve(nurbs, point, 1e-9)
+                    .is_ok_and(|found| {
+                        found.distance <= 1e-5 && (low..=high).contains(&found.parameter)
+                    });
             }
             let ab = b - a;
             let len2 = ab.length_squared();
