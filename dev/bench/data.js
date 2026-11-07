@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794039761748,
+  "lastUpdate": 1794044986858,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2213,6 +2213,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 23739428,
             "range": "± 32683",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "d54b59d90cf99ff9b45ffdb0fdec3be63ded5c51",
+          "message": "docs(buzzcad): progress, torus run-on to curved caps (#15)\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-07T01:46:22-08:00",
+          "tree_id": "c71272984466de2d97cbfff60fe67243373c1beb",
+          "url": "https://github.com/Robokan/brepkit/commit/d54b59d90cf99ff9b45ffdb0fdec3be63ded5c51"
+        },
+        "date": 1794044986414,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1096623,
+            "range": "± 2888",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1193848,
+            "range": "± 2852",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12797,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 738176,
+            "range": "± 3471",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 27977646,
+            "range": "± 136267",
             "unit": "ns/iter"
           }
         ]
