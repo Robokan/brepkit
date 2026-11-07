@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794021961728,
+  "lastUpdate": 1794032747936,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2051,6 +2051,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29502655,
             "range": "± 37146",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "6ed7ea89c1bdd93f12b016f884800ef08a6e64d4",
+          "message": "docs(buzzcad): progress, tangent kinks, ruling rounds, mitre limit, spline cap notch (#15)\n\nAlso corpus_fillet: a PICK filter and a VERTS switch.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-06T22:22:44-08:00",
+          "tree_id": "90f8900a9167454c7deed89d804d859bd9e14d71",
+          "url": "https://github.com/Robokan/brepkit/commit/6ed7ea89c1bdd93f12b016f884800ef08a6e64d4"
+        },
+        "date": 1794032747326,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 922196,
+            "range": "± 1089",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 997091,
+            "range": "± 1485",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11632,
+            "range": "± 300",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 587313,
+            "range": "± 1029",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 24098221,
+            "range": "± 199072",
             "unit": "ns/iter"
           }
         ]
