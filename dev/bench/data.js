@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794017575835,
+  "lastUpdate": 1794017777414,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1943,6 +1943,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29649507,
             "range": "± 45827",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "6268fb420623dc8152fa10e3156082a8e0cb4ecb",
+          "message": "docs(buzzcad): corpus pointer, PRIORITIES #15 curved end faces\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-06T18:10:17-08:00",
+          "tree_id": "dc60f50a545e7e5154afa641a10d759580021945",
+          "url": "https://github.com/Robokan/brepkit/commit/6268fb420623dc8152fa10e3156082a8e0cb4ecb"
+        },
+        "date": 1794017776737,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1114110,
+            "range": "± 8647",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1208791,
+            "range": "± 10477",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13782,
+            "range": "± 251",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 724376,
+            "range": "± 9157",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29295107,
+            "range": "± 77277",
             "unit": "ns/iter"
           }
         ]
