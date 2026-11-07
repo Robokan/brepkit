@@ -641,11 +641,12 @@ fn notched_wire_edges(
         }
         let both_straight = [oes[i].edge(), oes[j].edge()].iter().all(|&eid| {
             topo.edge(eid)
-                .is_ok_and(|e| matches!(e.curve(), EdgeCurve::Line))
+                .is_ok_and(|e| matches!(e.curve(), EdgeCurve::Line | EdgeCurve::Circle(_)))
         });
         // A round run on to a curved cap ends on its intersection with the
         // cap, a fitted curve, across the cap's corner edges, whatever they
-        // are; a section arc (circle or ellipse) notches straight edges only.
+        // are; a section arc (circle or ellipse) notches straight edges, or
+        // arcs (a cap's outline running on round a curved wall), only.
         let fitted = topo
             .edge(arc_eid)
             .is_ok_and(|e| matches!(e.curve(), EdgeCurve::NurbsCurve(_)));

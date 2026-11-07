@@ -1053,14 +1053,51 @@ pub fn set_back_convex_trihedral_stripes(
                 reason: "trihedral setbacks consume an entire stripe".to_owned(),
             });
         }
-        let first = result.stripe.sections[0].clone();
-        let last = result.stripe.sections[1].clone();
-        result.stripe.contact1 = trim_nurbs_curve(&result.stripe.contact1, start, end)?;
-        result.stripe.contact2 = trim_nurbs_curve(&result.stripe.contact2, start, end)?;
-        result.stripe.sections = vec![
-            interpolate_section(&first, &last, start),
-            interpolate_section(&first, &last, end),
-        ];
+        let stripe = &result.stripe;
+        if matches!(stripe_centreline(stripe), Some(Centreline::Circle { .. })) {
+            // A circular stripe's contacts are rational arcs, whose parameter
+            // does not run with the angle: trim them where the turned
+            // sections meet them.
+            let section = |fraction: f64| {
+                section_at_fraction(topo, stripe, fraction).ok_or_else(|| {
+                    BlendError::PlanningFailure {
+                        reason: "a set-back section of a circular stripe".to_owned(),
+                    }
+                })
+            };
+            let (first, last) = (section(start)?, section(end)?);
+            let trim = |curve: &NurbsCurve| {
+                let nearer = |section: &CircSection| {
+                    let at = |point: Point3| {
+                        brepkit_math::nurbs::projection::project_point_to_curve(curve, point, TOL)
+                            .map_or(f64::INFINITY, |projection| projection.distance)
+                    };
+                    if at(section.p1) <= at(section.p2) {
+                        section.p1
+                    } else {
+                        section.p2
+                    }
+                };
+                trim_nurbs_curve_at_points(
+                    curve,
+                    (start > TOL).then(|| nearer(&first)),
+                    (end < 1.0 - TOL).then(|| nearer(&last)),
+                )
+            };
+            let (contact1, contact2) = (trim(&stripe.contact1)?, trim(&stripe.contact2)?);
+            result.stripe.contact1 = contact1;
+            result.stripe.contact2 = contact2;
+            result.stripe.sections = vec![first, last];
+        } else {
+            let first = result.stripe.sections[0].clone();
+            let last = result.stripe.sections[1].clone();
+            result.stripe.contact1 = trim_nurbs_curve(&result.stripe.contact1, start, end)?;
+            result.stripe.contact2 = trim_nurbs_curve(&result.stripe.contact2, start, end)?;
+            result.stripe.sections = vec![
+                interpolate_section(&first, &last, start),
+                interpolate_section(&first, &last, end),
+            ];
+        }
         setback_edges.extend(original_stripes[index].spine_edges().iter().copied());
     }
 
@@ -1148,26 +1185,24 @@ fn convex_trihedral_setback(
     // The setback ball centre is the three support planes' common offset by
     // the fillet radius — the same solve `multi_edge_corner_data` uses to
     // classify a junction as set-back or un-set-back.
-    let Some(center) = trihedral_ball_centre(topo, radius, &support_faces) else {
+    let Some(center) = junction_ball_centre(topo, radius, &support_faces, indices, stripes) else {
         return Ok(None);
     };
 
     let mut fractions = Vec::with_capacity(indices.len());
     for &index in indices {
         let stripe = &stripes[index];
-        let start = stripe.sections[0].center;
-        let direction = stripe.sections[1].center - start;
-        let length_squared = direction.dot(direction);
-        if length_squared <= TOL * TOL {
+        if (stripe.sections[1].center - stripe.sections[0].center).length() <= TOL {
             return Err(BlendError::CornerFailure { vertex });
         }
-        let fraction = (center - start).dot(direction) / length_squared;
-        let projected = start + direction * fraction;
         // A setback trims the stripe end down to the rolling-ball center, so
         // the center must lie on the bounded stripe centerline. A short spine
         // whose two ends' setbacks meet is refused when the trims are applied
         // ("trihedral setbacks consume an entire stripe").
-        if !(TOL..=1.0 - TOL).contains(&fraction) || (projected - center).length() > TOL * 100.0 {
+        let Some(fraction) = centreline_fraction(topo, stripe, center) else {
+            return Ok(None);
+        };
+        if !(TOL..=1.0 - TOL).contains(&fraction) {
             return Ok(None);
         }
         fractions.push(fraction);
@@ -1285,6 +1320,254 @@ fn trihedral_ball_centre(topo: &Topology, radius: f64, support_faces: &[FaceId])
     ))
 }
 
+/// The path of a two-section analytic stripe's ball centre: the tube's
+/// centre circle for a toroidal band (a plane and a cylinder round its rim),
+/// else the straight line between its sections' centres (a cylindrical band
+/// between two planes, or a plane and a cylinder along its ruling).
+enum Centreline {
+    Line(Point3, Point3),
+    Circle {
+        centre: Point3,
+        axis: Vec3,
+        radius: f64,
+    },
+}
+
+fn stripe_centreline(stripe: &Stripe) -> Option<Centreline> {
+    if stripe.sections.len() != 2 {
+        return None;
+    }
+    Some(match &stripe.surface {
+        FaceSurface::Torus(torus) => Centreline::Circle {
+            centre: torus.center(),
+            axis: torus.z_axis(),
+            radius: torus.major_radius(),
+        },
+        _ => Centreline::Line(stripe.sections[0].center, stripe.sections[1].center),
+    })
+}
+
+/// Whether `point` lies on `centreline` within `tolerance`.
+fn on_centreline(centreline: &Centreline, point: Point3, tolerance: f64) -> bool {
+    match *centreline {
+        Centreline::Line(start, end) => {
+            let direction = end - start;
+            let length_squared = direction.dot(direction);
+            if length_squared <= TOL * TOL {
+                return false;
+            }
+            let fraction = (point - start).dot(direction) / length_squared;
+            (start + direction * fraction - point).length() <= tolerance
+        }
+        Centreline::Circle {
+            centre,
+            axis,
+            radius,
+        } => {
+            let offset = point - centre;
+            let height = offset.dot(axis);
+            let radial = (offset - axis * height).length();
+            height.abs() <= tolerance && (radial - radius).abs() <= tolerance
+        }
+    }
+}
+
+/// The rolling-ball centre of a convex trihedral corner whose supports are
+/// not all planes (a plane, a plane and a cylinder: a slot's end face, its
+/// top and the arc it runs round): the closest approach of two incident
+/// stripes' straight centrelines, when it lies on every incident stripe's
+/// centreline. Each centreline is the path of a ball touching that stripe's
+/// two supports, so a point on all three touches all three faces.
+fn centreline_ball_centre(indices: &[usize], stripes: &[Stripe]) -> Option<Point3> {
+    let centrelines: Vec<Centreline> = indices
+        .iter()
+        .map(|&index| stripe_centreline(&stripes[index]))
+        .collect::<Option<_>>()?;
+    let mut lines = centrelines
+        .iter()
+        .filter_map(|centreline| match *centreline {
+            Centreline::Line(start, end) => Some((start, end - start)),
+            Centreline::Circle { .. } => None,
+        });
+    let (a, u) = lines.next()?;
+    let (b, v) = lines.next()?;
+    let w = a - b;
+    let (uu, uv, vv) = (u.dot(u), u.dot(v), v.dot(v));
+    let denominator = uu * vv - uv * uv;
+    if denominator <= 1e-12 * uu * vv {
+        return None;
+    }
+    let s = (uv * v.dot(w) - vv * u.dot(w)) / denominator;
+    let t = (uu * v.dot(w) - uv * u.dot(w)) / denominator;
+    let on_first = a + u * s;
+    let on_second = b + v * t;
+    let centre = on_first + (on_second - on_first) * 0.5;
+    centrelines
+        .iter()
+        .all(|centreline| on_centreline(centreline, centre, TOL * 100.0))
+        .then_some(centre)
+}
+
+/// The ball centre of a convex trihedral corner: the three support planes'
+/// common offset, or, when a support is curved, the point the incident
+/// stripes' centrelines share.
+fn junction_ball_centre(
+    topo: &Topology,
+    radius: f64,
+    support_faces: &[FaceId],
+    indices: &[usize],
+    stripes: &[Stripe],
+) -> Option<Point3> {
+    trihedral_ball_centre(topo, radius, support_faces)
+        .or_else(|| centreline_ball_centre(indices, stripes))
+}
+
+/// Where `centre` lies along `stripe`'s centreline, as a fraction from its
+/// first section (0) to its second (1): by length along a straight one, by
+/// angle round a circular one (its sweep read from the spine, which turns
+/// round the same axis). `None` when the centre is off the centreline.
+fn centreline_fraction(topo: &Topology, stripe: &Stripe, centre: Point3) -> Option<f64> {
+    let centreline = stripe_centreline(stripe)?;
+    if !on_centreline(&centreline, centre, TOL * 100.0) {
+        return None;
+    }
+    match centreline {
+        Centreline::Line(start, end) => {
+            let direction = end - start;
+            Some((centre - start).dot(direction) / direction.dot(direction))
+        }
+        Centreline::Circle {
+            centre: axis_point,
+            axis,
+            ..
+        } => {
+            let sweep = circle_stripe_sweep(topo, stripe, axis_point, axis)?;
+            let angle = signed_angle_about(
+                axis_point,
+                axis,
+                stripe.sections[0].center,
+                centre,
+                sweep.signum(),
+            )?;
+            Some(angle / sweep)
+        }
+    }
+}
+
+/// The angle, signed about `axis`, a circular stripe sweeps from its first
+/// section to its second, read the way its spine runs.
+fn circle_stripe_sweep(
+    topo: &Topology,
+    stripe: &Stripe,
+    axis_point: Point3,
+    axis: Vec3,
+) -> Option<f64> {
+    if stripe.spine.is_closed() {
+        return None;
+    }
+    let start = stripe.sections[0].center;
+    let middle = stripe
+        .spine
+        .evaluate(topo, 0.5 * stripe.spine.length())
+        .ok()?;
+    let direction = signed_angle_about(axis_point, axis, start, middle, 0.0)?.signum();
+    signed_angle_about(
+        axis_point,
+        axis,
+        start,
+        stripe.sections[1].center,
+        direction,
+    )
+    .filter(|sweep| sweep.abs() > TOL)
+}
+
+/// The angle about `axis` from `from` to `to`, in (-pi, pi], or wrapped into
+/// the turn `direction` gives (`1.0` for [0, 2 pi), `-1.0` for (-2 pi, 0]).
+fn signed_angle_about(
+    axis_point: Point3,
+    axis: Vec3,
+    from: Point3,
+    to: Point3,
+    direction: f64,
+) -> Option<f64> {
+    let radial = |point: Point3| {
+        let offset = point - axis_point;
+        offset - axis * offset.dot(axis)
+    };
+    let x = radial(from);
+    let length = x.length();
+    if length <= TOL {
+        return None;
+    }
+    let x = x * (1.0 / length);
+    let y = axis.cross(x);
+    let target = radial(to);
+    let angle = target.dot(y).atan2(target.dot(x));
+    Some(if direction > 0.0 && angle < 0.0 {
+        angle + std::f64::consts::TAU
+    } else if direction < 0.0 && angle > 0.0 {
+        angle - std::f64::consts::TAU
+    } else {
+        angle
+    })
+}
+
+/// `point` turned by `angle` about the line through `axis_point` along the
+/// unit `axis`.
+fn rotate_about(point: Point3, axis_point: Point3, axis: Vec3, angle: f64) -> Point3 {
+    let offset = point - axis_point;
+    let (sin, cos) = angle.sin_cos();
+    let along = axis * offset.dot(axis);
+    let across = offset - along;
+    axis_point + along + across * cos + axis.cross(across) * sin
+}
+
+/// `stripe`'s section at `fraction` of its sweep: interpolated along a
+/// straight centreline, turned about the axis along a circular one.
+fn section_at_fraction(topo: &Topology, stripe: &Stripe, fraction: f64) -> Option<CircSection> {
+    let (first, last) = (&stripe.sections[0], &stripe.sections[1]);
+    let mut section = interpolate_section(first, last, fraction);
+    if let Some(Centreline::Circle {
+        centre: axis_point,
+        axis,
+        ..
+    }) = stripe_centreline(stripe)
+    {
+        let angle = circle_stripe_sweep(topo, stripe, axis_point, axis)? * fraction;
+        section.p1 = rotate_about(first.p1, axis_point, axis, angle);
+        section.p2 = rotate_about(first.p2, axis_point, axis, angle);
+        section.center = rotate_about(first.center, axis_point, axis, angle);
+    }
+    Some(section)
+}
+
+/// Trim a contact curve to the stretch between the points nearest `start`
+/// and `end` (either `None` to keep that end).
+fn trim_nurbs_curve_at_points(
+    curve: &NurbsCurve,
+    start: Option<Point3>,
+    end: Option<Point3>,
+) -> Result<NurbsCurve, BlendError> {
+    let parameter = |point: Point3| -> Result<f64, BlendError> {
+        let projection =
+            brepkit_math::nurbs::projection::project_point_to_curve(curve, point, TOL)?;
+        if projection.distance > TOL * 100.0 {
+            return Err(BlendError::PlanningFailure {
+                reason: "a set-back section misses its stripe's contact".to_owned(),
+            });
+        }
+        Ok(projection.parameter)
+    };
+    let mut trimmed = curve.clone();
+    if let Some(point) = start {
+        trimmed = curve_split(&trimmed, parameter(point)?)?.1;
+    }
+    if let Some(point) = end {
+        trimmed = curve_split(&trimmed, parameter(point)?)?.0;
+    }
+    Ok(trimmed)
+}
+
 /// Classify whether a trihedral junction's terminal sections were
 /// trimmed to the solved ball centre, `None` when no ball centre exists.
 ///
@@ -1333,7 +1616,8 @@ fn setback_trimmed_classification(
             }
         }
     }
-    let Some(ball_centre) = trihedral_ball_centre(topo, radius, &support_faces) else {
+    let Some(ball_centre) = junction_ball_centre(topo, radius, &support_faces, indices, stripes)
+    else {
         return Ok(None);
     };
     let mut at_ball_centre = 0_usize;

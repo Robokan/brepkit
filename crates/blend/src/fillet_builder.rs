@@ -3028,8 +3028,8 @@ fn run_stripes_to_tilted_caps(
 }
 
 /// Whether a stripe's terminal vertex sits on a planar cap whose two edges
-/// at the vertex are straight: the end-cap notch can replace that corner
-/// path with the stripe's cross-section arc.
+/// at the vertex are straight or circular arcs: the end-cap notch can
+/// replace that corner path with the stripe's cross-section arc.
 fn terminal_cap_is_notchable(
     topo: &Topology,
     junction: &crate::fillet_plan::VertexJunction,
@@ -3065,7 +3065,7 @@ fn terminal_cap_is_notchable(
     // The corner sits on the cap's outer wire (a convex fillet) or on one of
     // its holes (a concave one ending on a cup's rim); the notch replaces it
     // on whichever wire holds it.
-    let mut corner_edges: Vec<(Point3, Point3)> = Vec::new();
+    let mut corner_edges: Vec<(Point3, Point3, brepkit_topology::edge::EdgeCurve)> = Vec::new();
     let wires = std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied());
     for oriented in wires
         .filter_map(|wire| topo.wire(wire).ok())
@@ -3077,13 +3077,19 @@ fn terminal_cap_is_notchable(
         if edge.start() != junction.vertex && edge.end() != junction.vertex {
             continue;
         }
-        if !matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line) {
+        // A straight corner edge, or an arc (a cap whose outline runs on
+        // round a curved wall at the corner): the trim splits either where
+        // the contact ends on it.
+        if !matches!(
+            edge.curve(),
+            brepkit_topology::edge::EdgeCurve::Line | brepkit_topology::edge::EdgeCurve::Circle(_)
+        ) {
             return Ok(false);
         }
         let (Ok(a), Ok(b)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
             return Ok(false);
         };
-        corner_edges.push((a.point(), b.point()));
+        corner_edges.push((a.point(), b.point(), edge.curve().clone()));
     }
     if corner_edges.len() != 2 {
         return Ok(false);
@@ -3091,7 +3097,20 @@ fn terminal_cap_is_notchable(
     // Both contacts must end on those corner edges, or the split lands on
     // the cap's edge while the notch can never match its corner path.
     let on_segment = |point: Point3| {
-        corner_edges.iter().any(|&(a, b)| {
+        corner_edges.iter().any(|(a, b, curve)| {
+            let (a, b) = (*a, *b);
+            if let brepkit_topology::edge::EdgeCurve::Circle(circle) = curve {
+                let t = circle.project(point);
+                if (circle.evaluate(t) - point).length() > 1e-5 {
+                    return false;
+                }
+                let (t0, t1) = curve.domain_with_endpoints(a, b);
+                let (low, high) = (t0.min(t1) - 1e-9, t0.max(t1) + 1e-9);
+                let tau = std::f64::consts::TAU;
+                return [t - tau, t, t + tau]
+                    .iter()
+                    .any(|&t| (low..=high).contains(&t));
+            }
             let ab = b - a;
             let len2 = ab.length_squared();
             if len2 <= 1e-18 {
