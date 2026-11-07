@@ -584,6 +584,7 @@ fn plane_plane_fillet(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
 
@@ -707,6 +708,7 @@ fn plane_plane_chamfer(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
 
@@ -948,6 +950,7 @@ pub fn plane_cylinder_fillet(
         contact2: contact_cyl,
         face1: face_plane,
         face2: face_cyl,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -1100,6 +1103,7 @@ fn plane_cylinder_ruling_fillet(
         contact2: nurbs_line(wall_start, wall_end)?,
         face1: face_plane,
         face2: face_cyl,
+        beyond: Default::default(),
         sections: vec![
             section(plane_start, wall_start, centre_start, 0.0),
             section(plane_end, wall_end, centre_end, 1.0),
@@ -1398,6 +1402,7 @@ pub fn plane_cylinder_chamfer(
         contact2: contact_cyl,
         face1: face_plane,
         face2: face_cyl,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
 
@@ -1643,6 +1648,7 @@ pub fn plane_cone_fillet(
         contact2: contact_cone,
         face1: face_plane,
         face2: face_cone,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
 
@@ -1942,6 +1948,7 @@ pub fn plane_cone_chamfer(
         contact2: contact_cone,
         face1: face_plane,
         face2: face_cone,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
 
@@ -2242,6 +2249,7 @@ pub fn plane_sphere_fillet(
         contact2: contact_sphere,
         face1: face_plane,
         face2: face_sphere,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -2535,6 +2543,7 @@ pub fn plane_sphere_chamfer(
         contact2: contact_sphere,
         face1: face_plane,
         face2: face_sphere,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -2801,6 +2810,7 @@ pub fn sphere_sphere_fillet(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -3071,6 +3081,7 @@ pub fn sphere_cylinder_fillet(
         contact2: contact_cyl,
         face1: face_sphere,
         face2: face_cyl,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -3401,6 +3412,7 @@ pub fn sphere_cone_fillet(
         contact2: contact_cone,
         face1: face_sphere,
         face2: face_cone,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -3673,6 +3685,7 @@ pub fn sphere_sphere_chamfer(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -3940,6 +3953,7 @@ pub fn sphere_cylinder_chamfer(
         contact2: contact_cyl,
         face1: face_sphere,
         face2: face_cyl,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -4245,6 +4259,7 @@ pub fn sphere_cone_chamfer(
         contact2: contact_cone,
         face1: face_sphere,
         face2: face_cone,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -4502,6 +4517,7 @@ pub fn cylinder_cylinder_fillet(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -4765,6 +4781,7 @@ pub fn cone_cone_coaxial_fillet(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -5022,6 +5039,7 @@ pub fn cone_cone_coaxial_chamfer(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {
@@ -5262,6 +5280,7 @@ pub fn cylinder_cylinder_chamfer(
         contact2,
         face1,
         face2,
+        beyond: Default::default(),
         sections: vec![section_start, section_end],
     };
     Ok(Some(StripeResult {

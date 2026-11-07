@@ -5181,6 +5181,7 @@ mod tests {
                         contact2: line_curve(start_p2, end_p2),
                         face1: contour.side1,
                         face2: contour.side2,
+                        beyond: Default::default(),
                         sections: vec![
                             CircSection {
                                 p1: start_p1,
@@ -5478,6 +5479,7 @@ mod tests {
             .unwrap(),
             face1: face_xy,
             face2: face_xz,
+            beyond: Default::default(),
             sections: vec![
                 CircSection {
                     p1: Point3::new(radius, 0.0, radius),
@@ -5537,6 +5539,7 @@ mod tests {
             .unwrap(),
             face1: face_xy,
             face2: face_yz,
+            beyond: Default::default(),
             sections: vec![
                 CircSection {
                     p1: Point3::new(0.0, radius, radius),
@@ -5596,6 +5599,7 @@ mod tests {
             .unwrap(),
             face1: face_xz,
             face2: face_yz,
+            beyond: Default::default(),
             sections: vec![
                 CircSection {
                     p1: Point3::new(0.0, radius, radius),

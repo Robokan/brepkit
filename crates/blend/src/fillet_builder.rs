@@ -30,7 +30,7 @@ use crate::radius_law::RadiusLaw;
 use crate::spine::Spine;
 use crate::stripe::{Stripe, StripeResult};
 use crate::trimmer;
-use crate::walker::{Walker, WalkerConfig, approximate_blend_surface};
+use crate::walker::{Walker, WalkerConfig, approximate_blend_surface, interpolate_blend_surface};
 use crate::{BlendError, BlendResult};
 type BlendCrossEdge = (EdgeId, VertexId, VertexId);
 type BlendCrossPair = (Option<BlendCrossEdge>, Option<BlendCrossEdge>);
@@ -877,6 +877,12 @@ impl<'a> FilletBuilder<'a> {
                             let tol = 1e-7 * torus.major_radius().max(1.0);
                             torus_meets_cap(torus, start_point, end_point, |v, near| {
                                 torus_parallel_meets_surface(torus, cap, v, near, tol)
+                            })
+                        }
+                        (Some(&cap), FaceSurface::Nurbs(_)) => {
+                            let scale = (start_point - end_point).length().max(1.0);
+                            band_meets_cap(&stripe.surface, start_point, end_point, |p| {
+                                cap_offset(topo, cap, p, 1e-6 * scale)
                             })
                         }
                         (Some(&RunOnCap::Face(cap)), FaceSurface::Cylinder(cylinder)) => {
@@ -2910,6 +2916,8 @@ fn run_stripes_to_tilted_caps(
     const SQUARE: f64 = 1e-9;
     // A cap this oblique to the axis is left to the runout.
     const OBLIQUE: f64 = 0.05;
+    carry_walked_rounds(topo, plan, stripe_results)?;
+    let full_rounds = walked_full_rounds(stripe_results);
     let mut caps = TiltedCaps::new();
     for junction in &plan.junctions {
         if !matches!(
@@ -2924,12 +2932,14 @@ fn run_stripes_to_tilted_caps(
         let Some(contour) = plan.contours.get(*contour_index) else {
             continue;
         };
-        let Some(result) = stripe_results
-            .iter_mut()
-            .find(|result| result.stripe.spine_edges() == contour.spine.edges())
+        let Some(index) = stripe_results
+            .iter()
+            .position(|result| result.stripe.spine_edges() == contour.spine.edges())
         else {
             continue;
         };
+        let full_round = full_rounds[index];
+        let result = &mut stripe_results[index];
         let stripe = &result.stripe;
         let cylinder = match &stripe.surface {
             FaceSurface::Cylinder(cylinder) => cylinder,
@@ -2946,6 +2956,28 @@ fn run_stripes_to_tilted_caps(
                     section.center = run.centre;
                     log::debug!(
                         "terminal {:?}: torus round runs on to its tilted cap",
+                        junction.vertex
+                    );
+                    caps.insert((edge, run.end), run.cap);
+                }
+                continue;
+            }
+            FaceSurface::Nurbs(_) => {
+                if full_round {
+                    continue;
+                }
+                if let Some(run) = walked_run_back(topo, junction, contour, stripe)? {
+                    let edge = stripe.spine_edges()[0];
+                    let result_stripe = &mut result.stripe;
+                    result_stripe.contact1 = run.contact1;
+                    result_stripe.contact2 = run.contact2;
+                    // The sections stay as walked (or carried on): a
+                    // section's contact points moved to the contacts' new
+                    // ends would no longer lie on its arc, and a band rebuilt
+                    // through them at its other end would fold. The contacts'
+                    // own ends are what the trim and the notch read.
+                    log::debug!(
+                        "terminal {:?}: walked round cut back to its tilted cap",
                         junction.vertex
                     );
                     caps.insert((edge, run.end), run.cap);
@@ -3084,6 +3116,441 @@ fn run_stripes_to_tilted_caps(
         caps.insert((edge, end), run_on);
     }
     Ok(caps)
+}
+
+/// How far `point` stands outside a run-on cap, along the cap's outward
+/// normal: the plane's offset, or on a curved cap the point's offset from
+/// its nearest point on the cap's surface (within `tol` of it). `None` where
+/// the point does not project on to the cap.
+fn cap_offset(topo: &Topology, cap: RunOnCap, point: Point3, tol: f64) -> Option<f64> {
+    match cap {
+        RunOnCap::Plane(normal, d) => {
+            Some(normal.dot(Vec3::new(point.x(), point.y(), point.z())) - d)
+        }
+        RunOnCap::Face(face) => {
+            let surface = topo.face(face).ok()?.surface();
+            let (u, v) = surface.project_point(point)?;
+            let on = surface.evaluate(u, v)?;
+            let normal = outward_normal_at(topo, face, on, tol).ok()??;
+            Some((point - on).dot(normal))
+        }
+    }
+}
+
+/// A walked round's single cap at a terminal: the cap, its two corner edges,
+/// the run-on cap, which end of the spine meets it and its end section.
+struct WalkedEnd {
+    corner_edges: Vec<EdgeId>,
+    run_on: RunOnCap,
+    end: usize,
+    section: crate::section::CircSection,
+    tol: f64,
+}
+
+/// The cap a walked round's end meets at `junction`, where there is exactly
+/// one, with its two corner edges.
+fn walked_end(
+    topo: &Topology,
+    junction: &crate::fillet_plan::VertexJunction,
+    contour: &crate::fillet_plan::FilletContour,
+    stripe: &Stripe,
+) -> Result<Option<WalkedEnd>, BlendError> {
+    let fan: Vec<FaceId> = junction
+        .face_fan
+        .iter()
+        .copied()
+        .filter(|&face| face != contour.side1 && face != contour.side2)
+        .collect();
+    let [cap] = fan.as_slice() else {
+        return Ok(None);
+    };
+    let corner_edges = cap_corner_edges(topo, *cap, junction.vertex)?;
+    if corner_edges.len() != 2 {
+        return Ok(None);
+    }
+    let run_on = outward_plane(topo, *cap)?.map_or(RunOnCap::Face(*cap), |(normal, d)| {
+        RunOnCap::Plane(normal, d)
+    });
+    let vertex = topo.vertex(junction.vertex)?.point();
+    let end = usize::from(spine_ends_at(topo, stripe, vertex)?);
+    let Some(section) = end_section(topo, stripe, vertex)? else {
+        return Ok(None);
+    };
+    let tol = 1e-6 * (section.p1 - section.p2).length().max(1.0);
+    Ok(Some(WalkedEnd {
+        corner_edges,
+        run_on,
+        end,
+        section: section.clone(),
+        tol,
+    }))
+}
+
+/// A contact's `(near, far, near is its end)` parameters, `near` being its
+/// end at `at`.
+fn contact_ends(contact: &brepkit_math::nurbs::curve::NurbsCurve, at: Point3) -> (f64, f64, bool) {
+    let (t0, t1) = contact.domain();
+    let (_, at_end) = contact_end_at(contact, at);
+    if at_end {
+        (t1, t0, true)
+    } else {
+        (t0, t1, false)
+    }
+}
+
+/// The sections a walked round is carried on through past its end at
+/// `junction`, outwards, where a contact stops short of the end's single
+/// tilted or curved cap: the sections the ball rolls through past the
+/// spine's end ([`Stripe::beyond`]), until both contacts are past the cap,
+/// and a couple more. `None` where no contact falls short, or the ball's
+/// sections never take it past.
+fn walked_carry(
+    topo: &Topology,
+    junction: &crate::fillet_plan::VertexJunction,
+    contour: &crate::fillet_plan::FilletContour,
+    stripe: &Stripe,
+) -> Result<Option<(usize, Vec<crate::section::CircSection>)>, BlendError> {
+    // Sections carried past the first one with both contacts past the cap.
+    const MARGIN: usize = 2;
+    let FaceSurface::Nurbs(_) = &stripe.surface else {
+        return Ok(None);
+    };
+    let Some(walked) = walked_end(topo, junction, contour, stripe)? else {
+        return Ok(None);
+    };
+    let tol = walked.tol;
+    let offset = |point: Point3| cap_offset(topo, walked.run_on, point, tol);
+    let past = &stripe.beyond[walked.end];
+    let mut needed = None;
+    for (side, contact, at) in [
+        (0, &stripe.contact1, walked.section.p1),
+        (1, &stripe.contact2, walked.section.p2),
+    ] {
+        let (near, _, _) = contact_ends(contact, at);
+        let Some(beyond) = offset(contact.evaluate(near)) else {
+            return Ok(None);
+        };
+        if beyond >= -tol {
+            continue;
+        }
+        let reached = past.iter().position(|section| {
+            let point = if side == 0 { section.p1 } else { section.p2 };
+            offset(point).is_some_and(|off| off > tol)
+        });
+        let Some(index) = reached else {
+            return Ok(None);
+        };
+        needed = Some(needed.map_or(index + 1, |most: usize| most.max(index + 1)));
+    }
+    Ok(needed.map(|needed| {
+        (
+            walked.end,
+            past[..(needed + MARGIN).min(past.len())].to_vec(),
+        )
+    }))
+}
+
+/// Which walked rounds meet another round along a face: a contact of one
+/// coincides with a contact of another on the same face (a wall exactly
+/// twice the radius high, rounded along both rims). That is a full round,
+/// which takes the face between them away and is not built; such rounds are
+/// neither carried on nor cut back to their caps (the face was left a sliver
+/// along a curve, which took minutes to mesh).
+fn walked_full_rounds(stripe_results: &[StripeResult]) -> Vec<bool> {
+    let stripes: Vec<&Stripe> = stripe_results.iter().map(|result| &result.stripe).collect();
+    stripes
+        .iter()
+        .enumerate()
+        .map(|(index, stripe)| {
+            if !matches!(stripe.surface, FaceSurface::Nurbs(_)) {
+                return false;
+            }
+            let Some(first) = stripe.sections.first() else {
+                return false;
+            };
+            let tol = 1e-3 * (first.p1 - first.p2).length();
+            [
+                (&stripe.contact1, stripe.face1),
+                (&stripe.contact2, stripe.face2),
+            ]
+            .into_iter()
+            .any(|(contact, face)| {
+                let (t0, t1) = contact.domain();
+                let middle = contact.evaluate(f64::midpoint(t0, t1));
+                stripes.iter().enumerate().any(|(other_index, other)| {
+                    other_index != index
+                        && [
+                            (&other.contact1, other.face1),
+                            (&other.contact2, other.face2),
+                        ]
+                        .into_iter()
+                        .any(|(other_contact, other_face)| {
+                            other_face == face
+                                && brepkit_math::nurbs::projection::project_point_to_curve(
+                                    other_contact,
+                                    middle,
+                                    1e-9,
+                                )
+                                .is_ok_and(|found| found.distance <= tol)
+                        })
+                })
+            })
+        })
+        .collect()
+}
+
+/// Carries walked rounds on past their ends where a contact stops short of
+/// a tilted or curved cap ([`walked_carry`]), every end before any is cut
+/// back, so a band rebuilt for one end is never one already cut at its
+/// other. The band is rebuilt through its sections and the carried ones,
+/// passing through each ([`interpolate_blend_surface`]): the end section,
+/// now inside the band, keeps its contact points on it, the one on the
+/// cap's corner edge among them. Its contacts are the rebuilt band's sides.
+fn carry_walked_rounds(
+    topo: &Topology,
+    plan: &crate::fillet_plan::FilletPlan,
+    stripe_results: &mut [StripeResult],
+) -> Result<(), BlendError> {
+    let full_rounds = walked_full_rounds(stripe_results);
+    let mut carries: Vec<(
+        usize,
+        usize,
+        Vec<crate::section::CircSection>,
+        &crate::fillet_plan::VertexJunction,
+        &crate::fillet_plan::FilletContour,
+    )> = Vec::new();
+    for junction in &plan.junctions {
+        if !matches!(
+            junction.classification,
+            crate::fillet_plan::CornerClassification::Terminal
+        ) {
+            continue;
+        }
+        let [contour_index] = junction.incident_contours.as_slice() else {
+            continue;
+        };
+        let Some(contour) = plan.contours.get(*contour_index) else {
+            continue;
+        };
+        let Some(index) = stripe_results
+            .iter()
+            .position(|result| result.stripe.spine_edges() == contour.spine.edges())
+        else {
+            continue;
+        };
+        if full_rounds[index] {
+            continue;
+        }
+        if let Some((end, sections)) =
+            walked_carry(topo, junction, contour, &stripe_results[index].stripe)?
+        {
+            carries.push((index, end, sections, junction, contour));
+        }
+    }
+    for index in 0..stripe_results.len() {
+        let mut ends: [Option<&Vec<crate::section::CircSection>>; 2] = [None, None];
+        for (at, end, sections, _, _) in &carries {
+            if *at == index {
+                ends[*end] = Some(sections);
+            }
+        }
+        if ends.iter().all(Option::is_none) {
+            continue;
+        }
+        let stripe = &stripe_results[index].stripe;
+        let mut sections = Vec::with_capacity(stripe.sections.len() + 16);
+        if let Some(carried) = ends[0] {
+            sections.extend(carried.iter().rev().cloned());
+        }
+        sections.extend(stripe.sections.iter().cloned());
+        if let Some(carried) = ends[1] {
+            sections.extend(carried.iter().cloned());
+        }
+        let Ok(surface) = interpolate_blend_surface(&sections) else {
+            continue;
+        };
+        let mut carried = stripe.clone();
+        carried.contact1 = band_side(&surface, 0)?;
+        carried.contact2 = band_side(&surface, surface.control_points().len() - 1)?;
+        carried.sections = sections;
+        carried.surface = FaceSurface::Nurbs(surface);
+        // Kept only where every end carried on then cuts back to its cap: a
+        // contact left running past its face could not be trimmed.
+        let mut cuts = true;
+        for (at, _, _, junction, contour) in &carries {
+            if *at == index && walked_run_back(topo, junction, contour, &carried)?.is_none() {
+                cuts = false;
+            }
+        }
+        if !cuts {
+            continue;
+        }
+        log::debug!(
+            "walked round carried on past {} end(s)",
+            ends.iter().filter(|end| end.is_some()).count()
+        );
+        stripe_results[index].stripe = carried;
+    }
+    Ok(())
+}
+
+/// Cuts a walked round's end back to a tilted or curved cap.
+///
+/// A walked round (a fitted band between curved faces) ends in the plane
+/// square to its spine. Where its edge ends on a single cap turned to that
+/// plane, a contact runs on past the cap (the corner was closed by a runout
+/// patch, or the trim found the contact's end on no edge it could split);
+/// one stopping short has been carried on past it ([`carry_walked_rounds`]).
+/// Each contact running past the cap is cut where it crosses it, which lies
+/// on the cap's corner edge with that contact's face; a contact ending on
+/// the cap keeps its end. The band then ends on its intersection with the
+/// cap, between those two points, which the cap takes as its notch.
+fn walked_run_back(
+    topo: &Topology,
+    junction: &crate::fillet_plan::VertexJunction,
+    contour: &crate::fillet_plan::FilletContour,
+    stripe: &Stripe,
+) -> Result<Option<TorusRunOn>, BlendError> {
+    const SAMPLES: usize = 400;
+    let Some(walked) = walked_end(topo, junction, contour, stripe)? else {
+        return Ok(None);
+    };
+    let WalkedEnd {
+        corner_edges,
+        run_on,
+        end,
+        section,
+        tol,
+    } = walked;
+    let offset = |point: Point3| cap_offset(topo, run_on, point, tol);
+    let mut contacts = Vec::with_capacity(2);
+    let mut cut = false;
+    for (contact, at) in [
+        (&stripe.contact1, section.p1),
+        (&stripe.contact2, section.p2),
+    ] {
+        let (near, far, at_end) = contact_ends(contact, at);
+        let Some(beyond) = offset(contact.evaluate(near)) else {
+            return Ok(None);
+        };
+        if beyond < -tol {
+            return Ok(None);
+        }
+        let at_near = beyond <= tol;
+        let crossing = if at_near {
+            near
+        } else {
+            // The first crossing back from the end: a scan, then bisection
+            // between the last sample past the cap and the first inside it.
+            #[allow(clippy::cast_precision_loss)]
+            let at_sample = |k: usize| near + (far - near) * (k as f64) / (SAMPLES as f64);
+            let mut bracket = None;
+            for k in 1..=SAMPLES {
+                match offset(contact.evaluate(at_sample(k))) {
+                    Some(off) if off <= 0.0 => {
+                        bracket = Some((at_sample(k - 1), at_sample(k)));
+                        break;
+                    }
+                    Some(_) => {}
+                    None => return Ok(None),
+                }
+            }
+            let Some((mut outside, mut inside)) = bracket else {
+                return Ok(None);
+            };
+            for _ in 0..100 {
+                let middle = f64::midpoint(outside, inside);
+                match offset(contact.evaluate(middle)) {
+                    Some(off) if off > 0.0 => outside = middle,
+                    Some(_) => inside = middle,
+                    None => return Ok(None),
+                }
+            }
+            cut = true;
+            f64::midpoint(outside, inside)
+        };
+        let reached = contact.evaluate(crossing);
+        let mut on_corner = false;
+        for &edge in &corner_edges {
+            on_corner |= point_on_edge(topo, edge, reached, tol)?;
+        }
+        if !on_corner {
+            return Ok(None);
+        }
+        let piece = if at_near {
+            contact.clone()
+        } else {
+            let (left, right) = brepkit_math::nurbs::knot_ops::curve_split(contact, crossing)?;
+            if at_end { left } else { right }
+        };
+        contacts.push((piece, reached));
+    }
+    if !cut {
+        return Ok(None);
+    }
+    let Ok([(contact1, p1), (contact2, p2)]) = <[_; 2]>::try_from(contacts) else {
+        return Ok(None);
+    };
+    Ok(Some(TorusRunOn {
+        end,
+        contact1,
+        p1,
+        contact2,
+        p2,
+        centre: section.center,
+        cap: run_on,
+    }))
+}
+
+/// The curve where a walked band meets its cap between the contact ends `a`
+/// and `b`: across the band from `a` to `b`, each row of the band (fixed
+/// `u`) followed along the spine (`v`, by secant steps from the straight
+/// guess between the ends) to where `offset`, the point's offset outside the
+/// cap, is zero, and a cubic through those points. `None` where a row
+/// misses the cap.
+fn band_meets_cap(
+    band: &FaceSurface,
+    a: Point3,
+    b: Point3,
+    offset: impl Fn(Point3) -> Option<f64>,
+) -> Option<EdgeCurve> {
+    const SAMPLES: usize = 32;
+    let (ua, va) = band.project_point(a)?;
+    let (ub, vb) = band.project_point(b)?;
+    let tol = 1e-9 * (a - b).length().max(1.0);
+    let row = |u: f64, guess: f64| -> Option<Point3> {
+        let at = |v: f64| {
+            band.evaluate(u, v)
+                .and_then(|p| offset(p).map(|off| (p, off)))
+        };
+        let (mut v0, mut v1) = (guess, guess + 1e-4);
+        let (_, mut f0) = at(v0)?;
+        let (mut p1, mut f1) = at(v1)?;
+        for _ in 0..60 {
+            if f1.abs() <= tol {
+                return Some(p1);
+            }
+            if (f1 - f0).abs() <= f64::EPSILON * f1.abs() {
+                return None;
+            }
+            let v2 = v1 - f1 * (v1 - v0) / (f1 - f0);
+            (v0, f0) = (v1, f1);
+            v1 = v2;
+            (p1, f1) = at(v1)?;
+        }
+        None
+    };
+    let mut points = Vec::with_capacity(SAMPLES + 1);
+    points.push(a);
+    for k in 1..SAMPLES {
+        #[allow(clippy::cast_precision_loss)]
+        let f = k as f64 / SAMPLES as f64;
+        points.push(row(ua + (ub - ua) * f, va + (vb - va) * f)?);
+    }
+    points.push(b);
+    brepkit_math::nurbs::fitting::interpolate(&points, 3)
+        .ok()
+        .map(EdgeCurve::NurbsCurve)
 }
 
 /// A torus round's end run on to a tilted or curved cap.
@@ -4379,18 +4846,23 @@ fn compute_stripe_for_spine(
 
     let config = WalkerConfig::default();
 
-    let walk_result = if let RadiusLaw::Constant(r) = law {
+    let closed = spine.is_closed();
+    let (walk_result, beyond) = if let RadiusLaw::Constant(r) = law {
         let blend = ConstRadBlend { radius: *r };
         let walker = Walker::new(&blend, ps1, ps2, &spine, topo, config);
         let start = walker.find_start(0.0)?;
-        walker.walk(start, 0.0, spine.length())?
+        let result = walker.walk(start, 0.0, spine.length())?;
+        let beyond = walk_beyond(&walker, start, &result, closed);
+        (result, beyond)
     } else {
         let evol = EvolRadBlend {
             law: mirror_law(law),
         };
         let walker = Walker::new(&evol, ps1, ps2, &spine, topo, config);
         let start = walker.find_start(0.0)?;
-        walker.walk(start, 0.0, spine.length())?
+        let result = walker.walk(start, 0.0, spine.length())?;
+        let beyond = walk_beyond(&walker, start, &result, closed);
+        (result, beyond)
     };
 
     if spine.is_closed() {
@@ -4416,6 +4888,7 @@ fn compute_stripe_for_spine(
         contact2,
         face1,
         face2,
+        beyond,
         sections: walk_result.sections,
     };
 
@@ -4424,6 +4897,28 @@ fn compute_stripe_for_spine(
         stripe,
         new_edges: Vec::new(),
     })
+}
+
+/// The ball rolled on past both ends of an open spine, out to four radii in
+/// steps of a quarter radius (see [`Stripe::beyond`]).
+fn walk_beyond<F: crate::blend_func::BlendFunction>(
+    walker: &Walker<'_, F>,
+    start: crate::blend_func::BlendParams,
+    result: &crate::walker::WalkResult,
+    closed: bool,
+) -> [Vec<crate::section::CircSection>; 2] {
+    if closed {
+        return Default::default();
+    }
+    let past = |at_end: bool, from, section: Option<&crate::section::CircSection>| {
+        section.map_or_else(Vec::new, |section| {
+            walker.walk_past_end(at_end, from, 0.25 * section.radius, 4.0 * section.radius)
+        })
+    };
+    [
+        past(false, start, result.sections.first()),
+        past(true, result.end_params, result.sections.last()),
+    ]
 }
 
 /// Refuses a walked band round a closed spine whose contacts leave their
