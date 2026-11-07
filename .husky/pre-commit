@@ -4,6 +4,9 @@
 # Full test suite runs in pre-push and CI.
 echo "🔍 Running pre-commit checks..."
 
+# Fork-only: names that must never be public stay out of every commit.
+scripts/check-commit-words.sh --staged || exit 1
+
 cargo fmt --all -- --check &
 FMT_PID=$!
 

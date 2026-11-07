@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Fork-only: names that must never be public stay out of every commit message.
+scripts/check-commit-words.sh --message "$1" || exit 1
+
 npx --no -- commitlint --edit "$1" 2>/dev/null || {
   echo "⚠️  commitlint not available, skipping commit message check."
   echo "   Run 'npm install' to enable conventional commit enforcement."

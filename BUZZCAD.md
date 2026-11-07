@@ -197,6 +197,16 @@ Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`
   When they do, end commit messages with the attribution line they give
   you.
 - **License.** brepkit is AGPL-3.0, and so is the bridge.
+- **Engine naming.** Three engines come up here: Open CASCADE (what
+  BuzzCAD records with), brepkit (what we fix), and a third engine whose
+  stored answers some cases are judged against. Never name the third
+  engine, in this repo, its docs, commits, PRs or replies: it is "the third
+  engine". This fork is public, main and BUZZCAD.md included, so main's
+  commit hooks run `scripts/check-commit-words.sh` on every commit (staged
+  lines, file names and the message) against the names above the marker in
+  the private word list, `buzzcad-corpus/tools/banned_words.txt`. In
+  upstream text Open CASCADE is "a reference kernel" or "some STEP writers"
+  (see "Sending fixes upstream").
 
 ## Sending fixes upstream
 
