@@ -894,35 +894,12 @@ fn boolean_inner(
                             .is_none_or(|cls_b| {
                                 all_component_centers_outside(topo, result, &pieces, cls_b, tol)
                             });
-                    // Touching pieces share no volume: a point inside each,
-                    // and a point just inside each of its faces, lies outside
-                    // every other. The builder splits faces along every
-                    // section, so a face of a piece overlapping another lies
-                    // wholly inside it; a builder that kept both copies of
-                    // coincident solids leaves pieces that fail the first.
-                    let meshes: Vec<Option<Vec<[Point3; 3]>>> = pieces
-                        .iter()
-                        .map(|p| component_triangles(topo, p))
-                        .collect();
-                    let only_touch = pieces.iter().enumerate().all(|(i, piece)| {
-                        let Some(own) = meshes[i].as_ref() else {
-                            return false;
-                        };
-                        let outside_others = |p: Point3| {
-                            meshes.iter().enumerate().all(|(j, mesh)| {
-                                i == j || mesh.as_ref().is_some_and(|m| !triangles_hold(m, p))
-                            })
-                        };
-                        component_interior_point(topo, piece).is_some_and(outside_others)
-                            && face_witnesses(topo, piece, own)
-                                .is_some_and(|ws| ws.into_iter().all(outside_others))
-                    });
                     if pieces.len() >= 2
-                        && only_touch
                         && euler_balanced(euler, holes, count(pieces.len()))
                         && components_are_disjoint_pieces(topo, &pieces)
                         && cut_safe
                         && is_closed_manifold(topo, result)?
+                        && pieces_only_touch(topo, &pieces)
                         && validate_boolean_result(topo, result).is_ok()
                     {
                         log::info!(
@@ -3588,71 +3565,138 @@ fn planar_face_centroid(topo: &Topology, fid: FaceId) -> Option<Point3> {
         .then_some(centroid)
 }
 
-/// A point inside a face component: its box centre when the component holds
-/// it, else the deepest point it holds stepped off one of its plane faces'
-/// centroids or the middle of one of its face edges. A thin strip bent along
-/// a lip holds no point near its box centre, so the centre alone says
-/// nothing about where the strip lies. Whether the component holds a point is
-/// read by ray parity on its own surface, tessellated once: the ray caster
-/// reads a trimmed torus face as its whole band. `None` when no point is
-/// found.
-/// A component's faces as triangles, meshed finely for its size.
-fn component_triangles(topo: &Topology, comp: &[FaceId]) -> Option<Vec<[Point3; 3]>> {
-    let (min, max) = component_aabb(topo, comp)?;
-    let deflection = ((max - min).length() * 1e-3).min(0.01);
-    let mut triangles: Vec<[Point3; 3]> = Vec::new();
-    for &fid in comp {
-        let mesh = crate::tessellate::tessellate_with_uvs(topo, fid, deflection).ok()?;
-        let pos = &mesh.mesh.positions;
-        for tri in mesh.mesh.indices.chunks_exact(3) {
-            triangles.push([
-                pos[tri[0] as usize],
-                pos[tri[1] as usize],
-                pos[tri[2] as usize],
-            ]);
-        }
-    }
-    Some(triangles)
+/// A component's surface, meshed once finely for its size: its triangles,
+/// each face's run of them, and the box they span.
+struct ComponentMesh {
+    deflection: f64,
+    triangles: Vec<[Point3; 3]>,
+    faces: Vec<std::ops::Range<usize>>,
+    min: Point3,
+    max: Point3,
 }
 
-/// A point just inside a component off each of its faces: the centroid of
-/// the face's largest mesh triangle, stepped along the triangle's normal to
-/// the side the component holds (`triangles`, its whole surface). `None`
-/// when a face has no triangle or no such point.
-fn face_witnesses(
-    topo: &Topology,
-    comp: &[FaceId],
-    triangles: &[[Point3; 3]],
-) -> Option<Vec<Point3>> {
-    let (min, max) = component_aabb(topo, comp)?;
-    let extent = (max - min).length();
-    let deflection = (extent * 1e-3).min(0.01);
-    let mut out = Vec::with_capacity(comp.len());
-    for &fid in comp {
-        let mesh = crate::tessellate::tessellate_with_uvs(topo, fid, deflection).ok()?;
-        let pos = &mesh.mesh.positions;
-        let [a, b, c] = mesh
-            .mesh
-            .indices
-            .chunks_exact(3)
-            .map(|t| [pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]])
-            .max_by(|p, q| {
-                let area = |[a, b, c]: &[Point3; 3]| (*b - *a).cross(*c - *a).length();
-                area(p).total_cmp(&area(q))
-            })?;
+impl ComponentMesh {
+    fn new(topo: &Topology, comp: &[FaceId]) -> Option<Self> {
+        let (min, max) = component_aabb(topo, comp)?;
+        let deflection = ((max - min).length() * 1e-3).min(0.01);
+        let mut triangles: Vec<[Point3; 3]> = Vec::new();
+        let mut faces = Vec::with_capacity(comp.len());
+        for &fid in comp {
+            let mesh = crate::tessellate::tessellate_with_uvs(topo, fid, deflection).ok()?;
+            let pos = &mesh.mesh.positions;
+            let from = triangles.len();
+            triangles.extend(
+                mesh.mesh
+                    .indices
+                    .chunks_exact(3)
+                    .map(|t| [pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]]),
+            );
+            faces.push(from..triangles.len());
+        }
+        // The box of the triangles themselves, which the ray reads: a curved
+        // face can bulge past the box of the component's sampled edges.
+        let (min, max) = if triangles.is_empty() {
+            (min, max)
+        } else {
+            let bounds =
+                brepkit_math::aabb::Aabb3::from_points(triangles.iter().flatten().copied());
+            (bounds.min, bounds.max)
+        };
+        Some(Self {
+            deflection,
+            triangles,
+            faces,
+            min,
+            max,
+        })
+    }
+
+    /// Whether the component holds `p`. A point outside its box is outside
+    /// it, which spares the ray most of the pieces of a large fuse.
+    fn holds(&self, p: Point3) -> bool {
+        let pad = 1e-9 * (self.max - self.min).length().max(1.0);
+        let within = |v: f64, lo: f64, hi: f64| v >= lo - pad && v <= hi + pad;
+        within(p.x(), self.min.x(), self.max.x())
+            && within(p.y(), self.min.y(), self.max.y())
+            && within(p.z(), self.min.z(), self.max.z())
+            && triangles_hold(&self.triangles, p)
+    }
+}
+
+/// Whether `pieces` share no volume and no face: each piece's interior point,
+/// and the points either side of each of its faces, lie outside every other
+/// piece. The builder splits faces along every section, so a face of a piece
+/// overlapping another lies wholly inside it, and a face pressed against
+/// another piece has that piece on its outer side; an edge or vertex contact
+/// has neither. A builder that kept both copies of coincident solids leaves
+/// pieces that fail the interior point.
+fn pieces_only_touch(topo: &Topology, pieces: &[Vec<FaceId>]) -> bool {
+    let meshes: Vec<Option<ComponentMesh>> =
+        pieces.iter().map(|p| ComponentMesh::new(topo, p)).collect();
+    // The other side of a curved face pressed against another piece lies in
+    // that piece only past the sag of its mesh.
+    let clear = 2.0
+        * meshes
+            .iter()
+            .flatten()
+            .map(|m| m.deflection)
+            .fold(0.0, f64::max);
+    pieces.iter().enumerate().all(|(i, piece)| {
+        let Some(own) = meshes[i].as_ref() else {
+            return false;
+        };
+        let outside_others = |p: Point3| {
+            meshes
+                .iter()
+                .enumerate()
+                .all(|(j, mesh)| i == j || mesh.as_ref().is_some_and(|m| !m.holds(p)))
+        };
+        component_interior_point(topo, piece).is_some_and(outside_others)
+            && face_witnesses(own, clear).is_some_and(|ws| ws.into_iter().all(outside_others))
+    })
+}
+
+/// Points off each of a component's faces: one just inside the component, one
+/// just as far outside, which a neighbour thinner than `clear` still holds, and
+/// one outside by at least `clear`, past the sag of a curved neighbour's mesh.
+/// Each is the centroid of the face's largest mesh triangle, stepped along the
+/// triangle's normal. `None` when a face has no triangle or no step lands in
+/// the component.
+fn face_witnesses(mesh: &ComponentMesh, clear: f64) -> Option<Vec<Point3>> {
+    let extent = (mesh.max - mesh.min).length();
+    let mut out = Vec::with_capacity(3 * mesh.faces.len());
+    for face in &mesh.faces {
+        let [a, b, c] = *mesh.triangles[face.clone()].iter().max_by(|p, q| {
+            let area = |[a, b, c]: &[Point3; 3]| (*b - *a).cross(*c - *a).length();
+            area(p).total_cmp(&area(q))
+        })?;
         let normal = (b - a).cross(c - a).normalize().ok()?;
         let centroid = Point3::new(
             (a.x() + b.x() + c.x()) / 3.0,
             (a.y() + b.y() + c.y()) / 3.0,
             (a.z() + b.z() + c.z()) / 3.0,
         );
-        let witness = [1e-6, 1e-5, 1e-4, 1e-3]
+        let (inside, near, far) = [1e-6, 1e-5, 1e-4, 1e-3]
             .into_iter()
             .map(|f| f * extent)
             .filter(|&step| step >= 1e-7)
-            .flat_map(|step| [centroid + normal * step, centroid - normal * step])
-            .find(|&p| triangles_hold(triangles, p))?;
-        out.push(witness);
+            .flat_map(|step| {
+                let reach = step.max(clear);
+                [
+                    (
+                        centroid + normal * step,
+                        centroid - normal * step,
+                        centroid - normal * reach,
+                    ),
+                    (
+                        centroid - normal * step,
+                        centroid + normal * step,
+                        centroid + normal * reach,
+                    ),
+                ]
+            })
+            .find(|&(inside, _, _)| mesh.holds(inside))?;
+        out.extend([inside, near, far]);
     }
     Some(out)
 }
@@ -3674,6 +3718,14 @@ fn triangles_hold(triangles: &[[Point3; 3]], p: Point3) -> bool {
         == 1
 }
 
+/// A point inside a face component: its box centre when the component holds
+/// it, else the deepest point it holds stepped off one of its plane faces'
+/// centroids or the middle of one of its face edges. A thin strip bent along
+/// a lip holds no point near its box centre, so the centre alone says
+/// nothing about where the strip lies. Whether the component holds a point is
+/// read by ray parity on its own surface, tessellated once: the ray caster
+/// reads a trimmed torus face as its whole band. `None` when no point is
+/// found.
 fn component_interior_point(topo: &Topology, comp: &[FaceId]) -> Option<Point3> {
     let (min, max) = component_aabb(topo, comp)?;
     let centre = Point3::new(

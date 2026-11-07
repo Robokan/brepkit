@@ -1,5 +1,47 @@
 # Changelog
 
+## [4.6.30](https://github.com/andymai/brepkit/compare/v4.6.29...v4.6.30) (2026-11-07)
+
+
+### Bug Fixes
+
+* **heal:** merge a sphere's two halves into one face when simplifying ([#2311](https://github.com/andymai/brepkit/issues/2311)) ([c4d72e5](https://github.com/andymai/brepkit/commit/c4d72e5245452aac53dfa8279d1715a5754ded74))
+
+## [4.6.29](https://github.com/andymai/brepkit/compare/v4.6.28...v4.6.29) (2026-11-07)
+
+
+### Bug Fixes
+
+* **blend:** run a straight round's ends on to tilted end faces ([#2309](https://github.com/andymai/brepkit/issues/2309)) ([0ffc2a1](https://github.com/andymai/brepkit/commit/0ffc2a13d497414cffb7284401b1cfde5935ccab))
+* **operations:** round an edge that ends at a concave corner ([#2313](https://github.com/andymai/brepkit/issues/2313)) ([0dd2f42](https://github.com/andymai/brepkit/commit/0dd2f426af1572d6cddf28cc0506bba81967c345))
+
+## [4.6.28](https://github.com/andymai/brepkit/compare/v4.6.27...v4.6.28) (2026-11-07)
+
+
+### Bug Fixes
+
+* **blend:** fillet a closed rim between a flat face and a B-spline wall ([#2310](https://github.com/andymai/brepkit/issues/2310)) ([41b7be5](https://github.com/andymai/brepkit/commit/41b7be5e6291adfe33a340cb4fcd6f806757d928))
+* **io:** write IGES faces as trimmed surfaces and sew them back into solids ([#2293](https://github.com/andymai/brepkit/issues/2293)) ([78b8956](https://github.com/andymai/brepkit/commit/78b895652f752d9fa127632ce9e4e7fc7894237a))
+* **operations:** build a revolve one face per profile edge, and sweep holes as passages ([#2292](https://github.com/andymai/brepkit/issues/2292)) ([75bdc26](https://github.com/andymai/brepkit/commit/75bdc2651ea6c8112abb76683d627a307bc689d7))
+* **operations:** chamfer tangent chains of lines and arcs exactly ([#2291](https://github.com/andymai/brepkit/issues/2291)) ([4b0dbc5](https://github.com/andymai/brepkit/commit/4b0dbc5ef24c2bc3001555977b33ed6ad58f2811))
+* **operations:** draft a cylinder wall along the pull into a cone ([#2308](https://github.com/andymai/brepkit/issues/2308)) ([c7eda33](https://github.com/andymai/brepkit/commit/c7eda33bdb82d73a600860f80d93f685b1af4b10))
+* **operations:** refuse touching pieces pressed together across a face ([#2307](https://github.com/andymai/brepkit/issues/2307)) ([3d8b02f](https://github.com/andymai/brepkit/commit/3d8b02fd45dca653db2782e6da9d09933ca9dc36))
+
+## [4.6.27](https://github.com/andymai/brepkit/compare/v4.6.26...v4.6.27) (2026-11-07)
+
+
+### Bug Fixes
+
+* **blend:** a cap notch splits a B-spline rim ([#2303](https://github.com/andymai/brepkit/issues/2303)) ([601c65c](https://github.com/andymai/brepkit/commit/601c65cbb840add70bb678556aef8824b2d828f2))
+* **blend:** a closed fillet band's seam is its round's arc, not a chord ([#2296](https://github.com/andymai/brepkit/issues/2296)) ([3a00729](https://github.com/andymai/brepkit/commit/3a007296303557da5d24f22a2ba064dc1bc59dbd))
+* **blend:** a radius at a mitre's limit to a file's digits builds ([#2304](https://github.com/andymai/brepkit/issues/2304)) ([c314845](https://github.com/andymai/brepkit/commit/c314845b6ea6b8f1cacc963086ebf3ccb76d2b55))
+* **blend:** mitre square corners read from files; one section where fillets run on round ([#2298](https://github.com/andymai/brepkit/issues/2298)) ([869ea38](https://github.com/andymai/brepkit/commit/869ea38075617d61388e0d1c765883be272cbed3))
+* **blend:** one vertex for contact ends a file's kink apart ([#2302](https://github.com/andymai/brepkit/issues/2302)) ([8e270ea](https://github.com/andymai/brepkit/commit/8e270ea3377c642f8b789944a01c76b141c3d8ac))
+* **blend:** refuse a closed contact on a plane face that a hole crosses ([#2297](https://github.com/andymai/brepkit/issues/2297)) ([6ba576f](https://github.com/andymai/brepkit/commit/6ba576fd924d629afbc46bf34dfdf5326d1a259f))
+* **blend:** set back trihedral corners whose stripes differ in length ([#2301](https://github.com/andymai/brepkit/issues/2301)) ([ab645b5](https://github.com/andymai/brepkit/commit/ab645b51c5a54923f439978e21e2c2d5edcc29b6))
+* **operations:** fuse solids that only touch into separate pieces ([#2289](https://github.com/andymai/brepkit/issues/2289)) ([158db58](https://github.com/andymai/brepkit/commit/158db58b62fcbe1e4b4706766abc9449a958d0ce))
+* **topology:** with no seed, a shell's faces vote on its boundary-walk convention ([#2299](https://github.com/andymai/brepkit/issues/2299)) ([adbee8d](https://github.com/andymai/brepkit/commit/adbee8db68755660eaebad21d4730735cecc0525))
+
 ## [4.6.26](https://github.com/andymai/brepkit/compare/v4.6.25...v4.6.26) (2026-11-03)
 
 
