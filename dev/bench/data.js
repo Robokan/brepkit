@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794072353417,
+  "lastUpdate": 1794082341833,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2483,6 +2483,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29178129,
             "range": "± 262268",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "7227a6d50a89d49894a3c2ff47780b2037e0a6bc",
+          "message": "fix(blend): refuse a walk step whose contact leaps along its face\n\nA ball too big for a hollow of a face, wedged where it cannot roll on,\ndrives its contact away along the face, and one step can then land on\nanother solution far along it. The band built through such sections\nstands off the face. A step whose contact moves more than 100 times the\nspine's step is now treated as a failed solve: the step halves, and the\nwalk fails if it never settles.\n\nSeen on a plate 100 thick with a drafted B-spline wall, its top rim\nrounded at r = 100: the contact ran 68 times the rim's speed, then\njumped 520 in one step; the band stood 36 off the wall and meshing the\nresult ran for minutes. The fillet now fails at once.\n\nAlso: BUZZCAD.md names each engine where \"the reference engine\" was\nambiguous; corpus_fillet times each face's mesh (TESSF).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-07T12:08:59-08:00",
+          "tree_id": "17540334682fcaad147df9402810a3658e050a9f",
+          "url": "https://github.com/Robokan/brepkit/commit/7227a6d50a89d49894a3c2ff47780b2037e0a6bc"
+        },
+        "date": 1794082341234,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 652125,
+            "range": "± 4931",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 722845,
+            "range": "± 3902",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8428,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 433988,
+            "range": "± 12869",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18918816,
+            "range": "± 375582",
             "unit": "ns/iter"
           }
         ]
