@@ -1846,10 +1846,15 @@ fn rebuild_mapped_parametric_face(
                 // A cross-face split (an earlier face's fast path split this
                 // face's boundary) leaves child sub-edges in the wire. Find
                 // the parent restriction geometrically: the child lies on
-                // the same carrier within the parent's span.
+                // the same carrier within the parent's span. Only a straight
+                // parent's span is its carrier: an arc's chord is not (a D's
+                // straight side runs along its arc's chord, end to end).
                 let Ok(edge) = topo.edge(eid) else {
                     return None;
                 };
+                if !matches!(edge.curve(), EdgeCurve::Line) {
+                    return None;
+                }
                 let cs = topo.vertex(edge.start()).map(Vertex::point).ok();
                 let ct = topo.vertex(edge.end()).map(Vertex::point).ok();
                 let (Some(cs), Some(ct)) = (cs, ct) else {
@@ -1868,6 +1873,9 @@ fn rebuild_mapped_parametric_face(
                     let Ok(source) = topo.edge(source_edge) else {
                         continue;
                     };
+                    if !matches!(source.curve(), EdgeCurve::Line) {
+                        continue;
+                    }
                     let ss = topo.vertex(source.start()).map(Vertex::point).ok();
                     let st = topo.vertex(source.end()).map(Vertex::point).ok();
                     let (Some(ss), Some(st)) = (ss, st) else {

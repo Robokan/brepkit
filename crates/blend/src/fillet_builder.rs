@@ -867,6 +867,9 @@ impl<'a> FilletBuilder<'a> {
                                 end_point,
                             )
                         }
+                        (Some(&RunOnCap::Plane(normal, d)), FaceSurface::Torus(torus)) => {
+                            torus_meets_plane(torus, normal, d, start_point, end_point)
+                        }
                         (Some(&RunOnCap::Face(cap)), FaceSurface::Cylinder(cylinder)) => {
                             cylinder_meets_cap(
                                 cylinder,
@@ -2892,8 +2895,28 @@ fn run_stripes_to_tilted_caps(
             continue;
         };
         let stripe = &result.stripe;
-        let FaceSurface::Cylinder(cylinder) = &stripe.surface else {
-            continue;
+        let cylinder = match &stripe.surface {
+            FaceSurface::Cylinder(cylinder) => cylinder,
+            FaceSurface::Torus(torus) => {
+                let torus = torus.clone();
+                if let Some(run) = torus_run_on(topo, junction, contour, stripe, &torus)? {
+                    let edge = stripe.spine_edges()[0];
+                    let result_stripe = &mut result.stripe;
+                    result_stripe.contact1 = run.contact1;
+                    result_stripe.contact2 = run.contact2;
+                    let section = &mut result_stripe.sections[run.end];
+                    section.p1 = run.p1;
+                    section.p2 = run.p2;
+                    section.center = run.centre;
+                    log::debug!(
+                        "terminal {:?}: torus round runs on to its tilted cap",
+                        junction.vertex
+                    );
+                    caps.insert((edge, run.end), RunOnCap::Plane(run.normal, run.d));
+                }
+                continue;
+            }
+            _ => continue,
         };
         if stripe.sections.len() != 2 {
             continue;
@@ -3025,6 +3048,226 @@ fn run_stripes_to_tilted_caps(
         caps.insert((edge, end), run_on);
     }
     Ok(caps)
+}
+
+/// A torus round's end run on to a tilted plane cap.
+struct TorusRunOn {
+    /// Which end of the stripe (0 at the spine's start, 1 at its end).
+    end: usize,
+    contact1: brepkit_math::nurbs::curve::NurbsCurve,
+    p1: Point3,
+    contact2: brepkit_math::nurbs::curve::NurbsCurve,
+    p2: Point3,
+    centre: Point3,
+    normal: Vec3,
+    d: f64,
+}
+
+/// Where the parallel of `torus` at tube angle `v` meets the plane
+/// `normal . p = d`: the angle round the axis nearest `near`, or `None`
+/// where it misses the plane.
+fn torus_parallel_meets_plane(
+    torus: &brepkit_math::surfaces::ToroidalSurface,
+    normal: Vec3,
+    d: f64,
+    v: f64,
+    near: f64,
+) -> Option<f64> {
+    let rho = torus.minor_radius().mul_add(v.cos(), torus.major_radius());
+    let centre = torus.center();
+    let a = rho * normal.dot(torus.x_axis());
+    let b = rho * normal.dot(torus.y_axis());
+    let k = d
+        - normal.dot(Vec3::new(centre.x(), centre.y(), centre.z()))
+        - torus.minor_radius() * v.sin() * normal.dot(torus.z_axis());
+    let h = a.hypot(b);
+    if h <= 1e-12 * rho.abs().max(1.0) || (k / h).abs() > 1.0 {
+        return None;
+    }
+    let (phase, spread) = (b.atan2(a), (k / h).acos());
+    let tau = std::f64::consts::TAU;
+    [phase + spread, phase - spread]
+        .into_iter()
+        .map(|u| u + tau * ((near - u) / tau).round())
+        .min_by(|p, q| (p - near).abs().total_cmp(&(q - near).abs()))
+}
+
+/// An angle wrapped into `(-pi, pi]`.
+fn wrapped(angle: f64) -> f64 {
+    let tau = std::f64::consts::TAU;
+    angle - tau * (angle / tau).round()
+}
+
+/// Runs a torus round's end on to a tilted planar cap.
+///
+/// A round of an arc between a plane and a coaxial wall (or of a circle on
+/// a revolved part) is a torus whose sections are its tube circles, square
+/// to the arc. Where the arc ends on a planar cap square to it the end
+/// section lies in the cap; where the cap is tilted the section stands off
+/// it, and the end was closed by a runout patch. Each contact, a parallel
+/// of the torus, is run on (or back) round the axis to where it meets the
+/// cap's plane, which lies on that support face's corner edge with the
+/// cap, and the band ends on its section by the cap's plane: each parallel
+/// between the two contacts cut by it.
+fn torus_run_on(
+    topo: &Topology,
+    junction: &crate::fillet_plan::VertexJunction,
+    contour: &crate::fillet_plan::FilletContour,
+    stripe: &Stripe,
+    torus: &brepkit_math::surfaces::ToroidalSurface,
+) -> Result<Option<TorusRunOn>, BlendError> {
+    // Below this the cap is square to the round's end.
+    const SQUARE: f64 = 1e-9;
+    // A cap this oblique to the end is left to the runout.
+    const OBLIQUE: f64 = 0.05;
+    const SAMPLES: usize = 16;
+    if stripe.sections.len() != 2 {
+        return Ok(None);
+    }
+    let fan: Vec<FaceId> = junction
+        .face_fan
+        .iter()
+        .copied()
+        .filter(|&face| face != contour.side1 && face != contour.side2)
+        .collect();
+    let [cap] = fan.as_slice() else {
+        return Ok(None);
+    };
+    let Some((normal, d)) = outward_plane(topo, *cap)? else {
+        return Ok(None);
+    };
+    let corner_edges = cap_corner_edges(topo, *cap, junction.vertex)?;
+    if corner_edges.len() != 2
+        || corner_edges.iter().any(|&edge| {
+            !topo
+                .edge(edge)
+                .is_ok_and(|e| matches!(e.curve(), EdgeCurve::Line))
+        })
+    {
+        return Ok(None);
+    }
+    let vertex = topo.vertex(junction.vertex)?.point();
+    let end = usize::from(spine_ends_at(topo, stripe, vertex)?);
+    let section = &stripe.sections[end];
+    let (u_end, _) = torus.project_point(section.center);
+    let tangent = torus.y_axis() * u_end.cos() - torus.x_axis() * u_end.sin();
+    let tilt = normal.dot(tangent).abs();
+    if tilt >= 1.0 - SQUARE || tilt <= OBLIQUE {
+        return Ok(None);
+    }
+    let scale = (section.p1 - section.p2).length();
+    let tol = 1e-6 * scale.max(1.0);
+    let mut contacts = Vec::with_capacity(2);
+    for (contact, at) in [
+        (&stripe.contact1, section.p1),
+        (&stripe.contact2, section.p2),
+    ] {
+        let (t0, t1) = contact.domain();
+        let (_, at_end) = contact_end_at(contact, at);
+        let (from, to) = if at_end { (t0, t1) } else { (t1, t0) };
+        let far = contact.evaluate(from);
+        let (u_far, v) = torus.project_point(far);
+        // The contact is the parallel at `v`: its sweep round the axis from
+        // its far end to its near one, read over its samples.
+        let mut sweep = 0.0;
+        let mut previous = u_far;
+        let mut parallel = true;
+        for k in 1..=SAMPLES {
+            #[allow(clippy::cast_precision_loss)]
+            let t = from + (to - from) * (k as f64) / (SAMPLES as f64);
+            let point = contact.evaluate(t);
+            let (u, v_k) = torus.project_point(point);
+            if wrapped(v_k - v).abs() > 1e-9 || (torus.evaluate(u, v) - point).length() > tol {
+                parallel = false;
+                break;
+            }
+            sweep += wrapped(u - previous);
+            previous = u;
+        }
+        if !parallel {
+            break;
+        }
+        let Some(u_new) = torus_parallel_meets_plane(torus, normal, d, v, u_far + sweep) else {
+            break;
+        };
+        let new_sweep = u_new - u_far;
+        if new_sweep * sweep <= 0.0 || new_sweep.abs() <= 0.05 * sweep.abs() {
+            break;
+        }
+        let reached = torus.evaluate(u_new, v);
+        let mut on_corner = false;
+        for &edge in &corner_edges {
+            on_corner |= point_on_edge(topo, edge, reached, tol)?;
+        }
+        if !on_corner {
+            break;
+        }
+        let rho = torus.minor_radius().mul_add(v.cos(), torus.major_radius());
+        if rho <= 0.0 {
+            break;
+        }
+        let circle = Circle3D::with_axes(
+            torus.center() + torus.z_axis() * (torus.minor_radius() * v.sin()),
+            torus.z_axis(),
+            rho,
+            torus.x_axis(),
+            torus.y_axis(),
+        )?;
+        let curve = if at_end {
+            crate::analytic::circle_arc_to_nurbs(&circle, u_far, u_new)?
+        } else {
+            crate::analytic::circle_arc_to_nurbs(&circle, u_new, u_far)?
+        };
+        contacts.push((curve, reached, u_new));
+    }
+    let Ok([(contact1, p1, u1), (contact2, p2, u2)]) = <[_; 2]>::try_from(contacts) else {
+        return Ok(None);
+    };
+    // The section's centre: the tube's centre midway round between the two
+    // contact ends.
+    let u_mid = u1 + 0.5 * wrapped(u2 - u1);
+    let centre = torus.center()
+        + (torus.x_axis() * u_mid.cos() + torus.y_axis() * u_mid.sin()) * torus.major_radius();
+    Ok(Some(TorusRunOn {
+        end,
+        contact1,
+        p1,
+        contact2,
+        p2,
+        centre,
+        normal,
+        d,
+    }))
+}
+
+/// The curve where a torus band meets the plane `normal . p = d` between
+/// the contact ends `a` and `b`: each parallel of the band, the shorter way
+/// round its tube from `a` to `b`, cut by the plane, and a cubic through
+/// those points. `None` where a parallel misses the plane.
+fn torus_meets_plane(
+    torus: &brepkit_math::surfaces::ToroidalSurface,
+    normal: Vec3,
+    d: f64,
+    a: Point3,
+    b: Point3,
+) -> Option<EdgeCurve> {
+    const SAMPLES: usize = 32;
+    let (ua, va) = torus.project_point(a);
+    let (ub, vb) = torus.project_point(b);
+    let (du, dv) = (wrapped(ub - ua), wrapped(vb - va));
+    let mut points = Vec::with_capacity(SAMPLES + 1);
+    points.push(a);
+    for k in 1..SAMPLES {
+        #[allow(clippy::cast_precision_loss)]
+        let f = k as f64 / SAMPLES as f64;
+        let v = va + dv * f;
+        let u = torus_parallel_meets_plane(torus, normal, d, v, ua + du * f)?;
+        points.push(torus.evaluate(u, v));
+    }
+    points.push(b);
+    brepkit_math::nurbs::fitting::interpolate(&points, 3)
+        .ok()
+        .map(EdgeCurve::NurbsCurve)
 }
 
 /// Whether a stripe's terminal vertex sits on a planar cap whose two edges
