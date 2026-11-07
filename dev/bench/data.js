@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794017777414,
+  "lastUpdate": 1794021961728,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -1997,6 +1997,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29295107,
             "range": "± 77277",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "0bdca767189bf01419261de695e71d58136eb32d",
+          "message": "docs(buzzcad): progress, unequal-stripe set-backs (#15), PR #2301\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-06T19:22:44-08:00",
+          "tree_id": "d116e82410af984fb583a344d121d67480555c2c",
+          "url": "https://github.com/Robokan/brepkit/commit/0bdca767189bf01419261de695e71d58136eb32d"
+        },
+        "date": 1794021961268,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1145787,
+            "range": "± 979",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1238758,
+            "range": "± 8043",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13666,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 745207,
+            "range": "± 2034",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29502655,
+            "range": "± 37146",
             "unit": "ns/iter"
           }
         ]
