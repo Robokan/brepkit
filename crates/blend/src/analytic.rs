@@ -5323,7 +5323,7 @@ fn arc_span_end(u_start: f64, u_mid: f64, u_end: f64) -> f64 {
 /// `brepkit-geometry`. The geometry crate has the same algorithm in
 /// `convert::curve_to_nurbs::circle_to_nurbs`; consolidating both into the
 /// math layer is a follow-up.
-fn circle_arc_to_nurbs(
+pub fn circle_arc_to_nurbs(
     circle: &brepkit_math::curves::Circle3D,
     t_start: f64,
     t_end: f64,
