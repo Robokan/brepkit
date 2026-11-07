@@ -185,9 +185,25 @@ fn main() {
         if std::env::var("SIDES").is_ok() {
             sides(&topo, sid, eid);
         }
+        if std::env::var("VERTS").is_ok() {
+            for v in [e.start(), e.end()] {
+                println!("    {v:?} {:?}", topo.vertex(v).unwrap().point());
+            }
+        }
         edges.push(eid);
     }
     edges.dedup();
+    // PICK=0,2,5 keeps only those positions of the case's pick list.
+    if let Ok(keep) = std::env::var("PICK") {
+        let keep: Vec<usize> = keep.split(',').map(|k| k.trim().parse().unwrap()).collect();
+        edges = edges
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep.contains(i))
+            .map(|(_, &e)| e)
+            .collect();
+        println!("keeping picks {keep:?}");
+    }
     let t = std::time::Instant::now();
     match brepkit_operations::blend_ops::fillet_v2(&mut topo, sid, &edges, radius) {
         Err(e) => println!("fillet r={radius}: error: {e}"),
