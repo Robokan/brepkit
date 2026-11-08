@@ -500,17 +500,17 @@ pub fn create_blend_face_from_registry(
     topo: &mut Topology,
     stripe: &Stripe,
     registry: &mut crate::boundary_registry::BoundaryRegistry,
-    contact1: (crate::boundary_registry::BoundaryHandle, usize),
-    contact2: (crate::boundary_registry::BoundaryHandle, usize),
+    contact1: &[(crate::boundary_registry::BoundaryHandle, usize)],
+    contact2: &[(crate::boundary_registry::BoundaryHandle, usize)],
     cross_end: Option<(crate::boundary_registry::BoundaryHandle, usize)>,
     cross_start: Option<(crate::boundary_registry::BoundaryHandle, usize)>,
 ) -> Result<BlendFaceInfo, BlendError> {
     let mut boundaries = Vec::with_capacity(4);
-    boundaries.push(contact1);
+    boundaries.extend_from_slice(contact1);
     if let Some(boundary) = cross_end {
         boundaries.push(boundary);
     }
-    boundaries.push(contact2);
+    boundaries.extend_from_slice(contact2);
     if let Some(boundary) = cross_start {
         boundaries.push(boundary);
     }

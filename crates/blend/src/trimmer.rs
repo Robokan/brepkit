@@ -1155,8 +1155,12 @@ pub type PlanarRestriction = ParametricRestriction;
 pub struct BatchTrimResult {
     /// Replacement for the requested source face.
     pub trimmed_face: FaceId,
-    /// Contact edges in restriction order.
+    /// Contact edges in restriction order: each contact's first piece.
     pub contact_edges: Vec<EdgeId>,
+    /// Each contact's edges in restriction order, along the contact: one
+    /// edge, or two where an open contact crosses its periodic face's own
+    /// seam and the face's wire runs on round the seam between them.
+    pub contact_pieces: Vec<Vec<EdgeId>>,
     /// Edges copied from source boundaries and contact edges.
     pub new_edges: Vec<EdgeId>,
     /// Vertices minted at arrangement intersections.
@@ -1446,6 +1450,133 @@ fn mapped_planar_corner_geometry(
     )))
 }
 
+/// Where an open contact crosses its face's own seam (an edge a wire of the
+/// face runs twice), away from both the contact's ends and the seam's: the
+/// point on the seam and the contact curve's parameter there. Straight seams
+/// only (a ruled or extruded wall's).
+fn contact_crosses_own_seam(
+    topo: &Topology,
+    wire_ids: &[WireId],
+    contact_edge: EdgeId,
+) -> Result<Option<(Point3, f64)>, BlendError> {
+    /// How far a fitted contact may pass from the seam line it crosses.
+    const ON_SEAM: f64 = 1e-4;
+    let contact = topo.edge(contact_edge)?;
+    let (cs, ce) = (
+        topo.vertex(contact.start())?.point(),
+        topo.vertex(contact.end())?.point(),
+    );
+    let curve = contact.curve();
+    let (d0, d1) = curve.domain_with_endpoints(cs, ce);
+    for &wire_id in wire_ids {
+        let wire = topo.wire(wire_id)?;
+        for (position, oriented) in wire.edges().iter().enumerate() {
+            let seam = oriented.edge();
+            let repeated = wire
+                .edges()
+                .iter()
+                .skip(position + 1)
+                .any(|other| other.edge() == seam);
+            if !repeated {
+                continue;
+            }
+            let edge = topo.edge(seam)?;
+            if !matches!(edge.curve(), EdgeCurve::Line) {
+                continue;
+            }
+            let a = topo.vertex(edge.start())?.point();
+            let b = topo.vertex(edge.end())?.point();
+            let span = b - a;
+            let length = span.length();
+            let Ok(dir) = span.normalize() else {
+                continue;
+            };
+            let off = |t: f64| {
+                (curve.evaluate_with_endpoints(t, cs, ce) - a)
+                    .cross(dir)
+                    .length()
+            };
+            let samples = 256_u32;
+            let step = (d1 - d0) / f64::from(samples);
+            let mut best = (d0, off(d0));
+            for i in 1..=samples {
+                let t = step.mul_add(f64::from(i), d0);
+                let d = off(t);
+                if d < best.1 {
+                    best = (t, d);
+                }
+            }
+            let (low, high) = (d0.min(d1), d0.max(d1));
+            let mut lo = (best.0 - step.abs()).clamp(low, high);
+            let mut hi = (best.0 + step.abs()).clamp(low, high);
+            for _ in 0..200 {
+                if hi - lo <= f64::EPSILON * lo.abs().max(hi.abs()).max(1.0) {
+                    break;
+                }
+                let m1 = lo + (hi - lo) / 3.0;
+                let m2 = hi - (hi - lo) / 3.0;
+                if off(m1) < off(m2) {
+                    hi = m2;
+                } else {
+                    lo = m1;
+                }
+            }
+            let t = 0.5 * (lo + hi);
+            if off(t) > ON_SEAM {
+                continue;
+            }
+            let q = curve.evaluate_with_endpoints(t, cs, ce);
+            let along = (q - a).dot(dir);
+            let point = a + dir * along;
+            let clear = 1e3 * VERTEX_TOL;
+            if along <= clear
+                || along >= length - clear
+                || (point - cs).length() <= clear
+                || (point - ce).length() <= clear
+            {
+                continue;
+            }
+            return Ok(Some((point, t)));
+        }
+    }
+    Ok(None)
+}
+
+/// The piece of a contact that replaces `source_run`: the one whose ends lie
+/// nearest the run's, either way round.
+fn contact_piece_for_run(
+    topo: &Topology,
+    face_id: FaceId,
+    pieces: &[EdgeId],
+    source_run: &[OrientedEdge],
+) -> Result<EdgeId, BlendError> {
+    if let [only] = pieces {
+        return Ok(*only);
+    }
+    let (Some(first), Some(last)) = (source_run.first(), source_run.last()) else {
+        return Err(BlendError::TrimmingFailure { face: face_id });
+    };
+    let run_start = topo
+        .vertex(first.oriented_start(topo.edge(first.edge())?))?
+        .point();
+    let run_end = topo
+        .vertex(last.oriented_end(topo.edge(last.edge())?))?
+        .point();
+    let mut best: Option<(EdgeId, f64)> = None;
+    for &piece in pieces {
+        let edge = topo.edge(piece)?;
+        let a = topo.vertex(edge.start())?.point();
+        let b = topo.vertex(edge.end())?.point();
+        let distance = ((a - run_start).length() + (b - run_end).length())
+            .min((b - run_start).length() + (a - run_end).length());
+        if best.is_none_or(|(_, d)| distance < d) {
+            best = Some((piece, distance));
+        }
+    }
+    best.map(|(piece, _)| piece)
+        .ok_or(BlendError::TrimmingFailure { face: face_id })
+}
+
 fn mapped_contact_forward(
     topo: &Topology,
     face_id: FaceId,
@@ -1718,6 +1849,58 @@ fn rebuild_mapped_parametric_face(
         let curve = restriction.curve.clone().unwrap_or(EdgeCurve::Line);
         contact_edges.push(topo.add_edge(Edge::new(start_vertex, end_vertex, curve)));
     }
+    // An open contact on a periodic face may cross the face's own seam, the
+    // round's edges running on round the seam's foot (a closed spline wall's
+    // rim rounded across the seam's vertex). The face's wire then runs from
+    // one side of the removed run round the seam to the other: the contact
+    // is cut on the seam, each piece replacing one side, and the seam is cut
+    // there too, its foot dropped with the run.
+    let mut contact_pieces: Vec<Vec<EdgeId>> = contact_edges.iter().map(|&e| vec![e]).collect();
+    let mut seam_feet: Vec<(VertexId, usize)> = Vec::new();
+    if surface_u_period(&surface).is_some() {
+        for index in 0..contact_edges.len() {
+            let contact_edge = contact_edges[index];
+            if restrictions[index].source_edges.is_empty() {
+                continue;
+            }
+            let Some((point, t)) = contact_crosses_own_seam(topo, &wire_ids, contact_edge)? else {
+                continue;
+            };
+            let seam_vertex =
+                mapped_vertex_for_point(topo, &mut known_vertices, &mut new_vertices, point);
+            let contact = topo.edge(contact_edge)?.clone();
+            let (start_vertex, end_vertex) = (contact.start(), contact.end());
+            if start_vertex == end_vertex
+                || seam_vertex == start_vertex
+                || seam_vertex == end_vertex
+            {
+                continue;
+            }
+            let (first_curve, second_curve) = match contact.curve() {
+                EdgeCurve::NurbsCurve(nurbs) => {
+                    let sp = topo.vertex(start_vertex)?.point();
+                    let ep = topo.vertex(end_vertex)?.point();
+                    let (d0, d1) = contact.curve().domain_with_endpoints(sp, ep);
+                    let (left, right) = brepkit_math::nurbs::knot_ops::curve_split(nurbs, t)?;
+                    let (first, second) = if d0 <= d1 {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    (EdgeCurve::NurbsCurve(first), EdgeCurve::NurbsCurve(second))
+                }
+                EdgeCurve::Line => (EdgeCurve::Line, EdgeCurve::Line),
+                // An arc keeps its carrier: its ends bound each piece.
+                other => (other.clone(), other.clone()),
+            };
+            let first = topo.add_edge(Edge::new(start_vertex, seam_vertex, first_curve));
+            let second = topo.add_edge(Edge::new(seam_vertex, end_vertex, second_curve));
+            closed_vertices.insert(seam_vertex);
+            contact_edges[index] = first;
+            contact_pieces[index] = vec![first, second];
+            seam_feet.push((seam_vertex, index));
+        }
+    }
     {
         let single_contact = restrictions.len() == 1;
         for &vertex_id in &new_vertices.clone() {
@@ -1725,7 +1908,11 @@ fn rebuild_mapped_parametric_face(
             'edges: for &wire_id in &wire_ids {
                 let wire = topo.wire(wire_id)?;
                 for &oriented in wire.edges() {
-                    if contact_edges.contains(&oriented.edge()) {
+                    if contact_pieces
+                        .iter()
+                        .flatten()
+                        .any(|&e| e == oriented.edge())
+                    {
                         continue;
                     }
                     let edge = topo.edge(oriented.edge())?;
@@ -1863,7 +2050,39 @@ fn rebuild_mapped_parametric_face(
             }
         }
     }
+    // The seam's foot, from where a contact crosses it down to the removed
+    // run, goes with the run on either side.
+    for &(seam_vertex, index) in &seam_feet {
+        let run_vertices: std::collections::HashSet<VertexId> = restriction_for_edge
+            .iter()
+            .filter(|&(_, &owner)| owner == index)
+            .filter_map(|(&edge, _)| topo.edge(edge).ok())
+            .flat_map(|edge| [edge.start(), edge.end()])
+            .collect();
+        for &wire_id in &wire_ids {
+            let wire = topo.wire(wire_id)?;
+            for oriented in wire.edges() {
+                let uses = wire
+                    .edges()
+                    .iter()
+                    .filter(|other| other.edge() == oriented.edge())
+                    .count();
+                let edge = topo.edge(oriented.edge())?;
+                let foot = if edge.start() == seam_vertex {
+                    edge.end()
+                } else if edge.end() == seam_vertex {
+                    edge.start()
+                } else {
+                    continue;
+                };
+                if uses == 2 && run_vertices.contains(&foot) {
+                    restriction_for_edge.insert(oriented.edge(), index);
+                }
+            }
+        }
+    }
     let mut emitted = vec![0_usize; restrictions.len()];
+    let mut used_pieces = std::collections::HashSet::new();
     let mut retained_source_edges = std::collections::HashSet::new();
     // Periodic supports wrap onto themselves: the seam is one geometric
     // segment traversed twice (forward and reverse) in the face wire, exactly
@@ -1874,7 +2093,7 @@ fn rebuild_mapped_parametric_face(
         std::collections::HashMap::new();
     let period = surface_u_period(&surface);
     let mut result_wires = Vec::with_capacity(wire_ids.len());
-    let mut new_edges = contact_edges.clone();
+    let mut new_edges: Vec<EdgeId> = contact_pieces.iter().flatten().copied().collect();
     let mut connector_pcurves = Vec::new();
     for &wire_id in &wire_ids {
         let source_wire = topo.wire(wire_id)?.clone();
@@ -1987,15 +2206,17 @@ fn rebuild_mapped_parametric_face(
                         consumed += 1;
                     }
                     emitted[restriction_index] += 1;
+                    let contact = contact_piece_for_run(
+                        topo,
+                        face_id,
+                        &contact_pieces[restriction_index],
+                        &source_run,
+                    )?;
+                    used_pieces.insert(contact);
                     pieces.push((
                         OrientedEdge::new(
-                            contact_edges[restriction_index],
-                            mapped_contact_forward(
-                                topo,
-                                face_id,
-                                contact_edges[restriction_index],
-                                &source_run,
-                            )?,
+                            contact,
+                            mapped_contact_forward(topo, face_id, contact, &source_run)?,
                         ),
                         true,
                     ));
@@ -2147,7 +2368,16 @@ fn rebuild_mapped_parametric_face(
         }
         result_wires.push(topo.add_wire(Wire::new(reconstructed, true)?));
     }
-    if emitted.iter().any(|&count| count != 1) {
+    if emitted
+        .iter()
+        .zip(&contact_pieces)
+        .any(|(&count, pieces)| count != pieces.len())
+        || contact_pieces
+            .iter()
+            .filter(|pieces| pieces.len() > 1)
+            .flatten()
+            .any(|piece| !used_pieces.contains(piece))
+    {
         return Err(BlendError::TrimmingFailure { face: face_id });
     }
 
@@ -2159,8 +2389,17 @@ fn rebuild_mapped_parametric_face(
             topo.pcurves_mut().set(source_edge, trimmed_face, pcurve);
         }
     }
-    for (restriction_index, &contact_edge) in contact_edges.iter().enumerate() {
-        let pcurve = if let Some(pcurve) = restrictions[restriction_index].pcurve.clone() {
+    for (restriction_index, &contact_edge) in contact_pieces
+        .iter()
+        .enumerate()
+        .flat_map(|(index, pieces)| pieces.iter().map(move |piece| (index, piece)))
+    {
+        let whole = contact_pieces[restriction_index].len() == 1;
+        let pcurve = if let Some(pcurve) = restrictions[restriction_index]
+            .pcurve
+            .clone()
+            .filter(|_| whole)
+        {
             pcurve
         } else {
             let contact = topo.edge(contact_edge)?;
@@ -2179,6 +2418,7 @@ fn rebuild_mapped_parametric_face(
     Ok(Some(BatchTrimResult {
         trimmed_face,
         contact_edges,
+        contact_pieces,
         new_edges,
         new_vertices,
         incident_replacements: Vec::new(),
@@ -3480,9 +3720,11 @@ fn trim_parametric_face_batch_in_place(
             (!source_vertex_nodes.contains(&index)).then_some(*vertex)
         })
         .collect();
+    let contact_pieces = contact_edges.iter().map(|&edge| vec![edge]).collect();
     Ok(BatchTrimResult {
         trimmed_face,
         contact_edges,
+        contact_pieces,
         new_edges,
         new_vertices,
         incident_replacements,

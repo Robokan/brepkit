@@ -489,6 +489,14 @@ impl<'a> FilletBuilder<'a> {
             Option<crate::boundary_registry::BoundaryHandle>,
             Option<crate::boundary_registry::BoundaryHandle>,
         )> = regular_results.iter().map(|_| (None, None)).collect();
+        // Every piece of each side's contact, along the contact, where the
+        // trim cut it in pieces (on its support's own seam); empty otherwise,
+        // the side's one handle above being the whole contact.
+        let mut stripe_contact_chains: Vec<[Vec<crate::boundary_registry::BoundaryHandle>; 2]> =
+            regular_results
+                .iter()
+                .map(|_| [Vec::new(), Vec::new()])
+                .collect();
         let mut stripe_contact_edges: Vec<(
             Option<brepkit_topology::edge::EdgeId>,
             Option<brepkit_topology::edge::EdgeId>,
@@ -712,86 +720,112 @@ impl<'a> FilletBuilder<'a> {
                 face_replacements.entry(source).or_insert(replacement);
             }
             for (index, &(si, _)) in restrictions.iter().enumerate() {
-                let Some(&contact_edge) = batch.contact_edges.get(index) else {
+                let Some(pieces) = batch.contact_pieces.get(index) else {
                     return Err(BlendError::TrimmingFailure { face: face_id });
                 };
-                let stripe = &regular_results[si].stripe;
-                let support_forward = std::iter::once(topo.face(batch.trimmed_face)?.outer_wire())
-                    .chain(topo.face(batch.trimmed_face)?.inner_wires().iter().copied())
-                    .find_map(|wire_id| {
-                        topo.wire(wire_id)
-                            .ok()?
-                            .edges()
-                            .iter()
-                            .find_map(|oriented| {
-                                (oriented.edge() == contact_edge).then_some(oriented.is_forward())
+                let mut chain = Vec::with_capacity(pieces.len());
+                for (piece, &contact_edge) in pieces.iter().enumerate() {
+                    let stripe = &regular_results[si].stripe;
+                    let support_forward =
+                        std::iter::once(topo.face(batch.trimmed_face)?.outer_wire())
+                            .chain(topo.face(batch.trimmed_face)?.inner_wires().iter().copied())
+                            .find_map(|wire_id| {
+                                topo.wire(wire_id)
+                                    .ok()?
+                                    .edges()
+                                    .iter()
+                                    .find_map(|oriented| {
+                                        (oriented.edge() == contact_edge)
+                                            .then_some(oriented.is_forward())
+                                    })
                             })
-                    })
-                    .ok_or(BlendError::TrimmingFailure { face: face_id })?;
-                let contour_id = plan
-                    .as_ref()
-                    .and_then(|fillet_plan| {
-                        fillet_plan
-                            .contours
-                            .iter()
-                            .position(|contour| contour.spine.edges() == stripe.spine_edges())
-                    })
-                    .unwrap_or(si);
-                let side = if stripe.face1 == face_id { 0 } else { 1 };
-                let edge = topo.edge(contact_edge)?;
-                let start = edge.start();
-                let end = edge.end();
-                let curve = restrictions[index]
-                    .1
-                    .curve
-                    .clone()
-                    .unwrap_or(EdgeCurve::Line);
-                let start_point = topo.vertex(start)?.point();
-                let end_point = topo.vertex(end)?.point();
-                let periodic_support = matches!(
-                    topo.face(face_id)?.surface(),
-                    FaceSurface::Cylinder(_)
-                        | FaceSurface::Cone(_)
-                        | FaceSurface::Torus(_)
-                        | FaceSurface::Sphere(_)
-                ) || matches!(
-                    topo.face(face_id)?.surface(),
-                    FaceSurface::Nurbs(surface) if surface.is_periodic_u()
-                );
-                let start_vertex = if periodic_support {
-                    PlannedVertex::periodic(start, (contour_id as u64) << 32 | (side as u64) << 8)
-                } else {
-                    PlannedVertex::new(start)
-                };
-                let end_vertex = if periodic_support {
-                    PlannedVertex::periodic(end, (contour_id as u64) << 32 | (side as u64) << 8 | 1)
-                } else {
-                    PlannedVertex::new(end)
-                };
-                let handle = boundary_registry.register(
-                    BoundaryKey::contact(contour_id, 0, side),
-                    start_vertex,
-                    end_vertex,
-                    curve.clone(),
-                    curve.domain_with_endpoints(start_point, end_point),
-                    [
-                        BoundaryOwner::planned(
-                            format!("support face {face_id:?} contour {contour_id}"),
-                            support_forward,
-                        ),
-                        BoundaryOwner::planned(
-                            format!("blend contour {contour_id} contact {side}"),
-                            side == 0,
-                        ),
-                    ],
-                )?;
-                boundary_registry.bind_existing_edge(topo, handle, contact_edge)?;
-                if side == 0 {
-                    stripe_contact_handles[si].0 = Some(handle);
-                    stripe_contact_edges[si].0 = Some(contact_edge);
-                } else {
-                    stripe_contact_handles[si].1 = Some(handle);
-                    stripe_contact_edges[si].1 = Some(contact_edge);
+                            .ok_or(BlendError::TrimmingFailure { face: face_id })?;
+                    let contour_id =
+                        plan.as_ref()
+                            .and_then(|fillet_plan| {
+                                fillet_plan.contours.iter().position(|contour| {
+                                    contour.spine.edges() == stripe.spine_edges()
+                                })
+                            })
+                            .unwrap_or(si);
+                    let side = if stripe.face1 == face_id { 0 } else { 1 };
+                    let edge = topo.edge(contact_edge)?;
+                    let start = edge.start();
+                    let end = edge.end();
+                    let curve = if pieces.len() == 1 {
+                        restrictions[index]
+                            .1
+                            .curve
+                            .clone()
+                            .unwrap_or(EdgeCurve::Line)
+                    } else {
+                        edge.curve().clone()
+                    };
+                    let start_point = topo.vertex(start)?.point();
+                    let end_point = topo.vertex(end)?.point();
+                    let periodic_support = matches!(
+                        topo.face(face_id)?.surface(),
+                        FaceSurface::Cylinder(_)
+                            | FaceSurface::Cone(_)
+                            | FaceSurface::Torus(_)
+                            | FaceSurface::Sphere(_)
+                    ) || matches!(
+                        topo.face(face_id)?.surface(),
+                        FaceSurface::Nurbs(surface) if surface.is_periodic_u()
+                    );
+                    // A contact in pieces keys the vertices between them
+                    // apart from its two ends.
+                    let key = |at: usize| -> u64 {
+                        let slot = match at {
+                            0 => 0,
+                            at if at == pieces.len() => 1,
+                            at => 1 + at as u64,
+                        };
+                        (contour_id as u64) << 32 | (side as u64) << 8 | slot
+                    };
+                    let start_vertex = if periodic_support {
+                        PlannedVertex::periodic(start, key(piece))
+                    } else {
+                        PlannedVertex::new(start)
+                    };
+                    let end_vertex = if periodic_support {
+                        PlannedVertex::periodic(end, key(piece + 1))
+                    } else {
+                        PlannedVertex::new(end)
+                    };
+                    let handle = boundary_registry.register(
+                        BoundaryKey::contact(contour_id, piece, side),
+                        start_vertex,
+                        end_vertex,
+                        curve.clone(),
+                        curve.domain_with_endpoints(start_point, end_point),
+                        [
+                            BoundaryOwner::planned(
+                                format!("support face {face_id:?} contour {contour_id}"),
+                                support_forward,
+                            ),
+                            BoundaryOwner::planned(
+                                format!("blend contour {contour_id} contact {side}"),
+                                side == 0,
+                            ),
+                        ],
+                    )?;
+                    boundary_registry.bind_existing_edge(topo, handle, contact_edge)?;
+                    chain.push(handle);
+                    if piece > 0 {
+                        continue;
+                    }
+                    if side == 0 {
+                        stripe_contact_handles[si].0 = Some(handle);
+                        stripe_contact_edges[si].0 = Some(contact_edge);
+                    } else {
+                        stripe_contact_handles[si].1 = Some(handle);
+                        stripe_contact_edges[si].1 = Some(contact_edge);
+                    }
+                }
+                if chain.len() > 1 {
+                    let side = usize::from(regular_results[si].stripe.face1 != face_id);
+                    stripe_contact_chains[si][side] = chain;
                 }
             }
         }
@@ -863,46 +897,47 @@ impl<'a> FilletBuilder<'a> {
                         .unwrap_or(stripe.face2),
                 ];
                 let terminals = ordered_spine_endpoints(topo, &stripe.spine)?;
-                if let Some(forward) = contact_forward_for_spine(
-                    topo,
-                    &boundary_registry,
-                    contact1,
-                    support_faces[0],
-                    terminals,
-                    true,
-                )? {
-                    boundary_registry.set_owner_forward(contact1, 1, forward)?;
+                let chains = [
+                    if stripe_contact_chains[si][0].is_empty() {
+                        vec![contact1]
+                    } else {
+                        stripe_contact_chains[si][0].clone()
+                    },
+                    if stripe_contact_chains[si][1].is_empty() {
+                        vec![contact2]
+                    } else {
+                        stripe_contact_chains[si][1].clone()
+                    },
+                ];
+                for (side, chain) in chains.iter().enumerate() {
+                    if let Some(forward) = contact_forward_for_spine(
+                        topo,
+                        &boundary_registry,
+                        chain,
+                        support_faces[side],
+                        terminals,
+                        side == 0,
+                    )? {
+                        for &handle in chain {
+                            boundary_registry.set_owner_forward(handle, 1, forward)?;
+                        }
+                    }
                 }
-                if let Some(forward) = contact_forward_for_spine(
-                    topo,
-                    &boundary_registry,
-                    contact2,
-                    support_faces[1],
-                    terminals,
-                    false,
-                )? {
-                    boundary_registry.set_owner_forward(contact2, 1, forward)?;
-                }
-                let contact_vertices =
-                    |handle: crate::boundary_registry::BoundaryHandle| -> Result<
-                        (VertexId, VertexId),
-                        BlendError,
-                    > {
-                        let entry =
-                            boundary_registry.entry(handle).ok_or_else(|| {
-                                BlendError::PlanningFailure {
-                                    reason: format!("unknown contact boundary {handle}"),
-                                }
-                            })?;
-                        let (start, end) = (entry.start.vertex, entry.end.vertex);
-                        Ok(if entry.owners[1].forward {
-                            (start, end)
-                        } else {
-                            (end, start)
-                        })
-                    };
-                let (p1_start, p1_end) = contact_vertices(contact1)?;
-                let (p2_start, p2_end) = contact_vertices(contact2)?;
+                // The band runs each contact's chain forward or backward
+                // whole: its ends are the chain's.
+                let contact_vertices = |chain: &[crate::boundary_registry::BoundaryHandle]| -> Result<
+                    (VertexId, VertexId),
+                    BlendError,
+                > {
+                    let (start, end) = contact_chain_ends(&boundary_registry, chain)?;
+                    let forward = chain
+                        .first()
+                        .and_then(|&handle| boundary_registry.entry(handle))
+                        .is_some_and(|entry| entry.owners[1].forward);
+                    Ok(if forward { (start, end) } else { (end, start) })
+                };
+                let (p1_start, p1_end) = contact_vertices(&chains[0])?;
+                let (p2_start, p2_end) = contact_vertices(&chains[1])?;
                 let mut section_curve = |section: Option<&crate::section::CircSection>,
                                          cap: Option<&RunOnCap>,
                                          start: VertexId,
@@ -1086,20 +1121,34 @@ impl<'a> FilletBuilder<'a> {
                             p2_start,
                         )?
                     };
+                    // Each chain in the order the band runs it.
+                    let band_order = |chain: &[crate::boundary_registry::BoundaryHandle]| {
+                        let forward = chain
+                            .first()
+                            .and_then(|&handle| boundary_registry.entry(handle))
+                            .is_some_and(|entry| entry.owners[1].forward);
+                        let mut ordered: Vec<_> = chain.iter().map(|&handle| (handle, 1)).collect();
+                        if !forward {
+                            ordered.reverse();
+                        }
+                        ordered
+                    };
+                    let (band1, band2) = (band_order(&chains[0]), band_order(&chains[1]));
                     let info = crate::builder_utils::create_blend_face_from_registry(
                         topo,
                         stripe,
                         &mut boundary_registry,
-                        (contact1, 1),
-                        (contact2, 1),
+                        &band1,
+                        &band2,
                         cross_end,
                         cross_start,
                     )?;
                     for (handle, owner) in [cross_end, cross_start].into_iter().flatten() {
                         boundary_registry.set_owner_face(handle, owner, info.face)?;
                     }
-                    boundary_registry.set_owner_face(contact1, 1, info.face)?;
-                    boundary_registry.set_owner_face(contact2, 1, info.face)?;
+                    for &handle in chains.iter().flatten() {
+                        boundary_registry.set_owner_face(handle, 1, info.face)?;
+                    }
                     blend_cross_handles[si] = (
                         cross_end.map(|(handle, _)| handle),
                         cross_start.map(|(handle, _)| handle),
@@ -1597,8 +1646,15 @@ impl<'a> FilletBuilder<'a> {
                 let Some(handle) = handle else {
                     continue;
                 };
-                boundary_registry.set_owner_face(handle, 0, support_face)?;
-                let _ = boundary_registry.oriented_edge(topo, handle, 0)?;
+                let chain = if stripe_contact_chains[si][side].is_empty() {
+                    vec![handle]
+                } else {
+                    stripe_contact_chains[si][side].clone()
+                };
+                for handle in chain {
+                    boundary_registry.set_owner_face(handle, 0, support_face)?;
+                    let _ = boundary_registry.oriented_edge(topo, handle, 0)?;
+                }
             }
         }
         boundary_registry.preassembly_audit()?;
@@ -2501,10 +2557,31 @@ fn contact_source_vertex(
     None
 }
 
+/// The first and last vertex of a contact's chain of registry boundaries,
+/// along the contact.
+fn contact_chain_ends(
+    registry: &BoundaryRegistry,
+    chain: &[crate::boundary_registry::BoundaryHandle],
+) -> Result<(VertexId, VertexId), BlendError> {
+    let entry = |handle: crate::boundary_registry::BoundaryHandle| {
+        registry
+            .entry(handle)
+            .ok_or_else(|| BlendError::PlanningFailure {
+                reason: format!("unknown contact boundary {handle}"),
+            })
+    };
+    let (Some(&first), Some(&last)) = (chain.first(), chain.last()) else {
+        return Err(BlendError::PlanningFailure {
+            reason: "empty contact chain".to_owned(),
+        });
+    };
+    Ok((entry(first)?.start.vertex, entry(last)?.end.vertex))
+}
+
 fn contact_forward_for_spine(
     topo: &Topology,
     registry: &BoundaryRegistry,
-    handle: crate::boundary_registry::BoundaryHandle,
+    chain: &[crate::boundary_registry::BoundaryHandle],
     support_face: FaceId,
     terminals: Option<(VertexId, VertexId)>,
     starts_at_spine_start: bool,
@@ -2512,24 +2589,10 @@ fn contact_forward_for_spine(
     let Some((spine_start, spine_end)) = terminals else {
         return Ok(None);
     };
-    let entry = registry
-        .entry(handle)
-        .ok_or_else(|| BlendError::PlanningFailure {
-            reason: format!("unknown contact boundary {handle}"),
-        })?;
+    let (first, last) = contact_chain_ends(registry, chain)?;
     let direct_vertices = (
-        contact_source_vertex(
-            topo,
-            support_face,
-            entry.start.vertex,
-            (spine_start, spine_end),
-        ),
-        contact_source_vertex(
-            topo,
-            support_face,
-            entry.end.vertex,
-            (spine_start, spine_end),
-        ),
+        contact_source_vertex(topo, support_face, first, (spine_start, spine_end)),
+        contact_source_vertex(topo, support_face, last, (spine_start, spine_end)),
     );
     let (Some(start), Some(end)) = direct_vertices else {
         return Ok(None);
