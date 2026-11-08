@@ -2240,6 +2240,11 @@ fn input_edge_set(topo: &Topology, original_faces: &[FaceId]) -> HashSet<EdgeId>
 /// face's wire is the contact and that edge alone, joining the same two
 /// vertices. The face goes, and the round takes the wall's edge in place of
 /// its contact, so it meets the face beyond the wall along it.
+///
+/// A wall exactly twice the radius high, rounded along both rims (a full
+/// round), keeps only the strip between the two rounds' contacts, which lie
+/// on each other along its middle. The face goes the same way, and the one
+/// round takes the other's contact.
 fn drop_contact_slivers(
     topo: &mut Topology,
     faces: Vec<FaceId>,
@@ -2261,13 +2266,15 @@ fn drop_contact_slivers(
                 continue;
             };
             let (first, second) = (*first, *second);
+            // Two contacts lying on each other (a full round, a wall twice
+            // the radius high rounded along both rims) are kept as the first.
             let (own, contact) = match (
                 input_edges.contains(&first.edge()),
                 input_edges.contains(&second.edge()),
             ) {
-                (true, false) => (first, second),
+                (_, false) => (first, second),
                 (false, true) => (second, first),
-                _ => continue,
+                (true, true) => continue,
             };
             let (own_edge, contact_edge) = (
                 topo.edge(own.edge())?.clone(),
@@ -3565,7 +3572,6 @@ fn run_stripes_to_tilted_caps(
     // A cap this oblique to the axis is left to the runout.
     const OBLIQUE: f64 = 0.05;
     carry_walked_rounds(topo, plan, stripe_results)?;
-    let full_rounds = walked_full_rounds(stripe_results);
     let mut caps = TiltedCaps::new();
     for junction in &plan.junctions {
         if !matches!(
@@ -3586,7 +3592,6 @@ fn run_stripes_to_tilted_caps(
         else {
             continue;
         };
-        let full_round = full_rounds[index];
         let result = &mut stripe_results[index];
         let stripe = &result.stripe;
         let cylinder = match &stripe.surface {
@@ -3611,9 +3616,6 @@ fn run_stripes_to_tilted_caps(
                 continue;
             }
             FaceSurface::Nurbs(_) => {
-                if full_round {
-                    continue;
-                }
                 if let Some(run) = walked_run_back(topo, junction, contour, stripe)? {
                     let edge = stripe.spine_edges()[0];
                     let result_stripe = &mut result.stripe;
@@ -3898,55 +3900,6 @@ fn walked_carry(
     }))
 }
 
-/// Which walked rounds meet another round along a face: a contact of one
-/// coincides with a contact of another on the same face (a wall exactly
-/// twice the radius high, rounded along both rims). That is a full round,
-/// which takes the face between them away and is not built; such rounds are
-/// neither carried on nor cut back to their caps (the face was left a sliver
-/// along a curve, which took minutes to mesh).
-fn walked_full_rounds(stripe_results: &[StripeResult]) -> Vec<bool> {
-    let stripes: Vec<&Stripe> = stripe_results.iter().map(|result| &result.stripe).collect();
-    stripes
-        .iter()
-        .enumerate()
-        .map(|(index, stripe)| {
-            if !matches!(stripe.surface, FaceSurface::Nurbs(_)) {
-                return false;
-            }
-            let Some(first) = stripe.sections.first() else {
-                return false;
-            };
-            let tol = 1e-3 * (first.p1 - first.p2).length();
-            [
-                (&stripe.contact1, stripe.face1),
-                (&stripe.contact2, stripe.face2),
-            ]
-            .into_iter()
-            .any(|(contact, face)| {
-                let (t0, t1) = contact.domain();
-                let middle = contact.evaluate(f64::midpoint(t0, t1));
-                stripes.iter().enumerate().any(|(other_index, other)| {
-                    other_index != index
-                        && [
-                            (&other.contact1, other.face1),
-                            (&other.contact2, other.face2),
-                        ]
-                        .into_iter()
-                        .any(|(other_contact, other_face)| {
-                            other_face == face
-                                && brepkit_math::nurbs::projection::project_point_to_curve(
-                                    other_contact,
-                                    middle,
-                                    1e-9,
-                                )
-                                .is_ok_and(|found| found.distance <= tol)
-                        })
-                })
-            })
-        })
-        .collect()
-}
-
 /// Carries walked rounds on past their ends where a contact stops short of
 /// a tilted or curved cap ([`walked_carry`]), every end before any is cut
 /// back, so a band rebuilt for one end is never one already cut at its
@@ -3959,7 +3912,6 @@ fn carry_walked_rounds(
     plan: &crate::fillet_plan::FilletPlan,
     stripe_results: &mut [StripeResult],
 ) -> Result<(), BlendError> {
-    let full_rounds = walked_full_rounds(stripe_results);
     let mut carries: Vec<(
         usize,
         usize,
@@ -3986,9 +3938,6 @@ fn carry_walked_rounds(
         else {
             continue;
         };
-        if full_rounds[index] {
-            continue;
-        }
         if let Some((end, sections)) =
             walked_carry(topo, junction, contour, &stripe_results[index].stripe)?
         {
