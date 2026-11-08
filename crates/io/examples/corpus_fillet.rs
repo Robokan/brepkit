@@ -393,7 +393,14 @@ fn main() {
             let area = brepkit_operations::measure::solid_surface_area(&topo, r.solid, 0.001)
                 .unwrap_or(f64::NAN);
             let valid = brepkit_operations::validate::validate_solid(&topo, r.solid)
-                .map(|v| format!("{} errors", v.error_count()))
+                .map(|v| {
+                    if std::env::var("ISSUES").is_ok() {
+                        for issue in &v.issues {
+                            println!("  issue: {issue:?}");
+                        }
+                    }
+                    format!("{} errors", v.error_count())
+                })
                 .unwrap_or_else(|e| format!("{e}"));
             if std::env::var("FACES").is_ok() {
                 for fid in solid_faces(&topo, r.solid).unwrap() {

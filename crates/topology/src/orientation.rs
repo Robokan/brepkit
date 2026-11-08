@@ -118,7 +118,8 @@ pub fn propagate_orientation(
 /// the surface's natural normal: the signed area of their loop in `(u, v)`,
 /// positive when it runs counterclockwise about `∂u × ∂v` taken along the
 /// normal. A sample on the axis (a cone's apex, a horn torus's pinch) has no
-/// `u` of its own and takes its neighbour's. `None` for other surfaces, and
+/// `u` of its own and takes its neighbour's. A B-spline face is read in its
+/// own parameters ([`nurbs_uv_winding`]). `None` for other surfaces, and
 /// for a loop that does not close once unwrapped (a band around the axis).
 fn uv_winding(surface: &FaceSurface, points: &[Point3]) -> Option<f64> {
     use std::f64::consts::{PI, TAU};

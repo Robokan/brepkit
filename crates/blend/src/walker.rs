@@ -581,10 +581,10 @@ fn section_arc(sec: &CircSection) -> ([Point3; 3], f64) {
 ///
 /// As [`approximate_blend_surface`], each section is a rational quadratic
 /// arc across the band, but along it the band interpolates the sections'
-/// arcs (in homogeneous coordinates, at their centres' chord-length
-/// parameters, with averaged knots) rather than taking them as control
-/// points, so a section inside the band lies on it, contact points
-/// included.
+/// arcs (in homogeneous coordinates, each parameter step the farthest the
+/// centre or a contact moves, with averaged knots) rather than taking them
+/// as control points, so a section inside the band lies on it, contact
+/// points included.
 ///
 /// # Errors
 ///
