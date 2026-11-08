@@ -596,11 +596,16 @@ pub fn interpolate_blend_surface(sections: &[CircSection]) -> Result<NurbsSurfac
         return Err(BlendError::Math(brepkit_math::MathError::EmptyInput));
     }
     let degree_v = (n - 1).min(3);
-    // Chord-length parameters of the centres.
+    // Chord-length parameters, each step the farthest the centre or a
+    // contact moves (a ball pivoting on its centre, rounding a round's rim
+    // at the round's own radius, keeps its centre still).
     let mut params = Vec::with_capacity(n);
     params.push(0.0);
     for pair in sections.windows(2) {
-        let step = (pair[1].center - pair[0].center).length();
+        let step = (pair[1].center - pair[0].center)
+            .length()
+            .max((pair[1].p1 - pair[0].p1).length())
+            .max((pair[1].p2 - pair[0].p2).length());
         params.push(params.last().copied().unwrap_or(0.0) + step);
     }
     let total = params.last().copied().unwrap_or(0.0);
