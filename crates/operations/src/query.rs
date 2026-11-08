@@ -335,7 +335,7 @@ mod tests {
             .copied()
             .filter(|&e| at_height(e, height))
             .collect();
-        let mut got = chain.clone();
+        let mut got = chain;
         top.sort_unstable_by_key(|e| e.index());
         got.sort_unstable_by_key(|e| e.index());
         assert_eq!(got, top, "the whole top outline, and nothing else");
