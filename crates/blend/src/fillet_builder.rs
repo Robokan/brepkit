@@ -5342,6 +5342,13 @@ fn check_contacts_keep_their_edges(
                 if d.0 < best.0 { d } else { best }
             })
     };
+    // Each contact as points along its exact curve where it has one: a
+    // walked contact's sampled points may be its two ends alone, whose chord
+    // stands far off the contact on a curved face.
+    let contacts: Vec<Vec<Point3>> = restrictions
+        .iter()
+        .map(|(_, restriction)| contact_points(restriction))
+        .collect();
     let mut middles = Vec::with_capacity(restrictions.len());
     for (_, restriction) in restrictions {
         let edges = &restriction.source_edges;
@@ -5371,10 +5378,8 @@ fn check_contacts_keep_their_edges(
     // stripes' sections ending on one line), which `SWAP_MARGIN` leaves.
     let swapped = |i: usize, j: usize| {
         middles[i].is_some_and(|(middle, tangent)| {
-            let (own, own_alongside, own_cos) =
-                distance(middle, tangent, &restrictions[i].1.contact_3d);
-            let (other, other_alongside, other_cos) =
-                distance(middle, tangent, &restrictions[j].1.contact_3d);
+            let (own, own_alongside, own_cos) = distance(middle, tangent, &contacts[i]);
+            let (other, other_alongside, other_cos) = distance(middle, tangent, &contacts[j]);
             own_alongside
                 && other_alongside
                 && own_cos >= SWAP_PARALLEL
@@ -5395,6 +5400,27 @@ fn check_contacts_keep_their_edges(
         }
     }
     Ok(())
+}
+
+/// Samples along a contact's exact curve when reading where it runs.
+const CONTACT_CURVE_SAMPLES: u32 = 64;
+
+/// A contact's points in traversal order: along its exact curve, between its
+/// first and last sampled points, when it has one; else its sampled points.
+fn contact_points(restriction: &trimmer::ParametricRestriction) -> Vec<Point3> {
+    let points = &restriction.contact_3d;
+    let (Some(curve), Some(&first), Some(&last)) =
+        (restriction.curve.as_ref(), points.first(), points.last())
+    else {
+        return points.clone();
+    };
+    let (t0, t1) = curve.domain_with_endpoints(first, last);
+    (0..=CONTACT_CURVE_SAMPLES)
+        .map(|k| {
+            let t = (t1 - t0).mul_add(f64::from(k) / f64::from(CONTACT_CURVE_SAMPLES), t0);
+            curve.evaluate_with_endpoints(t, first, last)
+        })
+        .collect()
 }
 
 /// Samples per boundary edge when bounding a face's extent.
