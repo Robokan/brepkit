@@ -4928,6 +4928,7 @@ fn compute_stripe_for_spine(
     if spine.is_closed() {
         check_contacts_on_faces(topo, face1, face2, &walk_result.sections)?;
     }
+    check_contacts_run_on(&walk_result.sections)?;
     let blend_surface = approximate_blend_surface(&walk_result.sections)?;
     // The band's sides are its own boundary rows: a polyline through the
     // sections' contact points leaves the band wherever they do not lie on a
@@ -4980,6 +4981,42 @@ fn walk_beyond<F: crate::blend_func::BlendFunction>(
         past(true, result.end_params, result.sections.last()),
     ]
 }
+
+/// Refuses a walk whose contact on either face turns back on itself: a
+/// ball wider than a convex bend of its face (a round past the radius of
+/// an outline's tip) still solves at every station, but its contact on the
+/// face the bend is in runs to a cusp and back, the swallowtail of the
+/// face's outline set in by the radius. The band through such sections
+/// crosses itself, and the trimmed face's loop with it, though every edge
+/// still has two faces.
+fn check_contacts_run_on(sections: &[crate::section::CircSection]) -> Result<(), BlendError> {
+    for (side, contact) in [
+        sections.iter().map(|s| s.p1).collect::<Vec<_>>(),
+        sections.iter().map(|s| s.p2).collect::<Vec<_>>(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let steps: Vec<Vec3> = contact
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|d| d.length() > CONTACT_STEP_FLOOR)
+            .collect();
+        if let Some(i) = steps.windows(2).position(|w| w[0].dot(w[1]) < 0.0) {
+            return Err(BlendError::PlanningFailure {
+                reason: format!(
+                    "the fillet's contact on face {} turns back on itself near section {i}: the radius is larger than the face's bend there",
+                    side + 1
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Contact steps shorter than this are read as standing still, not as a
+/// direction (a ball pinned where a face's contact barely moves).
+const CONTACT_STEP_FLOOR: f64 = 1e-9;
 
 /// Refuses a walked band round a closed spine whose contacts leave their
 /// faces: a ball too big for a rim (a bore's mouth wider than its plate is

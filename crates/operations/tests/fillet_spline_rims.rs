@@ -296,3 +296,26 @@ fn crossing_rounds_on_both_rims_are_refused() {
         }
     }
 }
+
+/// The outline's tightest bend, at the ends of its major axis, has radius
+/// `b^2 / a`. A ball wider than that cannot round the tips: its contact on
+/// the lid runs to a cusp and back there (the outline set in by `r` crosses
+/// itself), and the lid was trimmed to a loop crossing itself, a valid-looking
+/// solid with several times the volume removed. Such a round is refused; one
+/// just inside the bend still rounds off.
+#[test]
+fn a_round_past_the_outlines_tightest_bend_is_refused() {
+    let tightest = SEMI_MINOR * SEMI_MINOR / SEMI_MAJOR;
+    assert_rim_rounds_off(HEIGHT, 0.96 * tightest);
+    for r in [1.12 * tightest, 1.25 * tightest] {
+        let mut topo = Topology::new();
+        let solid = slab(&mut topo);
+        let rim = rim_at(&topo, solid, HEIGHT);
+        if let Ok(result) = fillet_v2(&mut topo, solid, &[rim], r) {
+            assert!(
+                !result.failed.is_empty(),
+                "r = {r}, past the tips' bend {tightest}: the round was built"
+            );
+        }
+    }
+}
