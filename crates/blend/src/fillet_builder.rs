@@ -1753,7 +1753,9 @@ impl<'a> FilletBuilder<'a> {
                 is_partial: true,
             });
         }
-        fold_spoke_spurs(topo, &result_faces)?;
+        let input_edges = input_edge_set(topo, &original_faces);
+        fold_spoke_spurs(topo, &result_faces, &input_edges)?;
+        let result_faces = drop_contact_slivers(topo, result_faces, &input_edges)?;
         let new_shell = match Shell::new(result_faces) {
             Ok(shell) => shell,
             Err(error) => {
@@ -1965,7 +1967,17 @@ fn outward_normal_at(
 /// other face along the spoke takes the runout edge and the far piece. Every
 /// edge keeps two uses. This runs after the registry audit, which has
 /// already checked each boundary's owners.
-fn fold_spoke_spurs(topo: &mut Topology, faces: &[FaceId]) -> Result<(), BlendError> {
+///
+/// The same spur arises where a round's contact runs exactly along the
+/// support face's own straight boundary edges (a round whose width lands on
+/// a step's edge): the face's wire runs along those edges and back along the
+/// contact. Folding one edge at a time, the contact takes the input's edges,
+/// and the round meets each face beyond them along its own edge.
+fn fold_spoke_spurs(
+    topo: &mut Topology,
+    faces: &[FaceId],
+    input_edges: &HashSet<EdgeId>,
+) -> Result<(), BlendError> {
     const ON_LINE: f64 = 1e-6;
     // The angle (radians) a curved face beyond the spoke may turn from the
     // patch and still be carried on by it.
@@ -1990,14 +2002,12 @@ fn fold_spoke_spurs(topo: &mut Topology, faces: &[FaceId]) -> Result<(), BlendEr
                         continue;
                     }
                     let (e1, e2) = (topo.edge(first.edge())?, topo.edge(second.edge())?);
-                    if !matches!(e1.curve(), EdgeCurve::Line)
-                        || !matches!(e2.curve(), EdgeCurve::Line)
-                    {
-                        continue;
-                    }
                     let (p, v) = (first.oriented_start(e1), first.oriented_end(e1));
                     let (v2, q) = (second.oriented_start(e2), second.oriented_end(e2));
                     if v != v2 || p == q {
+                        continue;
+                    }
+                    if !straight_edge(topo, e1, ON_LINE)? || !straight_edge(topo, e2, ON_LINE)? {
                         continue;
                     }
                     let (pp, vp, qp) = (point(topo, p)?, point(topo, v)?, point(topo, q)?);
@@ -2058,27 +2068,25 @@ fn fold_spoke_spurs(topo: &mut Topology, faces: &[FaceId]) -> Result<(), BlendEr
                     // patch standing in its own plane, or facing the other
                     // way, covers material the fillet removed: folding it in
                     // would only close a wrong shell.
-                    let Some((n2, _)) = outward_plane(topo, *beyond_short)? else {
-                        continue;
-                    };
-                    let short_edge = topo.edge(short.edge())?;
-                    let (a, b) = (
-                        point(topo, short_edge.start())?,
-                        point(topo, short_edge.end())?,
-                    );
-                    // A curved face beyond may meet the patch at a slight
-                    // kink: a fitted surface rarely runs on exactly level.
-                    let alike = if topo.face(*beyond_long)?.surface().is_planar() {
-                        1.0 - 1e-9
-                    } else {
-                        CURVED_CARRIES_ON.cos()
-                    };
-                    let mut carries_on = true;
-                    for at in [a, b, a + (b - a) * 0.5] {
-                        carries_on &= outward_normal_at(topo, *beyond_long, at, ON_LINE)?
-                            .is_some_and(|n1| n1.dot(n2) >= alike);
-                    }
-                    if !carries_on {
+                    //
+                    // Or where the short edge is one of the input's own and
+                    // the long one an edge the fillet made: a contact that
+                    // runs exactly along the face's own boundary (a round
+                    // whose width lands on a step's edge). The face beyond
+                    // the short edge is the input's, and the round meets it
+                    // along that edge.
+                    let own_boundary =
+                        input_edges.contains(&short.edge()) && !input_edges.contains(&long.edge());
+                    if !own_boundary
+                        && !patch_carries_on(
+                            topo,
+                            *beyond_short,
+                            *beyond_long,
+                            short.edge(),
+                            ON_LINE,
+                            CURVED_CARRIES_ON,
+                        )?
+                    {
                         continue;
                     }
                     let other_wire = *other_wire;
@@ -2142,6 +2150,229 @@ fn fold_spoke_spurs(topo: &mut Topology, faces: &[FaceId]) -> Result<(), BlendEr
         }
     }
     Ok(())
+}
+
+/// The edges of the input's faces, as the fillet found them.
+fn input_edge_set(topo: &Topology, original_faces: &[FaceId]) -> HashSet<EdgeId> {
+    let mut edges = HashSet::new();
+    for &face_id in original_faces {
+        let Ok(face) = topo.face(face_id) else {
+            continue;
+        };
+        for wire_id in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied())
+        {
+            if let Ok(wire) = topo.wire(wire_id) {
+                edges.extend(wire.edges().iter().map(OrientedEdge::edge));
+            }
+        }
+    }
+    edges
+}
+
+/// Drop the faces a round has left with no area: a wall exactly a radius
+/// high, its top rim rounded, keeps only the strip between the round's
+/// contact and the wall's own bottom edge, which the contact lies on. Such a
+/// face's wire is the contact and that edge alone, joining the same two
+/// vertices. The face goes, and the round takes the wall's edge in place of
+/// its contact, so it meets the face beyond the wall along it.
+fn drop_contact_slivers(
+    topo: &mut Topology,
+    faces: Vec<FaceId>,
+    input_edges: &HashSet<EdgeId>,
+) -> Result<Vec<FaceId>, BlendError> {
+    // How far the contact may stand off the wall's edge, for each unit of
+    // the edge's span: a walked contact is fitted through its sections (a
+    // round of 3 along a quarter arc of 4.5 stands 3.2e-4 off it).
+    const ON_EDGE: f64 = 1e-4;
+    let mut faces = faces;
+    'slivers: loop {
+        for (index, &face_id) in faces.iter().enumerate() {
+            let face = topo.face(face_id)?;
+            if !face.inner_wires().is_empty() {
+                continue;
+            }
+            let wire_id = face.outer_wire();
+            let [first, second] = topo.wire(wire_id)?.edges() else {
+                continue;
+            };
+            let (first, second) = (*first, *second);
+            let (own, contact) = match (
+                input_edges.contains(&first.edge()),
+                input_edges.contains(&second.edge()),
+            ) {
+                (true, false) => (first, second),
+                (false, true) => (second, first),
+                _ => continue,
+            };
+            let (own_edge, contact_edge) = (
+                topo.edge(own.edge())?.clone(),
+                topo.edge(contact.edge())?.clone(),
+            );
+            let ends = [contact_edge.start(), contact_edge.end()];
+            if own_edge.start() == own_edge.end()
+                || ([own_edge.start(), own_edge.end()] != ends
+                    && [own_edge.end(), own_edge.start()] != ends)
+            {
+                continue;
+            }
+            let span = (topo.vertex(own_edge.start())?.point()
+                - topo.vertex(own_edge.end())?.point())
+            .length();
+            if !edge_lies_on(topo, &contact_edge, &own_edge, ON_EDGE * span.max(1e-2))? {
+                continue;
+            }
+            // Each edge has one other use, in a face other than this one.
+            let mut contact_uses = Vec::new();
+            let mut own_uses = 0;
+            for &other in &faces {
+                if other == face_id {
+                    continue;
+                }
+                let f = topo.face(other)?;
+                for w in std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied()) {
+                    for oe in topo.wire(w)?.edges() {
+                        if oe.edge() == contact.edge() {
+                            contact_uses.push(w);
+                        }
+                        own_uses += usize::from(oe.edge() == own.edge());
+                    }
+                }
+            }
+            let ([round_wire], 1) = (contact_uses.as_slice(), own_uses) else {
+                continue;
+            };
+            let round_wire = *round_wire;
+            log::debug!(
+                "contact sliver {face_id:?}: {:?} lies on {:?}",
+                contact.edge(),
+                own.edge()
+            );
+            // The round runs the wall's edge the way it ran the contact.
+            let closed = topo.wire(round_wire)?.is_closed();
+            let rewritten: Vec<OrientedEdge> = topo
+                .wire(round_wire)?
+                .edges()
+                .iter()
+                .map(|&oe| {
+                    if oe.edge() == contact.edge() {
+                        let from = oe.oriented_start(&contact_edge);
+                        OrientedEdge::new(own.edge(), own_edge.start() == from)
+                    } else {
+                        oe
+                    }
+                })
+                .collect();
+            *topo.wire_mut(round_wire)? = Wire::new(rewritten, closed)?;
+            faces.remove(index);
+            continue 'slivers;
+        }
+        return Ok(faces);
+    }
+}
+
+/// Whether every point of `edge` lies within `tol` of `on`'s curve.
+fn edge_lies_on(topo: &Topology, edge: &Edge, on: &Edge, tol: f64) -> Result<bool, BlendError> {
+    let (a, b) = (
+        topo.vertex(edge.start())?.point(),
+        topo.vertex(edge.end())?.point(),
+    );
+    let (p, q) = (
+        topo.vertex(on.start())?.point(),
+        topo.vertex(on.end())?.point(),
+    );
+    let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+    let mut worst: f64 = 0.0;
+    for k in 1..16 {
+        let at = edge
+            .curve()
+            .evaluate_with_endpoints(t0 + (t1 - t0) * f64::from(k) / 16.0, a, b);
+        let off = match on.curve() {
+            EdgeCurve::Line => {
+                let chord = q - p;
+                let length2 = chord.dot(chord);
+                if length2 <= 1e-18 {
+                    return Ok(false);
+                }
+                let along = ((at - p).dot(chord) / length2).clamp(0.0, 1.0);
+                (p + chord * along - at).length()
+            }
+            EdgeCurve::Circle(circle) => (circle.evaluate(circle.project(at)) - at).length(),
+            EdgeCurve::Ellipse(ellipse) => (ellipse.evaluate(ellipse.project(at)) - at).length(),
+            EdgeCurve::NurbsCurve(nurbs) => {
+                match brepkit_math::nurbs::projection::project_point_to_curve(nurbs, at, 1e-9) {
+                    Ok(found) => found.distance,
+                    Err(_) => return Ok(false),
+                }
+            }
+        };
+        worst = worst.max(off);
+    }
+    log::debug!("edge lies within {worst:e} of its neighbour");
+    Ok(worst <= tol)
+}
+
+/// Whether a patch beyond a spur's short edge carries on the face beyond its
+/// long edge: in its plane (or, on a curved face, its tangent plane along the
+/// short edge, within `curved` radians) and facing its way.
+fn patch_carries_on(
+    topo: &Topology,
+    patch: FaceId,
+    beyond: FaceId,
+    short: EdgeId,
+    tol: f64,
+    curved: f64,
+) -> Result<bool, BlendError> {
+    let Some((n2, _)) = outward_plane(topo, patch)? else {
+        return Ok(false);
+    };
+    let edge = topo.edge(short)?;
+    let (a, b) = (
+        topo.vertex(edge.start())?.point(),
+        topo.vertex(edge.end())?.point(),
+    );
+    // A curved face beyond may meet the patch at a slight kink: a fitted
+    // surface rarely runs on exactly level.
+    let alike = if topo.face(beyond)?.surface().is_planar() {
+        1.0 - 1e-9
+    } else {
+        curved.cos()
+    };
+    for at in [a, b, a + (b - a) * 0.5] {
+        if !outward_normal_at(topo, beyond, at, tol)?.is_some_and(|n1| n1.dot(n2) >= alike) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether an edge is straight: a line, or a B-spline lying on the chord
+/// between its ends within `tol` (a contact fitted along a straight ruling).
+fn straight_edge(topo: &Topology, edge: &Edge, tol: f64) -> Result<bool, BlendError> {
+    match edge.curve() {
+        EdgeCurve::Line => Ok(true),
+        EdgeCurve::NurbsCurve(_) => {
+            let (a, b) = (
+                topo.vertex(edge.start())?.point(),
+                topo.vertex(edge.end())?.point(),
+            );
+            let chord = b - a;
+            let length2 = chord.dot(chord);
+            if length2 <= 1e-18 {
+                return Ok(false);
+            }
+            let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+            Ok((1..16).all(|k| {
+                let at = edge.curve().evaluate_with_endpoints(
+                    t0 + (t1 - t0) * f64::from(k) / 16.0,
+                    a,
+                    b,
+                );
+                let along = (at - a).dot(chord) / length2;
+                (a + chord * along - at).length() <= tol
+            }))
+        }
+        EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => Ok(false),
+    }
 }
 
 fn face_edge_forward(topo: &Topology, face_id: FaceId, edge_id: EdgeId) -> Option<bool> {
