@@ -85,6 +85,20 @@ fn surface_u_period(surface: &FaceSurface) -> Option<f64> {
     }
 }
 
+/// The period of a surface's `v`, where it closes on itself in `v`: a
+/// torus's tube angle, or a B-spline periodic in `v` (a wing's section
+/// closed round its leading edge).
+fn surface_v_period(surface: &FaceSurface) -> Option<f64> {
+    match surface {
+        FaceSurface::Torus(_) => Some(std::f64::consts::TAU),
+        FaceSurface::Nurbs(surface) if surface.is_periodic_v() => {
+            let (v0, v1) = surface.domain_v();
+            (v1 > v0).then_some(v1 - v0)
+        }
+        _ => None,
+    }
+}
+
 /// A point where the contact line crosses a face boundary edge.
 struct BoundaryHit {
     /// Index into the wire's oriented-edge list.
@@ -1328,8 +1342,13 @@ fn mapped_connector_geometry(
 ) -> Result<(EdgeCurve, brepkit_topology::pcurve::PCurve), BlendError> {
     let start_uv = mapped_surface_uv(surface, start, face_id)?;
     let mut end_uv = mapped_surface_uv(surface, end, face_id)?;
+    // A connector is short: it takes the near way across a seam, in `v` as
+    // in `u` (straight across the `v` range it ran the long way round).
     if let Some(period) = surface_u_period(surface) {
         end_uv.0 -= period * ((end_uv.0 - start_uv.0) / period).round();
+    }
+    if let Some(period) = surface_v_period(surface) {
+        end_uv.1 -= period * ((end_uv.1 - start_uv.1) / period).round();
     }
     if surface.is_planar() {
         let pcurve = brepkit_math::curves2d::NurbsCurve2D::from_line(
@@ -3772,6 +3791,38 @@ mod tests {
     use super::*;
     use brepkit_math::vec::{Point3, Vec3};
     use brepkit_topology::Topology;
+
+    /// A connector between two contact ends either side of a surface's `v`
+    /// seam (a torus's tube, or a B-spline closed round in `v`) takes the
+    /// near way across it: straight across the `v` range it ran the long way
+    /// round the tube.
+    #[test]
+    fn connector_takes_the_near_way_across_a_v_seam() {
+        let torus =
+            brepkit_math::surfaces::ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 5.0, 1.0)
+                .unwrap();
+        let surface = FaceSurface::Torus(torus.clone());
+        // The face only names the trim in an error.
+        let (face, _, _) = make_square_face(&mut Topology::new());
+        // One pair straddles v = 0, the other v = pi: whichever window the
+        // projection reads, one of them crosses its seam.
+        for v in [0.0, std::f64::consts::PI] {
+            let (start, end) = (torus.evaluate(0.5, v - 0.1), torus.evaluate(0.5, v + 0.1));
+            let (curve, _) = mapped_connector_geometry(&surface, start, end, face).unwrap();
+            let EdgeCurve::NurbsCurve(curve) = curve else {
+                panic!("a connector on a torus is a polyline");
+            };
+            let length: f64 = curve
+                .control_points()
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).length())
+                .sum();
+            assert!(
+                (length - 0.2).abs() < 1e-3,
+                "across v = {v}: connector {length} long, the tube's arc 0.2"
+            );
+        }
+    }
 
     /// Helper: create a unit square face on the XY plane (z=0).
     ///

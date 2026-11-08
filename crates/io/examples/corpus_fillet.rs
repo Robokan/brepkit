@@ -193,6 +193,17 @@ fn main() {
         edges.push(eid);
     }
     edges.dedup();
+    // CHAIN=<radians> also rounds each pick's tangent chain
+    // (`query::tangent_chain`), as some kernels do.
+    if let Ok(angle) = std::env::var("CHAIN") {
+        let chained =
+            brepkit_operations::query::tangent_chain(&topo, sid, &edges, angle.parse().unwrap())
+                .unwrap();
+        for e in &chained[edges.len()..] {
+            println!("  chain adds edge {}", e.index());
+        }
+        edges = chained;
+    }
     // PICK=0,2,5 keeps only those positions of the case's pick list.
     if let Ok(keep) = std::env::var("PICK") {
         let keep: Vec<usize> = keep.split(',').map(|k| k.trim().parse().unwrap()).collect();
