@@ -1799,7 +1799,11 @@ impl<'a> FilletBuilder<'a> {
             Err("forced postassembly incidence gate failure".to_owned())
         } else {
             boundary_registry
-                .postassembly_audit(topo, &result_faces)
+                .postassembly_audit_with_input(
+                    topo,
+                    &result_faces,
+                    &input_edge_uses(topo, &original_faces),
+                )
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         };
@@ -2216,6 +2220,28 @@ fn fold_spoke_spurs(
         }
     }
     Ok(())
+}
+
+/// How many uses each edge of the input's faces has there.
+fn input_edge_uses(
+    topo: &Topology,
+    original_faces: &[FaceId],
+) -> std::collections::HashMap<EdgeId, usize> {
+    let mut uses = std::collections::HashMap::new();
+    for &face_id in original_faces {
+        let Ok(face) = topo.face(face_id) else {
+            continue;
+        };
+        for wire_id in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied())
+        {
+            if let Ok(wire) = topo.wire(wire_id) {
+                for oriented in wire.edges() {
+                    *uses.entry(oriented.edge()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    uses
 }
 
 /// The edges of the input's faces, as the fillet found them.
