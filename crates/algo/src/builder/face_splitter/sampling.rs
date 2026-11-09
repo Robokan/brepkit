@@ -210,9 +210,12 @@ pub(super) fn sample_wire_loop_uv_periodic(
                     // way that lands on the edge's own end UVs is the one the
                     // wire runs, whatever the flag says (a plane facing
                     // against a circle's axis has its rim arcs both ways).
-                    // Only the face's own boundary edges: a section's pcurve
+                    // Only the face's own boundary arcs: a section's pcurve
                     // is read by its flag elsewhere, and its sample must
-                    // agree with those readings.
+                    // agree with those readings; and a B-spline boundary
+                    // edge's flag is the one the face's other readings
+                    // follow (a closed B-spline wall laid out in one
+                    // window has its seam's two uses on one line).
                     let span_off = |dx: f64, dy: f64| {
                         let reduce = |x: f64, period: Option<f64>| {
                             period.map_or(x, |p| x - (x / p).round() * p)
@@ -235,6 +238,11 @@ pub(super) fn sample_wire_loop_uv_periodic(
                         misfit(a, b)
                     };
                     let ahead = if edge.source_edge_idx.is_none()
+                        && matches!(
+                            edge.curve_3d,
+                            brepkit_topology::edge::EdgeCurve::Circle(_)
+                                | brepkit_topology::edge::EdgeCurve::Ellipse(_)
+                        )
                         && (edge.end_uv.x() - edge.start_uv.x())
                             .hypot(edge.end_uv.y() - edge.start_uv.y())
                             > 1e-9

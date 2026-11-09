@@ -372,7 +372,13 @@ fn main() {
     }
     println!("B: {}", census(&topo, b[0]));
     let mut occ_topo = Topology::new();
-    if let Some(&occ) = read(&dir, "occ.step", &mut occ_topo).first() {
+    // The reference's file can be missing, or hold curves brepkit does not
+    // read (a hyperbola): the case still runs without it.
+    let reference = std::fs::read_to_string(dir.join("occ.step"))
+        .ok()
+        .and_then(|text| brepkit_io::step::read_step(&text, &mut occ_topo).ok())
+        .unwrap_or_default();
+    if let Some(&occ) = reference.first() {
         println!("OCC: {}", census(&occ_topo, occ));
         if std::env::var("FOLDS").is_ok() {
             println!("OCC folds:");

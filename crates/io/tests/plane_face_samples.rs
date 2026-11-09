@@ -21,6 +21,11 @@
 //! 0.77 off the notch's (its rim's arc in the gap is kept on the plate's
 //! sixteen-chord outline, and the fuse depends on it); and a fuse whose
 //! section pcurves run against their flags, which other readings expect.
+//!
+//! And a peg cut by a block, the peg's B-spline wall closed round its axis
+//! and laid out in one window, its seam's two uses on one line: the loop
+//! sampler turned that seam's B-spline edge to land on its end points,
+//! against the flag the face's other readings follow, and the cut fell back.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
@@ -121,5 +126,17 @@ fn a_fuse_with_section_pcurves_against_their_flags_is_exact() {
         "spline_section_fuse_a.step",
         "spline_section_fuse_b.step",
         |_, _| 827_622.216_4,
+    );
+}
+
+#[test]
+fn a_peg_cut_across_its_closed_spline_wall_is_exact() {
+    // brepkit's own measure; a reference kernel measures this result and
+    // its own both at 351.794_5, the B-spline wall integrated otherwise.
+    check(
+        BooleanOp::Cut,
+        "peg_cone_cut_peg.step",
+        "peg_cone_cut_block.step",
+        |_, _| 351.820_608_6,
     );
 }
