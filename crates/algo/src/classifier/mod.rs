@@ -108,7 +108,8 @@ pub struct FaceLoops2d {
 }
 
 impl FaceLoops2d {
-    /// Sample `face_id`'s loops: two points per line, sixteen per curved edge,
+    /// Sample `face_id`'s loops: two points per line, a conic every 1/128 of
+    /// a turn (sixteen at least), sixteen per other curved edge,
     /// each edge walked in its traversal direction and excluding the traversal
     /// endpoint (the next edge supplies it).
     ///
@@ -169,10 +170,18 @@ impl FaceLoops2d {
                 } else {
                     (t0, t1)
                 };
-                let n = if matches!(e.curve(), EdgeCurve::Line) {
-                    2
-                } else {
-                    16
+                // A conic at least every 1/128 of a turn: the splitter reads
+                // a piece's outline every 1/64, and an interior point it
+                // takes near a rim must still read on this face (sixteen
+                // samples round a whole rim stand 2% of its radius inside it).
+                let n = match e.curve() {
+                    EdgeCurve::Line => 2,
+                    EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let by_turn = ((t1 - t0).abs() / (PI / 64.0)).ceil() as usize;
+                        by_turn.clamp(16, 128)
+                    }
+                    EdgeCurve::NurbsCurve(_) => 16,
                 };
                 for k in 0..n {
                     #[allow(clippy::cast_precision_loss)]

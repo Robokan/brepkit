@@ -5891,6 +5891,62 @@ fn loops_have_out_and_back(
     false
 }
 
+/// Join a face's holes that meet along a section, run one way by one hole
+/// and back by the other, into one hole without it. Both sides of a
+/// section lying in an opening are opening: a pin's flat across its bore
+/// leaves the bore's rim in two loops, the flat's chord between them, and a
+/// face carrying both holes uses the chord twice.
+fn merge_holes_across_twin_sections(holes: &mut Vec<Vec<OrientedPCurveEdge>>, tol: f64) {
+    let twins = |a: &OrientedPCurveEdge, b: &OrientedPCurveEdge| {
+        a.source_edge_idx.is_some()
+            && a.source_edge_idx == b.source_edge_idx
+            && (a.start_3d - b.end_3d).length() < tol
+            && (a.end_3d - b.start_3d).length() < tol
+            && (a.start_3d - a.end_3d).length() > tol
+    };
+    'again: loop {
+        for i in 0..holes.len() {
+            for j in i + 1..holes.len() {
+                let found = holes[i].iter().enumerate().find_map(|(ki, a)| {
+                    holes[j].iter().position(|b| twins(a, b)).map(|kj| (ki, kj))
+                });
+                if let Some((ki, kj)) = found {
+                    let b = holes.remove(j);
+                    let a = &holes[i];
+                    let mut joined = Vec::with_capacity(a.len() + b.len() - 2);
+                    joined.extend_from_slice(&a[..ki]);
+                    joined.extend_from_slice(&b[kj + 1..]);
+                    joined.extend_from_slice(&b[..kj]);
+                    joined.extend_from_slice(&a[ki + 1..]);
+                    holes[i] = joined;
+                    continue 'again;
+                }
+            }
+        }
+        break;
+    }
+}
+
+/// Whether a loop runs a section out and, later, back: the weave of
+/// [`loops_have_out_and_back`] with other edges between the two twins. Where
+/// a hole's rim reaches the outline through sections at both its ends (a
+/// bore whose diameter a slot's floor runs along), the walk can take the
+/// pieces on either side of the hole round it as one loop, crossing each
+/// section twice.
+fn loops_run_a_section_both_ways(loops: &[Vec<OrientedPCurveEdge>], tol: f64) -> bool {
+    loops.iter().any(|lp| {
+        lp.iter().enumerate().any(|(i, a)| {
+            a.source_edge_idx.is_some()
+                && (a.start_uv - a.end_uv).length() > tol
+                && lp[i + 1..].iter().any(|b| {
+                    b.source_edge_idx == a.source_edge_idx
+                        && (a.start_uv - b.end_uv).length() < tol
+                        && (a.end_uv - b.start_uv).length() < tol
+                })
+        })
+    })
+}
+
 /// Split a face by its section edges, producing sub-faces.
 ///
 /// If there are no section edges, returns a single sub-face covering
@@ -9385,7 +9441,8 @@ fn split_face_2d_impl(
     let woven_spur = is_plane
         && holes_integrated
         && !woven_inner_wires.is_empty()
-        && loops_have_out_and_back(&loops, tol.linear, holes_promoted);
+        && (loops_have_out_and_back(&loops, tol.linear, holes_promoted)
+            || loops_run_a_section_both_ways(&loops, tol.linear));
     if is_plane
         && ((holes_integrated && original_inner_wires.len() >= 2 && !woven_inner_wires.is_empty())
             || bay_mouth_arrangement
@@ -10425,6 +10482,9 @@ fn split_face_2d_impl(
             }
         }
     }
+    for sf in &mut sub_faces {
+        merge_holes_across_twin_sections(&mut sf.inner_wires, tol.linear);
+    }
 
     // Distribute original inner wires (holes from the source face) to sub-faces.
     // Each hole is assigned to the sub-face whose outer wire contains its
@@ -10669,7 +10729,15 @@ pub fn interior_point_3d(
     // neighbouring region. A crescent thinner than its chords' sag has no
     // candidate across its polygon inside it, so one is stepped off its curves.
     let exact = match (&sub_face.surface, frame) {
-        (FaceSurface::Plane { .. }, Some(f)) => containment::exact_hole(&sub_face.outer_wire, f),
+        (FaceSurface::Plane { .. }, Some(f)) => {
+            // The holes go in too: the region's parity reads a point in a
+            // hole as outside, so its sample needs no second pass round them.
+            std::iter::once(&sub_face.outer_wire)
+                .chain(&sub_face.inner_wires)
+                .map(|w| containment::region_with_fitted_splines(w, f))
+                .collect::<Option<Vec<_>>>()
+                .map(|loops| loops.concat())
+        }
         _ => None,
     };
     let mut interior_uv = match exact.as_ref() {
@@ -10830,9 +10898,14 @@ pub fn interior_point_3d(
     // multi-hole frame (two adjacent cavities sharing a divider) lands inside
     // the OTHER hole and silently drops the whole frame face. The accurate
     // `is_inside_any_hole` UV point-in-polygon test avoids that.
-    if matches!(&sub_face.surface, FaceSurface::Plane { .. }) && !sub_face.inner_wires.is_empty() {
-        interior_uv = find_point_outside_holes(&pts_2d, &sub_face.inner_wires, frame);
-    } else if is_inside_any_hole(&interior_uv, &sub_face.inner_wires) {
+    // A point read in the exact region, holes included, already stands
+    // clear of them; the ring's chord polygons can put a point back past an
+    // outer arc (a notch hugging a round boss: 3e-3 inside the arc).
+    if exact.is_none()
+        && ((matches!(&sub_face.surface, FaceSurface::Plane { .. })
+            && !sub_face.inner_wires.is_empty())
+            || is_inside_any_hole(&interior_uv, &sub_face.inner_wires))
+    {
         interior_uv = find_point_outside_holes(&pts_2d, &sub_face.inner_wires, frame);
     }
 
