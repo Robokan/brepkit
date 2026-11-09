@@ -3796,6 +3796,18 @@ struct WalkedEnd {
     end: usize,
     section: crate::section::CircSection,
     tol: f64,
+    /// The sign of the cap's offset past it, away from the round: `1.0` for
+    /// an end face the round runs out through, `-1.0` for a floor it stands
+    /// on (the walls meeting the cap in concave edges), whose outward side
+    /// is the round's own.
+    past: f64,
+}
+
+impl WalkedEnd {
+    /// How far `point` lies past the cap, away from the round.
+    fn past_cap(&self, topo: &Topology, point: Point3) -> Option<f64> {
+        cap_offset(topo, self.run_on, point, self.tol).map(|offset| self.past * offset)
+    }
 }
 
 /// The cap a walked round's end meets at `junction`, where there is exactly
@@ -3828,12 +3840,31 @@ fn walked_end(
         return Ok(None);
     };
     let tol = 1e-6 * (section.p1 - section.p2).length().max(1.0);
+    // The round lies on the cap's inner side: read where the ball's centre
+    // moves from the end section to the next one in (the far end of a
+    // spine curving round may lie anywhere about the cap's plane).
+    let count = stripe.sections.len();
+    if count < 2 {
+        return Ok(None);
+    }
+    let next = &stripe.sections[if end == 0 { 1 } else { count - 2 }];
+    let (Some(at_end), Some(inward)) = (
+        cap_offset(topo, run_on, section.center, tol),
+        cap_offset(topo, run_on, next.center, tol),
+    ) else {
+        return Ok(None);
+    };
+    let towards_round = inward - at_end;
+    if towards_round.abs() <= tol * 1e-3 {
+        return Ok(None);
+    }
     Ok(Some(WalkedEnd {
         corner_edges,
         run_on,
         end,
         section: section.clone(),
         tol,
+        past: -towards_round.signum(),
     }))
 }
 
@@ -3870,7 +3901,7 @@ fn walked_carry(
         return Ok(None);
     };
     let tol = walked.tol;
-    let offset = |point: Point3| cap_offset(topo, walked.run_on, point, tol);
+    let offset = |point: Point3| walked.past_cap(topo, point);
     let past = &stripe.beyond[walked.end];
     let mut needed = None;
     for (side, contact, at) in [
@@ -4013,14 +4044,15 @@ fn walked_run_back(
     let Some(walked) = walked_end(topo, junction, contour, stripe)? else {
         return Ok(None);
     };
+    let offset = |point: Point3| walked.past_cap(topo, point);
     let WalkedEnd {
-        corner_edges,
+        ref corner_edges,
         run_on,
         end,
-        section,
+        ref section,
         tol,
+        ..
     } = walked;
-    let offset = |point: Point3| cap_offset(topo, run_on, point, tol);
     let mut contacts = Vec::with_capacity(2);
     let mut cut = false;
     for (contact, at) in [
@@ -4069,7 +4101,7 @@ fn walked_run_back(
         };
         let reached = contact.evaluate(crossing);
         let mut on_corner = false;
-        for &edge in &corner_edges {
+        for &edge in corner_edges {
             on_corner |= point_on_edge(topo, edge, reached, tol)?;
         }
         if !on_corner {
