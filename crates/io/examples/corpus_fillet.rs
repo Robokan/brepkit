@@ -202,6 +202,19 @@ fn main() {
                 println!("    loop {}", line.join(" "));
             }
         }
+        // With VERTS=1 too, every vertex's position.
+        if std::env::var("VERTS").is_ok() {
+            for v in brepkit_topology::explorer::solid_vertices(&topo, sid).unwrap() {
+                let p = topo.vertex(v).unwrap().point();
+                println!(
+                    "  vertex {} ({:.6}, {:.6}, {:.6})",
+                    v.index(),
+                    p.x(),
+                    p.y(),
+                    p.z()
+                );
+            }
+        }
     }
     let mut edges = Vec::new();
     for pick in case["picks"]["edges"].as_array().unwrap() {
