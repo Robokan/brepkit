@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794190754264,
+  "lastUpdate": 1794191657591,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2645,6 +2645,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 24099358,
             "range": "± 347428",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "894a3e7031dd9753777f03cd5aac0f53cb4e92ed",
+          "message": "fix(operations): revolved bands hold their volume exactly\n\nA circle arc whose centre is a millionth of its radius off the revolve axis\nnow sweeps a sphere centred on the axis, not a NURBS band (sketch round-off\nfar from the origin left a bite 9.6e-7 off a tilted axis).  A NURBS face that\ncovers its whole surface is integrated over the surface's parameters rather\nthan its mesh, so a revolved half ellipse measures exact instead of 1.2e-6\nshort.  The STEP writer was already right; a regression test checks both\ncases in brepkit and through write_step / read_step.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-08T18:17:45-08:00",
+          "tree_id": "6eb4bc23cdecbc6d237dc332025c81840da4f0bd",
+          "url": "https://github.com/Robokan/brepkit/commit/894a3e7031dd9753777f03cd5aac0f53cb4e92ed"
+        },
+        "date": 1794191656717,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 696612,
+            "range": "± 5435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 765165,
+            "range": "± 4690",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9027,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 577259,
+            "range": "± 4594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18975558,
+            "range": "± 143971",
             "unit": "ns/iter"
           }
         ]
