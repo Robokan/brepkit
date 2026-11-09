@@ -54,10 +54,21 @@ pub(super) fn sample_wire_loop_uv_via_frame(
             t0 = c.project(s3);
             t1 = t0 + std::f64::consts::TAU;
         }
+        // A conic's samples follow its turn, one at least every 1/64 of it:
+        // eight over a whole circle make an octagon whose sides cut inside
+        // it by 7.6% of its radius, past which a hole near the rim pokes.
+        let n = match &e.curve_3d {
+            EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let by_turn = ((t1 - t0).abs() / (std::f64::consts::PI / 32.0)).ceil() as usize;
+                by_turn.clamp(CURVE_SAMPLES, 64)
+            }
+            _ => CURVE_SAMPLES,
+        };
         #[allow(clippy::cast_precision_loss)]
-        let mut samples: Vec<Point2> = (1..CURVE_SAMPLES)
+        let mut samples: Vec<Point2> = (1..n)
             .map(|k| {
-                let t = (t1 - t0).mul_add(k as f64 / CURVE_SAMPLES as f64, t0);
+                let t = (t1 - t0).mul_add(k as f64 / n as f64, t0);
                 frame.project(e.curve_3d.evaluate_with_endpoints(t, s3, e3))
             })
             .collect();

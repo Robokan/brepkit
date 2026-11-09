@@ -10214,9 +10214,32 @@ fn split_face_2d_impl(
             let poly = sample_wire_loop_uv_via_frame(&outer_wire, frame);
             if poly.len() >= 3 {
                 let ip = super::classify_2d::sample_interior_point(&poly);
+                // A region round the hole (the outer rim of a ring the
+                // sections cut only near its hole) is no island, though its
+                // own interior point, read without its holes, lies in it.
+                let surrounds = |hp: &[Point2]| {
+                    let (lo, hi) = hp.iter().fold(
+                        (
+                            Point2::new(f64::MAX, f64::MAX),
+                            Point2::new(f64::MIN, f64::MIN),
+                        ),
+                        |(lo, hi), q| {
+                            (
+                                Point2::new(lo.x().min(q.x()), lo.y().min(q.y())),
+                                Point2::new(hi.x().max(q.x()), hi.y().max(q.y())),
+                            )
+                        },
+                    );
+                    let clear = 0.01 * (hi - lo).length();
+                    hp.iter().any(|&q| {
+                        super::classify_2d::point_in_polygon_2d(q, &poly)
+                            && super::classify_2d::distance_to_polygon_boundary(q, &poly) > clear
+                    })
+                };
                 let matched_hole = hole_polys_for_discard.iter().find(|hp| {
                     super::classify_2d::point_in_polygon_2d(ip, hp)
                         && super::classify_2d::distance_to_polygon_boundary(ip, hp) > hole_margin
+                        && !surrounds(hp)
                 });
                 if let Some(hole_poly) = matched_hole {
                     if trace_split {
