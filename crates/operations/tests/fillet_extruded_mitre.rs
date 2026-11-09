@@ -79,12 +79,17 @@ fn edge_between(topo: &Topology, solid: SolidId, a: Point3, b: Point3) -> EdgeId
 /// its edges `V -> A` and `V -> B`, each `L` long, square to the walls
 /// `A -> C` and `B -> C`.
 fn kite(theta: f64) -> [Point3; 4] {
+    kite_of(theta, L)
+}
+
+/// [`kite`] with edges `length` long.
+fn kite_of(theta: f64, length: f64) -> [Point3; 4] {
     let h = theta / 2.0;
     [
         Point3::new(0.0, 0.0, 0.0),
-        Point3::new(L * h.cos(), -L * h.sin(), 0.0),
-        Point3::new(L / h.cos(), 0.0, 0.0),
-        Point3::new(L * h.cos(), L * h.sin(), 0.0),
+        Point3::new(length * h.cos(), -length * h.sin(), 0.0),
+        Point3::new(length / h.cos(), 0.0, 0.0),
+        Point3::new(length * h.cos(), length * h.sin(), 0.0),
     ]
 }
 
@@ -126,5 +131,51 @@ fn rounds_meeting_at_a_corner_not_square_are_mitred() {
                 "{case}: lost {lost}, the mitred rounds {removed}"
             );
         }
+    }
+}
+
+/// A mitre takes of each edge only as far as the two rounds' contacts on
+/// the top cross, `r cot(theta / 2)` from the corner: at an obtuse corner
+/// the rounds may be wider than their edges are long. (The limit took a
+/// whole radius of each edge, as a square corner does, and refused these.)
+#[test]
+fn rounds_wider_than_their_edges_meet_at_an_obtuse_corner() {
+    let length = 4.0;
+    for theta_deg in [150.0_f64, 160.0] {
+        let theta = theta_deg.to_radians();
+        let r = 5.0;
+        let case = format!("theta = {theta_deg}, r = {r}");
+        let mut topo = Topology::new();
+        let points = kite_of(theta, length);
+        let [v, b, _, a] = points;
+        let solid = prism(&mut topo, &points);
+        let up = Vec3::new(0.0, 0.0, H);
+        let edges = [
+            edge_between(&topo, solid, v + up, a + up),
+            edge_between(&topo, solid, v + up, b + up),
+        ];
+        let before = solid_volume(&topo, solid, 1e-3).unwrap();
+        let faces_before = solid_faces(&topo, solid).unwrap().len();
+
+        let result = fillet_v2(&mut topo, solid, &edges, r).unwrap();
+        assert!(result.failed.is_empty(), "{case}: {:?}", result.failed);
+        let report = validate_solid(&topo, result.solid).unwrap();
+        assert!(report.is_valid(), "{case}: {:?}", report.issues);
+        let mesh = tessellate_solid(&topo, result.solid, 0.01).unwrap();
+        assert!(is_watertight(&mesh), "{case}: mesh not watertight");
+        assert_eq!(
+            solid_faces(&topo, result.solid).unwrap().len(),
+            faces_before + 2,
+            "{case}: the two rounds alone are added"
+        );
+
+        let cot = 1.0 / (theta / 2.0).tan();
+        let removed = 2.0 * length * r * r * (1.0 - PI / 4.0)
+            - 2.0 * cot * r.powi(3) * (5.0 / 6.0 - PI / 4.0);
+        let lost = before - solid_volume(&topo, result.solid, 1e-3).unwrap();
+        assert!(
+            (lost - removed).abs() <= 1e-6 * before,
+            "{case}: lost {lost}, the mitred rounds {removed}"
+        );
     }
 }

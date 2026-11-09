@@ -1196,7 +1196,9 @@ const LIMIT_SLACK: f64 = 5e-10;
 /// invariant under rigid placement and uniform scale):
 ///
 /// - a selected contour of length `L` with `m` mitered ends (1 or 2; a contour
-///   with 0 qualifying ends is out of scope here): `m*r <= L (1 + LIMIT_SLACK)`;
+///   with 0 qualifying ends is out of scope here): `r (cot(a1 / 2) + ...)
+///   <= L (1 + LIMIT_SLACK)`, one term per mitered end, `a` its corner's angle
+///   between the contours (each term `1` at a square corner);
 /// - the retained (unselected) third edge at each qualifying corner, length
 ///   `H`: `r <= H (1 + LIMIT_SLACK)`;
 /// - the unselected edge(s) at a runout terminal (the far, non-mitered end of
@@ -1230,26 +1232,44 @@ pub fn check_equal_two_edge_admissibility(
         Ok((topo.vertex(b)?.point() - topo.vertex(a)?.point()).length())
     };
 
-    // Rule 1: selected-edge remaining length, m mitered ends.
+    // Rule 1: selected-edge remaining length. A mitre takes `r cot(a / 2)`
+    // of each contour from its corner, `a` the corner's angle between the
+    // contours: where the two rounds' contacts on the common face cross, `r`
+    // in from each edge (`r` at a square corner, nearly none where the
+    // contours run on almost tangent).
     let mut by_contour_m = vec![0usize; plan.contours.len()];
+    let mut by_contour_take = vec![0.0_f64; plan.contours.len()];
     let mut by_contour_r = vec![0.0_f64; plan.contours.len()];
     for miter in &miters {
+        let directions = miter
+            .contours
+            .map(|ci| contour_direction_away_from(topo, &plan.contours[ci], miter.vertex));
+        let share = match directions {
+            [Ok(Some(a)), Ok(Some(b))] => {
+                let cos = a.dot(b).clamp(-1.0, 1.0);
+                // cot(a / 2), at most 1 (a square corner's) for an acute one.
+                ((1.0 + cos) / (1.0 - cos).max(f64::MIN_POSITIVE))
+                    .sqrt()
+                    .max(if cos > 0.0 { 1.0 } else { 0.0 })
+            }
+            _ => 1.0,
+        };
         for &ci in &miter.contours {
             by_contour_m[ci] += 1;
+            by_contour_take[ci] += share;
             by_contour_r[ci] = miter.radius;
         }
     }
     for (ci, contour) in plan.contours.iter().enumerate() {
-        let m = by_contour_m[ci];
-        if m == 0 {
+        if by_contour_m[ci] == 0 {
             continue;
         }
-        let r = by_contour_r[ci];
+        let (r, take) = (by_contour_r[ci], by_contour_take[ci]);
         let length = contour.spine.length();
-        if (m as f64) * r > length * (1.0 + LIMIT_SLACK) {
+        if take * r > length * (1.0 + LIMIT_SLACK) {
             return Err(BlendError::RadiusTooLarge {
                 edge: contour.edges[0],
-                max_radius: (length / (m as f64)).max(0.0),
+                max_radius: (length / take).max(0.0),
             });
         }
     }
