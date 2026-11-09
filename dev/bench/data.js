@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794100491502,
+  "lastUpdate": 1794190754264,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2591,6 +2591,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29162136,
             "range": "± 42542",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "14e2e1b133c8ecde3c6055efe279171453011fc0",
+          "message": "docs(buzzcad): a closed contact cut on its face's seam (#15)\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-08T16:29:49-08:00",
+          "tree_id": "0c8bbebe3a63008d573b2730ea3c444c0e80efc3",
+          "url": "https://github.com/Robokan/brepkit/commit/14e2e1b133c8ecde3c6055efe279171453011fc0"
+        },
+        "date": 1794190753414,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 931391,
+            "range": "± 19893",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1019432,
+            "range": "± 21476",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 10456,
+            "range": "± 176",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 772147,
+            "range": "± 7776",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 24099358,
+            "range": "± 347428",
             "unit": "ns/iter"
           }
         ]
