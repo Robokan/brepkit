@@ -164,6 +164,45 @@ fn main() {
     let sid = brepkit_io::step::read_step(&text, &mut topo).unwrap()[0];
     let n_faces = solid_faces(&topo, sid).unwrap().len();
     println!("input: {} faces ({})", n_faces, census(&topo, sid));
+    // INVOL=1 prints the input's own volume as brepkit measures it.
+    if std::env::var("INVOL").is_ok() {
+        println!(
+            "input volume {:.4}",
+            brepkit_operations::measure::solid_volume(&topo, sid, 0.1).unwrap()
+        );
+    }
+    // INPUT=1 lists the input's faces, each loop's edges and their curves.
+    if std::env::var("INPUT").is_ok() {
+        for f in solid_faces(&topo, sid).unwrap() {
+            let face = topo.face(f).unwrap();
+            println!(
+                "  face {} {} rev={}",
+                f.index(),
+                face.surface().type_tag(),
+                u8::from(face.is_reversed())
+            );
+            for w in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+                let line: Vec<String> = topo
+                    .wire(w)
+                    .unwrap()
+                    .edges()
+                    .iter()
+                    .map(|oe| {
+                        let e = topo.edge(oe.edge()).unwrap();
+                        format!(
+                            "{}{}{}[{}-{}]",
+                            if oe.is_forward() { "+" } else { "-" },
+                            oe.edge().index(),
+                            &e.curve().type_tag()[..2],
+                            e.start().index(),
+                            e.end().index()
+                        )
+                    })
+                    .collect();
+                println!("    loop {}", line.join(" "));
+            }
+        }
+    }
     let mut edges = Vec::new();
     for pick in case["picks"]["edges"].as_array().unwrap() {
         let p = pick["point"].as_array().unwrap();
@@ -193,6 +232,41 @@ fn main() {
         edges.push(eid);
     }
     edges.dedup();
+    // KINKS=1 prints the turn between picked edges at each vertex they share.
+    if std::env::var("KINKS").is_ok() {
+        let along = |eid: brepkit_topology::edge::EdgeId, at_start: bool| {
+            let e = topo.edge(eid).unwrap();
+            let (a, b) = (
+                topo.vertex(e.start()).unwrap().point(),
+                topo.vertex(e.end()).unwrap().point(),
+            );
+            let (t0, t1) = e.curve().domain_with_endpoints(a, b);
+            let h = (t1 - t0) * 1e-6;
+            let (t, s) = if at_start { (t0, 1.0) } else { (t1, -1.0) };
+            let p = e.curve().evaluate_with_endpoints(t, a, b);
+            let q = e.curve().evaluate_with_endpoints(t + s * h, a, b);
+            (q - p).normalize().unwrap()
+        };
+        for (i, &x) in edges.iter().enumerate() {
+            for &y in &edges[i + 1..] {
+                let (ex, ey) = (topo.edge(x).unwrap(), topo.edge(y).unwrap());
+                for (vx, sx) in [(ex.start(), true), (ex.end(), false)] {
+                    for (vy, sy) in [(ey.start(), true), (ey.end(), false)] {
+                        if vx == vy {
+                            // Both directions leave the vertex; a smooth join has them opposite.
+                            let turn = (-along(x, sx)).dot(along(y, sy)).clamp(-1.0, 1.0).acos();
+                            println!(
+                                "  kink at {vx:?} edges {} {}: {:.6} deg",
+                                x.index(),
+                                y.index(),
+                                turn.to_degrees()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     // CHAIN=<radians> also rounds each pick's tangent chain
     // (`query::tangent_chain`), as some kernels do.
     if let Ok(angle) = std::env::var("CHAIN") {
@@ -222,6 +296,16 @@ fn main() {
             for (eid, why) in &r.failed {
                 println!("  failed edge {}: {why}", eid.index());
             }
+            // FLIPFACE=i turns face i of the result over (a debugging aid).
+            if let Ok(i) = std::env::var("FLIPFACE") {
+                let i: usize = i.parse().unwrap();
+                for f in solid_faces(&topo, r.solid).unwrap() {
+                    if f.index() == i {
+                        let face = topo.face_mut(f).unwrap();
+                        face.set_reversed(!face.is_reversed());
+                    }
+                }
+            }
             let (open, over) = bad_edges(&topo, r.solid);
             if let Ok(out) = std::env::var("OUT") {
                 std::fs::write(
@@ -229,6 +313,49 @@ fn main() {
                     brepkit_io::step::write_step(&topo, &[r.solid]).unwrap(),
                 )
                 .unwrap();
+            }
+            // MESHVOL=d: the signed volume of the solid's mesh at deflection
+            // d, and each face's share of it (about the mesh's box centre).
+            if let Ok(d) = std::env::var("MESHVOL") {
+                let d: f64 = d.parse().unwrap();
+                let (mesh, offs) =
+                    brepkit_operations::tessellate::tessellate_solid_grouped_with_tolerance(
+                        &topo, r.solid, d, 0.5,
+                    )
+                    .unwrap();
+                let mut lo = [f64::MAX; 3];
+                let mut hi = [f64::MIN; 3];
+                for p in &mesh.positions {
+                    for (k, c) in [p.x(), p.y(), p.z()].into_iter().enumerate() {
+                        lo[k] = lo[k].min(c);
+                        hi[k] = hi[k].max(c);
+                    }
+                }
+                let c = brepkit_math::vec::Point3::new(
+                    0.5 * (lo[0] + hi[0]),
+                    0.5 * (lo[1] + hi[1]),
+                    0.5 * (lo[2] + hi[2]),
+                );
+                let faces = solid_faces(&topo, r.solid).unwrap();
+                let mut total = 0.0;
+                for (g, w) in offs.windows(2).enumerate() {
+                    let mut share = 0.0;
+                    for tri in mesh.indices[w[0] as usize..w[1] as usize].chunks_exact(3) {
+                        let [a, b, e] =
+                            [tri[0], tri[1], tri[2]].map(|i| mesh.positions[i as usize] - c);
+                        share += a.dot(b.cross(e)) / 6.0;
+                    }
+                    total += share;
+                    println!(
+                        "   mesh face {} {}: {share:.4}",
+                        faces.get(g).map_or(usize::MAX, |f| f.index()),
+                        faces
+                            .get(g)
+                            .map_or("?", |&f| topo.face(f).unwrap().surface().type_tag())
+                    );
+                }
+                println!("mesh volume({d}) {total:.4}");
+                return;
             }
             if std::env::var("VOL05").is_ok() {
                 let t = std::time::Instant::now();
