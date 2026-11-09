@@ -204,11 +204,44 @@ pub(super) fn sample_wire_loop_uv_periodic(
                     // seam): sample it on the copy its start sits at.
                     // Both ends must land on the edge's end UVs under the one
                     // shift.
-                    let (first, last) = if edge.forward {
-                        (nurbs.evaluate(t0), nurbs.evaluate(tn))
-                    } else {
-                        (nurbs.evaluate(tn), nurbs.evaluate(t0))
+                    // Pcurves reach a wire under two conventions: fit along
+                    // the curve (the flag then says which way the wire runs
+                    // it) or fit in traversal order with the flag kept. The
+                    // way that lands on the edge's own end UVs is the one the
+                    // wire runs, whatever the flag says (a plane facing
+                    // against a circle's axis has its rim arcs both ways).
+                    let span_off = |dx: f64, dy: f64| {
+                        let reduce = |x: f64, period: Option<f64>| {
+                            period.map_or(x, |p| x - (x / p).round() * p)
+                        };
+                        reduce(dx, u_period).hypot(reduce(dy, v_period))
                     };
+                    let (a, b) = (nurbs.evaluate(t0), nurbs.evaluate(tn));
+                    let misfit = |first: Point2, last: Point2| {
+                        span_off(edge.start_uv.x() - first.x(), edge.start_uv.y() - first.y())
+                            + span_off(edge.end_uv.x() - last.x(), edge.end_uv.y() - last.y())
+                    };
+                    let flagged = if edge.forward {
+                        misfit(a, b)
+                    } else {
+                        misfit(b, a)
+                    };
+                    let other = if edge.forward {
+                        misfit(b, a)
+                    } else {
+                        misfit(a, b)
+                    };
+                    let ahead = if (edge.end_uv.x() - edge.start_uv.x())
+                        .hypot(edge.end_uv.y() - edge.start_uv.y())
+                        > 1e-9
+                        && flagged > 1e-6
+                        && other < 0.25 * flagged
+                    {
+                        !edge.forward
+                    } else {
+                        edge.forward
+                    };
+                    let (first, last) = if ahead { (a, b) } else { (b, a) };
                     // A marched section's pcurve is a fit, its ends a few
                     // 1e-4 off the edge's own UVs; whole turns are what tell
                     // the copy apart, not the fit's residual.
@@ -233,7 +266,7 @@ pub(super) fn sample_wire_loop_uv_periodic(
                     #[allow(clippy::cast_precision_loss)]
                     for i in 0..CURVE_SAMPLES {
                         let frac = i as f64 / CURVE_SAMPLES as f64;
-                        let t = if edge.forward {
+                        let t = if ahead {
                             t0 + (tn - t0) * frac
                         } else {
                             tn - (tn - t0) * frac

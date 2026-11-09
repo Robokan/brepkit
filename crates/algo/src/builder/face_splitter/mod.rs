@@ -79,6 +79,24 @@ fn seg_cross_param(a0: Point2, a1: Point2, b0: Point2, b1: Point2) -> Option<f64
     (t > 1e-6 && t < 1.0 - 1e-6 && u > -1e-6 && u < 1.0 + 1e-6).then_some(t)
 }
 
+/// Whether a boundary arc's chord crosses a section's chord in (u, v): a
+/// chord-read arrangement then sees regions the arcs do not bound.
+fn arc_chords_cross_sections(edges: &[OrientedPCurveEdge]) -> bool {
+    let sections: Vec<(Point2, Point2)> = edges
+        .iter()
+        .filter(|e| e.source_edge_idx.is_some())
+        .map(|e| (e.start_uv, e.end_uv))
+        .collect();
+    edges
+        .iter()
+        .filter(|e| e.source_edge_idx.is_none() && !edge_curve_is_straight(&e.curve_3d))
+        .any(|e| {
+            sections
+                .iter()
+                .any(|&(a, b)| seg_cross_param(e.start_uv, e.end_uv, a, b).is_some())
+        })
+}
+
 /// Overlap span `[ta, tb]` (parameters along `a0->a1`, clamped to `[0,1]`)
 /// where segment `a` rides collinearly on segment `b`: parallel within the
 /// same near-parallel rejection band as [`seg_cross_param`], on the same
@@ -9328,8 +9346,6 @@ fn split_face_2d_impl(
     // cap (the d-series shelled-cup lip fuse) is partitioned correctly by the
     // calibrated wire-builder path, and the arrangement picks a worse
     // decomposition there.
-    let bay_mouth_arrangement =
-        !holes_integrated && boundary_arc_crossed && original_inner_wires.len() >= 2;
     // The boundary-arc×section crossings are applied HERE, not globally: the
     // arrangement needs the bay arcs pre-split at the crossings (each arc
     // piece is then uncrossed and its endpoints register as T-junctions on the
@@ -9350,6 +9366,14 @@ fn split_face_2d_impl(
     } else {
         &all_edges
     };
+    // The arrangement reads each edge by its chord, so a boundary arc whose
+    // chord crosses a section (a disc's long rim arc beyond a box's corner,
+    // its chord passing under the box's top) bounds regions it cannot see;
+    // such a face is left to the wire builder.
+    let bay_mouth_arrangement = !holes_integrated
+        && boundary_arc_crossed
+        && original_inner_wires.len() >= 2
+        && !arc_chords_cross_sections(arr_input);
     // Third entry condition: the angular walker demonstrably WOVE the greedy
     // loops — some loop contains an edge immediately followed by its exact
     // reverse (an out-and-back spur, the label-tab corner-crescent weave where
