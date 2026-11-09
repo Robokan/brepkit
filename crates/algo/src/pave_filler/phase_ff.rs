@@ -9269,13 +9269,26 @@ fn line_face_intervals(
                 let qb = 2.0 * x0.mul_add(dx, y0 * dy);
                 let qc = x0.mul_add(x0, y0 * y0) - 1.0;
                 let disc = qb.mul_add(qb, -4.0 * qa * qc);
-                if disc < 0.0 {
+                // A line tangent to the arc's conic: its two roots, a
+                // rounding apart (or none, a rounding short), bound a chord
+                // whose sagitta (on the conic's tightest bend, `b^2 / a`
+                // for `a >= b`) is within tolerance. It touches the conic
+                // at one point, which cuts it there: a run between the two
+                // roots would read as a meeting, and with no cut the run
+                // through the touch point reads as on the boundary.
+                let half_chord = disc.abs().sqrt() / (2.0 * qa) * len;
+                let tightest = a.min(b) * a.min(b) / a.max(b);
+                let roots = if half_chord * half_chord <= 2.0 * tightest * tol {
+                    vec![-qb / (2.0 * qa)]
+                } else if disc < 0.0 {
                     continue;
-                }
-                for s in [
-                    (-qb - disc.sqrt()) / (2.0 * qa),
-                    (-qb + disc.sqrt()) / (2.0 * qa),
-                ] {
+                } else {
+                    vec![
+                        (-qb - disc.sqrt()) / (2.0 * qa),
+                        (-qb + disc.sqrt()) / (2.0 * qa),
+                    ]
+                };
+                for s in roots {
                     let t = s.mul_add(dy, y0).atan2(s.mul_add(dx, x0));
                     if t0 + (t - t0).rem_euclid(std::f64::consts::TAU) <= t1 + 1e-9 {
                         cuts.push(s);

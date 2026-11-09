@@ -7277,13 +7277,34 @@ fn split_face_2d_impl(
                 matches!(e.curve_3d, EdgeCurve::Line)
                     && (e.start_3d - e.end_3d).length() < tol.linear * 100.0
             });
+        // A closed section that starts on the boundary but runs off it
+        // everywhere else only touches it there: a cylinder whose wall is
+        // tangent to the face's rim, its section loop started at the
+        // tangent point. It bounds a hole all the same, unless it winds
+        // round the wall (a whole rim section from the seam's vertex).
+        let touches_only = |s: &SectionEdge| {
+            if (s.start - s.end).length() >= tol.linear
+                || winding_section_chain(std::slice::from_ref(s), &surface, tol.linear, true)
+                    .is_some()
+            {
+                return false;
+            }
+            let (t0, t1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+            // Samples between sixteenths, clear of the start and of the
+            // loop's halfway point, where a second touch often lies.
+            (0..16).all(|k| {
+                let t = t0 + (t1 - t0) * (f64::from(k) + 0.5) / 16.0;
+                let p = s.curve_3d.evaluate_with_endpoints(t, s.start, s.end);
+                !is_point_on_boundary_uv(p, &surface, &boundary_edges, uv_tol)
+            })
+        };
         let endpoints_internal = whole_ring
             || sections.iter().all(|s| {
                 let start_on_boundary =
                     is_point_on_boundary_uv(s.start, &surface, &boundary_edges, uv_tol);
                 let end_on_boundary =
                     is_point_on_boundary_uv(s.end, &surface, &boundary_edges, uv_tol);
-                !start_on_boundary && !end_on_boundary
+                (!start_on_boundary && !end_on_boundary) || touches_only(s)
             });
         // Winding veto: on a u-periodic lateral, a section chain that winds
         // the full period is a band separator, not a contractible hole — an
