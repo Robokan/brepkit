@@ -1155,6 +1155,256 @@ pub(super) fn separate_touching_pieces(
     Ok(pieces)
 }
 
+/// One use of an edge: the face, its wire, the edge's position in the
+/// wire, and whether the wire runs it forward.
+type EdgeUse = (FaceId, WireId, usize, bool);
+
+/// Give each wedge of material around a pinched edge its own copy of it.
+///
+/// Two solids pressed together over a face and also meeting along a line
+/// beside it (a plate standing on a box, its underside's edge lying on the
+/// box's top edge) fuse into one piece whose surface touches itself along
+/// that line: four faces use the edge, the material filling two opposite
+/// wedges round it and leaving the other two empty. Each wedge is closed
+/// by the two faces bounding it, so each pair takes its own copy of the
+/// edge (the first keeps the edge), and every edge then has two uses. Its
+/// end vertices, where the wedges now meet only at a point, take a copy
+/// for each fan of faces round them after the first.
+///
+/// An edge is split only when its faces sort round it, each wedge between
+/// two neighbours is clearly open (two faces lying on one another are a
+/// doubled face, not a pinch) and the wedges alternate material and empty,
+/// the two faces of each material wedge using the edge in opposite senses.
+/// Returns the number of edges split.
+pub(super) fn separate_pinched_edges(
+    topo: &mut Topology,
+    solid: SolidId,
+) -> Result<usize, crate::OperationsError> {
+    // Each edge's uses: (face, wire, position in the wire, forward).
+    let face_ids = brepkit_topology::explorer::solid_faces(topo, solid)?;
+    let mut uses: HashMap<EdgeId, Vec<EdgeUse>> = HashMap::new();
+    for &fid in &face_ids {
+        let face = topo.face(fid)?;
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for (i, oe) in topo.wire(wid)?.edges().iter().enumerate() {
+                uses.entry(oe.edge())
+                    .or_default()
+                    .push((fid, wid, i, oe.is_forward()));
+            }
+        }
+    }
+    let mut pinched: Vec<(EdgeId, Vec<EdgeUse>)> = uses
+        .into_iter()
+        .filter(|(_, u)| u.len() >= 4 && u.len() % 2 == 0)
+        .collect();
+    pinched.sort_unstable_by_key(|(e, _)| e.index());
+
+    let mut split = 0;
+    let mut touched: HashSet<VertexId> = HashSet::new();
+    for (eid, edge_uses) in pinched {
+        // A face using the edge twice (a seam) is no pinch.
+        let mut faces: Vec<FaceId> = edge_uses.iter().map(|u| u.0).collect();
+        faces.sort_unstable_by_key(|f| f.index());
+        faces.dedup();
+        if faces.len() != edge_uses.len() {
+            continue;
+        }
+        let edge = topo.edge(eid)?.clone();
+        let (p0, p1) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(p0, p1);
+        let tm = 0.5 * (t0 + t1);
+        let at = edge.curve().evaluate_with_endpoints(tm, p0, p1);
+        let Ok(tangent) = edge.curve().tangent_with_endpoints(tm, p0, p1).normalize() else {
+            continue;
+        };
+        // A frame across the edge: each face leaves the edge at an angle
+        // round it, along `n x t` for its outward normal `n` and the sense
+        // `t` it runs the edge in (its inside lies to the left).
+        let seed = if tangent.x().abs() < 0.9 {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        };
+        let Ok(across) = tangent.cross(seed).normalize() else {
+            continue;
+        };
+        let up = tangent.cross(across);
+        // A step into each face, on its surface, for the angle it leaves
+        // the edge at: two faces tangent along the edge (a rod lying on a
+        // plate) leave it alike at first and part only as one curves away.
+        let step = (p1 - p0).length().mul_add(1e-3, 0.0).clamp(1e-4, 0.1);
+        let mut round: Vec<(f64, usize, bool)> = Vec::with_capacity(edge_uses.len());
+        for (k, &(fid, _, _, forward)) in edge_uses.iter().enumerate() {
+            let face = topo.face(fid)?;
+            let normal = face_normal_at_point(face, at);
+            let sense = if forward { tangent } else { -tangent };
+            let Ok(into) = normal.cross(sense).normalize() else {
+                break;
+            };
+            let probe = at + into * step;
+            let onto = face
+                .surface()
+                .project_point(probe)
+                .and_then(|(u, v)| face.surface().evaluate(u, v))
+                .unwrap_or(probe);
+            let off = onto - at;
+            let off = off - tangent * off.dot(tangent);
+            let leave = if off.length() > 0.5 * step { off } else { into };
+            let angle = leave.dot(up).atan2(leave.dot(across));
+            // Material lies just past the face, turning round the edge,
+            // when the turn heads against its outward normal.
+            let material_after = tangent.cross(into).dot(normal) < 0.0;
+            round.push((angle, k, material_after));
+        }
+        if round.len() != edge_uses.len() {
+            continue;
+        }
+        round.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let n = round.len();
+        let open = (0..n).all(|i| {
+            let (a, b) = (round[i].0, round[(i + 1) % n].0);
+            let gap = if i + 1 == n {
+                b + std::f64::consts::TAU - a
+            } else {
+                b - a
+            };
+            gap > 1e-9
+        });
+        let alternate = (0..n).all(|i| round[i].2 != round[(i + 1) % n].2);
+        if !open || !alternate {
+            log::debug!(
+                "pinch: edge {} skipped (open {open}, alternate {alternate}, {} uses)",
+                eid.index(),
+                n
+            );
+            continue;
+        }
+        // The material wedges, each from a face to the next one round.
+        let first = usize::from(!round[0].2);
+        let wedges: Vec<(usize, usize)> = (0..n / 2)
+            .map(|w| {
+                let i = first + 2 * w;
+                (round[i % n].1, round[(i + 1) % n].1)
+            })
+            .collect();
+        if wedges
+            .iter()
+            .any(|&(a, b)| edge_uses[a].3 == edge_uses[b].3)
+        {
+            continue;
+        }
+        for &(a, b) in wedges.iter().skip(1) {
+            let mut copy = Edge::new(edge.start(), edge.end(), edge.curve().clone());
+            copy.set_tolerance(edge.tolerance());
+            let new = topo.add_edge(copy);
+            for k in [a, b] {
+                let (fid, wid, pos, forward) = edge_uses[k];
+                if let Some(oe) = topo.wire_mut(wid)?.edges_mut().get_mut(pos) {
+                    *oe = OrientedEdge::new(new, forward);
+                }
+                if let Some(pc) = topo.pcurves_mut().remove(eid, fid) {
+                    topo.pcurves_mut().set(new, fid, pc);
+                }
+            }
+        }
+        split += 1;
+        touched.extend([edge.start(), edge.end()]);
+    }
+    if split > 0 {
+        separate_vertex_fans(topo, &face_ids, &touched)?;
+    }
+    Ok(split)
+}
+
+/// Give each fan of faces round a vertex its own copy of the vertex.
+///
+/// A pinched edge's copies still share its end vertices, where the faces
+/// round each copy now meet only at a point: each set of face corners
+/// joined through the edges they share there is a fan, and every fan after
+/// the first takes a copy of the vertex for its edges' ends.
+fn separate_vertex_fans(
+    topo: &mut Topology,
+    face_ids: &[FaceId],
+    vertices: &HashSet<VertexId>,
+) -> Result<(), crate::OperationsError> {
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    // Nodes are edge ends at the vertices, keyed by the edge and whether it
+    // is the edge's end; a face corner joins the end its wire arrives by to
+    // the end it leaves by.
+    let mut nodes: HashMap<(EdgeId, bool), usize> = HashMap::new();
+    let mut node_vertex: Vec<VertexId> = Vec::new();
+    let mut parent: Vec<usize> = Vec::new();
+    for &fid in face_ids {
+        let face = topo.face(fid)?;
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            let edges = topo.wire(wid)?.edges().to_vec();
+            for (i, arrive) in edges.iter().enumerate() {
+                let leave = edges[(i + 1) % edges.len()];
+                let a = topo.edge(arrive.edge())?;
+                let at = if arrive.is_forward() {
+                    a.end()
+                } else {
+                    a.start()
+                };
+                if !vertices.contains(&at) {
+                    continue;
+                }
+                let mut ends = [
+                    (arrive.edge(), arrive.is_forward()),
+                    (leave.edge(), !leave.is_forward()),
+                ]
+                .map(|key| {
+                    *nodes.entry(key).or_insert_with(|| {
+                        parent.push(parent.len());
+                        node_vertex.push(at);
+                        parent.len() - 1
+                    })
+                });
+                ends[0] = root(&mut parent, ends[0]);
+                ends[1] = root(&mut parent, ends[1]);
+                parent[ends[1]] = ends[0];
+            }
+        }
+    }
+    // The fans at each vertex, the first keeping the vertex.
+    let mut fan_vertex: HashMap<usize, VertexId> = HashMap::new();
+    let mut first_fan: HashMap<VertexId, usize> = HashMap::new();
+    let mut keys: Vec<((EdgeId, bool), usize)> = nodes.into_iter().collect();
+    keys.sort_unstable_by_key(|((e, end), _)| (e.index(), *end));
+    for ((eid, end), node) in keys {
+        let fan = root(&mut parent, node);
+        let vid = node_vertex[node];
+        let first = *first_fan.entry(vid).or_insert(fan);
+        if first == fan {
+            continue;
+        }
+        let copy = if let Some(&copy) = fan_vertex.get(&fan) {
+            copy
+        } else {
+            let vertex = topo.vertex(vid)?;
+            let copy = topo.add_vertex(Vertex::new(vertex.point(), vertex.tolerance()));
+            fan_vertex.insert(fan, copy);
+            copy
+        };
+        let edge = topo.edge_mut(eid)?;
+        if end {
+            edge.set_end(copy);
+        } else {
+            edge.set_start(copy);
+        }
+    }
+    Ok(())
+}
+
 /// Split long boundary edges at intermediate collinear vertices.
 ///
 /// After boolean assembly, some unsplit (passthrough) faces may have edges that

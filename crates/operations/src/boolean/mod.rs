@@ -910,6 +910,35 @@ fn boolean_inner(
                         return Ok(result);
                     }
                 }
+                // One piece pinched along an edge (two solids pressed together
+                // over a face and also meeting along a line beside it): with
+                // each wedge of material round the edge taking its own copy,
+                // every edge has two uses and the piece closes, its Euler
+                // count that of a body with a handle through the pinch.
+                if components == 1
+                    && !closed_manifold
+                    && open_shell_ok
+                    && !has_free_edges(topo, result)?
+                    && crate::boolean::assembly::separate_pinched_edges(topo, result)? > 0
+                    && is_closed_manifold(topo, result)?
+                {
+                    let (f, e, v) = brepkit_topology::explorer::solid_entity_counts(topo, result)?;
+                    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+                    let euler = count(v) - count(e) + count(f) - inner_shell_surplus;
+                    let holes = solid_inner_wire_count(topo, result)?;
+                    let faces = brepkit_topology::explorer::solid_faces(topo, result)?;
+                    let fans = crate::validate::extra_vertex_fans(topo, &faces)?;
+                    if (euler_balanced(euler, holes, 1) || euler_balanced(euler + fans, holes, 1))
+                        && crate::validate::validate_solid(topo, result)?.is_valid()
+                        && validate_boolean_result(topo, result).is_ok()
+                    {
+                        log::info!(
+                            "GFA pinched piece succeeded in {:.1}ms",
+                            timer_elapsed_ms(gfa_start)
+                        );
+                        return Ok(result);
+                    }
+                }
                 // Which gate refused? Both acceptance paths are conjunctions,
                 // so the bare rejection below says nothing about the cause —
                 // and when `validate` is None the result is topologically fine
