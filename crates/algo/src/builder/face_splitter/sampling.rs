@@ -210,6 +210,9 @@ pub(super) fn sample_wire_loop_uv_periodic(
                     // way that lands on the edge's own end UVs is the one the
                     // wire runs, whatever the flag says (a plane facing
                     // against a circle's axis has its rim arcs both ways).
+                    // Only the face's own boundary edges: a section's pcurve
+                    // is read by its flag elsewhere, and its sample must
+                    // agree with those readings.
                     let span_off = |dx: f64, dy: f64| {
                         let reduce = |x: f64, period: Option<f64>| {
                             period.map_or(x, |p| x - (x / p).round() * p)
@@ -231,9 +234,10 @@ pub(super) fn sample_wire_loop_uv_periodic(
                     } else {
                         misfit(a, b)
                     };
-                    let ahead = if (edge.end_uv.x() - edge.start_uv.x())
-                        .hypot(edge.end_uv.y() - edge.start_uv.y())
-                        > 1e-9
+                    let ahead = if edge.source_edge_idx.is_none()
+                        && (edge.end_uv.x() - edge.start_uv.x())
+                            .hypot(edge.end_uv.y() - edge.start_uv.y())
+                            > 1e-9
                         && flagged > 1e-6
                         && other < 0.25 * flagged
                     {

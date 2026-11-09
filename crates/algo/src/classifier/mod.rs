@@ -108,10 +108,9 @@ pub struct FaceLoops2d {
 }
 
 impl FaceLoops2d {
-    /// Sample `face_id`'s loops: two points per line, a conic every 1/128 of
-    /// a turn (sixteen at least), sixteen per other curved edge,
-    /// each edge walked in its traversal direction and excluding the traversal
-    /// endpoint (the next edge supplies it).
+    /// Sample `face_id`'s loops: two points per line, sixteen per curved
+    /// edge, each edge walked in its traversal direction and excluding the
+    /// traversal endpoint (the next edge supplies it).
     ///
     /// # Errors
     ///
@@ -119,6 +118,29 @@ impl FaceLoops2d {
     pub fn new(
         topo: &Topology,
         face_id: brepkit_topology::face::FaceId,
+    ) -> Result<Self, AlgoError> {
+        Self::sampled(topo, face_id, false)
+    }
+
+    /// [`Self::new`], with a plane's conics sampled at least every 1/128 of
+    /// a turn: the splitter reads a plane piece's outline every 1/64, and an
+    /// interior point it takes near a rim must still read on this face
+    /// (sixteen samples round a whole rim stand 2% of its radius inside it).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlgoError`] on a topology lookup failure.
+    pub fn fine(
+        topo: &Topology,
+        face_id: brepkit_topology::face::FaceId,
+    ) -> Result<Self, AlgoError> {
+        Self::sampled(topo, face_id, true)
+    }
+
+    fn sampled(
+        topo: &Topology,
+        face_id: brepkit_topology::face::FaceId,
+        fine: bool,
     ) -> Result<Self, AlgoError> {
         use brepkit_math::vec::Point2;
         use brepkit_topology::edge::EdgeCurve;
@@ -170,12 +192,9 @@ impl FaceLoops2d {
                 } else {
                     (t0, t1)
                 };
-                // A conic at least every 1/128 of a turn: the splitter reads
-                // a piece's outline every 1/64, and an interior point it
-                // takes near a rim must still read on this face (sixteen
-                // samples round a whole rim stand 2% of its radius inside it).
                 let n = match e.curve() {
                     EdgeCurve::Line => 2,
+                    EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) if !fine => 16,
                     EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => {
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         let by_turn = ((t1 - t0).abs() / (PI / 64.0)).ceil() as usize;
@@ -450,7 +469,7 @@ impl BoundaryProbe {
     pub fn new(topo: &Topology, solid: SolidId) -> Result<Self, AlgoError> {
         let mut faces = Vec::new();
         for fid in brepkit_topology::explorer::solid_faces(topo, solid)? {
-            faces.push(FaceLoops2d::new(topo, fid)?);
+            faces.push(FaceLoops2d::fine(topo, fid)?);
         }
         Ok(Self { faces })
     }

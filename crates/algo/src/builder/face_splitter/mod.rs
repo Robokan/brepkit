@@ -10728,17 +10728,32 @@ pub fn interior_point_3d(
     // inner arc passes near it can sit between that arc and its chords, in the
     // neighbouring region. A crescent thinner than its chords' sag has no
     // candidate across its polygon inside it, so one is stepped off its curves.
-    let exact = match (&sub_face.surface, frame) {
+    // The holes are read too where each reads, to check the point moved clear
+    // of them below. Each hole is its own region, not one parity with the
+    // outline: a face can carry a hole twice, and the two copies would cancel.
+    let (exact, holes) = match (&sub_face.surface, frame) {
         (FaceSurface::Plane { .. }, Some(f)) => {
-            // The holes go in too: the region's parity reads a point in a
-            // hole as outside, so its sample needs no second pass round them.
-            std::iter::once(&sub_face.outer_wire)
-                .chain(&sub_face.inner_wires)
-                .map(|w| containment::region_with_fitted_splines(w, f))
-                .collect::<Option<Vec<_>>>()
-                .map(|loops| loops.concat())
+            let outline = containment::region_with_fitted_splines(&sub_face.outer_wire, f);
+            let holes = outline.as_ref().and_then(|_| {
+                sub_face
+                    .inner_wires
+                    .iter()
+                    .map(|w| containment::region_with_fitted_splines(w, f))
+                    .collect::<Option<Vec<_>>>()
+            });
+            (outline, holes)
         }
-        _ => None,
+        _ => (None, None),
+    };
+    // A point clear of the outline's curves and of every hole's.
+    let clear_of_holes = |p: Point2| {
+        exact
+            .as_ref()
+            .is_some_and(|pieces| point_in_region(pieces, p, clearance) == Some(true))
+            && holes
+                .iter()
+                .flatten()
+                .all(|hole| point_in_region(hole, p, clearance) == Some(false))
     };
     let mut interior_uv = match exact.as_ref() {
         Some(pieces) => {
@@ -10898,15 +10913,32 @@ pub fn interior_point_3d(
     // multi-hole frame (two adjacent cavities sharing a divider) lands inside
     // the OTHER hole and silently drops the whole frame face. The accurate
     // `is_inside_any_hole` UV point-in-polygon test avoids that.
-    // A point read in the exact region, holes included, already stands
-    // clear of them; the ring's chord polygons can put a point back past an
-    // outer arc (a notch hugging a round boss: 3e-3 inside the arc).
-    if exact.is_none()
-        && ((matches!(&sub_face.surface, FaceSurface::Plane { .. })
-            && !sub_face.inner_wires.is_empty())
-            || is_inside_any_hole(&interior_uv, &sub_face.inner_wires))
+    // The ring's chord polygons can put the point back past an outer arc (a
+    // notch hugging a round boss: 3e-3 inside the arc). Where the outline and
+    // holes read exactly, such a point is replaced by one read on them.
+    if (matches!(&sub_face.surface, FaceSurface::Plane { .. }) && !sub_face.inner_wires.is_empty())
+        || is_inside_any_hole(&interior_uv, &sub_face.inner_wires)
     {
-        interior_uv = find_point_outside_holes(&pts_2d, &sub_face.inner_wires, frame);
+        let ring = find_point_outside_holes(&pts_2d, &sub_face.inner_wires, frame);
+        interior_uv = match (exact.as_ref(), holes.as_ref()) {
+            (Some(outline), Some(hole_regions)) if !clear_of_holes(ring) => {
+                // A ring of crescents (a pocket whose lobes reach the rim)
+                // holds no candidate across the polygon: step in off the
+                // curves, the outline and holes read as one region.
+                let region: Vec<brepkit_math::region2d::Boundary2> = outline
+                    .iter()
+                    .chain(hole_regions.iter().flatten())
+                    .copied()
+                    .collect();
+                sample_interior_point_where(&pts_2d, clear_of_holes)
+                    .or_else(|| {
+                        containment::point_stepped_into_region(&region, &pts_2d, clearance)
+                            .filter(|&p| clear_of_holes(p))
+                    })
+                    .unwrap_or(ring)
+            }
+            _ => ring,
+        };
     }
 
     // Evaluate back to 3D.
