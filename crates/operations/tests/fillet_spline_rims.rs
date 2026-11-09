@@ -49,6 +49,14 @@ fn outline() -> Ellipse3D {
 /// ruled between the outline and its copy `HEIGHT` up, closed round the
 /// outline, with a seam line where the outline starts.
 fn slab(topo: &mut Topology) -> SolidId {
+    split_slab(topo, None)
+}
+
+/// The slab, its top rim in two pieces when `split` gives a fraction of the
+/// outline's parameter to cut it at, away from the wall's seam (as a file
+/// gives a rim a neighbour's edge met), the lid's wire then running from
+/// the cut.
+fn split_slab(topo: &mut Topology, split: Option<f64>) -> SolidId {
     let spline = ellipse_to_nurbs(&outline(), 0.0, 2.0 * PI).unwrap();
     let up = Vec3::new(0.0, 0.0, HEIGHT);
     let lifted = NurbsCurve::new(
@@ -74,6 +82,17 @@ fn slab(topo: &mut Topology) -> SolidId {
     let start = spline.evaluate(spline.domain().0);
     let vb = topo.add_vertex(Vertex::new(start, 1e-7));
     let vt = topo.add_vertex(Vertex::new(start + up, 1e-7));
+    let (d0, d1) = lifted.domain();
+    let top_pieces = split.map(|f| {
+        let t = (d1 - d0).mul_add(f, d0);
+        let (left, right) = brepkit_math::nurbs::knot_ops::curve_split(&lifted, t).unwrap();
+        let vp = topo.add_vertex(Vertex::new(lifted.evaluate(t), 1e-7));
+        // The piece from the cut made first: a fillet walks a closed chain
+        // from its first edge's start.
+        let second = topo.add_edge(Edge::new(vp, vt, EdgeCurve::NurbsCurve(right)));
+        let first = topo.add_edge(Edge::new(vt, vp, EdgeCurve::NurbsCurve(left)));
+        (first, second)
+    });
     let bottom = topo.add_edge(Edge::new(vb, vb, EdgeCurve::NurbsCurve(spline)));
     let top = topo.add_edge(Edge::new(vt, vt, EdgeCurve::NurbsCurve(lifted)));
     let seam = topo.add_edge(Edge::new(vb, vt, EdgeCurve::Line));
@@ -84,10 +103,22 @@ fn slab(topo: &mut Topology) -> SolidId {
             .collect();
         topo.add_wire(Wire::new(edges, true).unwrap())
     };
-    let wall_wire = wire(
-        topo,
-        &[(bottom, true), (seam, true), (top, false), (seam, false)],
-    );
+    let wall_wire = match top_pieces {
+        Some((first, second)) => wire(
+            topo,
+            &[
+                (bottom, true),
+                (seam, true),
+                (second, false),
+                (first, false),
+                (seam, false),
+            ],
+        ),
+        None => wire(
+            topo,
+            &[(bottom, true), (seam, true), (top, false), (seam, false)],
+        ),
+    };
     let wall = topo.add_face(Face::new(
         wall_wire,
         vec![],
@@ -102,7 +133,10 @@ fn slab(topo: &mut Topology) -> SolidId {
             d: 0.0,
         },
     ));
-    let lid_wire = wire(topo, &[(top, true)]);
+    let lid_wire = match top_pieces {
+        Some((first, second)) => wire(topo, &[(second, true), (first, true)]),
+        None => wire(topo, &[(top, true)]),
+    };
     let lid = topo.add_face(Face::new(
         lid_wire,
         vec![],
@@ -154,8 +188,22 @@ fn assert_rim_rounds_off(z: f64, r: f64) {
 
 /// As [`assert_rim_rounds_off`], filleting the rims at all of `zs` at once.
 fn assert_rims_round_off(zs: &[f64], r: f64) {
+    assert_slab_rounds_off(None, r, zs.len(), |topo, solid| {
+        zs.iter().map(|&z| rim_at(topo, solid, z)).collect()
+    });
+}
+
+/// Fillets the edges `pick` takes of a slab (its top rim cut at `split`)
+/// with radius `r`, `rims` whole rims of it, and checks the result as
+/// [`assert_rim_rounds_off`] does.
+fn assert_slab_rounds_off(
+    split: Option<f64>,
+    r: f64,
+    rims: usize,
+    pick: impl Fn(&Topology, SolidId) -> Vec<EdgeId>,
+) {
     let mut topo = Topology::new();
-    let solid = slab(&mut topo);
+    let solid = split_slab(&mut topo, split);
     assert!(
         crate_faces(&topo, solid)
             .iter()
@@ -180,7 +228,7 @@ fn assert_rims_round_off(zs: &[f64], r: f64) {
         is_watertight(&input_mesh),
         "the slab's own mesh is not watertight"
     );
-    let edges: Vec<EdgeId> = zs.iter().map(|&z| rim_at(&topo, solid, z)).collect();
+    let edges = pick(&topo, solid);
     let before = solid_volume(&topo, solid, 0.001).unwrap();
     let result = fillet_v2(&mut topo, solid, &edges, r).unwrap();
     assert!(result.failed.is_empty(), "r = {r}: {:?}", result.failed);
@@ -196,7 +244,7 @@ fn assert_rims_round_off(zs: &[f64], r: f64) {
         brepkit_operations::tessellate::non_manifold_edge_count(&mesh)
     );
     #[allow(clippy::cast_precision_loss)]
-    let removed = zs.len() as f64
+    let removed = rims as f64
         * (1.0 - PI / 4.0)
         * r
         * r
@@ -205,7 +253,7 @@ fn assert_rims_round_off(zs: &[f64], r: f64) {
     let truth = before - removed;
     assert!(
         (after - truth).abs() < 1e-3 * truth,
-        "r = {r}, z = {zs:?}: volume {after}, expected {truth} (removed {removed})"
+        "r = {r}, split {split:?}: volume {after}, expected {truth} (removed {removed})"
     );
 }
 
@@ -257,6 +305,38 @@ fn crate_faces(topo: &Topology, solid: SolidId) -> Vec<FaceSurface> {
 fn an_elliptic_slabs_top_rim_rounds_off() {
     for r in [0.5, 1.0, 2.0] {
         assert_rim_rounds_off(HEIGHT, r);
+    }
+}
+
+/// The top rim in two pieces, cut away from the wall's seam, and rounded
+/// whole: the walk starts at the cut, so the round's closed contact on the
+/// wall crosses the wall's seam away from its vertex. The wall's trim cuts
+/// the contact there, and its seam with it; it had bridged the contact's
+/// vertex to the seam by an edge run out and back, which leaves the wall's
+/// mesh open there.
+#[test]
+fn a_top_rim_in_pieces_rounds_off_across_the_wall_s_seam() {
+    for split in [0.3, 0.6] {
+        for r in [0.5, 1.0] {
+            for reversed in [false, true] {
+                assert_slab_rounds_off(Some(split), r, 1, |topo, solid| {
+                    let mut pieces: Vec<EdgeId> = solid_edges(topo, solid)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|&e| {
+                            let edge = topo.edge(e).unwrap();
+                            matches!(edge.curve(), EdgeCurve::NurbsCurve(_))
+                                && edge.start() != edge.end()
+                        })
+                        .collect();
+                    assert_eq!(pieces.len(), 2);
+                    if reversed {
+                        pieces.reverse();
+                    }
+                    pieces
+                });
+            }
+        }
     }
 }
 

@@ -1094,11 +1094,12 @@ impl<'a> FilletBuilder<'a> {
                         topo,
                         stripe,
                         &mut boundary_registry,
-                        contact1,
-                        contact2,
+                        &chains[0],
+                        &chains[1],
                     )?;
-                    boundary_registry.set_owner_face(contact1, 1, info.face)?;
-                    boundary_registry.set_owner_face(contact2, 1, info.face)?;
+                    for &handle in chains.iter().flatten() {
+                        boundary_registry.set_owner_face(handle, 1, info.face)?;
+                    }
                     blend_cross_handles[si] = (None, None);
                     stripe_faces[si] = Some(info.face);
                     info
