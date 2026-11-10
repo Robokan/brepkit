@@ -550,6 +550,51 @@ impl<'a> FilletBuilder<'a> {
                 let mut restriction =
                     trimmer::ParametricRestriction::new(sample_nurbs_endpoints(&contact), keep);
                 restriction.source_edges = stripe.spine_edges().to_vec();
+                // A face the stripe does not run along lies beyond a plane
+                // face the round swallowed (`swallow_narrow_face`): its
+                // contact replaces the loop it shares with that face, and
+                // the face goes.
+                let spine_faces = stripe
+                    .spine_edges()
+                    .first()
+                    .map(|&edge| adjacency.faces_for_edge(edge).to_vec())
+                    .unwrap_or_default();
+                if !spine_faces.contains(&face_id) {
+                    let swallowed: Vec<FaceId> = spine_faces
+                        .iter()
+                        .copied()
+                        .filter(|&f| f != stripe.face1 && f != stripe.face2)
+                        .collect();
+                    let [plane] = swallowed[..] else {
+                        return Err(BlendError::TrimmingFailure { face: face_id });
+                    };
+                    let face_edges = |face: FaceId| -> Result<HashSet<EdgeId>, BlendError> {
+                        let f = topo.face(face)?;
+                        let mut edges = HashSet::new();
+                        for wire in
+                            std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied())
+                        {
+                            edges.extend(topo.wire(wire)?.edges().iter().map(OrientedEdge::edge));
+                        }
+                        Ok(edges)
+                    };
+                    let plane_edges = face_edges(plane)?;
+                    let f = topo.face(face_id)?;
+                    let mut far = Vec::new();
+                    for wire in
+                        std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied())
+                    {
+                        for oriented in topo.wire(wire)?.edges() {
+                            if plane_edges.contains(&oriented.edge())
+                                && !far.contains(&oriented.edge())
+                            {
+                                far.push(oriented.edge());
+                            }
+                        }
+                    }
+                    restriction.source_edges = far;
+                    vanished_walls.insert(plane);
+                }
                 let source_surface = topo.face(face_id)?.surface().clone();
                 let mut adapter = None;
                 let support = surface_ref_or_adapter(&source_surface, &mut adapter);
@@ -1823,7 +1868,21 @@ impl<'a> FilletBuilder<'a> {
             brepkit_topology::orientation::propagate_orientation(topo, &result_faces, &seeds)?;
             boundary_registry.refresh_owner_orientations(topo)?;
         }
-        if align_seamed_faces_with_tangent_neighbours(topo, &new_faces, &result_faces)? {
+        let mut sources: std::collections::HashMap<FaceId, FaceId> =
+            std::collections::HashMap::new();
+        for &original in &original_faces {
+            let mut current = original;
+            for _ in 0..=face_replacements.len() {
+                match face_replacements.get(&current) {
+                    Some(&next) if next != current => current = next,
+                    _ => break,
+                }
+            }
+            if current != original {
+                sources.insert(current, original);
+            }
+        }
+        if align_seamed_faces_with_tangent_neighbours(topo, &new_faces, &result_faces, &sources)? {
             boundary_registry.refresh_owner_orientations(topo)?;
         }
         let postassembly = if force_postassembly_failure {
@@ -5354,23 +5413,60 @@ fn effective_normal(
 /// senses and reversal flag toggled, so shared edges keep their senses) when
 /// the tangent neighbours disagree with it. Only faces already settled vote,
 /// so a seamed wall and the band beside it are not judged by each other
-/// first; they settle in rounds outward from the other faces.
+/// first; they settle in rounds outward from the other faces. A seamed
+/// face trimmed from an input face (`sources` maps it to that face) is set
+/// facing as its source did, before the rounds: it lies on the source's
+/// surface, while its neighbours may meet it at a knife edge, facing the
+/// other way rightly.
 fn align_seamed_faces_with_tangent_neighbours(
     topo: &mut Topology,
     new_faces: &[FaceId],
     result_faces: &[FaceId],
+    sources: &std::collections::HashMap<FaceId, FaceId>,
 ) -> Result<bool, BlendError> {
     const TANGENT_COS: f64 = 0.985;
     let mut pending: Vec<FaceId> = Vec::new();
+    let mut turned_any = false;
     for &face_id in new_faces {
         let face = topo.face(face_id)?;
         if matches!(face.surface(), FaceSurface::Plane { .. }) || !face.inner_wires().is_empty() {
             continue;
         }
-        let edges = topo.wire(face.outer_wire())?.edges();
+        let edges = topo.wire(face.outer_wire())?.edges().to_vec();
         let mut seen = HashSet::new();
-        if !edges.iter().all(|oe| seen.insert(oe.edge())) {
+        if edges.iter().all(|oe| seen.insert(oe.edge())) {
+            continue;
+        }
+        let Some(&source) = sources.get(&face_id) else {
             pending.push(face_id);
+            continue;
+        };
+        // A trimmed input face lies on its source's surface, so it faces as
+        // its source did; its neighbours cannot say (a knife edge, two
+        // sheets meeting at no angle, has them facing opposite ways).
+        let uses = |e: EdgeId| edges.iter().filter(|oe| oe.edge() == e).count();
+        for oe in edges.iter().filter(|oe| uses(oe.edge()) == 1) {
+            let edge = topo.edge(oe.edge())?;
+            let (a, b) = (
+                topo.vertex(edge.start())?.point(),
+                topo.vertex(edge.end())?.point(),
+            );
+            let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+            let p = edge
+                .curve()
+                .evaluate_with_endpoints(f64::midpoint(t0, t1), a, b);
+            let (Some(mine), Some(theirs)) = (
+                effective_normal(topo, face_id, p)?,
+                effective_normal(topo, source, p)?,
+            ) else {
+                continue;
+            };
+            if mine.dot(theirs) < 0.0 {
+                log::debug!("trimmed face {face_id:?} faced away from its source: turned");
+                turn_face(topo, face_id)?;
+                turned_any = true;
+            }
+            break;
         }
     }
     let mut edge_faces: std::collections::HashMap<EdgeId, Vec<FaceId>> =
@@ -5388,7 +5484,6 @@ fn align_seamed_faces_with_tangent_neighbours(
             }
         }
     }
-    let mut turned_any = false;
     while !pending.is_empty() {
         let mut settled = Vec::new();
         for &face_id in &pending {
@@ -5434,19 +5529,7 @@ fn align_seamed_faces_with_tangent_neighbours(
                 continue;
             }
             log::debug!("seamed face {face_id:?} faced away from its tangent neighbours: turned");
-            let wire_id = topo.face(face_id)?.outer_wire();
-            let wire = topo.wire_mut(wire_id)?;
-            let turned: Vec<OrientedEdge> = wire
-                .edges()
-                .iter()
-                .rev()
-                .map(|oe| OrientedEdge::new(oe.edge(), !oe.is_forward()))
-                .collect();
-            for (slot, oe) in wire.edges_mut().iter_mut().zip(turned) {
-                *slot = oe;
-            }
-            let face = topo.face_mut(face_id)?;
-            face.set_reversed(!face.is_reversed());
+            turn_face(topo, face_id)?;
             turned_any = true;
         }
         if settled.is_empty() {
@@ -5455,6 +5538,25 @@ fn align_seamed_faces_with_tangent_neighbours(
         pending.retain(|f| !settled.contains(f));
     }
     Ok(turned_any)
+}
+
+/// Turns a face over: its wire reversed, edge senses and reversal flag
+/// toggled, so the edges it shares keep their senses.
+fn turn_face(topo: &mut Topology, face_id: FaceId) -> Result<(), BlendError> {
+    let wire_id = topo.face(face_id)?.outer_wire();
+    let wire = topo.wire_mut(wire_id)?;
+    let turned: Vec<OrientedEdge> = wire
+        .edges()
+        .iter()
+        .rev()
+        .map(|oe| OrientedEdge::new(oe.edge(), !oe.is_forward()))
+        .collect();
+    for (slot, oe) in wire.edges_mut().iter_mut().zip(turned) {
+        *slot = oe;
+    }
+    let face = topo.face_mut(face_id)?;
+    face.set_reversed(!face.is_reversed());
+    Ok(())
 }
 
 fn succeeded_candidates(
@@ -5662,6 +5764,22 @@ fn check_stripe_residuals(topo: &Topology, stripe: &Stripe) -> Result<(), BlendE
     let mut adapter2 = None;
     let ps1 = surface_ref_or_adapter(&surface1, &mut adapter1);
     let ps2 = surface_ref_or_adapter(&surface2, &mut adapter2);
+    // A side whose face the spine does not run along is a face beyond a
+    // narrow face the round swallowed: the ball pivots on its rim there
+    // (`pivot_on_far_loop`), and is not tangent to it.
+    let along = |face_id: FaceId| -> Result<bool, BlendError> {
+        let Some(&edge) = stripe.spine_edges().first() else {
+            return Ok(true);
+        };
+        let face = topo.face(face_id)?;
+        for wire in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            if topo.wire(wire)?.edges().iter().any(|oe| oe.edge() == edge) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let (tangent1, tangent2) = (along(stripe.face1)?, along(stripe.face2)?);
     let mut max_contact: f64 = 0.0;
     let mut max_radius: f64 = 0.0;
     let mut max_tangent: f64 = 0.0;
@@ -5677,9 +5795,14 @@ fn check_stripe_residuals(topo: &Topology, stripe: &Stripe) -> Result<(), BlendE
         let radial1 = (section.p1 - section.center).normalize();
         let radial2 = (section.p2 - section.center).normalize();
         if let (Ok(radial1), Ok(radial2)) = (radial1, radial2) {
-            max_tangent = max_tangent
-                .max((1.0 - ps1.normal(uv1.0, uv1.1).dot(radial1).abs()).abs())
-                .max((1.0 - ps2.normal(uv2.0, uv2.1).dot(radial2).abs()).abs());
+            if tangent1 {
+                max_tangent =
+                    max_tangent.max((1.0 - ps1.normal(uv1.0, uv1.1).dot(radial1).abs()).abs());
+            }
+            if tangent2 {
+                max_tangent =
+                    max_tangent.max((1.0 - ps2.normal(uv2.0, uv2.1).dot(radial2).abs()).abs());
+            }
         }
     }
     if max_contact > CONTACT_TOL || max_radius > RADIUS_TOL || max_tangent > TANGENT_TOL {
@@ -5764,7 +5887,14 @@ fn compute_stripe_for_edge(
         });
     }
     let spine = Spine::from_single_edge(topo, edge_id)?;
-    compute_stripe_for_spine(topo, adj_faces[0], adj_faces[1], spine, law)
+    compute_stripe_for_spine(
+        topo,
+        Some(adjacency),
+        adj_faces[0],
+        adj_faces[1],
+        spine,
+        law,
+    )
 }
 
 fn radius_law_from_plan(plan: &crate::fillet_plan::RadiusLawPlan) -> RadiusLaw {
@@ -5800,6 +5930,7 @@ fn compute_stripe_for_contour(
     let law = radius_law_from_plan(&contour.radius_law);
     compute_stripe_for_spine(
         topo,
+        Some(adjacency),
         contour.side1,
         contour.side2,
         contour.spine.clone(),
@@ -5810,6 +5941,7 @@ fn compute_stripe_for_contour(
 #[allow(clippy::too_many_arguments)]
 fn compute_stripe_for_spine(
     topo: &Topology,
+    adjacency: Option<&brepkit_topology::adjacency::AdjacencyIndex>,
     face1: FaceId,
     face2: FaceId,
     spine: Spine,
@@ -5846,7 +5978,17 @@ fn compute_stripe_for_spine(
             face2,
         )? {
             check_stripe_residuals(topo, &result.stripe)?;
-            return Ok(result);
+            // A closed round whose contact runs off its face (a tube's rim
+            // rounded wider than the wall is thick) is not this exact band:
+            // its trim built a valid solid with material added, not taken
+            // off. The walk below finds such a round's ball pivoting on the
+            // face's far rim, or refuses it.
+            if !spine.is_closed()
+                || (check_contacts_on_faces(topo, face1, face2, &result.stripe.sections).is_ok()
+                    && contacts_inside_plane_faces(topo, face1, face2, &result.stripe.sections)?)
+            {
+                return Ok(result);
+            }
         }
     }
 
@@ -5953,9 +6095,60 @@ fn compute_stripe_for_spine(
         (result, beyond)
     };
 
-    if spine.is_closed() {
-        check_contacts_on_faces(topo, face1, face2, &walk_result.sections)?;
-    }
+    let mut walk_result = walk_result;
+    // A closed round wider than a narrow plane face between its two walls
+    // (a thin shell's rim rounded past the rim's width) runs its contact
+    // off the face, past its far rim: the ball, resting on the wall, pivots
+    // on that rim, the band meets the face beyond there in place of the
+    // face, and the face goes.
+    let swallowed = if spine.is_closed()
+        && let Err(error) = check_contacts_on_faces(topo, face1, face2, &walk_result.sections)
+    {
+        let Some(found) = adjacency
+            .map(|adjacency| {
+                swallow_narrow_face(topo, adjacency, face1, face2, &spine, &walk_result.sections)
+            })
+            .transpose()?
+            .flatten()
+        else {
+            return Err(error);
+        };
+        let Some(sections) = pivot_on_far_loop(topo, &found, ps1, ps2, law, &walk_result.sections)?
+        else {
+            return Err(error);
+        };
+        let (on1, on2) = if found.side == 0 {
+            (found.beyond, face2)
+        } else {
+            (face1, found.beyond)
+        };
+        check_contacts_on_faces(topo, on1, on2, &sections).map_err(|_| error)?;
+        walk_result.sections = sections;
+        Some(found)
+    } else {
+        None
+    };
+    let (face1, face2) = match &swallowed {
+        Some(found) if found.side == 0 => (found.beyond, face2),
+        Some(found) => (face1, found.beyond),
+        None => (face1, face2),
+    };
+    let beyond_surface = swallowed
+        .as_ref()
+        .map(|found| topo.face(found.beyond).map(|f| f.surface().clone()))
+        .transpose()?;
+    let mut beyond_adapter = None;
+    let beyond_ps = beyond_surface
+        .as_ref()
+        .map(|surface| surface_ref_or_adapter(surface, &mut beyond_adapter));
+    let (ps1, period1) = match (&swallowed, beyond_ps, &beyond_surface) {
+        (Some(found), Some(ps), Some(surface)) if found.side == 0 => (ps, face_u_period(surface)),
+        _ => (ps1, face_u_period(&oriented_surf1)),
+    };
+    let (ps2, period2) = match (&swallowed, beyond_ps, &beyond_surface) {
+        (Some(found), Some(ps), Some(surface)) if found.side == 1 => (ps, face_u_period(surface)),
+        _ => (ps2, face_u_period(&oriented_surf2)),
+    };
     check_contacts_run_on(&walk_result.sections)?;
     // The band passes through its walked sections, so its boundary rows pass
     // through the walked contacts. Where the interpolation is refused, the
@@ -5968,8 +6161,8 @@ fn compute_stripe_for_spine(
     let contact2 = band_side(&blend_surface, blend_surface.control_points().len() - 1)?;
     let blend_face_surface = brepkit_topology::face::FaceSurface::Nurbs(blend_surface);
 
-    let pcurve1 = build_pcurve_from_contact(ps1, &contact1, face_u_period(&oriented_surf1))?;
-    let pcurve2 = build_pcurve_from_contact(ps2, &contact2, face_u_period(&oriented_surf2))?;
+    let pcurve1 = build_pcurve_from_contact(ps1, &contact1, period1)?;
+    let pcurve2 = build_pcurve_from_contact(ps2, &contact2, period2)?;
 
     let stripe = Stripe {
         spine,
@@ -5989,6 +6182,295 @@ fn compute_stripe_for_spine(
         stripe,
         new_edges: Vec::new(),
     })
+}
+
+/// A narrow plane face a closed round swallows (see
+/// [`swallow_narrow_face`]).
+struct SwallowedFace {
+    /// Which side of the stripe the face was (0: `face1`).
+    side: usize,
+    /// The face beyond it, which the band meets in its place.
+    beyond: FaceId,
+    /// The plane face's far loop, which it shares with `beyond`.
+    far: Vec<EdgeId>,
+}
+
+/// Whether a closed round's contact on a plane face runs off the face past
+/// its far loop all round: the face a narrow annulus between the rim
+/// rounded and one other loop, all of which it shares with one face beyond
+/// (a thin shell's rim). Each section's arc, from the contact on the other
+/// wall towards the plane's, then crosses the face beyond before it reaches
+/// the plane: it is cut there.
+fn swallow_narrow_face(
+    topo: &Topology,
+    adjacency: &brepkit_topology::adjacency::AdjacencyIndex,
+    face1: FaceId,
+    face2: FaceId,
+    spine: &Spine,
+    sections: &[crate::section::CircSection],
+) -> Result<Option<SwallowedFace>, BlendError> {
+    let spine_edges: HashSet<EdgeId> = spine.edges().iter().copied().collect();
+    for (side, (plane, wall)) in [(face1, face2), (face2, face1)].into_iter().enumerate() {
+        let face = topo.face(plane)?;
+        if !face.surface().is_planar() {
+            continue;
+        }
+        let loops: Vec<Vec<EdgeId>> = std::iter::once(face.outer_wire())
+            .chain(face.inner_wires().iter().copied())
+            .map(|wire| {
+                topo.wire(wire)
+                    .map(|w| w.edges().iter().map(OrientedEdge::edge).collect())
+            })
+            .collect::<Result<_, _>>()?;
+        let [first, second] = &loops[..] else {
+            continue;
+        };
+        let rim_loop = |edges: &[EdgeId]| edges.iter().all(|e| spine_edges.contains(e));
+        let far = match (rim_loop(first), rim_loop(second)) {
+            (true, false) => second,
+            (false, true) => first,
+            _ => continue,
+        };
+        let mut beyond = None;
+        let mut shared = true;
+        for &edge in far {
+            let faces = adjacency.faces_for_edge(edge);
+            let other = match faces {
+                [a, b] if *a == plane => *b,
+                [a, b] if *b == plane => *a,
+                _ => {
+                    shared = false;
+                    break;
+                }
+            };
+            if other == wall || beyond.is_some_and(|b| b != other) {
+                shared = false;
+                break;
+            }
+            beyond = Some(other);
+        }
+        let (true, Some(beyond)) = (shared, beyond) else {
+            continue;
+        };
+        let beyond_face = topo.face(beyond)?;
+        let surface = beyond_face.surface();
+        let outward = if beyond_face.is_reversed() { -1.0 } else { 1.0 };
+        // Signed distance off the face beyond's surface, outward of the
+        // solid, and the surface's (u, v) there.
+        let off = |q: Point3| -> Option<(f64, (f64, f64))> {
+            if let FaceSurface::Plane { normal, d } = surface {
+                let value = (normal.dot(Vec3::new(q.x(), q.y(), q.z())) - d) / normal.length();
+                return Some((outward * value, (0.0, 0.0)));
+            }
+            let (u, v) = surface.project_point(q)?;
+            let foot = surface.evaluate(u, v)?;
+            let n = surface.normal(u, v);
+            Some((outward * (q - foot).dot(n), (u, v)))
+        };
+        // Each section's arc must cross the face beyond, from inside the
+        // solid out, for the face to be swallowed.
+        for section in sections {
+            let (on_plane, on_wall) = if side == 0 {
+                (section.p1, section.p2)
+            } else {
+                (section.p2, section.p1)
+            };
+            let (a, b) = (on_wall - section.center, on_plane - section.center);
+            let angle = a
+                .normalize()
+                .ok()
+                .zip(b.normalize().ok())
+                .map(|(a, b)| a.dot(b).clamp(-1.0, 1.0).acos());
+            let Some(angle) = angle.filter(|&angle| angle > 1e-9) else {
+                return Ok(None);
+            };
+            // The arc from the wall's contact to the plane's, by slerp.
+            let at = |f: f64| {
+                let (sa, sb) = (((1.0 - f) * angle).sin(), (f * angle).sin());
+                section.center + (a * sa + b * sb) * (1.0 / angle.sin())
+            };
+            let Some((start, _)) = off(at(0.0)) else {
+                return Ok(None);
+            };
+            if start >= 0.0 {
+                return Ok(None);
+            }
+            let samples = 32_u32;
+            let mut low = 0.0;
+            let mut high = None;
+            for k in 1..=samples {
+                let f = f64::from(k) / f64::from(samples);
+                let Some((value, _)) = off(at(f)) else {
+                    return Ok(None);
+                };
+                if value >= 0.0 {
+                    high = Some(f);
+                    break;
+                }
+                low = f;
+            }
+            let Some(mut high) = high else {
+                return Ok(None);
+            };
+            for _ in 0..60 {
+                let mid = 0.5 * (low + high);
+                match off(at(mid)) {
+                    Some((value, _)) if value < 0.0 => low = mid,
+                    Some(_) => high = mid,
+                    None => return Ok(None),
+                }
+            }
+            if off(at(0.5 * (low + high))).is_none() {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(SwallowedFace {
+            side,
+            beyond,
+            far: far.clone(),
+        }));
+    }
+    Ok(None)
+}
+
+/// The round's sections where it swallows a narrow plane face: the ball
+/// rests on the wall and pivots on the face's far rim (`found.far`), each
+/// in its section's plane, so the band runs from its contact on the wall to
+/// that rim, where it meets the face beyond. `sections` are the walk on the
+/// plane, whose contacts on it lie past the rim.
+fn pivot_on_far_loop(
+    topo: &Topology,
+    found: &SwallowedFace,
+    ps1: &dyn brepkit_math::traits::ParametricSurface,
+    ps2: &dyn brepkit_math::traits::ParametricSurface,
+    law: &RadiusLaw,
+    sections: &[crate::section::CircSection],
+) -> Result<Option<Vec<crate::section::CircSection>>, BlendError> {
+    const SAMPLES: usize = 128;
+    let RadiusLaw::Constant(radius) = law else {
+        return Ok(None);
+    };
+    let radius = *radius;
+    let tol = 1e-9 * radius.max(1.0);
+    // The far rim as a closed polyline of curve samples, each segment
+    // refined on its curve where a section's plane crosses it.
+    let mut rim: Vec<(EdgeId, f64, f64)> = Vec::new();
+    for &edge_id in &found.far {
+        let edge = topo.edge(edge_id)?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+        for k in 0..SAMPLES {
+            let f = |k: usize| t0 + (t1 - t0) * k as f64 / SAMPLES as f64;
+            rim.push((edge_id, f(k), f(k + 1)));
+        }
+    }
+    let at = |edge_id: EdgeId, t: f64| -> Result<Point3, BlendError> {
+        let edge = topo.edge(edge_id)?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        Ok(edge.curve().evaluate_with_endpoints(t, a, b))
+    };
+    let (wall, beyond_surface) = (
+        if found.side == 0 { ps2 } else { ps1 },
+        topo.face(found.beyond)?.surface().clone(),
+    );
+    let mut pivoted = Vec::with_capacity(sections.len());
+    for section in sections {
+        let (on_plane, on_wall, wall_uv) = if found.side == 0 {
+            (section.p1, section.p2, section.uv2)
+        } else {
+            (section.p2, section.p1, section.uv1)
+        };
+        let Ok(normal) = (on_plane - section.center)
+            .cross(on_wall - section.center)
+            .normalize()
+        else {
+            return Ok(None);
+        };
+        let height = |p: Point3| (p - section.center).dot(normal);
+        // The rim's crossing of the section's plane nearest the plane's
+        // contact.
+        let mut pivot: Option<Point3> = None;
+        for &(edge_id, a, b) in &rim {
+            let (pa, pb) = (at(edge_id, a)?, at(edge_id, b)?);
+            let (ha, hb) = (height(pa), height(pb));
+            if ha * hb > 0.0 {
+                continue;
+            }
+            let (mut lo, mut hi, mut h_lo) = (a, b, ha);
+            for _ in 0..80 {
+                let mid = 0.5 * (lo + hi);
+                let h = height(at(edge_id, mid)?);
+                if h * h_lo > 0.0 {
+                    lo = mid;
+                    h_lo = h;
+                } else {
+                    hi = mid;
+                }
+            }
+            let q = at(edge_id, 0.5 * (lo + hi))?;
+            if pivot.is_none_or(|p| (q - on_plane).length() < (p - on_plane).length()) {
+                pivot = Some(q);
+            }
+        }
+        let Some(pivot) = pivot else {
+            return Ok(None);
+        };
+        // The ball on the wall: its centre a radius off the wall, toward
+        // the ball, in the section's plane, a radius from the pivot.
+        let side = (section.center - on_wall).dot(wall.normal(wall_uv.0, wall_uv.1));
+        let sign = if side < 0.0 { -1.0 } else { 1.0 };
+        let centre = |u: f64, v: f64| wall.evaluate(u, v) + wall.normal(u, v) * (sign * radius);
+        let residual = |u: f64, v: f64| {
+            let c = centre(u, v);
+            (height(c), (c - pivot).length() - radius)
+        };
+        let (mut u, mut v) = wall_uv;
+        let mut solved = false;
+        for _ in 0..40 {
+            let (f1, f2) = residual(u, v);
+            if f1.abs() <= tol && f2.abs() <= tol {
+                solved = true;
+                break;
+            }
+            let h = 1e-7 * (1.0 + u.abs().max(v.abs()));
+            let (a1, a2) = residual(u + h, v);
+            let (b1, b2) = residual(u, v + h);
+            let (j11, j21, j12, j22) = ((a1 - f1) / h, (a2 - f2) / h, (b1 - f1) / h, (b2 - f2) / h);
+            let det = j11 * j22 - j12 * j21;
+            if det.abs() < 1e-30 {
+                break;
+            }
+            u -= (j22 * f1 - j12 * f2) / det;
+            v -= (j11 * f2 - j21 * f1) / det;
+        }
+        if !solved {
+            return Ok(None);
+        }
+        let Some(pivot_uv) = beyond_surface.project_point(pivot) else {
+            return Ok(None);
+        };
+        let mut next = section.clone();
+        next.center = centre(u, v);
+        if found.side == 0 {
+            next.p1 = pivot;
+            next.uv1 = pivot_uv;
+            next.p2 = wall.evaluate(u, v);
+            next.uv2 = (u, v);
+        } else {
+            next.p1 = wall.evaluate(u, v);
+            next.uv1 = (u, v);
+            next.p2 = pivot;
+            next.uv2 = pivot_uv;
+        }
+        pivoted.push(next);
+    }
+    Ok(Some(pivoted))
 }
 
 /// The ball rolled on past both ends of an open spine, out to four radii in
@@ -6048,6 +6530,49 @@ fn check_contacts_run_on(sections: &[crate::section::CircSection]) -> Result<(),
 /// Contact steps shorter than this are read as standing still, not as a
 /// direction (a ball pinned where a face's contact barely moves).
 const CONTACT_STEP_FLOOR: f64 = 1e-9;
+
+/// Whether every contact a band leaves on a plane face lies inside that
+/// face, read against its exact outline in its plane (a box holds a tilted
+/// ring's whole circle a little past its rim). `true` where an outline
+/// cannot be read.
+fn contacts_inside_plane_faces(
+    topo: &Topology,
+    face1: FaceId,
+    face2: FaceId,
+    sections: &[crate::section::CircSection],
+) -> Result<bool, BlendError> {
+    for (side, face_id) in [face1, face2].into_iter().enumerate() {
+        let FaceSurface::Plane { normal, d } = *topo.face(face_id)?.surface() else {
+            continue;
+        };
+        let Ok(n) = normal.normalize() else {
+            continue;
+        };
+        let origin = Point3::new(0.0, 0.0, 0.0) + n * (d / normal.length());
+        let seed = if n.x().abs() < 0.9 {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        };
+        let Ok(x) = n.cross(seed).normalize() else {
+            continue;
+        };
+        let y = n.cross(x);
+        let Some(region) =
+            brepkit_topology::planar::face_region_2d(topo, face_id, origin, x, y, 1e-7)?
+        else {
+            continue;
+        };
+        for section in sections {
+            let p = if side == 0 { section.p1 } else { section.p2 };
+            let q = brepkit_math::vec::Point2::new((p - origin).dot(x), (p - origin).dot(y));
+            if !region.contains_clear(q, 0.0) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
 
 /// Refuses a walked band round a closed spine whose contacts leave their
 /// faces: a ball too big for a rim (a bore's mouth wider than its plate is
@@ -7603,7 +8128,7 @@ mod tests {
         };
         for (face1, face2) in [(wall, plate), (plate, wall)] {
             let spine = Spine::from_single_edge(&topo, foot_edge).unwrap();
-            let result = compute_stripe_for_spine(&topo, face1, face2, spine, &law).unwrap();
+            let result = compute_stripe_for_spine(&topo, None, face1, face2, spine, &law).unwrap();
             for contact in [&result.stripe.contact1, &result.stripe.contact2] {
                 let (t0, t1) = contact.domain();
                 for k in 0..=8 {

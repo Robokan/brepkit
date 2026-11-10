@@ -1758,30 +1758,38 @@ fn mapped_contact_forward(
         return Ok(forward_distance <= reverse_distance);
     }
 
-    let stored_start = topo.vertex(first_edge.start())?.point();
-    let stored_end = topo.vertex(first_edge.end())?.point();
-    let (source_t0, source_t1) = first_edge
-        .curve()
-        .domain_with_endpoints(stored_start, stored_end);
-    let source_parameter = if source_first.is_forward() {
-        source_t0
-    } else {
-        source_t1
+    // A closed loop's parameter need not start at its vertex (a closed
+    // circle runs from its frame's origin), so both tangents are read at
+    // one point: where each curve passes nearest the source's start.
+    let tangent_near = |edge: &brepkit_topology::edge::Edge,
+                        forward: bool|
+     -> Result<brepkit_math::vec::Vec3, BlendError> {
+        const SAMPLES: u32 = 256;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+        let at = |k: u32| t0 + (t1 - t0) * f64::from(k) / f64::from(SAMPLES);
+        let nearest = (0..SAMPLES)
+            .min_by(|&i, &j| {
+                let d = |k: u32| {
+                    (edge.curve().evaluate_with_endpoints(at(k), a, b) - source_start).length()
+                };
+                d(i).total_cmp(&d(j))
+            })
+            .unwrap_or(0);
+        // The tangent by a step either side, signed along the parameter as
+        // the domain runs (a descending domain runs against the derivative).
+        let (p, q) = (
+            edge.curve().evaluate_with_endpoints(at(nearest), a, b),
+            edge.curve().evaluate_with_endpoints(at(nearest + 1), a, b),
+        );
+        let step = q - p;
+        Ok(if forward { step } else { -step })
     };
-    let mut source_tangent =
-        first_edge
-            .curve()
-            .tangent_with_endpoints(source_parameter, stored_start, stored_end);
-    if !source_first.is_forward() {
-        source_tangent = -source_tangent;
-    }
-    let (contact_t0, _) = contact
-        .curve()
-        .domain_with_endpoints(contact_start, contact_end);
-    let contact_tangent =
-        contact
-            .curve()
-            .tangent_with_endpoints(contact_t0, contact_start, contact_end);
+    let source_tangent = tangent_near(first_edge, source_first.is_forward())?;
+    let contact_tangent = tangent_near(contact, true)?;
     Ok(contact_tangent.dot(source_tangent) >= 0.0)
 }
 
