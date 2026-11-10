@@ -322,6 +322,7 @@ impl<'a> FilletBuilder<'a> {
         } else {
             HashSet::new()
         };
+        pivot_crossing_rounds(topo, &mut stripe_results)?;
         let tilted_caps = if let Some(plan) = plan.as_ref() {
             run_stripes_to_tilted_caps(topo, plan, &mut stripe_results)?
         } else {
@@ -3971,6 +3972,133 @@ enum RunOnCap {
 /// The caps stripe ends were run on to, keyed by the stripe's first spine
 /// edge and its end (0 at the spine's start, 1 at its end).
 type TiltedCaps = std::collections::HashMap<(EdgeId, usize), RunOnCap>;
+
+/// Two rounds of parallel straight edges of one plane face, together wider
+/// than the face (a slab's end rounded at both corners past half its
+/// width), cross on it: each one's contact on the face lies past the
+/// other's. The first round is kept; the second rests on its other face
+/// and pivots on the first's contact on the shared face, so the face goes
+/// and the two bands meet there along the first's contact. Both rounds then
+/// have that contact on the face, which is trimmed to the strip between
+/// them, with no area, and dropped as a full round's is.
+fn pivot_crossing_rounds(
+    topo: &Topology,
+    stripe_results: &mut [StripeResult],
+) -> Result<(), BlendError> {
+    const PARALLEL: f64 = 1e-12;
+    let mut moved = vec![false; stripe_results.len()];
+    for i in 0..stripe_results.len() {
+        for j in i + 1..stripe_results.len() {
+            if moved[i] || moved[j] {
+                continue;
+            }
+            let (a, b) = (&stripe_results[i].stripe, &stripe_results[j].stripe);
+            let (FaceSurface::Cylinder(ca), FaceSurface::Cylinder(cb)) = (&a.surface, &b.surface)
+            else {
+                continue;
+            };
+            if a.sections.len() != 2 || b.sections.len() != 2 {
+                continue;
+            }
+            let axis = ca.axis();
+            let r = ca.radius();
+            if axis.dot(cb.axis()).abs() < 1.0 - PARALLEL || (r - cb.radius()).abs() > 1e-9 * r {
+                continue;
+            }
+            let side = |stripe: &Stripe, face: FaceId| {
+                if stripe.face1 == face {
+                    Some(1_u8)
+                } else if stripe.face2 == face {
+                    Some(2)
+                } else {
+                    None
+                }
+            };
+            let Some((face, sa, sb)) = [a.face1, a.face2]
+                .into_iter()
+                .find_map(|face| Some((face, side(a, face)?, side(b, face)?)))
+            else {
+                continue;
+            };
+            let Some((normal, _)) = outward_plane(topo, face)? else {
+                continue;
+            };
+            let other = if sb == 1 { b.face2 } else { b.face1 };
+            let Some((other_normal, _)) = outward_plane(topo, other)? else {
+                continue;
+            };
+            let on = |section: &crate::section::CircSection, side: u8| {
+                if side == 1 { section.p1 } else { section.p2 }
+            };
+            let across = normal.cross(axis);
+            let (pa, pb) = (on(&a.sections[0], sa), on(&b.sections[0], sb));
+            let (ea, eb) = (a.spine.evaluate(topo, 0.0)?, b.spine.evaluate(topo, 0.0)?);
+            // Each contact lies past the other, toward the other's edge.
+            if across.dot(pa - pb) * across.dot(eb - ea) <= 0.0 {
+                continue;
+            }
+            // The second round's ball, kept a radius off its other face,
+            // moves along it until it passes through the first's contact.
+            let along = other_normal.cross(axis).normalize()?;
+            let line = on(&a.sections[0], sa);
+            let mut sections = b.sections.clone();
+            let mut ok = true;
+            for section in &mut sections {
+                let c = section.center;
+                let pivot = line + axis * (c - line).dot(axis);
+                let off = c - pivot;
+                let half = along.dot(off);
+                let disc = half * half - (off.length_squared() - r * r);
+                if disc < 0.0 {
+                    ok = false;
+                    break;
+                }
+                let root = disc.sqrt();
+                let lambda = if (-half + root).abs() <= (-half - root).abs() {
+                    -half + root
+                } else {
+                    -half - root
+                };
+                let centre = c + along * lambda;
+                let touch = centre + other_normal * r;
+                if sb == 1 {
+                    section.p1 = pivot;
+                    section.p2 = touch;
+                } else {
+                    section.p2 = pivot;
+                    section.p1 = touch;
+                }
+                section.center = centre;
+            }
+            if !ok {
+                continue;
+            }
+            let line_of = |from: Point3, to: Point3| {
+                brepkit_math::nurbs::curve::NurbsCurve::new(
+                    1,
+                    vec![0.0, 0.0, 1.0, 1.0],
+                    vec![from, to],
+                    vec![1.0, 1.0],
+                )
+            };
+            let contact1 = line_of(sections[0].p1, sections[1].p1)?;
+            let contact2 = line_of(sections[0].p2, sections[1].p2)?;
+            let cylinder =
+                brepkit_math::surfaces::CylindricalSurface::new(sections[0].center, cb.axis(), r)?;
+            log::debug!(
+                "crossing rounds on face {face:?}: stripe {j} pivots on stripe {i}'s contact"
+            );
+            let b = &mut stripe_results[j].stripe;
+            b.surface = FaceSurface::Cylinder(cylinder);
+            b.contact1 = contact1;
+            b.contact2 = contact2;
+            b.sections = sections;
+            moved[i] = true;
+            moved[j] = true;
+        }
+    }
+    Ok(())
+}
 
 /// Runs a straight round's ends on to tilted end caps.
 ///
