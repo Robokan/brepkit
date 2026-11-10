@@ -10,6 +10,10 @@
 //! boolean fell back to a mesh whenever the bar's seam turned to the side or
 //! the bottom.
 //!
+//! With the rod's seam turned a quarter, one touch point is the seam vertex
+//! and the other halves the rim: the wall's rim is cut there, and the top
+//! disc's rim, whole, has to be cut there too, or the two rims never pair.
+//!
 //! The shared volume is the half Steinmetz solid, 8 r^3 / 3.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -75,26 +79,10 @@ const BAR_TURNS: [f64; 4] = [0.0, 1.0, FRAC_PI_2, PI];
 #[test]
 fn a_t_joint_of_equal_cylinders_is_exact_in_every_seam_pose() {
     for op in [BooleanOp::Fuse, BooleanOp::Cut, BooleanOp::Intersect] {
-        for rod_turn in [0.0, 1.0, PI] {
+        for rod_turn in [0.0, 1.0, FRAC_PI_2, PI] {
             for bar_turn in BAR_TURNS {
                 check(op, rod_turn, bar_turn);
             }
         }
-    }
-    for op in [BooleanOp::Fuse, BooleanOp::Cut] {
-        for bar_turn in BAR_TURNS {
-            check(op, FRAC_PI_2, bar_turn);
-        }
-    }
-}
-
-/// With the rod's seam turned a quarter, the rod's top disc keeps its rim
-/// whole while the wall's rim is split in halves where the section ends on
-/// it, and the intersection falls back.
-#[test]
-#[ignore = "the rod's rim is split on its wall and whole on its top disc"]
-fn a_t_joint_intersect_with_the_rod_seam_turned_a_quarter() {
-    for bar_turn in BAR_TURNS {
-        check(BooleanOp::Intersect, FRAC_PI_2, bar_turn);
     }
 }

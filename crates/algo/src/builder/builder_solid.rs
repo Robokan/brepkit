@@ -3521,6 +3521,24 @@ fn split_arc_edges_at_collinear_vertices(
     let positions: Vec<Point3> = verts.iter().map(|&(_, p)| p).collect();
     let grid = PointGrid::new(&positions, snap);
 
+    // The open circle and ellipse arcs, by their two ends and middle: a full
+    // rim cut once may match a mate rim already in two arcs (below).
+    let open_arcs: Vec<(Point3, Point3, Point3)> = arc_edges
+        .iter()
+        .filter(|(_, _, _, sp, ep, curve)| {
+            (*ep - *sp).length() >= snap
+                && matches!(curve, EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_))
+        })
+        .map(|(_, _, _, sp, ep, curve)| {
+            let (t0, t1) = curve.domain_with_endpoints(*sp, *ep);
+            (
+                *sp,
+                *ep,
+                curve.evaluate_with_endpoints(0.5 * (t0 + t1), *sp, *ep),
+            )
+        })
+        .collect();
+
     let mut replacements: HashMap<EdgeId, Vec<OrientedEdge>> = HashMap::new();
     for (eid, sv, ev, sp, ep, curve) in arc_edges {
         // A closed (full) circle/ellipse CAN be refined — at global vertices
@@ -3719,7 +3737,34 @@ fn split_arc_edges_at_collinear_vertices(
             }
             cuts.push((a_branch, vid));
         }
-        if cuts.is_empty() || (is_closed && cuts.len() < 2) {
+        // A single cut halves a closed rim only where a mate rim already runs
+        // as both halves, two arcs of this curve between its seam vertex and
+        // the cut (a wall's rim split where a section ends on it, its cap's
+        // rim whole). Split at any one vertex on it, a rim whose mate is cut
+        // elsewhere too, or not at all, would lose its partner.
+        let halved_mate = || {
+            let (_, cut_v) = cuts[0];
+            let Ok(cut) = topo
+                .vertex(cut_v)
+                .map(brepkit_topology::vertex::Vertex::point)
+            else {
+                return false;
+            };
+            let mut halves: Vec<Point3> = Vec::new();
+            for &(a, b, mid) in &open_arcs {
+                let ends = ((a - sp).length() < snap && (b - cut).length() < snap)
+                    || ((b - sp).length() < snap && (a - cut).length() < snap);
+                let on = curve.evaluate_with_endpoints(project_angle_on_curve(&curve, mid), sp, ep);
+                if ends
+                    && (on - mid).length() < snap
+                    && halves.iter().all(|&h| (h - mid).length() >= snap)
+                {
+                    halves.push(mid);
+                }
+            }
+            halves.len() == 2
+        };
+        if cuts.is_empty() || (is_closed && cuts.len() < 2 && !halved_mate()) {
             continue;
         }
         // Total order: angle then vertex index (the `vert_at` HashMap iteration
