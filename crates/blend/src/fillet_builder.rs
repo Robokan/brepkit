@@ -4760,28 +4760,21 @@ fn terminal_cap_is_notchable(
         }
         // Seen along the band's axis, the notch lies in the triangle between
         // its ends and the corner, as on a planar cap seen square to it. A
-        // band that is no cylinder (a torus round, a walked band) is seen
-        // square to its end section, along the round there.
+        // band that is no cylinder (a torus round, a walked band) has no one
+        // axis to see it along: its run-on already ended its contacts on the
+        // cap's corner edges.
+        let FaceSurface::Cylinder(cylinder) = &stripe.surface else {
+            return Ok(true);
+        };
         let Some(section) = end_section(topo, stripe, vertex)? else {
             return Ok(false);
-        };
-        let view = if let FaceSurface::Cylinder(cylinder) = &stripe.surface {
-            cylinder.axis()
-        } else {
-            let Ok(view) = (section.p1 - section.center)
-                .cross(section.p2 - section.center)
-                .normalize()
-            else {
-                return Ok(false);
-            };
-            view
         };
         let near_ends = [
             (&stripe.contact1, section.p1),
             (&stripe.contact2, section.p2),
         ]
         .map(|(contact, at)| contact_end_at(contact, at).0);
-        return notch_stays_clear(topo, face, junction.vertex, view, near_ends);
+        return notch_stays_clear(topo, face, junction.vertex, cylinder.axis(), near_ends);
     }
     // The corner sits on the cap's outer wire (a convex fillet) or on one of
     // its holes (a concave one ending on a cup's rim); the notch replaces it

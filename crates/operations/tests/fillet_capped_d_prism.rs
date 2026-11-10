@@ -199,7 +199,6 @@ mod d {
 }
 
 #[test]
-#[ignore = "the capped corner takes a straight or cylinder round meeting the wall in an ellipse; a torus round along the D's arc is not built yet"]
 fn a_d_s_top_arc_and_its_verticals_meet_at_the_sharp_chord() {
     let b = (d::RC * d::RC - d::A * d::A).sqrt();
     for r in [1.0, 2.0, 3.0] {
