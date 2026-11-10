@@ -116,6 +116,91 @@ fn sides(topo: &Topology, sid: SolidId, eid: EdgeId) {
     }
 }
 
+/// The distance from `p` to the triangle `t`.
+fn point_triangle(p: Point3, t: &[Point3; 3]) -> f64 {
+    let [a, b, c] = *t;
+    let (ab, ac, ap) = (b - a, c - a, p - a);
+    let n = ab.cross(ac);
+    let nn = n.dot(n);
+    if nn > 1e-30 {
+        let (u, v) = (ap.cross(ac).dot(n) / nn, ab.cross(ap).dot(n) / nn);
+        if u >= 0.0 && v >= 0.0 && u + v <= 1.0 {
+            return (n.dot(ap) / nn.sqrt()).abs();
+        }
+    }
+    let seg = |s: Point3, e: Point3| {
+        let d = e - s;
+        let dd = d.dot(d);
+        let k = if dd > 0.0 {
+            ((p - s).dot(d) / dd).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (p - (s + d * k)).length()
+    };
+    seg(a, b).min(seg(b, c)).min(seg(c, a))
+}
+
+/// Each face of `sid` as a row: its surface, the edges round it, its area
+/// and its box, both from a mesh at `deflection`, largest first. Used to
+/// set brepkit's result beside another engine's, face by face.
+fn face_table(topo: &Topology, sid: SolidId, label: &str, deflection: f64) {
+    let mut rows = Vec::new();
+    for fid in solid_faces(topo, sid).unwrap() {
+        let face = topo.face(fid).unwrap();
+        let n_edges: usize = std::iter::once(face.outer_wire())
+            .chain(face.inner_wires().iter().copied())
+            .map(|w| topo.wire(w).unwrap().edges().len())
+            .sum();
+        let (mut area, mut lo, mut hi) = (0.0, [f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        match brepkit_operations::tessellate::tessellate(topo, fid, deflection) {
+            Ok(mesh) => {
+                for t in mesh.indices.chunks_exact(3) {
+                    let [a, b, c] = [0, 1, 2].map(|k| mesh.positions[t[k] as usize]);
+                    area += (b - a).cross(c - a).length() / 2.0;
+                }
+                for p in &mesh.positions {
+                    for (k, v) in [p.x(), p.y(), p.z()].into_iter().enumerate() {
+                        lo[k] = lo[k].min(v);
+                        hi[k] = hi[k].max(v);
+                    }
+                }
+            }
+            Err(_) => area = f64::NAN,
+        }
+        let detail = match face.surface() {
+            brepkit_topology::face::FaceSurface::Cylinder(c) => format!(
+                " r={:.3} axis {:?} at {:?}",
+                c.radius(),
+                c.axis(),
+                c.origin()
+            ),
+            brepkit_topology::face::FaceSurface::Plane { normal, d } => {
+                format!(" n {normal:?} d {d:.3}")
+            }
+            _ => String::new(),
+        };
+        rows.push((
+            area,
+            fid.index(),
+            face.surface().type_tag(),
+            n_edges,
+            1 + face.inner_wires().len(),
+            lo,
+            hi,
+            detail,
+        ));
+    }
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!("{label}: {} faces", rows.len());
+    for (area, id, kind, n_edges, loops, lo, hi, detail) in rows {
+        println!(
+            "  {label} face {id:>4} {kind:<8} loops={loops} edges={n_edges:<3} area={area:>12.3} box [{:.2}, {:.2}, {:.2}] .. [{:.2}, {:.2}, {:.2}]{detail}",
+            lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]
+        );
+    }
+}
+
 fn census(topo: &Topology, sid: SolidId) -> String {
     let mut mix: BTreeMap<&'static str, usize> = BTreeMap::new();
     for fid in solid_faces(topo, sid).unwrap() {
@@ -162,6 +247,23 @@ fn main() {
     let mut topo = Topology::new();
     let text = std::fs::read_to_string(dir.join("input0.step")).unwrap();
     let sid = brepkit_io::step::read_step(&text, &mut topo).unwrap()[0];
+    // THIRD=<step> lists another engine's result of the case face by face.
+    let mut other = Topology::new();
+    let theirs = if let Ok(path) = std::env::var("THIRD") {
+        let text = std::fs::read_to_string(path).unwrap();
+        brepkit_io::step::read_step(&text, &mut other).unwrap()
+    } else {
+        Vec::new()
+    };
+    for (k, &solid) in theirs.iter().enumerate() {
+        if std::env::var("ROUNDED").is_err() {
+            println!(
+                "theirs {k}: volume {:.4}",
+                brepkit_operations::measure::solid_volume(&other, solid, 0.05).unwrap_or(f64::NAN)
+            );
+            face_table(&other, solid, "theirs", 0.05);
+        }
+    }
     let n_faces = solid_faces(&topo, sid).unwrap().len();
     println!("input: {} faces ({})", n_faces, census(&topo, sid));
     // INVOL=1 prints the input's own volume as brepkit measures it.
@@ -301,6 +403,106 @@ fn main() {
             .map(|(_, &e)| e)
             .collect();
         println!("keeping picks {keep:?}");
+    }
+    // ROUNDED=1 (with THIRD) lists the input's edges whose middle no longer
+    // lies on the other engine's result (the edges it rounded), against the
+    // picks: an edge it rounded that is not picked, or a pick it left alone.
+    if std::env::var("ROUNDED").is_ok() && !theirs.is_empty() {
+        let mut tris: Vec<[Point3; 3]> = Vec::new();
+        for &solid in &theirs {
+            let mesh =
+                brepkit_operations::tessellate::tessellate_solid(&other, solid, 0.05).unwrap();
+            for t in mesh.indices.chunks_exact(3) {
+                tris.push([0, 1, 2].map(|k| mesh.positions[t[k] as usize]));
+            }
+        }
+        let off = |p: Point3| {
+            tris.iter()
+                .map(|t| point_triangle(p, t))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut rounded = Vec::new();
+        for e in solid_edges(&topo, sid).unwrap() {
+            let edge = topo.edge(e).unwrap();
+            let (a, b) = (
+                topo.vertex(edge.start()).unwrap().point(),
+                topo.vertex(edge.end()).unwrap().point(),
+            );
+            let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+            let mid = edge.curve().evaluate_with_endpoints(0.5 * (t0 + t1), a, b);
+            let d = off(mid);
+            if d > (0.1 * radius).max(0.1) {
+                rounded.push((e, d));
+            }
+        }
+        let picked: Vec<usize> = edges.iter().map(|e| e.index()).collect();
+        let theirs_ids: Vec<usize> = rounded.iter().map(|(e, _)| e.index()).collect();
+        let missing: Vec<usize> = theirs_ids
+            .iter()
+            .copied()
+            .filter(|i| !picked.contains(i))
+            .collect();
+        let extra: Vec<usize> = picked
+            .iter()
+            .copied()
+            .filter(|i| !theirs_ids.contains(i))
+            .collect();
+        println!(
+            "rounded by them: {theirs_ids:?} (off {:?}); picked {picked:?}; theirs not picked {missing:?}; picked not theirs {extra:?}",
+            rounded
+                .iter()
+                .map(|(_, d)| (d * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>()
+        );
+        // The angle between the faces' outward normals at each pick's middle
+        // the other engine left alone: about 0 for a smooth edge.
+        let mut bends = Vec::new();
+        for &i in &extra {
+            let Some(e) = solid_edges(&topo, sid)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.index() == i)
+            else {
+                continue;
+            };
+            let edge = topo.edge(e).unwrap();
+            let (a, b) = (
+                topo.vertex(edge.start()).unwrap().point(),
+                topo.vertex(edge.end()).unwrap().point(),
+            );
+            let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+            let mid = edge.curve().evaluate_with_endpoints(0.5 * (t0 + t1), a, b);
+            let mut normals = Vec::new();
+            for f in solid_faces(&topo, sid).unwrap() {
+                if face_edges(&topo, f).unwrap().contains(&e) {
+                    let face = topo.face(f).unwrap();
+                    if let Some((u, v)) = face.surface().project_point(mid) {
+                        let n = face.surface().normal(u, v);
+                        normals.push(if face.is_reversed() { -n } else { n });
+                    }
+                }
+            }
+            if let [n1, n2] = normals[..] {
+                bends.push((
+                    i,
+                    (n1.dot(n2).clamp(-1.0, 1.0).acos().to_degrees() * 10.0).round() / 10.0,
+                ));
+            }
+        }
+        println!("bends of picks they left (deg): {bends:?}");
+        if std::env::var("ROUNDED").is_ok_and(|v| v == "only") {
+            return;
+        }
+    }
+    // EDGEIDS=a,b rounds the input's edges of those ids instead of the picks.
+    if let Ok(ids) = std::env::var("EDGEIDS") {
+        let ids: Vec<usize> = ids.split(',').map(|k| k.trim().parse().unwrap()).collect();
+        edges = solid_edges(&topo, sid)
+            .unwrap()
+            .into_iter()
+            .filter(|e| ids.contains(&e.index()))
+            .collect();
+        println!("rounding edges {ids:?}");
     }
     let t = std::time::Instant::now();
     match brepkit_operations::blend_ops::fillet_v2(&mut topo, sid, &edges, radius) {
@@ -553,6 +755,9 @@ fn main() {
                     format!("{} errors", v.error_count())
                 })
                 .unwrap_or_else(|e| format!("{e}"));
+            if std::env::var("THIRD").is_ok() || std::env::var("TABLE").is_ok() {
+                face_table(&topo, r.solid, "ours", 0.05);
+            }
             if std::env::var("FACES").is_ok() {
                 for fid in solid_faces(&topo, r.solid).unwrap() {
                     let face = topo.face(fid).unwrap();
