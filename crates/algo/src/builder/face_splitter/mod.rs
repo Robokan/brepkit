@@ -10082,8 +10082,31 @@ fn split_face_2d_impl(
             // cutting a pin's wall clear of the seam): read as a band by its
             // lines, its hole twin became a second patch and the wall round
             // it lost its hole.
+            // A loop of curved sections alone whose corners lie on the
+            // face's own boundary (two equal walls crossing, one truncated
+            // through the other's axis: the patch between their arcs runs
+            // rim to rim and touches the seam) has no region round it to be
+            // a hole of, and no hole twin: it is told by its winding too.
+            let touches_boundary = || {
+                let boundary_vertex = |p: Point3| {
+                    all_edges[..n_boundary_edges].iter().any(|b| {
+                        (b.start_3d - p).length() <= tol.linear
+                            || (b.end_3d - p).length() <= tol.linear
+                    })
+                };
+                let net_u: f64 = wire_loop
+                    .iter()
+                    .map(|e| e.end_uv.x() - e.start_uv.x())
+                    .sum();
+                net_u.abs() < std::f64::consts::PI
+                    && wire_loop.iter().any(|e| boundary_vertex(e.start_3d))
+            };
             let island = wire_loop.iter().all(|e| e.source_edge_idx.is_some())
-                && (!u_periodic || (has_line && has_nonline));
+                && (!u_periodic
+                    || (has_line && has_nonline)
+                    || (!has_line
+                        && matches!(surface, FaceSurface::Cylinder(_) | FaceSurface::Cone(_))
+                        && touches_boundary()));
             if island {
                 if loop_eff_area(&wire_loop) > 0.0 {
                     outers.push((wire_loop, 1.0));
