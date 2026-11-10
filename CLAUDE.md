@@ -181,6 +181,7 @@ Quick reference — find the right file for any task:
 | Fillet builder (orchestration) | `fillet_builder.rs` |
 | Chamfer builder (orchestration) | `chamfer_builder.rs` |
 | Vertex blend / corner solver | `corner.rs` |
+| Corner set back along its rounds (patches and surgery) | `setback_corner.rs` |
 | Face trimming along contact curves | `trimmer.rs` |
 | Shared builder utilities | `builder_utils.rs` |
 
@@ -286,6 +287,7 @@ Quick reference — find the right file for any task:
 | Boolean (union/cut/intersect) | `boolean/` (mod, types, classify, assembly, tests) |
 | Mesh boolean (co-refinement) | `mesh_boolean.rs` |
 | Extrude, Revolve, Sweep, Loft, Pipe | `extrude.rs`, `revolve.rs`, `sweep.rs`, `loft.rs`, `pipe.rs` |
+| Loft along guide rails and under end conditions | `loft/network.rs` |
 | Helical sweep | `helix.rs` |
 | Chamfer, Fillet | `chamfer.rs`, `fillet/` (mod, rolling_ball, g1_chain, geometry, radius_law, helpers, tests) |
 | Chamfer along tangent chains of lines and arcs | `chamfer_chain.rs` |
@@ -301,6 +303,7 @@ Quick reference — find the right file for any task:
 | Offset face / solid | `offset_face.rs`, `offset_v2.rs` (delegates to brepkit-offset), `offset_trim.rs` |
 | Offset wire | `offset_wire.rs` |
 | Face filling (Coons patch) | `fill_face.rs` |
+| Blend, match and fair surfaces with G0/G1/G2 control | `blend_surface.rs`, `blend_surface/` (chain, neighbour, rows, spline, match_edge, fair) |
 | Shape healing | `heal.rs` |
 | Defeaturing | `defeature.rs` |
 | Feature recognition | `feature_recognition.rs` |
