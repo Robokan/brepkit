@@ -38,6 +38,19 @@ type BlendCrossHandlePair = (
     Option<crate::boundary_registry::BoundaryHandle>,
     Option<crate::boundary_registry::BoundaryHandle>,
 );
+/// The edges in the order given, each once: an edge picked twice in one set
+/// (two picks landing on the same edge) asks for the same round, so it is
+/// the same request. Across sets an edge may still be asked for twice, with
+/// two laws, which is refused.
+fn distinct_edges(edges: &[EdgeId]) -> Vec<EdgeId> {
+    let mut seen = HashSet::new();
+    edges
+        .iter()
+        .copied()
+        .filter(|edge| seen.insert(edge.index()))
+        .collect()
+}
+
 /// Builder for fillet (rounding) operations on solid edges.
 ///
 /// Collects edge sets with their radius laws, then computes and assembles
@@ -65,7 +78,7 @@ impl<'a> FilletBuilder<'a> {
     /// Returns `&mut Self` for method chaining.
     pub fn add_edges(&mut self, edges: &[EdgeId], radius: f64) -> &mut Self {
         self.edge_sets
-            .push((edges.to_vec(), RadiusLaw::Constant(radius)));
+            .push((distinct_edges(edges), RadiusLaw::Constant(radius)));
         self
     }
 
@@ -73,7 +86,7 @@ impl<'a> FilletBuilder<'a> {
     ///
     /// Returns `&mut Self` for method chaining.
     pub fn add_edges_with_law(&mut self, edges: &[EdgeId], law: RadiusLaw) -> &mut Self {
-        self.edge_sets.push((edges.to_vec(), law));
+        self.edge_sets.push((distinct_edges(edges), law));
         self
     }
 
@@ -7658,6 +7671,26 @@ mod tests {
             found_cylinder,
             "fillet should produce a cylindrical blend surface"
         );
+    }
+
+    /// An edge picked twice in one set is the same request: it is rounded
+    /// once, as if picked once.
+    #[test]
+    fn an_edge_picked_twice_is_rounded_once() {
+        let mut topo = Topology::new();
+        let solid = make_unit_cube_manifold(&mut topo);
+        let adjacency = AdjacencyIndex::build(&topo, solid).unwrap();
+        let edge = brepkit_topology::explorer::solid_edges(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&edge| adjacency.faces_for_edge(edge).len() == 2)
+            .expect("a manifold edge");
+        let mut builder = FilletBuilder::new(&mut topo, solid);
+        builder.add_edges(&[edge, edge], 0.1);
+        let result = builder.build().expect("fillet build should succeed");
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(result.succeeded, vec![edge]);
+        assert_shell_edges_are_closed(&topo, result.solid);
     }
 
     #[test]
