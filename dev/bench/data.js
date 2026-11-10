@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794340149268,
+  "lastUpdate": 1794345262521,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2753,6 +2753,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 23576493,
             "range": "± 176804",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "fd6f5e976b72b2d66e7c129b70984faf05caa9e0",
+          "message": "fix(blend): an edge picked twice in one fillet set is rounded once\n\nTwo picks landing on the same edge ask for the same round; the builder\nrefused every such edge as \"requested more than once\", and with it the\nwhole fillet. Within one set a repeated edge is now taken once; an edge\nasked for in two sets, with two laws, is still refused.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-10T13:11:26-08:00",
+          "tree_id": "7390ce2fb26360e605243464ab3870b7f34aabf6",
+          "url": "https://github.com/Robokan/brepkit/commit/fd6f5e976b72b2d66e7c129b70984faf05caa9e0"
+        },
+        "date": 1794345261775,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 687622,
+            "range": "± 5619",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 754127,
+            "range": "± 10089",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8763,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 589297,
+            "range": "± 13492",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18532806,
+            "range": "± 503270",
             "unit": "ns/iter"
           }
         ]
