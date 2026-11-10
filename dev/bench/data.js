@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794345262521,
+  "lastUpdate": 1794348964482,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2807,6 +2807,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 18532806,
             "range": "± 503270",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "f6009b426a5bccd12e14de1511b4b34e4bf3990e",
+          "message": "docs(buzzcad): #15 pivot round, fillet replay 20261110-140058\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-10T14:12:46-08:00",
+          "tree_id": "cc37fdf6048a4b63282c83c7affc01e1b36479eb",
+          "url": "https://github.com/Robokan/brepkit/commit/f6009b426a5bccd12e14de1511b4b34e4bf3990e"
+        },
+        "date": 1794348963439,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 952485,
+            "range": "± 10586",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 989784,
+            "range": "± 4155",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11321,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 761439,
+            "range": "± 7548",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 23471681,
+            "range": "± 235116",
             "unit": "ns/iter"
           }
         ]
