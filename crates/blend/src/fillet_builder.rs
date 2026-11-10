@@ -1717,7 +1717,9 @@ impl<'a> FilletBuilder<'a> {
         // because a disc bounded by one closed circle also has a single
         // vertex but a real boundary. A two-vertex face whose edges are
         // anti-parallel (a zero-area planar remnant) fails the extent test
-        // and keeps closing the shell.
+        // and keeps closing the shell. A closed edge (a contact round a whole
+        // rim) starts and ends at one vertex too, but runs round its curve:
+        // its middle stands off that vertex.
         result_faces.retain(|&face_id| {
             let Ok(face) = topo.face(face_id) else {
                 return true;
@@ -1737,7 +1739,12 @@ impl<'a> FilletBuilder<'a> {
                 else {
                     return true;
                 };
-                (start.point() - end.point()).length() > 1e-7
+                let (start, end) = (start.point(), end.point());
+                let (t0, t1) = edge.curve().domain_with_endpoints(start, end);
+                let middle =
+                    edge.curve()
+                        .evaluate_with_endpoints(f64::midpoint(t0, t1), start, end);
+                (start - end).length() > 1e-7 || (middle - start).length() > 1e-7
             })
         });
 
@@ -2353,15 +2360,21 @@ fn drop_contact_slivers(
                 topo.edge(contact.edge())?.clone(),
             );
             let ends = [contact_edge.start(), contact_edge.end()];
-            if own_edge.start() == own_edge.end()
+            // Two closed contacts round one vertex (a full round of a closed
+            // rim's wall) span their length; open edges their chord.
+            let loops = own_edge.start() == own_edge.end() && ends[0] == ends[1];
+            if (own_edge.start() == own_edge.end() && !loops)
                 || ([own_edge.start(), own_edge.end()] != ends
                     && [own_edge.end(), own_edge.start()] != ends)
             {
                 continue;
             }
-            let span = (topo.vertex(own_edge.start())?.point()
-                - topo.vertex(own_edge.end())?.point())
-            .length();
+            let span = if loops {
+                loop_length(topo, &own_edge)?
+            } else {
+                (topo.vertex(own_edge.start())?.point() - topo.vertex(own_edge.end())?.point())
+                    .length()
+            };
             if !edge_lies_on(topo, &contact_edge, &own_edge, ON_EDGE * span.max(1e-2))? {
                 continue;
             }
@@ -2399,6 +2412,13 @@ fn drop_contact_slivers(
                 .iter()
                 .map(|&oe| {
                     if oe.edge() == contact.edge() {
+                        if loops {
+                            // The sliver runs along one loop and back along
+                            // the other: their curves run the same way where
+                            // its wire takes them in opposite senses.
+                            let same = own.is_forward() != contact.is_forward();
+                            return OrientedEdge::new(own.edge(), oe.is_forward() == same);
+                        }
                         let from = oe.oriented_start(&contact_edge);
                         OrientedEdge::new(own.edge(), own_edge.start() == from)
                     } else {
@@ -2412,6 +2432,24 @@ fn drop_contact_slivers(
         }
         return Ok(faces);
     }
+}
+
+/// A closed edge's length, along its curve.
+fn loop_length(topo: &Topology, edge: &Edge) -> Result<f64, BlendError> {
+    const SAMPLES: u32 = 256;
+    let at = topo.vertex(edge.start())?.point();
+    let curve = edge.curve();
+    let (t0, t1) = curve.domain_with_endpoints(at, at);
+    let point = |k: u32| {
+        curve.evaluate_with_endpoints(
+            (t1 - t0).mul_add(f64::from(k) / f64::from(SAMPLES), t0),
+            at,
+            at,
+        )
+    };
+    Ok((0..SAMPLES)
+        .map(|k| (point(k + 1) - point(k)).length())
+        .sum())
 }
 
 /// Whether `edge` traces `on` within `tol`, certified rather than sampled.
@@ -3624,6 +3662,60 @@ fn edge_distance(
     Ok(at(f64::midpoint(lo, hi)))
 }
 
+/// Where the line `origin + run * s` passes through an edge: the edge's
+/// point nearest the line (its nearest sample, refined by golden section
+/// between the sample's neighbours), and the line's `s` there; `None` where
+/// the line passes farther than `tol` from the edge.
+fn line_meets_edge(
+    topo: &Topology,
+    edge_id: EdgeId,
+    origin: Point3,
+    run: Vec3,
+    tol: f64,
+) -> Result<Option<f64>, BlendError> {
+    const SAMPLES: usize = 64;
+    let len2 = run.length_squared();
+    if len2 <= 1e-24 {
+        return Ok(None);
+    }
+    let edge = topo.edge(edge_id)?;
+    let (a, b) = (
+        topo.vertex(edge.start())?.point(),
+        topo.vertex(edge.end())?.point(),
+    );
+    let curve = edge.curve();
+    let (t0, t1) = curve.domain_with_endpoints(a, b);
+    let off = |t: f64| {
+        let d = curve.evaluate_with_endpoints(t, a, b) - origin;
+        (d - run * (d.dot(run) / len2)).length()
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let param = |k: usize| t0 + (t1 - t0) * (k as f64) / (SAMPLES as f64);
+    let nearest = (0..=SAMPLES)
+        .min_by(|&i, &j| off(param(i)).total_cmp(&off(param(j))))
+        .unwrap_or(0);
+    let (mut lo, mut hi) = (
+        param(nearest.saturating_sub(1)),
+        param((nearest + 1).min(SAMPLES)),
+    );
+    let ratio = 0.5 * (5.0_f64.sqrt() - 1.0);
+    for _ in 0..80 {
+        let (x1, x2) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+        if off(x1) <= off(x2) {
+            hi = x2;
+        } else {
+            lo = x1;
+        }
+    }
+    let t = f64::midpoint(lo, hi);
+    if off(t) > tol {
+        return Ok(None);
+    }
+    Ok(Some(
+        (curve.evaluate_with_endpoints(t, a, b) - origin).dot(run) / len2,
+    ))
+}
+
 /// Where the line `origin + run * s` meets `surface`, by Newton steps from
 /// `s0` along the surface's normal at its nearest point; `None` where they
 /// do not converge to a point on the surface within `tol`.
@@ -3656,11 +3748,18 @@ fn line_meets_surface(
 }
 
 /// The curve where a cylinder band meets a curved cap between the contact
-/// ends `a` and `b`: each ruling of the band, the shorter way round from `a`
-/// to `b`, cut by the cap's surface, and a cubic through those points. The
-/// rulings are doubled until the cubic lies on both the band and the cap
-/// between its points, within the cuts' tolerance. `None` where a ruling
-/// misses the cap, or the cubic stays off them.
+/// ends `a` and `b`, and a cubic through points along it.
+///
+/// The curve is traced in the band's development, `w` the arc round the
+/// axis from `a` and `s` the height along it, by steps of equal length
+/// along the curve, each pulled back on to the cap along the gradient of
+/// its offset from the cap. Cutting each ruling of the band by the cap
+/// instead cannot follow a curve that runs nearly along the rulings (a cap
+/// meeting the support face almost tangentially at the corner, where the
+/// band's end runs to the corner along the rulings, and a ruling there can
+/// cross the cap beyond the face). The steps are halved until the cubic
+/// lies on both the band and the cap between its points. `None` where the
+/// trace leaves the cap, or the cubic stays off them.
 fn cylinder_meets_cap(
     cylinder: &brepkit_math::surfaces::CylindricalSurface,
     cap: &FaceSurface,
@@ -3681,13 +3780,37 @@ fn cylinder_meets_cap(
     let across = axis.cross(ra);
     let angle = rb.dot(across).atan2(rb.dot(ra));
     let (sa, sb) = ((a - origin).dot(axis), (b - origin).dot(axis));
-    // The ruling `f` of the way round from `a`, cut by the cap from a guess
-    // of its height along the axis: the point and its height.
-    let cut = |f: f64, guess: f64| -> Option<(Point3, f64)> {
-        let theta = angle * f;
-        let foot = origin + (ra * theta.cos() + across * theta.sin()) * radius;
-        let s = line_meets_surface(cap, foot, axis, guess, tol)?;
-        Some((foot + axis * s, s))
+    let target = (radius * angle, sb);
+    let at = |w: f64, s: f64| {
+        let theta = w / radius;
+        origin + (ra * theta.cos() + across * theta.sin()) * radius + axis * s
+    };
+    // The point's offset from the cap along the cap's normal, and that
+    // offset's gradient in (w, s).
+    let offset = |w: f64, s: f64| -> Option<(f64, f64, f64)> {
+        let p = at(w, s);
+        let (u, v) = cap.project_point(p)?;
+        let q = cap.evaluate(u, v)?;
+        let n = cap.normal(u, v);
+        let theta = w / radius;
+        let round = across * theta.cos() - ra * theta.sin();
+        Some(((p - q).dot(n), n.dot(round), n.dot(axis)))
+    };
+    // Pulls (w, s) back on to the cap along the offset's gradient.
+    let settle = |mut w: f64, mut s: f64| -> Option<(f64, f64)> {
+        for _ in 0..30 {
+            let (f, gw, gs) = offset(w, s)?;
+            if f.abs() <= 1e-3 * tol {
+                return Some((w, s));
+            }
+            let g2 = gw.mul_add(gw, gs * gs);
+            if g2 <= 1e-24 {
+                return None;
+            }
+            w -= f * gw / g2;
+            s -= f * gs / g2;
+        }
+        None
     };
     // How far a point lies off the band or the cap, whichever is farther.
     let off = |p: Point3| -> Option<f64> {
@@ -3695,18 +3818,42 @@ fn cylinder_meets_cap(
         let on_cap = (cap.evaluate(u, v)? - p).length();
         Some(on_cap.max((radial(p).length() - radius).abs()))
     };
-    let mut cuts = Vec::with_capacity(FIRST + 1);
-    cuts.push((a, sa));
-    for k in 1..FIRST {
-        let s = cuts[k - 1].1;
-        #[allow(clippy::cast_precision_loss)]
-        let guess = s + (sb - s) / ((FIRST - k + 1) as f64);
-        #[allow(clippy::cast_precision_loss)]
-        cuts.push(cut(k as f64 / FIRST as f64, guess)?);
+    let span = target.0.hypot(target.1 - sa);
+    if span <= tol {
+        return None;
     }
-    cuts.push((b, sb));
+    let mut steps = FIRST;
     loop {
-        let points: Vec<Point3> = cuts.iter().map(|&(p, _)| p).collect();
+        #[allow(clippy::cast_precision_loss)]
+        let h = span / steps as f64;
+        let mut points = vec![a];
+        let (mut w, mut s) = (0.0, sa);
+        let mut heading: Option<(f64, f64)> = None;
+        loop {
+            if (target.0 - w).hypot(target.1 - s) <= 1.5 * h {
+                points.push(b);
+                break;
+            }
+            if points.len() > 8 * steps {
+                return None;
+            }
+            let (_, gw, gs) = offset(w, s)?;
+            let g = gw.hypot(gs);
+            if g <= 1e-12 {
+                return None;
+            }
+            let (mut tw, mut ts) = (-gs / g, gw / g);
+            let backwards = heading.map_or_else(
+                || tw.mul_add(target.0 - w, ts * (target.1 - s)) < 0.0,
+                |(hw, hs)| tw.mul_add(hw, ts * hs) < 0.0,
+            );
+            if backwards {
+                (tw, ts) = (-tw, -ts);
+            }
+            heading = Some((tw, ts));
+            (w, s) = settle(tw.mul_add(h, w), ts.mul_add(h, s))?;
+            points.push(at(w, s));
+        }
         let curve = brepkit_math::nurbs::fitting::interpolate(&points, 3).ok()?;
         // The cubic takes its points at their chord-length parameters: check
         // it at the quarters between each two.
@@ -3734,19 +3881,10 @@ fn cylinder_meets_cap(
         if on {
             return Some(EdgeCurve::NurbsCurve(curve));
         }
-        let steps = cuts.len() - 1;
         if steps >= MOST {
             return None;
         }
-        let mut finer = Vec::with_capacity(2 * steps + 1);
-        for (k, pair) in cuts.windows(2).enumerate() {
-            finer.push(pair[0]);
-            #[allow(clippy::cast_precision_loss)]
-            let f = (2 * k + 1) as f64 / (2 * steps) as f64;
-            finer.push(cut(f, f64::midpoint(pair[0].1, pair[1].1))?);
-        }
-        finer.push((b, sb));
-        cuts = finer;
+        steps *= 2;
     }
 }
 
@@ -3931,7 +4069,26 @@ fn run_stripes_to_tilted_caps(
                     None => break,
                 },
             };
-            let reached = far + run * fraction;
+            let mut reached = far + run * fraction;
+            if plane.is_none() && !on_corner(reached)? {
+                // A curved cap may cross the contact's line more than once
+                // (an extruded profile curling back across it beyond the
+                // face): the crossing the run-on wants is the one on the
+                // cap's corner edge with the contact's face, the nearest to
+                // the end section.
+                let mut best: Option<f64> = None;
+                for &edge in &corner_edges {
+                    if let Some(s) = line_meets_edge(topo, edge, far, run, tol)?
+                        && s > 0.05
+                        && best.is_none_or(|b| (s - 1.0).abs() < (b - 1.0).abs())
+                    {
+                        best = Some(s);
+                    }
+                }
+                if let Some(s) = best {
+                    reached = far + run * s;
+                }
+            }
             if fraction <= 0.05 || !on_corner(reached)? {
                 break;
             }
@@ -6090,6 +6247,7 @@ fn check_closed_contacts_do_not_cross(
 ) -> Result<(), BlendError> {
     const SAMPLES: u32 = 256;
     const GAP: f64 = 1e-4;
+    const FULL_ROUND: f64 = 1e-5;
     // A closed contact is a loop: its ends meet, within a small fraction of
     // its own length (a fillet near half a box's size leaves contacts a few
     // microns long whose ends lie a few microns apart).
@@ -6126,8 +6284,29 @@ fn check_closed_contacts_do_not_cross(
                 .collect()
         })
         .collect();
+    // Two contacts lying on each other all round, within a small fraction of
+    // their length, are a full round: a wall exactly twice the radius high,
+    // rounded along both rims, kept as the strip between them, which has
+    // no area (`drop_contact_slivers` takes it out, one round taking the
+    // other's contact). Walked contacts through the same sections differ
+    // only by their fits between them.
+    let length = |points: &[Point3]| {
+        points
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).length())
+            .sum::<f64>()
+    };
+    let full_round = |i: usize, j: usize| {
+        let (a, b) = (&sampled[i], &sampled[j]);
+        let tol = FULL_ROUND * length(a).min(length(b));
+        a.iter().all(|&p| distance(p, closed[j].1) <= tol)
+            && b.iter().all(|&p| distance(p, closed[i].1) <= tol)
+    };
     for (i, a) in sampled.iter().enumerate() {
-        for b in &sampled[i + 1..] {
+        for (j, b) in sampled.iter().enumerate().skip(i + 1) {
+            if full_round(i, j) {
+                continue;
+            }
             let meet = a.windows(2).any(|p| {
                 b.windows(2)
                     .any(|q| segments_within(p[0], p[1], q[0], q[1], GAP))
@@ -6145,7 +6324,7 @@ fn check_closed_contacts_do_not_cross(
     for (i, &(rim, own)) in closed.iter().enumerate() {
         let near = distance(rim, own);
         for (j, &(_, other)) in closed.iter().enumerate() {
-            if i != j && distance(rim, other) <= near {
+            if i != j && !full_round(i.min(j), i.max(j)) && distance(rim, other) <= near {
                 return Err(BlendError::PlanningFailure {
                     reason: format!(
                         "two fillets on face {} cross: their radii are too large for the face between them",

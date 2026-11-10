@@ -355,12 +355,10 @@ fn an_elliptic_slabs_two_rims_round_off_together() {
 }
 
 /// Rounds on both rims whose radii add up to more than the wall's height
-/// would cross on the wall: refused, not built as faces that overlap. At
-/// exactly half the height (r = 2) the two contacts meet along one line and
-/// leave the wall no width, which is refused as well.
+/// would cross on the wall: refused, not built as faces that overlap.
 #[test]
 fn crossing_rounds_on_both_rims_are_refused() {
-    for r in [2.0, 2.5] {
+    for r in [2.5, 3.0] {
         let mut topo = Topology::new();
         let solid = slab(&mut topo);
         let edges = [rim_at(&topo, solid, 0.0), rim_at(&topo, solid, HEIGHT)];
@@ -375,6 +373,45 @@ fn crossing_rounds_on_both_rims_are_refused() {
             }
         }
     }
+}
+
+/// Rounds of exactly half the wall's height on both rims (a full round)
+/// meet along the wall's middle and leave it no width: the wall goes, and
+/// the two bands share their contact. At height `z` from the middle the
+/// section is the outline set in by `d = r - sqrt(r^2 - z^2)`, of area
+/// `A - P d + pi d^2` (the outline is convex and bends no tighter than `d`),
+/// so the solid holds `2 r A - (2 - pi / 2) P r^2 + pi (10 / 3 - pi) r^3`.
+#[test]
+fn rounds_of_half_the_wall_on_both_rims_make_a_full_round() {
+    let r = HEIGHT / 2.0;
+    let mut topo = Topology::new();
+    let solid = slab(&mut topo);
+    let edges = [rim_at(&topo, solid, 0.0), rim_at(&topo, solid, HEIGHT)];
+    let result = fillet_v2(&mut topo, solid, &edges, r).unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    let report = validate_solid(&topo, result.solid).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+    let faces = crate_faces(&topo, result.solid);
+    assert_eq!(faces.len(), 4, "lid, floor and two bands: {faces:?}");
+    assert_edges_lie_on_their_faces(&topo, result.solid, r);
+    let mesh = tessellate_solid(&topo, result.solid, 0.01).unwrap();
+    assert!(
+        is_watertight(&mesh),
+        "mesh not watertight ({} open, {} over-used)",
+        brepkit_operations::tessellate::boundary_edge_count(&mesh),
+        brepkit_operations::tessellate::non_manifold_edge_count(&mesh)
+    );
+    let area = PI * SEMI_MAJOR * SEMI_MINOR;
+    let truth = (2.0 * r).mul_add(
+        area,
+        (PI * PI.mul_add(-1.0, 10.0 / 3.0) * r)
+            .mul_add(r * r, -(2.0 - PI / 2.0) * perimeter() * r * r),
+    );
+    let volume = solid_volume(&topo, result.solid, 0.001).unwrap();
+    assert!(
+        (volume - truth).abs() < 1e-3 * truth,
+        "volume {volume}, the full round {truth}"
+    );
 }
 
 /// The outline's tightest bend, at the ends of its major axis, has radius
