@@ -266,6 +266,10 @@ fn main() {
     }
     let n_faces = solid_faces(&topo, sid).unwrap().len();
     println!("input: {} faces ({})", n_faces, census(&topo, sid));
+    // TABLE=2 lists the input face by face too.
+    if std::env::var("TABLE").is_ok_and(|v| v == "2") {
+        face_table(&topo, sid, "input", 0.05);
+    }
     // INVOL=1 prints the input's own volume as brepkit measures it.
     if std::env::var("INVOL").is_ok() {
         println!(
