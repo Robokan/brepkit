@@ -2703,6 +2703,35 @@ fn flat_segment_distance(a0: Flat, a1: Flat, b0: Flat, b1: Flat) -> f64 {
         .min(to_segment(b1, a0, a1))
 }
 
+/// How near two closed contacts must lie to each other all round, as a
+/// fraction of their length beyond their sags, to read as a full round:
+/// walked contacts through the same sections differ by their fits.
+const FULL_ROUND: f64 = 1e-5;
+
+/// Whether two closed polylines lie on each other all round: each point of
+/// either within `margin` and [`FULL_ROUND`] of their length of the other.
+fn polylines_lie_on_each_other(a: &FlatPolyline, b: &FlatPolyline, margin: f64) -> bool {
+    let length = |line: &FlatPolyline| {
+        (0..line.points.len())
+            .map(|k| {
+                let (p, q) = (line.points[k], line.points[(k + 1) % line.points.len()]);
+                (q.0 - p.0).hypot(q.1 - p.1)
+            })
+            .sum::<f64>()
+    };
+    let tol = FULL_ROUND.mul_add(length(a).min(length(b)), margin);
+    let near = |p: Flat, line: &FlatPolyline| {
+        (0..line.points.len()).any(|k| {
+            let (s0, s1) = (line.points[k], line.points[(k + 1) % line.points.len()]);
+            flat_segment_distance(p, p, s0, s1) <= tol
+        })
+    };
+    !a.points.is_empty()
+        && !b.points.is_empty()
+        && a.points.iter().all(|&p| near(p, b))
+        && b.points.iter().all(|&p| near(p, a))
+}
+
 /// Whether two closed polylines stay further than `margin` apart.
 fn polylines_clear_by(a: &FlatPolyline, b: &FlatPolyline, margin: f64) -> bool {
     let span =
@@ -2829,7 +2858,13 @@ fn check_holes_clear_of_closed_contacts(
     }
     for (i, a) in outlines.iter().enumerate() {
         for b in &outlines[i + 1..] {
-            if !polylines_clear_by(&a.line, &b.line, a.line.sag + b.line.sag + VERTEX_TOL) {
+            let margin = a.line.sag + b.line.sag + VERTEX_TOL;
+            // Two contacts lying on each other all round are a full round
+            // (two rounds meeting along the face, which the trim leaves a
+            // strip with no area, dropped as a full round's wall is).
+            if !polylines_clear_by(&a.line, &b.line, margin)
+                && !polylines_lie_on_each_other(&a.line, &b.line, margin)
+            {
                 return Err(refuse());
             }
         }

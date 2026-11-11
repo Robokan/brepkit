@@ -470,7 +470,7 @@ const MIN_TURN_STEP: f64 = 1e-3;
 
 /// `(u, v)` moved by whole turns into the range of each direction in which
 /// `surface` closes on itself.
-fn wrap_params(surface: &dyn ParametricSurface, u: f64, v: f64) -> (f64, f64) {
+pub fn wrap_params(surface: &dyn ParametricSurface, u: f64, v: f64) -> (f64, f64) {
     let wrap = |x: f64, range: Option<(f64, f64)>| match range {
         Some((a, b)) if b - a > f64::EPSILON => a + (x - a).rem_euclid(b - a),
         _ => x,

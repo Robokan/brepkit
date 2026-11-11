@@ -508,6 +508,10 @@ fn main() {
             .collect();
         println!("rounding edges {ids:?}");
     }
+    // REVERSE=1 picks the edges in the other order.
+    if std::env::var("REVERSE").is_ok() {
+        edges.reverse();
+    }
     let t = std::time::Instant::now();
     match brepkit_operations::blend_ops::fillet_v2(&mut topo, sid, &edges, radius) {
         Err(e) => println!("fillet r={radius}: error: {e}"),
