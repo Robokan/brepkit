@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794351479479,
+  "lastUpdate": 1794358367997,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -2915,6 +2915,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 23501750,
             "range": "± 49548",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "3d6947643867ed9490e64eb50d957c2afb3d692a",
+          "message": "docs(buzzcad): #15 walked rounds pivot, fillet replay 20261110-162837\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-10T16:49:49-08:00",
+          "tree_id": "f431c95ed865ae4c2ea5adbbebbbca801a65dfae",
+          "url": "https://github.com/Robokan/brepkit/commit/3d6947643867ed9490e64eb50d957c2afb3d692a"
+        },
+        "date": 1794358367282,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 698668,
+            "range": "± 2532",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 759345,
+            "range": "± 5361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8917,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 608884,
+            "range": "± 30426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18740546,
+            "range": "± 161918",
             "unit": "ns/iter"
           }
         ]
