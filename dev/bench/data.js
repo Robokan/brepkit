@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794365854799,
+  "lastUpdate": 1794371606150,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3023,6 +3023,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19805751,
             "range": "± 126134",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "5ac72e9f967548355b3d1a8d6f47ce2283d0cae5",
+          "message": "docs(buzzcad): #15 closed annuli meet along the first round's contact, fillet replay 20261110-200914\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-10T20:29:38-08:00",
+          "tree_id": "0895c4472fb8df6043fa4abfb0176c7f4be31a88",
+          "url": "https://github.com/Robokan/brepkit/commit/5ac72e9f967548355b3d1a8d6f47ce2283d0cae5"
+        },
+        "date": 1794371605460,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1227384,
+            "range": "± 20137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1274967,
+            "range": "± 16022",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 14447,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 980806,
+            "range": "± 1682",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 30199775,
+            "range": "± 54163",
             "unit": "ns/iter"
           }
         ]
