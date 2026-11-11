@@ -7512,33 +7512,42 @@ fn compute_stripe_for_spine(
     };
 
     let mut walk_result = walk_result;
-    // A closed round wider than a narrow plane face between its two walls
-    // (a thin shell's rim rounded past the rim's width) runs its contact
-    // off the face, past its far rim: the ball, resting on the wall, pivots
-    // on that rim, the band meets the face beyond there in place of the
-    // face, and the face goes.
+    // A closed round wider than a narrow face (a thin shell's rim or a
+    // counterbore's ledge rounded past its width, a thin disc's edge past
+    // its thickness) runs its contact off the face, past its far rim: the
+    // ball, resting on the other face, pivots on that rim, the band meets
+    // the face beyond there in place of the face, and the face goes.
     let swallowed = if spine.is_closed()
         && let Err(error) = check_contacts_on_faces(topo, face1, face2, &walk_result.sections)
     {
-        let Some(found) = adjacency
+        let candidates = adjacency
             .map(|adjacency| {
                 swallow_narrow_face(topo, adjacency, face1, face2, &spine, &walk_result.sections)
             })
             .transpose()?
-            .flatten()
-        else {
+            .unwrap_or_default();
+        // Each face the contacts run off is tried in turn: the first whose
+        // pivot keeps both contacts on their faces.
+        let mut pivoted = None;
+        for found in candidates {
+            let Some(sections) =
+                pivot_on_far_loop(topo, &found, ps1, ps2, law, &walk_result.sections)?
+            else {
+                continue;
+            };
+            let (on1, on2) = if found.side == 0 {
+                (found.beyond, face2)
+            } else {
+                (face1, found.beyond)
+            };
+            if check_contacts_on_faces(topo, on1, on2, &sections).is_ok() {
+                pivoted = Some((found, sections));
+                break;
+            }
+        }
+        let Some((found, sections)) = pivoted else {
             return Err(error);
         };
-        let Some(sections) = pivot_on_far_loop(topo, &found, ps1, ps2, law, &walk_result.sections)?
-        else {
-            return Err(error);
-        };
-        let (on1, on2) = if found.side == 0 {
-            (found.beyond, face2)
-        } else {
-            (face1, found.beyond)
-        };
-        check_contacts_on_faces(topo, on1, on2, &sections).map_err(|_| error)?;
         walk_result.sections = sections;
         Some(found)
     } else {
@@ -7603,7 +7612,7 @@ fn compute_stripe_for_spine(
     })
 }
 
-/// A narrow plane face a closed round swallows (see
+/// A narrow face a closed round swallows (see
 /// [`swallow_narrow_face`]).
 struct SwallowedFace {
     /// Which side of the stripe the face was (0: `face1`).
@@ -7614,12 +7623,14 @@ struct SwallowedFace {
     far: Vec<EdgeId>,
 }
 
-/// Whether a closed round's contact on a plane face runs off the face past
-/// its far loop all round: the face a narrow annulus between the rim
-/// rounded and one other loop, all of which it shares with one face beyond
-/// (a thin shell's rim). Each section's arc, from the contact on the other
-/// wall towards the plane's, then crosses the face beyond before it reaches
-/// the plane: it is cut there.
+/// The faces a closed round's contact runs off past their far loop all
+/// round, each the face a narrow annulus between the rim
+/// rounded and one other loop (a thin shell's rim, a counterbore's ledge),
+/// or a wall lower than the round running up its seam from the rim to its
+/// far rim (a thin disc's edge), its far loop all shared with one face
+/// beyond. Each section's arc, from the contact on the other face towards
+/// the narrow face's, then crosses the face beyond's surface before it
+/// reaches the narrow face's: it is cut there.
 fn swallow_narrow_face(
     topo: &Topology,
     adjacency: &brepkit_topology::adjacency::AdjacencyIndex,
@@ -7627,13 +7638,11 @@ fn swallow_narrow_face(
     face2: FaceId,
     spine: &Spine,
     sections: &[crate::section::CircSection],
-) -> Result<Option<SwallowedFace>, BlendError> {
+) -> Result<Vec<SwallowedFace>, BlendError> {
+    let mut found = Vec::new();
     let spine_edges: HashSet<EdgeId> = spine.edges().iter().copied().collect();
-    for (side, (plane, wall)) in [(face1, face2), (face2, face1)].into_iter().enumerate() {
+    'sides: for (side, (plane, wall)) in [(face1, face2), (face2, face1)].into_iter().enumerate() {
         let face = topo.face(plane)?;
-        if !face.surface().is_planar() {
-            continue;
-        }
         let loops: Vec<Vec<EdgeId>> = std::iter::once(face.outer_wire())
             .chain(face.inner_wires().iter().copied())
             .map(|wire| {
@@ -7641,15 +7650,35 @@ fn swallow_narrow_face(
                     .map(|w| w.edges().iter().map(OrientedEdge::edge).collect())
             })
             .collect::<Result<_, _>>()?;
-        let [first, second] = &loops[..] else {
-            continue;
-        };
         let rim_loop = |edges: &[EdgeId]| edges.iter().all(|e| spine_edges.contains(e));
-        let far = match (rim_loop(first), rim_loop(second)) {
-            (true, false) => second,
-            (false, true) => first,
-            _ => continue,
+        let far: Vec<EdgeId> = if face.surface().is_planar() {
+            let [first, second] = &loops[..] else {
+                continue;
+            };
+            match (rim_loop(first), rim_loop(second)) {
+                (true, false) => second.clone(),
+                (false, true) => first.clone(),
+                _ => continue,
+            }
+        } else {
+            // A wall lower than the round (a thin disc's rim rounded past
+            // its thickness): one wire running round the rim, up its seam,
+            // round its far rim and back down the seam.
+            let [wire] = &loops[..] else {
+                continue;
+            };
+            let count = |e: EdgeId| wire.iter().filter(|&&x| x == e).count();
+            let (rim, far): (Vec<EdgeId>, Vec<EdgeId>) = wire
+                .iter()
+                .copied()
+                .filter(|&e| count(e) == 1)
+                .partition(|e| spine_edges.contains(e));
+            if rim.is_empty() || far.is_empty() || wire.len() == rim.len() + far.len() {
+                continue;
+            }
+            far
         };
+        let far = &far;
         let mut beyond = None;
         let mut shared = true;
         for &edge in far {
@@ -7701,58 +7730,61 @@ fn swallow_narrow_face(
                 .zip(b.normalize().ok())
                 .map(|(a, b)| a.dot(b).clamp(-1.0, 1.0).acos());
             let Some(angle) = angle.filter(|&angle| angle > 1e-9) else {
-                return Ok(None);
+                continue 'sides;
             };
             // The arc from the wall's contact to the plane's, by slerp.
             let at = |f: f64| {
                 let (sa, sb) = (((1.0 - f) * angle).sin(), (f * angle).sin());
                 section.center + (a * sa + b * sb) * (1.0 / angle.sin())
             };
+            // From either side: past a ledge's far rim the face beyond (a
+            // wider bore's wall) stands over the wall's side of its surface.
             let Some((start, _)) = off(at(0.0)) else {
-                return Ok(None);
+                continue 'sides;
             };
-            if start >= 0.0 {
-                return Ok(None);
+            if start == 0.0 {
+                continue 'sides;
             }
+            let inside = start < 0.0;
             let samples = 32_u32;
             let mut low = 0.0;
             let mut high = None;
             for k in 1..=samples {
                 let f = f64::from(k) / f64::from(samples);
                 let Some((value, _)) = off(at(f)) else {
-                    return Ok(None);
+                    continue 'sides;
                 };
-                if value >= 0.0 {
+                if (value < 0.0) != inside {
                     high = Some(f);
                     break;
                 }
                 low = f;
             }
             let Some(mut high) = high else {
-                return Ok(None);
+                continue 'sides;
             };
             for _ in 0..60 {
                 let mid = 0.5 * (low + high);
                 match off(at(mid)) {
-                    Some((value, _)) if value < 0.0 => low = mid,
+                    Some((value, _)) if (value < 0.0) == inside => low = mid,
                     Some(_) => high = mid,
-                    None => return Ok(None),
+                    None => continue 'sides,
                 }
             }
             if off(at(0.5 * (low + high))).is_none() {
-                return Ok(None);
+                continue 'sides;
             }
         }
-        return Ok(Some(SwallowedFace {
+        found.push(SwallowedFace {
             side,
             beyond,
             far: far.clone(),
-        }));
+        });
     }
-    Ok(None)
+    Ok(found)
 }
 
-/// The round's sections where it swallows a narrow plane face: the ball
+/// The round's sections where it swallows a narrow face: the ball
 /// rests on the wall and pivots on the face's far rim (`found.far`), each
 /// in its section's plane, so the band runs from its contact on the wall to
 /// that rim, where it meets the face beyond. `sections` are the walk on the

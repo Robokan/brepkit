@@ -110,3 +110,125 @@ fn a_round_wider_than_a_tube_wall_pivots_on_the_outer_rim() {
         }
     }
 }
+
+/// The volume a round of radius `r` takes off between a rim of radius
+/// `rim` and the circle of radius `far` it pivots on, the ball's centre
+/// `centre` from the axis, its contact on the wall `depth` from the
+/// rim's plane: at each height the annulus from the rim out to the ball's
+/// circle (or in from it, where `far < rim`).
+fn pivoted(r: f64, rim: f64, centre: f64, depth: f64) -> f64 {
+    const N: usize = 2000;
+    let sign: f64 = if centre > rim { 1.0 } else { -1.0 };
+    let f = |s: f64| {
+        let ball = sign.mul_add(-(r * r - s * s).sqrt(), centre);
+        PI * (ball * ball - rim * rim).abs()
+    };
+    let h = depth / N as f64;
+    let mut sum = f(0.0) + f(depth);
+    for i in 1..N {
+        sum += f(i as f64 * h) * if i % 2 == 1 { 4.0 } else { 2.0 };
+    }
+    sum * h / 3.0
+}
+
+/// A disc thinner than the round along its top rim: the ball rests on the
+/// top and pivots on the bottom rim, the wall goes, and the round runs from
+/// the top to the bottom rim.
+#[test]
+fn a_round_past_a_disc_s_thickness_pivots_on_the_bottom_rim() {
+    const R: f64 = 4.32;
+    const T: f64 = 0.5;
+    for r in [0.8, 1.0] {
+        let mut topo = Topology::new();
+        let solid = make_cylinder(&mut topo, R, T).unwrap();
+        let before = solid_volume(&topo, solid, 1e-3).unwrap();
+        let rim = solid_edges(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&e| {
+                matches!(topo.edge(e).unwrap().curve(), EdgeCurve::Circle(c)
+                    if (c.center().z() - T).abs() < 1e-9)
+            })
+            .expect("the top rim");
+        let result = fillet_v2(&mut topo, solid, &[rim], r).unwrap();
+        assert!(result.failed.is_empty(), "r = {r}: {:?}", result.failed);
+        let faces = solid_faces(&topo, result.solid).unwrap().len();
+        assert_eq!(faces, 3, "r = {r}: the wall is swallowed by the round");
+        let report = validate_solid(&topo, result.solid).unwrap();
+        assert!(report.is_valid(), "r = {r}: {:?}", report.issues);
+        let mesh = tessellate_solid(&topo, result.solid, 0.01).unwrap();
+        assert!(is_watertight(&mesh), "r = {r}: mesh open");
+        let lost = before - solid_volume(&topo, result.solid, 1e-3).unwrap();
+        // In a meridian the ball's centre stands `r` below the top and
+        // `r` from the bottom rim; each height of the disc loses the
+        // annulus out from the ball's circle to the rim.
+        let reach = (r * r - (r - T).powi(2)).sqrt();
+        let centre = R - reach;
+        let expected = {
+            const N: usize = 2000;
+            let f = |z: f64| {
+                let ball = centre + (r * r - (z - (T - r)).powi(2)).sqrt();
+                PI * (R * R - ball * ball)
+            };
+            let h = T / N as f64;
+            let mut sum = f(0.0) + f(T);
+            for i in 1..N {
+                sum += f(i as f64 * h) * if i % 2 == 1 { 4.0 } else { 2.0 };
+            }
+            sum * h / 3.0
+        };
+        assert!(
+            (lost - expected).abs() <= 1e-3 * expected,
+            "r = {r}: removed {lost}, the pivoting ball takes off {expected}"
+        );
+    }
+}
+
+/// A counterbore whose ledge is narrower than the round along its inner
+/// rim: the ball rests on the narrow bore's wall and pivots on the wide
+/// bore's rim, and the ledge goes.
+#[test]
+fn a_round_past_a_counterbore_ledge_pivots_on_the_wide_bore() {
+    const NARROW: f64 = 3.0;
+    const WIDE: f64 = 3.4;
+    const LEDGE: f64 = 6.0;
+    for r in [0.5, 0.6] {
+        let mut topo = Topology::new();
+        let block = brepkit_operations::primitives::make_box(&mut topo, 20.0, 20.0, 10.0).unwrap();
+        let narrow = make_cylinder(&mut topo, NARROW, 12.0).unwrap();
+        transform_solid(&mut topo, narrow, &Mat4::translation(10.0, 10.0, -1.0)).unwrap();
+        let wide = make_cylinder(&mut topo, WIDE, 6.0).unwrap();
+        transform_solid(&mut topo, wide, &Mat4::translation(10.0, 10.0, LEDGE)).unwrap();
+        let bored = boolean(&mut topo, BooleanOp::Cut, block, narrow).unwrap();
+        let solid = boolean(&mut topo, BooleanOp::Cut, bored, wide).unwrap();
+        let before = solid_volume(&topo, solid, 1e-3).unwrap();
+        let faces_before = solid_faces(&topo, solid).unwrap().len();
+        let rim = solid_edges(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&e| {
+                matches!(topo.edge(e).unwrap().curve(), EdgeCurve::Circle(c)
+                    if (c.radius() - NARROW).abs() < 1e-9 && (c.center().z() - LEDGE).abs() < 1e-9)
+            })
+            .expect("the ledge's inner rim");
+        let result = fillet_v2(&mut topo, solid, &[rim], r).unwrap();
+        assert!(result.failed.is_empty(), "r = {r}: {:?}", result.failed);
+        let faces = solid_faces(&topo, result.solid).unwrap().len();
+        assert_eq!(
+            faces, faces_before,
+            "r = {r}: the ledge gives way to the round"
+        );
+        let report = validate_solid(&topo, result.solid).unwrap();
+        assert!(report.is_valid(), "r = {r}: {:?}", report.issues);
+        let mesh = tessellate_solid(&topo, result.solid, 0.01).unwrap();
+        assert!(is_watertight(&mesh), "r = {r}: mesh open");
+        let lost = before - solid_volume(&topo, result.solid, 1e-3).unwrap();
+        let centre = NARROW + r;
+        let depth = (r * r - (centre - WIDE).powi(2)).sqrt();
+        let expected = pivoted(r, NARROW, centre, depth);
+        assert!(
+            (lost - expected).abs() <= 1e-3 * expected,
+            "r = {r}: removed {lost}, the pivoting ball takes off {expected}"
+        );
+    }
+}

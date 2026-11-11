@@ -608,8 +608,13 @@ fn main() {
             if let Ok(d) = std::env::var("TESS") {
                 for d in d.split(',').map(|d| d.parse::<f64>().unwrap()) {
                     let t = std::time::Instant::now();
+                    // TESSANG sets the angular tolerance (BuzzCAD's 0.5 by default).
+                    let angular = std::env::var("TESSANG")
+                        .ok()
+                        .and_then(|a| a.parse::<f64>().ok())
+                        .unwrap_or(0.5);
                     let m = brepkit_operations::tessellate::tessellate_solid_grouped_with_tolerance(
-                        &topo, r.solid, d, 0.5,
+                        &topo, r.solid, d, angular,
                     );
                     if let Ok((mesh, offs)) = &m {
                         for (i, w) in offs.windows(2).enumerate() {
