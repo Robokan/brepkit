@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794385350357,
+  "lastUpdate": 1794427129698,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3239,6 +3239,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 24203657,
             "range": "± 141017",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b01ca8f6608996ea70b44b87c73dfc1ace8ae1f2",
+          "message": "chore(buzzcad): corpus with the 20261111-114938 fillet replay\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-11T11:55:07-08:00",
+          "tree_id": "10a4f210ea28ecf3d69fd810fdb2726f70765d63",
+          "url": "https://github.com/Robokan/brepkit/commit/b01ca8f6608996ea70b44b87c73dfc1ace8ae1f2"
+        },
+        "date": 1794427128624,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 989621,
+            "range": "± 24963",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1065580,
+            "range": "± 25541",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11212,
+            "range": "± 307",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 836533,
+            "range": "± 16128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 25147428,
+            "range": "± 2135300",
             "unit": "ns/iter"
           }
         ]
