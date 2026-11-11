@@ -185,6 +185,13 @@ impl<'a> FilletBuilder<'a> {
         // Keep actual RadiusLaw values only for the recoverable invalid-edge
         // fallback. Valid geometry always consumes the immutable plan's law.
         let mut all_edges: Vec<(EdgeId, usize)> = Vec::new();
+        // The edges in the order they were picked: where two rounds cross,
+        // the first picked is made as it would be alone.
+        let pick_order: Vec<EdgeId> = self
+            .edge_sets
+            .iter()
+            .flat_map(|(edges, _)| edges.iter().copied())
+            .collect();
         let mut laws: Vec<RadiusLaw> = Vec::with_capacity(self.edge_sets.len());
         for (law_idx, (edges, law)) in self.edge_sets.into_iter().enumerate() {
             for eid in edges {
@@ -322,7 +329,7 @@ impl<'a> FilletBuilder<'a> {
         } else {
             HashSet::new()
         };
-        pivot_crossing_rounds(topo, &mut stripe_results)?;
+        pivot_crossing_rounds(topo, &mut stripe_results, &pick_order)?;
         let tilted_caps = if let Some(plan) = plan.as_ref() {
             run_stripes_to_tilted_caps(topo, plan, &mut stripe_results)?
         } else {
@@ -3976,23 +3983,53 @@ type TiltedCaps = std::collections::HashMap<(EdgeId, usize), RunOnCap>;
 /// Two rounds of parallel straight edges of one plane face, together wider
 /// than the face (a slab's end rounded at both corners past half its
 /// width), cross on it: each one's contact on the face lies past the
-/// other's. The first round is kept; the second rests on its other face
-/// and pivots on the first's contact on the shared face, so the face goes
-/// and the two bands meet there along the first's contact. Both rounds then
-/// have that contact on the face, which is trimmed to the strip between
-/// them, with no area, and dropped as a full round's is.
+/// other's. The round picked first (`pick_order`) is kept; the second rests
+/// on its other face and pivots on the first's contact on the shared face,
+/// so the face goes and the two bands meet there along the first's contact.
+/// Both rounds then have that contact on the face, which is trimmed to the
+/// strip between them, with no area, and dropped as a full round's is.
+/// Walked rounds crossing on a face (a curved plate rounded on both rims,
+/// thinner than twice the radius) pivot the same way
+/// ([`pivot_walked_round`]).
 fn pivot_crossing_rounds(
     topo: &Topology,
     stripe_results: &mut [StripeResult],
+    pick_order: &[EdgeId],
 ) -> Result<(), BlendError> {
     const PARALLEL: f64 = 1e-12;
+    let picked = |stripe: &Stripe| {
+        stripe
+            .spine_edges()
+            .iter()
+            .filter_map(|edge| pick_order.iter().position(|picked| picked == edge))
+            .min()
+            .unwrap_or(usize::MAX)
+    };
     let mut moved = vec![false; stripe_results.len()];
-    for i in 0..stripe_results.len() {
-        for j in i + 1..stripe_results.len() {
-            if moved[i] || moved[j] {
+    for first in 0..stripe_results.len() {
+        for second in first + 1..stripe_results.len() {
+            if moved[first] || moved[second] {
                 continue;
             }
+            // `i` is the round picked first, made as it would be alone.
+            let (i, j) =
+                if picked(&stripe_results[second].stripe) < picked(&stripe_results[first].stripe) {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
             let (a, b) = (&stripe_results[i].stripe, &stripe_results[j].stripe);
+            if let (FaceSurface::Nurbs(_), FaceSurface::Nurbs(_)) = (&a.surface, &b.surface) {
+                if let Some(pivoted) = pivot_walked_round(topo, a, b)? {
+                    log::debug!(
+                        "crossing walked rounds: stripe {j} pivots on stripe {i}'s contact"
+                    );
+                    stripe_results[j].stripe = pivoted;
+                    moved[i] = true;
+                    moved[j] = true;
+                }
+                continue;
+            }
             let (FaceSurface::Cylinder(ca), FaceSurface::Cylinder(cb)) = (&a.surface, &b.surface)
             else {
                 continue;
@@ -4098,6 +4135,138 @@ fn pivot_crossing_rounds(
         }
     }
     Ok(())
+}
+
+/// [`pivot_crossing_rounds`] for two walked rounds (fitted bands) on one
+/// face: `second`, crossing `first` on it, rebuilt with its ball resting on
+/// its other face and pivoting on `first`'s contact there. `None` where they
+/// do not cross, or the pivot cannot be found.
+fn pivot_walked_round(
+    topo: &Topology,
+    first: &Stripe,
+    second: &Stripe,
+) -> Result<Option<Stripe>, BlendError> {
+    const SAMPLES: usize = 512;
+    let Some(radius) = second.sections.first().map(|section| section.radius) else {
+        return Ok(None);
+    };
+    if first
+        .sections
+        .iter()
+        .chain(&second.sections)
+        .any(|section| (section.radius - radius).abs() > 1e-9 * radius)
+    {
+        return Ok(None);
+    }
+    let side = |stripe: &Stripe, face: FaceId| {
+        if stripe.face1 == face {
+            Some(0_usize)
+        } else if stripe.face2 == face {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let Some((face, sa, sb)) = [first.face1, first.face2]
+        .into_iter()
+        .find_map(|face| Some((face, side(first, face)?, side(second, face)?)))
+    else {
+        return Ok(None);
+    };
+    let on_first = if sa == 0 {
+        &first.contact1
+    } else {
+        &first.contact2
+    };
+    let on_second = if sb == 0 {
+        &second.contact1
+    } else {
+        &second.contact2
+    };
+    // Crossing: each round's edge nearer the other's contact on the face
+    // than its own.
+    let distance = |p: Point3, curve: &brepkit_math::nurbs::curve::NurbsCurve| {
+        brepkit_math::nurbs::projection::project_point_to_curve(curve, p, 1e-9)
+            .map_or(f64::INFINITY, |found| found.distance)
+    };
+    let middle = |stripe: &Stripe| stripe.spine.evaluate(topo, 0.5 * stripe.spine.length());
+    let (ma, mb) = (middle(first)?, middle(second)?);
+    // Contacts that only meet (a full round, a wall exactly twice the
+    // radius high, its walked contacts a little apart) are left to the
+    // full-round check.
+    let clear = 1e-3 * radius;
+    if distance(ma, on_second) + clear >= distance(ma, on_first)
+        || distance(mb, on_first) + clear >= distance(mb, on_second)
+    {
+        return Ok(None);
+    }
+    let other = if sb == 0 { second.face2 } else { second.face1 };
+    let wall_surface = topo.face(other)?.surface().clone();
+    let face_surface = topo.face(face)?.surface().clone();
+    let mut adapter = None;
+    let wall = surface_ref_or_adapter(&wall_surface, &mut adapter);
+    let (t0, t1) = on_first.domain();
+    let pieces: Vec<((), f64, f64)> = (0..SAMPLES)
+        .map(|k| {
+            let f = |k: usize| t0 + (t1 - t0) * k as f64 / SAMPLES as f64;
+            ((), f(k), f(k + 1))
+        })
+        .collect();
+    let at = |(): &(), t: f64| -> Result<Point3, BlendError> { Ok(on_first.evaluate(t)) };
+    let Some(sections) = pivot_sections(
+        &pieces,
+        &at,
+        wall,
+        &face_surface,
+        sb,
+        radius,
+        &second.sections,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    // The ball pivoting stays on the walk's side of the first's contact:
+    // within a radius of the walk's centre, as it rests on the same face
+    // and touches a line on the wall the walk touches (the far root lies
+    // past the contact, outside the part).
+    if sections
+        .iter()
+        .zip(&second.sections)
+        .any(|(new, old)| (new.center - old.center).length() >= radius)
+    {
+        return Ok(None);
+    }
+    let Ok(surface) = interpolate_blend_surface(&sections) else {
+        return Ok(None);
+    };
+    let contact1 = band_side(&surface, 0)?;
+    let contact2 = band_side(&surface, surface.control_points().len() - 1)?;
+    let surfaces = [
+        topo.face(second.face1)?.surface().clone(),
+        topo.face(second.face2)?.surface().clone(),
+    ];
+    let (mut adapter1, mut adapter2) = (None, None);
+    let pcurve1 = build_pcurve_from_contact(
+        surface_ref_or_adapter(&surfaces[0], &mut adapter1),
+        &contact1,
+        face_u_period(&surfaces[0]),
+    )?;
+    let pcurve2 = build_pcurve_from_contact(
+        surface_ref_or_adapter(&surfaces[1], &mut adapter2),
+        &contact2,
+        face_u_period(&surfaces[1]),
+    )?;
+    let mut pivoted = second.clone();
+    pivoted.surface = FaceSurface::Nurbs(surface);
+    pivoted.contact1 = contact1;
+    pivoted.contact2 = contact2;
+    pivoted.pcurve1 = pcurve1;
+    pivoted.pcurve2 = pcurve2;
+    pivoted.sections = sections;
+    // Rolled on past its ends without the pivot: dropped.
+    pivoted.beyond = Default::default();
+    Ok(Some(pivoted))
 }
 
 /// Runs a straight round's ends on to tilted end caps.
@@ -6479,7 +6648,6 @@ fn pivot_on_far_loop(
         return Ok(None);
     };
     let radius = *radius;
-    let tol = 1e-9 * radius.max(1.0);
     // The far rim as a closed polyline of curve samples, each segment
     // refined on its curve where a section's plane crosses it.
     let mut rim: Vec<(EdgeId, f64, f64)> = Vec::new();
@@ -6503,13 +6671,48 @@ fn pivot_on_far_loop(
         );
         Ok(edge.curve().evaluate_with_endpoints(t, a, b))
     };
-    let (wall, beyond_surface) = (
-        if found.side == 0 { ps2 } else { ps1 },
-        topo.face(found.beyond)?.surface().clone(),
-    );
-    let mut pivoted = Vec::with_capacity(sections.len());
+    let wall = if found.side == 0 { ps2 } else { ps1 };
+    let beyond_surface = topo.face(found.beyond)?.surface().clone();
+    let at = |&(edge_id, _, _): &(EdgeId, f64, f64), t: f64| at(edge_id, t);
+    let pieces: Vec<((EdgeId, f64, f64), f64, f64)> =
+        rim.iter().map(|&piece| (piece, piece.1, piece.2)).collect();
+    pivot_sections(
+        &pieces,
+        &at,
+        wall,
+        &beyond_surface,
+        found.side,
+        radius,
+        sections,
+        false,
+    )
+}
+
+/// The sections of a round whose ball rests on `wall` (the side other than
+/// `side_index`) and pivots on a rim, each in its section's plane: the
+/// rim's crossing of that plane nearest its contact on side `side_index`,
+/// which that contact moves to (its `(u, v)` on `pivot_surface`). With
+/// `follow`, each section after the first takes the crossing nearest the
+/// last one's pivot and starts its ball from the last one's contact on the
+/// wall, as the ball rolls on (a plane cutting a curved rim more than once,
+/// a curved wall the walk's own contact would lead it off). The rim is `pieces`, each a
+/// key evaluated by `at` over its parameter range. `None` where a plane
+/// misses the rim or the ball cannot be placed against it.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn pivot_sections<K>(
+    pieces: &[(K, f64, f64)],
+    at: &dyn Fn(&K, f64) -> Result<Point3, BlendError>,
+    wall: &dyn brepkit_math::traits::ParametricSurface,
+    pivot_surface: &FaceSurface,
+    side_index: usize,
+    radius: f64,
+    sections: &[crate::section::CircSection],
+    follow: bool,
+) -> Result<Option<Vec<crate::section::CircSection>>, BlendError> {
+    let tol = 1e-9 * radius.max(1.0);
+    let mut pivoted: Vec<crate::section::CircSection> = Vec::with_capacity(sections.len());
     for section in sections {
-        let (on_plane, on_wall, wall_uv) = if found.side == 0 {
+        let (on_plane, on_wall, wall_uv) = if side_index == 0 {
             (section.p1, section.p2, section.uv2)
         } else {
             (section.p2, section.p1, section.uv1)
@@ -6524,16 +6727,22 @@ fn pivot_on_far_loop(
         // The rim's crossing of the section's plane nearest the plane's
         // contact.
         let mut pivot: Option<Point3> = None;
-        for &(edge_id, a, b) in &rim {
-            let (pa, pb) = (at(edge_id, a)?, at(edge_id, b)?);
+        for (key, a, b) in pieces {
+            let (a, b) = (*a, *b);
+            let (pa, pb) = (at(key, a)?, at(key, b)?);
             let (ha, hb) = (height(pa), height(pb));
-            if ha * hb > 0.0 {
+            // A crossing at a piece's end (a section in the plane of the
+            // rim's seam) reads a hair off zero on both sides of it.
+            if ha * hb > 0.0 && ha.abs().min(hb.abs()) > tol {
                 continue;
             }
             let (mut lo, mut hi, mut h_lo) = (a, b, ha);
+            if ha * hb > 0.0 {
+                (lo, hi) = if ha.abs() <= hb.abs() { (a, a) } else { (b, b) };
+            }
             for _ in 0..80 {
                 let mid = 0.5 * (lo + hi);
-                let h = height(at(edge_id, mid)?);
+                let h = height(at(key, mid)?);
                 if h * h_lo > 0.0 {
                     lo = mid;
                     h_lo = h;
@@ -6541,8 +6750,13 @@ fn pivot_on_far_loop(
                     hi = mid;
                 }
             }
-            let q = at(edge_id, 0.5 * (lo + hi))?;
-            if pivot.is_none_or(|p| (q - on_plane).length() < (p - on_plane).length()) {
+            let q = at(key, 0.5 * (lo + hi))?;
+            // Following, from the last section's pivot, so a plane cutting
+            // the rim more than once takes the crossing the rim runs on to.
+            let from = pivoted.last().filter(|_| follow).map_or(on_plane, |last| {
+                if side_index == 0 { last.p1 } else { last.p2 }
+            });
+            if pivot.is_none_or(|p| (q - from).length() < (p - from).length()) {
                 pivot = Some(q);
             }
         }
@@ -6558,7 +6772,12 @@ fn pivot_on_far_loop(
             let c = centre(u, v);
             (height(c), (c - pivot).length() - radius)
         };
-        let (mut u, mut v) = wall_uv;
+        // Following, from the last section's contact on the wall, as the
+        // ball rolls on (from the walk's own contact it can land on
+        // another part of a curved wall).
+        let (mut u, mut v) = pivoted.last().filter(|_| follow).map_or(wall_uv, |last| {
+            if side_index == 0 { last.uv2 } else { last.uv1 }
+        });
         let mut solved = false;
         for _ in 0..40 {
             let (f1, f2) = residual(u, v);
@@ -6580,12 +6799,12 @@ fn pivot_on_far_loop(
         if !solved {
             return Ok(None);
         }
-        let Some(pivot_uv) = beyond_surface.project_point(pivot) else {
+        let Some(pivot_uv) = pivot_surface.project_point(pivot) else {
             return Ok(None);
         };
         let mut next = section.clone();
         next.center = centre(u, v);
-        if found.side == 0 {
+        if side_index == 0 {
             next.p1 = pivot;
             next.uv1 = pivot_uv;
             next.p2 = wall.evaluate(u, v);

@@ -355,24 +355,85 @@ fn an_elliptic_slabs_two_rims_round_off_together() {
 }
 
 /// Rounds on both rims whose radii add up to more than the wall's height
-/// would cross on the wall: refused, not built as faces that overlap.
+/// cross on the wall. The first picked, the floor's, is made as it would be
+/// alone, its contact on the wall `r` up; the lid's ball rests on the lid
+/// and pivots on that contact, its centre `w = sqrt(r^2 - (2 r - H)^2)` in
+/// from the wall, and the wall goes. At height `z` the section is the
+/// outline set in by `d(z)`, of area `A - P d + pi d^2`.
 #[test]
-fn crossing_rounds_on_both_rims_are_refused() {
+fn crossing_rounds_on_both_rims_pivot() {
+    let length = perimeter();
     for r in [2.5, 3.0] {
-        let mut topo = Topology::new();
-        let solid = slab(&mut topo);
-        let edges = [rim_at(&topo, solid, 0.0), rim_at(&topo, solid, HEIGHT)];
-        match fillet_v2(&mut topo, solid, &edges, r) {
-            Err(_) => {}
-            Ok(result) => {
+        for floor_first in [true, false] {
+            let mut topo = Topology::new();
+            let solid = slab(&mut topo);
+            let before = solid_volume(&topo, solid, 0.01).unwrap();
+            let (floor, lid) = (rim_at(&topo, solid, 0.0), rim_at(&topo, solid, HEIGHT));
+            let edges = if floor_first {
+                [floor, lid]
+            } else {
+                [lid, floor]
+            };
+            let case = format!("r = {r}, floor first {floor_first}");
+            let result = fillet_v2(&mut topo, solid, &edges, r).unwrap();
+            assert!(result.failed.is_empty(), "{case}: {:?}", result.failed);
+            let report = validate_solid(&topo, result.solid).unwrap();
+            assert!(report.is_valid(), "{case}: {:?}", report.issues);
+            let faces = brepkit_topology::explorer::solid_faces(&topo, result.solid).unwrap();
+            assert_eq!(faces.len(), 4, "{case}: lid, floor and two bands");
+            assert_edges_lie_on_their_faces(&topo, result.solid, r);
+            let mesh = tessellate_solid(&topo, result.solid, 0.01).unwrap();
+            assert!(is_watertight(&mesh), "{case}: mesh not watertight");
+            let w = r.mul_add(r, -(2.0 * r - HEIGHT).powi(2)).sqrt();
+            let set_in = |d: f64| length * d - PI * d * d;
+            // The first round: `r - z = r sin t`, set in `r - r cos t`.
+            let first = simpson(0.0, PI / 2.0, |t| set_in(r - r * t.cos()) * r * t.cos());
+            // The second: `z - (H - r) = r sin s` from the pivot, set in
+            // `w - r cos s`.
+            let from = ((2.0 * r - HEIGHT) / r).asin();
+            let second = simpson(from, PI / 2.0, |s| set_in(w - r * s.cos()) * r * s.cos());
+            let removed = before - solid_volume(&topo, result.solid, 0.01).unwrap();
+            assert!(
+                (removed - (first + second)).abs() < 1e-6 * (first + second),
+                "{case}: removed {removed}, the pivoting round takes off {}",
+                first + second
+            );
+            // The first picked rim's face is set in by `r`, the other's by `w`.
+            let plane_at = |z: f64| {
+                faces
+                    .iter()
+                    .copied()
+                    .find(|&f| {
+                        matches!(topo.face(f).unwrap().surface(), FaceSurface::Plane { normal, d }
+                            if (normal.z().abs() - 1.0).abs() < 1e-9 && (d.abs() - z).abs() < 1e-9)
+                    })
+                    .expect("a plane face at that height")
+            };
+            let ellipse = PI * SEMI_MAJOR * SEMI_MINOR;
+            let inset = |d: f64| ellipse - set_in(d);
+            let (floor_in, lid_in) = if floor_first { (r, w) } else { (w, r) };
+            for (z, d) in [(0.0, floor_in), (HEIGHT, lid_in)] {
+                let area =
+                    brepkit_operations::measure::face_area(&topo, plane_at(z), 0.001).unwrap();
                 assert!(
-                    !result.failed.is_empty() && result.succeeded.is_empty(),
-                    "r = {r}: two rounds of {r} on a wall {HEIGHT} high were built"
+                    (area - inset(d)).abs() < 1e-3 * inset(d),
+                    "{case}: the face at z = {z} has area {area}, set in by {d} it has {}",
+                    inset(d)
                 );
-                assert_eq!(result.solid, solid, "r = {r}: the solid was changed");
             }
         }
     }
+}
+
+/// Simpson's rule over `[a, b]`.
+fn simpson(a: f64, b: f64, f: impl Fn(f64) -> f64) -> f64 {
+    const N: u32 = 2000;
+    let step = (b - a) / f64::from(N);
+    let mut sum = f(a) + f(b);
+    for i in 1..N {
+        sum += f(f64::from(i).mul_add(step, a)) * if i % 2 == 1 { 4.0 } else { 2.0 };
+    }
+    sum * step / 3.0
 }
 
 /// Rounds of exactly half the wall's height on both rims (a full round)
