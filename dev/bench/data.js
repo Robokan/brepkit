@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794371606150,
+  "lastUpdate": 1794380687780,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3077,6 +3077,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 30199775,
             "range": "± 54163",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "d656ff4f1ed735e2c4afd4c827aeab0a7a53e9f4",
+          "message": "docs(buzzcad): #15 thin walls and ledges pivot, root-cause triage, fillet replay 20261110-224320\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-10T23:00:57-08:00",
+          "tree_id": "9dd5a009d863cb92a68fd00eaa57450a577c0a06",
+          "url": "https://github.com/Robokan/brepkit/commit/d656ff4f1ed735e2c4afd4c827aeab0a7a53e9f4"
+        },
+        "date": 1794380687133,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1115135,
+            "range": "± 6367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1219230,
+            "range": "± 14214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12729,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 948423,
+            "range": "± 2657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 28686175,
+            "range": "± 75589",
             "unit": "ns/iter"
           }
         ]
