@@ -1925,6 +1925,7 @@ impl<'a> FilletBuilder<'a> {
         let result_faces = drop_contact_slivers(topo, result_faces, &input_edges)?;
         fold_spoke_spurs(topo, &result_faces, &input_edges)?;
         let result_faces = drop_contact_slivers(topo, result_faces, &input_edges)?;
+        let result_faces = extend_caps_over_runouts(topo, result_faces, &input_edges)?;
         let new_shell = match Shell::new(result_faces) {
             Ok(shell) => shell,
             Err(error) => {
@@ -2422,6 +2423,10 @@ fn drop_contact_slivers(
             }
             let wire_id = face.outer_wire();
             let [first, second] = topo.wire(wire_id)?.edges() else {
+                if drop_folded_sliver(topo, &faces, face_id, input_edges)? {
+                    faces.remove(index);
+                    continue 'slivers;
+                }
                 continue;
             };
             let (first, second) = (*first, *second);
@@ -2514,6 +2519,249 @@ fn drop_contact_slivers(
     }
 }
 
+/// A face whose wire only runs out and back along itself, enclosing
+/// nothing: where two crossing rounds meet along a contact on a wall that
+/// also ends on split edges, the wall is left running up an end edge, back
+/// down its pieces, and out and back along the two contacts. Two edges
+/// running between the same vertices both ways, lying on each other, are
+/// paired, the one kept (an input edge where there is one) taking the
+/// other's place in its other face; every edge left must have a chain of
+/// pieces lying on it running back from its end to its start, which take
+/// its place in its other face; there must be at least one pair. Every edge
+/// involved has exactly one use outside this face. `true` where the
+/// face was dropped so.
+#[allow(clippy::too_many_lines)]
+fn drop_folded_sliver(
+    topo: &mut Topology,
+    faces: &[FaceId],
+    face_id: FaceId,
+    input_edges: &HashSet<EdgeId>,
+) -> Result<bool, BlendError> {
+    // As in `drop_contact_slivers`.
+    const ON_EDGE: f64 = 1e-4;
+    let face = topo.face(face_id)?;
+    if !face.inner_wires().is_empty() {
+        return Ok(false);
+    }
+    let mut ring: Vec<OrientedEdge> = topo.wire(face.outer_wire())?.edges().to_vec();
+    if ring.len() < 3 {
+        return Ok(false);
+    }
+    // The one wire outside this face using each edge.
+    let other_use = |topo: &Topology, edge: EdgeId| -> Result<Option<WireId>, BlendError> {
+        let mut uses = Vec::new();
+        for &other in faces {
+            if other == face_id {
+                continue;
+            }
+            let f = topo.face(other)?;
+            for w in std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied()) {
+                for oe in topo.wire(w)?.edges() {
+                    if oe.edge() == edge {
+                        uses.push(w);
+                    }
+                }
+            }
+        }
+        Ok(if let [only] = uses.as_slice() {
+            Some(*only)
+        } else {
+            None
+        })
+    };
+    let ends = |topo: &Topology, oe: OrientedEdge| -> Result<(VertexId, VertexId), BlendError> {
+        let edge = topo.edge(oe.edge())?;
+        Ok(if oe.is_forward() {
+            (edge.start(), edge.end())
+        } else {
+            (edge.end(), edge.start())
+        })
+    };
+    let span = |topo: &Topology, edge: &Edge| -> Result<f64, BlendError> {
+        Ok((topo.vertex(edge.start())?.point() - topo.vertex(edge.end())?.point()).length())
+    };
+    // (kept, dropped): `dropped` runs back along `kept`, between the same
+    // two vertices, anywhere in the wire.
+    let mut pairs: Vec<(OrientedEdge, OrientedEdge)> = Vec::new();
+    'pair: loop {
+        for i in 0..ring.len() {
+            for j in i + 1..ring.len() {
+                let (a, b) = (ring[i], ring[j]);
+                if a.edge() == b.edge() {
+                    continue;
+                }
+                let ((sa, ea), (sb, eb)) = (ends(topo, a)?, ends(topo, b)?);
+                if sb != ea || eb != sa || sa == ea {
+                    continue;
+                }
+                let (kept, dropped) = match (
+                    input_edges.contains(&a.edge()),
+                    input_edges.contains(&b.edge()),
+                ) {
+                    (_, false) => (a, b),
+                    (false, true) => (b, a),
+                    (true, true) => continue,
+                };
+                let (kept_edge, dropped_edge) = (
+                    topo.edge(kept.edge())?.clone(),
+                    topo.edge(dropped.edge())?.clone(),
+                );
+                let tol = ON_EDGE * span(topo, &kept_edge)?.max(1e-2);
+                if !edge_lies_on(topo, &dropped_edge, &kept_edge, tol)? {
+                    continue;
+                }
+                pairs.push((kept, dropped));
+                ring.remove(j);
+                ring.remove(i);
+                continue 'pair;
+            }
+        }
+        break;
+    }
+    // A strip between two contacts lying on each other: without such a
+    // pair, a face of an edge and pieces near it may be a thin face of the
+    // part's own.
+    if pairs.is_empty() {
+        return Ok(false);
+    }
+    // Each edge left and the chain of pieces lying on it, running from its
+    // end back to its start.
+    let mut chains: Vec<(OrientedEdge, Vec<OrientedEdge>)> = Vec::new();
+    'chain: while !ring.is_empty() {
+        for w in 0..ring.len() {
+            let whole = ring[w];
+            let (start, end) = ends(topo, whole)?;
+            if start == end {
+                continue;
+            }
+            let whole_edge = topo.edge(whole.edge())?.clone();
+            let tol = ON_EDGE * span(topo, &whole_edge)?.max(1e-2);
+            let mut used = vec![w];
+            let mut at = end;
+            while at != start {
+                let mut next = None;
+                for (k, &piece) in ring.iter().enumerate() {
+                    if used.contains(&k) || piece.edge() == whole.edge() {
+                        continue;
+                    }
+                    let (from, _) = ends(topo, piece)?;
+                    if from != at {
+                        continue;
+                    }
+                    let piece_edge = topo.edge(piece.edge())?.clone();
+                    if stays_within(topo, &piece_edge, &whole_edge, tol)? {
+                        next = Some(k);
+                        break;
+                    }
+                }
+                let Some(k) = next else {
+                    break;
+                };
+                used.push(k);
+                at = ends(topo, ring[k])?.1;
+            }
+            if at != start || used.len() < 2 {
+                continue;
+            }
+            let pieces: Vec<OrientedEdge> = used[1..].iter().map(|&k| ring[k]).collect();
+            chains.push((whole, pieces));
+            used.sort_unstable();
+            for &k in used.iter().rev() {
+                ring.remove(k);
+            }
+            continue 'chain;
+        }
+        return Ok(false);
+    }
+    // Each edge used once outside this face.
+    let mut rewrites: Vec<(WireId, EdgeId, Vec<OrientedEdge>)> = Vec::new();
+    for &(kept, dropped) in &pairs {
+        let (Some(_), Some(wire)) = (
+            other_use(topo, kept.edge())?,
+            other_use(topo, dropped.edge())?,
+        ) else {
+            return Ok(false);
+        };
+        // The other face ran the dropped edge one way; it runs the kept
+        // edge the same way between the same vertices.
+        let kept_edge = topo.edge(kept.edge())?.clone();
+        let dropped_edge = topo.edge(dropped.edge())?.clone();
+        let Some(oe) = topo
+            .wire(wire)?
+            .edges()
+            .iter()
+            .find(|oe| oe.edge() == dropped.edge())
+            .copied()
+        else {
+            return Ok(false);
+        };
+        let from = oe.oriented_start(&dropped_edge);
+        rewrites.push((
+            wire,
+            dropped.edge(),
+            vec![OrientedEdge::new(kept.edge(), kept_edge.start() == from)],
+        ));
+    }
+    for (whole, pieces) in &chains {
+        let Some(wire) = other_use(topo, whole.edge())? else {
+            return Ok(false);
+        };
+        for piece in pieces {
+            if other_use(topo, piece.edge())?.is_none() {
+                return Ok(false);
+            }
+        }
+        let whole_edge = topo.edge(whole.edge())?.clone();
+        let Some(oe) = topo
+            .wire(wire)?
+            .edges()
+            .iter()
+            .find(|oe| oe.edge() == whole.edge())
+            .copied()
+        else {
+            return Ok(false);
+        };
+        // The pieces run from the whole edge's end back to its start in
+        // this face; the other face takes them the way it ran the edge.
+        let (_, whole_end) = ends(topo, *whole)?;
+        let replacement: Vec<OrientedEdge> = if oe.oriented_start(&whole_edge) == whole_end {
+            pieces.clone()
+        } else {
+            pieces
+                .iter()
+                .rev()
+                .map(|piece| OrientedEdge::new(piece.edge(), !piece.is_forward()))
+                .collect()
+        };
+        rewrites.push((wire, whole.edge(), replacement));
+    }
+    if rewrites.is_empty() {
+        return Ok(false);
+    }
+    log::debug!(
+        "folded sliver {face_id:?}: {} pairs run back on each other, {} edges replaced by their pieces",
+        pairs.len(),
+        chains.len()
+    );
+    for (wire, edge, replacement) in rewrites {
+        let closed = topo.wire(wire)?.is_closed();
+        let rewritten: Vec<OrientedEdge> = topo
+            .wire(wire)?
+            .edges()
+            .iter()
+            .flat_map(|&oe| {
+                if oe.edge() == edge {
+                    replacement.clone()
+                } else {
+                    vec![oe]
+                }
+            })
+            .collect();
+        *topo.wire_mut(wire)? = Wire::new(rewritten, closed)?;
+    }
+    Ok(true)
+}
+
 /// A closed edge's length, along its curve.
 fn loop_length(topo: &Topology, edge: &Edge) -> Result<f64, BlendError> {
     const SAMPLES: u32 = 256;
@@ -2530,6 +2778,571 @@ fn loop_length(topo: &Topology, edge: &Edge) -> Result<f64, BlendError> {
     Ok((0..SAMPLES)
         .map(|k| (point(k + 1) - point(k)).length())
         .sum())
+}
+
+/// Ends walked rounds on the curved caps they ran into at a kink
+/// ([`extend_cap_over_runout`]), each runout patch in turn. Where nothing
+/// else is left at the corner, the cap's corner edge and its run on are
+/// then one edge.
+fn extend_caps_over_runouts(
+    topo: &mut Topology,
+    faces: Vec<FaceId>,
+    input_edges: &HashSet<EdgeId>,
+) -> Result<Vec<FaceId>, BlendError> {
+    let mut faces = faces;
+    let mut runs = Vec::new();
+    'runouts: loop {
+        for (index, &face_id) in faces.iter().enumerate() {
+            if let Some(run) = extend_cap_over_runout(topo, &faces, face_id, input_edges)? {
+                runs.push(run);
+                faces.remove(index);
+                continue 'runouts;
+            }
+        }
+        break;
+    }
+    for run in runs {
+        join_run_on(topo, &faces, run)?;
+    }
+    Ok(faces)
+}
+
+/// A cap's corner edge run on past its corner: the corner, the edge, the
+/// run on, and the two wires using both.
+struct RunOn {
+    corner: VertexId,
+    edge: EdgeId,
+    run: EdgeId,
+    wires: [WireId; 2],
+}
+
+/// Rewrites a wire edge by edge, each edge taking the edges `swap` gives.
+fn rewrite_wire(
+    topo: &mut Topology,
+    wire: WireId,
+    swap: impl Fn(OrientedEdge) -> Vec<OrientedEdge>,
+) -> Result<(), BlendError> {
+    let closed = topo.wire(wire)?.is_closed();
+    let edges: Vec<OrientedEdge> = topo
+        .wire(wire)?
+        .edges()
+        .iter()
+        .flat_map(|&oe| swap(oe))
+        .collect();
+    *topo.wire_mut(wire)? = Wire::new(edges, closed)?;
+    Ok(())
+}
+
+/// Joins a cap's corner edge and its run on into one edge where they are
+/// the only edges left at the corner and are the same kind of curve, run
+/// the same way.
+fn join_run_on(topo: &mut Topology, faces: &[FaceId], run_on: RunOn) -> Result<(), BlendError> {
+    let RunOn {
+        corner,
+        edge,
+        run,
+        wires,
+    } = run_on;
+    for &face_id in faces {
+        let face = topo.face(face_id)?;
+        for w in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(w)?.edges() {
+                if oe.edge() == edge || oe.edge() == run {
+                    if !wires.contains(&w) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let e = topo.edge(oe.edge())?;
+                if e.start() == corner || e.end() == corner {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let (edge_data, run_data) = (topo.edge(edge)?.clone(), topo.edge(run)?.clone());
+    let joined = match (edge_data.curve(), run_data.curve()) {
+        (EdgeCurve::Line, EdgeCurve::Line) => EdgeCurve::Line,
+        (EdgeCurve::Circle(a), EdgeCurve::Circle(_)) => EdgeCurve::Circle(a.clone()),
+        _ => return Ok(()),
+    };
+    let (start, end) = if run_data.end() == corner && edge_data.start() == corner {
+        (run_data.start(), edge_data.end())
+    } else if edge_data.end() == corner && run_data.start() == corner {
+        (edge_data.start(), run_data.end())
+    } else {
+        return Ok(());
+    };
+    let joined = topo.add_edge(Edge::new(start, end, joined));
+    for wire in wires {
+        // The joined edge runs the way the corner edge did.
+        rewrite_wire(topo, wire, |oe| {
+            if oe.edge() == run {
+                vec![]
+            } else if oe.edge() == edge {
+                vec![OrientedEdge::new(joined, oe.is_forward())]
+            } else {
+                vec![oe]
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// A walked round whose edge ends where its wall meets a cap at a kink (a
+/// plate's spline side running into its rounded end at an angle) ends in
+/// the plane square to its spine, closed by a three-edge runout patch: the
+/// band's end section `B` from its contact end `P` to `A`, the piece `V` of
+/// the cap's corner edge from `A` to the corner `C`, and a line `L` on the
+/// contact's face from `P` to `C`. Where `P` lies inside the cap's material
+/// (the cap's surface turned in past the kink), the round has cut into the
+/// cap: the band and its contact are cut back where the contact crosses the
+/// cap's surface, at `X`, which lies on the carrier of the cap's corner
+/// edge `E` on the contact's face (a circle or a line); the band ends on its
+/// intersection with the cap from `X` to `A`, the cap takes that curve and
+/// `E` run on from `C` to `X` in place of `V`, the contact's face takes
+/// that run in place of `L`, and the patch goes. The run on where the face
+/// was such a patch and is dropped.
+#[allow(clippy::too_many_lines)]
+fn extend_cap_over_runout(
+    topo: &mut Topology,
+    faces: &[FaceId],
+    face_id: FaceId,
+    input_edges: &HashSet<EdgeId>,
+) -> Result<Option<RunOn>, BlendError> {
+    let face = topo.face(face_id)?;
+    if !face.inner_wires().is_empty() || !matches!(face.surface(), FaceSurface::Plane { .. }) {
+        return Ok(None);
+    }
+    let ring = topo.wire(face.outer_wire())?.edges().to_vec();
+    if ring.len() != 3 || ring.iter().any(|oe| input_edges.contains(&oe.edge())) {
+        return Ok(None);
+    }
+    // The one other face using each edge, with its wire.
+    let other_use = |edge: EdgeId| -> Result<Option<(FaceId, WireId)>, BlendError> {
+        let mut uses = Vec::new();
+        for &other in faces {
+            if other == face_id {
+                continue;
+            }
+            let f = topo.face(other)?;
+            for w in std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied()) {
+                for oe in topo.wire(w)?.edges() {
+                    if oe.edge() == edge {
+                        uses.push((other, w));
+                    }
+                }
+            }
+        }
+        Ok(if let [one] = uses.as_slice() {
+            Some(*one)
+        } else {
+            None
+        })
+    };
+    let mut users = Vec::with_capacity(3);
+    for oe in &ring {
+        let Some(user) = other_use(oe.edge())? else {
+            return Ok(None);
+        };
+        users.push(user);
+    }
+    let ends = |e: &Edge| [e.start(), e.end()];
+    let other_end = |e: &Edge, v: VertexId| if e.start() == v { e.end() } else { e.start() };
+    // Each edge with a B-spline face beyond may be the band's end.
+    for b in 0..3 {
+        if !topo
+            .face(users[b].0)
+            .is_ok_and(|f| matches!(f.surface(), FaceSurface::Nurbs(_)))
+        {
+            continue;
+        }
+        let (band_face, band_wire) = users[b];
+        let b_id = ring[b].edge();
+        let b_edge = topo.edge(b_id)?.clone();
+        let band = topo.face(band_face)?.surface().clone();
+        let (k1, k2) = ((b + 1) % 3, (b + 2) % 3);
+        for (kl, kv) in [(k1, k2), (k2, k1)] {
+            let (l_id, v_id) = (ring[kl].edge(), ring[kv].edge());
+            let (l_edge, v_edge) = (topo.edge(l_id)?.clone(), topo.edge(v_id)?.clone());
+            let Some(c) = ends(&l_edge)
+                .into_iter()
+                .find(|v| ends(&v_edge).contains(v))
+            else {
+                continue;
+            };
+            let (p, a) = (other_end(&l_edge, c), other_end(&v_edge, c));
+            if p == a || ends(&b_edge).contains(&c) || !ends(&b_edge).contains(&p) {
+                continue;
+            }
+            if let Some(run) = runout_onto_cap(
+                topo,
+                faces,
+                face_id,
+                RunoutPatch {
+                    band: (band_wire, &band, b_id, &b_edge),
+                    line: (users[kl].1, l_id, &l_edge),
+                    piece: (users[kv], v_id, &v_edge),
+                    corner: c,
+                    contact_end: p,
+                    cap_end: a,
+                },
+            )? {
+                return Ok(Some(run));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A runout patch's three edges: the band's end section (the band's wire,
+/// surface, the edge), the line on the contact's face (that face's wire, the
+/// edge), and the piece of the cap's corner edge (the face and wire beyond
+/// it, the edge), with the corner `C`, the contact's end `P` and the piece's
+/// end `A`.
+struct RunoutPatch<'a> {
+    band: (WireId, &'a FaceSurface, EdgeId, &'a Edge),
+    line: (WireId, EdgeId, &'a Edge),
+    piece: ((FaceId, WireId), EdgeId, &'a Edge),
+    corner: VertexId,
+    contact_end: VertexId,
+    cap_end: VertexId,
+}
+
+/// A runout patch's cap (its face and wire), with the whole corner edge and
+/// the wall's wire where a wall runs up that edge and back down the piece.
+type RunoutCap = ((FaceId, WireId), Option<(EdgeId, WireId)>);
+
+/// The cap a runout patch's corner piece lies on: the face beyond the piece
+/// where its wire takes the cap's corner edge on the contact's face too, or,
+/// where the face beyond is a wall running up the whole corner edge and
+/// back down the piece (a spur), the face beyond that edge. The cap's face
+/// and wire, with the spur's whole edge and wall wire.
+fn runout_cap(
+    topo: &Topology,
+    faces: &[FaceId],
+    beyond: (FaceId, WireId),
+    piece: (EdgeId, &Edge),
+    corner: VertexId,
+    f_wire: WireId,
+) -> Result<Option<RunoutCap>, BlendError> {
+    const ON_LINE: f64 = 1e-6;
+    let at_corner = |e: &Edge| e.start() == corner || e.end() == corner;
+    let f_edges = topo.wire(f_wire)?.edges().to_vec();
+    let beyond_edges = topo.wire(beyond.1)?.edges().to_vec();
+    let shares_corner = beyond_edges.iter().any(|oe| {
+        oe.edge() != piece.0
+            && f_edges.iter().any(|f| f.edge() == oe.edge())
+            && topo.edge(oe.edge()).is_ok_and(at_corner)
+    });
+    if shares_corner {
+        return Ok(Some((beyond, None)));
+    }
+    if !straight_edge(topo, piece.1, ON_LINE)? {
+        return Ok(None);
+    }
+    let a = if piece.1.start() == corner {
+        piece.1.end()
+    } else {
+        piece.1.start()
+    };
+    let ap = topo.vertex(a)?.point();
+    let cp = topo.vertex(corner)?.point();
+    for oe in &beyond_edges {
+        if oe.edge() == piece.0 {
+            continue;
+        }
+        let whole = topo.edge(oe.edge())?;
+        if !at_corner(whole) || !straight_edge(topo, whole, ON_LINE)? {
+            continue;
+        }
+        let far = if whole.start() == corner {
+            whole.end()
+        } else {
+            whole.start()
+        };
+        let span = topo.vertex(far)?.point() - cp;
+        let t = (ap - cp).dot(span) / span.dot(span).max(1e-300);
+        if !(1e-9..1.0 - 1e-9).contains(&t) || (cp + span * t - ap).length() > ON_LINE {
+            continue;
+        }
+        let mut uses = Vec::new();
+        for &other in faces {
+            let f = topo.face(other)?;
+            for w in std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied()) {
+                if w == beyond.1 {
+                    continue;
+                }
+                if topo.wire(w)?.edges().iter().any(|e| e.edge() == oe.edge()) {
+                    uses.push((other, w));
+                }
+            }
+        }
+        if let [cap] = uses.as_slice() {
+            return Ok(Some((*cap, Some((oe.edge(), beyond.1)))));
+        }
+    }
+    Ok(None)
+}
+
+/// Extends the cap over a runout patch where its contact runs on into the
+/// cap ([`extend_cap_over_runout`]).
+#[allow(clippy::too_many_lines)]
+fn runout_onto_cap(
+    topo: &mut Topology,
+    faces: &[FaceId],
+    face_id: FaceId,
+    patch: RunoutPatch<'_>,
+) -> Result<Option<RunOn>, BlendError> {
+    const SAMPLES: usize = 200;
+    let ends = |e: &Edge| [e.start(), e.end()];
+    let other_end = |e: &Edge, v: VertexId| if e.start() == v { e.end() } else { e.start() };
+    let RunoutPatch {
+        band: (band_wire, band, b_id, b_edge),
+        line: (f_wire, l_id, l_edge),
+        piece: (beyond, v_id, v_edge),
+        corner: c,
+        contact_end: p,
+        cap_end: a,
+    } = patch;
+    let b_edge = b_edge.clone();
+    let l_edge = l_edge.clone();
+    let v_edge = v_edge.clone();
+    let Some(((k_face, k_wire), spur)) =
+        runout_cap(topo, faces, beyond, (v_id, &v_edge), c, f_wire)?
+    else {
+        return Ok(None);
+    };
+    let band_edges = topo.wire(band_wire)?.edges().to_vec();
+    let f_edges = topo.wire(f_wire)?.edges().to_vec();
+    let k_edges = topo.wire(k_wire)?.edges().to_vec();
+    // The band's contact on the contact's face, ending at `P`.
+    let contact = band_edges.iter().map(OrientedEdge::edge).find(|&e| {
+        e != b_id
+            && f_edges.iter().any(|oe| oe.edge() == e)
+            && topo.edge(e).is_ok_and(|edge| ends(edge).contains(&p))
+    });
+    // The cap's corner edge on the contact's face, from `C`.
+    let corner = f_edges.iter().map(OrientedEdge::edge).find(|&e| {
+        e != l_id
+            && k_edges.iter().any(|oe| oe.edge() == e)
+            && topo.edge(e).is_ok_and(|edge| ends(edge).contains(&c))
+    });
+    let (Some(contact), Some(corner)) = (contact, corner) else {
+        return Ok(None);
+    };
+    let contact_edge = topo.edge(contact)?.clone();
+    let corner_edge = topo.edge(corner)?.clone();
+    let q = other_end(&contact_edge, p);
+    let [pp, qp, cp, ap] = [p, q, c, a].map(|v| topo.vertex(v).map(Vertex::point));
+    let (pp, qp, cp, ap) = (pp?, qp?, cp?, ap?);
+    let tol = 1e-6 * (pp - ap).length().max(1.0);
+    let offset = |point: Point3| cap_offset(topo, RunOnCap::Face(k_face), point, tol);
+    let (Some(at_p), Some(at_q)) = (offset(pp), offset(qp)) else {
+        return Ok(None);
+    };
+    log::debug!("runout {face_id:?}: P offset {at_p}, far end {at_q}");
+    if at_p >= -tol || at_q <= tol {
+        return Ok(None);
+    }
+    // Where the contact crosses the cap's surface, back from `P`.
+    let (sp, ep) = (
+        topo.vertex(contact_edge.start())?.point(),
+        topo.vertex(contact_edge.end())?.point(),
+    );
+    let curve = contact_edge.curve();
+    let (t0, t1) = curve.domain_with_endpoints(sp, ep);
+    let (tp, tq) = if contact_edge.start() == p {
+        (t0, t1)
+    } else {
+        (t1, t0)
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let at_sample = |k: usize| tp + (tq - tp) * (k as f64) / (SAMPLES as f64);
+    let mut bracket = None;
+    for k in 1..=SAMPLES {
+        match offset(curve.evaluate_with_endpoints(at_sample(k), sp, ep)) {
+            Some(off) if off >= 0.0 => {
+                bracket = Some((at_sample(k - 1), at_sample(k)));
+                break;
+            }
+            Some(_) => {}
+            None => return Ok(None),
+        }
+    }
+    let Some((mut inside, mut outside)) = bracket else {
+        return Ok(None);
+    };
+    for _ in 0..100 {
+        let middle = f64::midpoint(inside, outside);
+        match offset(curve.evaluate_with_endpoints(middle, sp, ep)) {
+            Some(off) if off < 0.0 => inside = middle,
+            Some(_) => outside = middle,
+            None => return Ok(None),
+        }
+    }
+    let tx = f64::midpoint(inside, outside);
+    let x = curve.evaluate_with_endpoints(tx, sp, ep);
+    // `E` run on from `C` to `X`: `X` on its carrier, past `C`.
+    let on_carrier = 1e-5 * (pp - ap).length().max(1.0);
+    let other = topo.vertex(other_end(&corner_edge, c))?.point();
+    let run_on = match corner_edge.curve() {
+        EdgeCurve::Line => {
+            let along = (cp - other).normalize()?;
+            let reach = (x - cp).dot(along);
+            if reach <= tol || (x - cp - along * reach).length() > on_carrier {
+                return Ok(None);
+            }
+            EdgeCurve::Line
+        }
+        EdgeCurve::Circle(circle) => {
+            let off_plane = (x - circle.center()).dot(circle.normal()).abs();
+            let off_circle = ((x - circle.center()).length() - circle.radius()).abs();
+            if off_plane > on_carrier || off_circle > on_carrier {
+                return Ok(None);
+            }
+            EdgeCurve::Circle(circle.clone())
+        }
+        _ => return Ok(None),
+    };
+    // The run must leave `C` away from `E` and take the short way round;
+    // a circle runs its own way, so the edge runs from whichever end
+    // makes it so.
+    let probe = Edge::new(c, c, run_on.clone());
+    let mut run_from_x = None;
+    for from_x in [true, false] {
+        let (s0, s1) = if from_x { (x, cp) } else { (cp, x) };
+        let (r0, r1) = probe.curve().domain_with_endpoints(s0, s1);
+        let middle = probe
+            .curve()
+            .evaluate_with_endpoints(f64::midpoint(r0, r1), s0, s1);
+        if (middle - x).length() < (cp - x).length()
+            && !point_on_edge(topo, corner, middle, on_carrier)?
+        {
+            run_from_x = Some(from_x);
+            break;
+        }
+    }
+    let Some(run_from_x) = run_from_x else {
+        return Ok(None);
+    };
+    let Some(meet) = band_meets_cap(band, x, ap, offset) else {
+        return Ok(None);
+    };
+    let piece = match curve {
+        EdgeCurve::NurbsCurve(nurbs) => {
+            let (left, right) = brepkit_math::nurbs::knot_ops::curve_split(nurbs, tx)?;
+            EdgeCurve::NurbsCurve(if tq > tx { right } else { left })
+        }
+        other => other.clone(),
+    };
+    log::debug!(
+        "runout {face_id:?}: the round is cut back to its cap {k_face:?} at {x:?}, the cap run on over the notch"
+    );
+    // A wall running up the cap's whole corner edge and back down the
+    // piece: the edge splits at `A`, the wall keeps the piece below, and
+    // the cap takes the piece below and the piece above.
+    if let Some((whole, wall_wire)) = spur {
+        let whole_edge = topo.edge(whole)?.clone();
+        let far = other_end(&whole_edge, c);
+        let wall = topo.wire(wall_wire)?.edges().to_vec();
+        let n = wall.len();
+        let Some(at) = (0..n).find(|&k| {
+            let pair = [wall[k].edge(), wall[(k + 1) % n].edge()];
+            pair == [whole, v_id] || pair == [v_id, whole]
+        }) else {
+            return Ok(None);
+        };
+        let rest = topo.add_edge(Edge::new(a, far, EdgeCurve::Line));
+        let first = wall[at];
+        let first_edge = topo.edge(first.edge())?.clone();
+        let from = first.oriented_start(&first_edge);
+        let mut folded: Vec<OrientedEdge> = Vec::with_capacity(n - 1);
+        for (k, &oe) in wall.iter().enumerate() {
+            if k == at {
+                folded.push(OrientedEdge::new(rest, from == a));
+            } else if k != (at + 1) % n {
+                folded.push(oe);
+            }
+        }
+        let closed = topo.wire(wall_wire)?.is_closed();
+        *topo.wire_mut(wall_wire)? = Wire::new(folded, closed)?;
+        rewrite_wire(topo, k_wire, |oe| {
+            if oe.edge() != whole {
+                vec![oe]
+            } else if oe.oriented_start(&whole_edge) == c {
+                vec![
+                    OrientedEdge::new(v_id, v_edge.start() == c),
+                    OrientedEdge::new(rest, true),
+                ]
+            } else {
+                vec![
+                    OrientedEdge::new(rest, false),
+                    OrientedEdge::new(v_id, v_edge.start() == a),
+                ]
+            }
+        })?;
+    }
+    let vertex_tol = topo.vertex(p)?.tolerance();
+    let vx = topo.add_vertex(Vertex::new(x, vertex_tol));
+    let new_contact = topo.add_edge(if contact_edge.start() == p {
+        Edge::new(vx, q, piece)
+    } else {
+        Edge::new(q, vx, piece)
+    });
+    let meet_id = topo.add_edge(Edge::new(vx, a, meet));
+    let run_id = topo.add_edge(if run_from_x {
+        Edge::new(vx, c, run_on)
+    } else {
+        Edge::new(c, vx, run_on)
+    });
+    // `from` -> the start the replacement takes.
+    let moved = |from: VertexId| if from == p { vx } else { from };
+    let swap_contact = |oe: OrientedEdge| {
+        (oe.edge() == contact).then(|| OrientedEdge::new(new_contact, oe.is_forward()))
+    };
+    rewrite_wire(topo, band_wire, |oe| {
+        if let Some(swapped) = swap_contact(oe) {
+            vec![swapped]
+        } else if oe.edge() == b_id {
+            let from = moved(oe.oriented_start(&b_edge));
+            vec![OrientedEdge::new(meet_id, from == vx)]
+        } else {
+            vec![oe]
+        }
+    })?;
+    rewrite_wire(topo, f_wire, |oe| {
+        if let Some(swapped) = swap_contact(oe) {
+            vec![swapped]
+        } else if oe.edge() == l_id {
+            let from = moved(oe.oriented_start(&l_edge));
+            vec![OrientedEdge::new(run_id, (from == vx) == run_from_x)]
+        } else {
+            vec![oe]
+        }
+    })?;
+    rewrite_wire(topo, k_wire, |oe| {
+        if oe.edge() != v_id {
+            vec![oe]
+        } else if oe.oriented_start(&v_edge) == a {
+            // `A` -> `X` -> `C`.
+            vec![
+                OrientedEdge::new(meet_id, false),
+                OrientedEdge::new(run_id, run_from_x),
+            ]
+        } else {
+            vec![
+                OrientedEdge::new(run_id, !run_from_x),
+                OrientedEdge::new(meet_id, true),
+            ]
+        }
+    })?;
+    Ok(Some(RunOn {
+        corner: c,
+        edge: corner,
+        run: run_id,
+        wires: [f_wire, k_wire],
+    }))
 }
 
 /// Whether `edge` traces `on` within `tol`, certified rather than sampled.
@@ -4205,38 +5018,98 @@ fn pivot_walked_round(
     let face_surface = topo.face(face)?.surface().clone();
     let mut adapter = None;
     let wall = surface_ref_or_adapter(&wall_surface, &mut adapter);
-    let (t0, t1) = on_first.domain();
+    // The first's contact, carried on through the sections its ball rolls
+    // on past the spine's ends (where its end is run on to a cap, its
+    // contact is the side of the band rebuilt through them).
+    let carried: Vec<crate::section::CircSection> = first.beyond[0]
+        .iter()
+        .rev()
+        .chain(&first.sections)
+        .chain(&first.beyond[1])
+        .cloned()
+        .collect();
+    let extended = if first.beyond.iter().all(Vec::is_empty) {
+        None
+    } else {
+        interpolate_blend_surface(&carried)
+            .ok()
+            .map(|band| {
+                band_side(
+                    &band,
+                    if sa == 0 {
+                        0
+                    } else {
+                        band.control_points().len() - 1
+                    },
+                )
+            })
+            .transpose()?
+    };
+    let rim = extended.as_ref().unwrap_or(on_first);
+    let (t0, t1) = rim.domain();
     let pieces: Vec<((), f64, f64)> = (0..SAMPLES)
         .map(|k| {
             let f = |k: usize| t0 + (t1 - t0) * k as f64 / SAMPLES as f64;
             ((), f(k), f(k + 1))
         })
         .collect();
-    let at = |(): &(), t: f64| -> Result<Point3, BlendError> { Ok(on_first.evaluate(t)) };
-    let Some(sections) = pivot_sections(
-        &pieces,
-        &at,
-        wall,
-        &face_surface,
-        sb,
-        radius,
-        &second.sections,
-        true,
-    )?
-    else {
-        return Ok(None);
-    };
+    let at = |(): &(), t: f64| -> Result<Point3, BlendError> { Ok(rim.evaluate(t)) };
     // The ball pivoting stays on the walk's side of the first's contact:
     // within a radius of the walk's centre, as it rests on the same face
     // and touches a line on the wall the walk touches (the far root lies
     // past the contact, outside the part).
-    if sections
-        .iter()
-        .zip(&second.sections)
-        .any(|(new, old)| (new.center - old.center).length() >= radius)
-    {
+    let near = |new: &crate::section::CircSection, old: &crate::section::CircSection| {
+        (new.center - old.center).length() < radius
+    };
+    // The sections, then those rolled on past one end, pivoted in turn;
+    // the rolled-on ones as far as they still pivot.
+    let core = second.sections.len();
+    let pivot_on = |run: Vec<crate::section::CircSection>| {
+        let pivoted = pivot_sections(
+            &pieces,
+            &at,
+            wall,
+            &face_surface,
+            sb,
+            radius,
+            &run,
+            true,
+            core,
+        )?;
+        Ok::<_, BlendError>(pivoted.and_then(|pivoted| {
+            let kept = pivoted
+                .iter()
+                .zip(&run)
+                .take_while(|(new, old)| near(new, old))
+                .count();
+            (kept >= core).then(|| pivoted[..kept].to_vec())
+        }))
+    };
+    let Some(mut ahead) = pivot_on(
+        second
+            .sections
+            .iter()
+            .chain(&second.beyond[1])
+            .cloned()
+            .collect(),
+    )?
+    else {
         return Ok(None);
-    }
+    };
+    let Some(mut behind) = pivot_on(
+        second
+            .sections
+            .iter()
+            .rev()
+            .chain(&second.beyond[0])
+            .cloned()
+            .collect(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let beyond = [behind.split_off(core), ahead.split_off(core)];
+    let sections = ahead;
     let Ok(surface) = interpolate_blend_surface(&sections) else {
         return Ok(None);
     };
@@ -4264,8 +5137,7 @@ fn pivot_walked_round(
     pivoted.pcurve1 = pcurve1;
     pivoted.pcurve2 = pcurve2;
     pivoted.sections = sections;
-    // Rolled on past its ends without the pivot: dropped.
-    pivoted.beyond = Default::default();
+    pivoted.beyond = beyond;
     Ok(Some(pivoted))
 }
 
@@ -6685,6 +7557,7 @@ fn pivot_on_far_loop(
         radius,
         sections,
         false,
+        sections.len(),
     )
 }
 
@@ -6696,8 +7569,9 @@ fn pivot_on_far_loop(
 /// last one's pivot and starts its ball from the last one's contact on the
 /// wall, as the ball rolls on (a plane cutting a curved rim more than once,
 /// a curved wall the walk's own contact would lead it off). The rim is `pieces`, each a
-/// key evaluated by `at` over its parameter range. `None` where a plane
-/// misses the rim or the ball cannot be placed against it.
+/// key evaluated by `at` over its parameter range. Where a plane misses the
+/// rim or the ball cannot be placed against it, the sections pivoted before
+/// it, if they are at least `required`, else `None`.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn pivot_sections<K>(
     pieces: &[(K, f64, f64)],
@@ -6708,6 +7582,7 @@ fn pivot_sections<K>(
     radius: f64,
     sections: &[crate::section::CircSection],
     follow: bool,
+    required: usize,
 ) -> Result<Option<Vec<crate::section::CircSection>>, BlendError> {
     let tol = 1e-9 * radius.max(1.0);
     let mut pivoted: Vec<crate::section::CircSection> = Vec::with_capacity(sections.len());
@@ -6721,7 +7596,7 @@ fn pivot_sections<K>(
             .cross(on_wall - section.center)
             .normalize()
         else {
-            return Ok(None);
+            return Ok((pivoted.len() >= required).then_some(pivoted));
         };
         let height = |p: Point3| (p - section.center).dot(normal);
         // The rim's crossing of the section's plane nearest the plane's
@@ -6761,7 +7636,7 @@ fn pivot_sections<K>(
             }
         }
         let Some(pivot) = pivot else {
-            return Ok(None);
+            return Ok((pivoted.len() >= required).then_some(pivoted));
         };
         // The ball on the wall: its centre a radius off the wall, toward
         // the ball, in the section's plane, a radius from the pivot.
@@ -6774,8 +7649,15 @@ fn pivot_sections<K>(
         };
         // Following, from the last section's contact on the wall, as the
         // ball rolls on (from the walk's own contact it can land on
-        // another part of a curved wall).
-        let (mut u, mut v) = pivoted.last().filter(|_| follow).map_or(wall_uv, |last| {
+        // another part of a curved wall). The first from the walk's
+        // `(u, v)` on the wall, or its contact projected where the walk read
+        // the face in a frame of its own (a reversed plane).
+        let start = if (wall.evaluate(wall_uv.0, wall_uv.1) - on_wall).length() <= tol {
+            wall_uv
+        } else {
+            wall.project_point(on_wall)
+        };
+        let (mut u, mut v) = pivoted.last().filter(|_| follow).map_or(start, |last| {
             if side_index == 0 { last.uv2 } else { last.uv1 }
         });
         let mut solved = false;
@@ -6797,10 +7679,10 @@ fn pivot_sections<K>(
             v -= (j11 * f2 - j21 * f1) / det;
         }
         if !solved {
-            return Ok(None);
+            return Ok((pivoted.len() >= required).then_some(pivoted));
         }
         let Some(pivot_uv) = pivot_surface.project_point(pivot) else {
-            return Ok(None);
+            return Ok((pivoted.len() >= required).then_some(pivoted));
         };
         let mut next = section.clone();
         next.center = centre(u, v);
