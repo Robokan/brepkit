@@ -2819,6 +2819,9 @@ fn check_holes_clear_of_closed_contacts(
         }
     };
     let mut outlines = Vec::new();
+    // Open contacts, each with the edges it rounds sampled, the ends of
+    // their run, and the edges themselves.
+    let mut opens: Vec<OpenContact> = Vec::new();
     for r in restrictions {
         let (Some(&first), Some(&last), Some(curve)) =
             (r.contact_3d.first(), r.contact_3d.last(), r.curve.as_ref())
@@ -2826,6 +2829,47 @@ fn check_holes_clear_of_closed_contacts(
             continue;
         };
         if (first - last).length() > VERTEX_TOL {
+            let mut contact = FlatPolyline {
+                points: Vec::new(),
+                sag: 0.0,
+            };
+            sample(curve, (first, last), true, 16 * HOLE_SAMPLES, &mut contact);
+            contact.points.push(flat(last));
+            let mut rounded = Vec::new();
+            let mut ends: Vec<(Point3, usize)> = Vec::new();
+            for &edge_id in &r.source_edges {
+                let edge = topo.edge(edge_id)?;
+                let (a, b) = (
+                    topo.vertex(edge.start())?.point(),
+                    topo.vertex(edge.end())?.point(),
+                );
+                let mut line = FlatPolyline {
+                    points: Vec::new(),
+                    sag: 0.0,
+                };
+                sample(edge.curve(), (a, b), true, HOLE_SAMPLES, &mut line);
+                line.points.push(flat(b));
+                rounded.extend(line.points.windows(2).map(|pair| (pair[0], pair[1])));
+                for p in [a, b] {
+                    match ends
+                        .iter_mut()
+                        .find(|(q, _)| (*q - p).length() <= VERTEX_TOL)
+                    {
+                        Some(end) => end.1 += 1,
+                        None => ends.push((p, 1)),
+                    }
+                }
+            }
+            opens.push(OpenContact {
+                contact,
+                rounded,
+                ends: ends
+                    .into_iter()
+                    .filter(|&(_, uses)| uses == 1)
+                    .map(|(p, _)| flat(p))
+                    .collect(),
+                rounds: r.source_edges.iter().copied().collect(),
+            });
             continue;
         }
         let mut line = FlatPolyline {
@@ -2853,7 +2897,7 @@ fn check_holes_clear_of_closed_contacts(
             rounds: r.source_edges.iter().copied().collect(),
         });
     }
-    if outlines.is_empty() {
+    if outlines.is_empty() && opens.is_empty() {
         return Ok(());
     }
     for (i, a) in outlines.iter().enumerate() {
@@ -2907,8 +2951,78 @@ fn check_holes_clear_of_closed_contacts(
                 return Err(refuse());
             }
         }
+        // An open contact stands off the edges it rounds by the band's
+        // width: a hole wholly nearer those edges than the contact is,
+        // beside them (not past their run's ends), lies under the band. It
+        // would leave with the cut-off strip while its wall stays, standing
+        // through the band.
+        for open in &opens {
+            if open.rounds.iter().any(|edge| edges.contains(edge)) {
+                continue;
+            }
+            let margin = line.sag + open.contact.sag + VERTEX_TOL;
+            let under = |point: Flat| {
+                let Some((foot, hole_off)) = open
+                    .rounded
+                    .iter()
+                    .map(|&(a, b)| {
+                        let foot = flat_closest_on_segment(point, a, b);
+                        (foot, flat_length(point, foot))
+                    })
+                    .min_by(|x, y| x.1.total_cmp(&y.1))
+                else {
+                    return false;
+                };
+                if open
+                    .ends
+                    .iter()
+                    .any(|&end| flat_length(foot, end) <= VERTEX_TOL)
+                {
+                    return false;
+                }
+                let contact_off = open
+                    .contact
+                    .points
+                    .windows(2)
+                    .map(|pair| flat_length(foot, flat_closest_on_segment(foot, pair[0], pair[1])))
+                    .fold(f64::INFINITY, f64::min);
+                hole_off < contact_off - margin
+            };
+            if line.points.iter().all(|&point| under(point)) {
+                return Err(refuse());
+            }
+        }
     }
     Ok(())
+}
+
+/// An open contact on a plane face, read by
+/// [`check_holes_clear_of_closed_contacts`].
+struct OpenContact {
+    /// The contact, in the plane's frame.
+    contact: FlatPolyline,
+    /// The segments of the edges it rounds.
+    rounded: Vec<(Flat, Flat)>,
+    /// The ends of the run of edges it rounds.
+    ends: Vec<Flat>,
+    /// The edges it rounds.
+    rounds: std::collections::HashSet<EdgeId>,
+}
+
+/// The point of the segment `a b` nearest `p`.
+fn flat_closest_on_segment(p: Flat, a: Flat, b: Flat) -> Flat {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx.mul_add(dx, dy * dy);
+    if len2 <= f64::MIN_POSITIVE {
+        return a;
+    }
+    let t = ((p.0 - a.0).mul_add(dx, (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
+    (t.mul_add(dx, a.0), t.mul_add(dy, a.1))
+}
+
+/// The distance between two points of the plane.
+fn flat_length(a: Flat, b: Flat) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
 }
 
 /// A curve sampled in space: its polyline, and how far the curve can stray
