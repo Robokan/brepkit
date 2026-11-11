@@ -7399,10 +7399,31 @@ fn compute_stripe_for_spine(
             // its trim built a valid solid with material added, not taken
             // off. The walk below finds such a round's ball pivoting on the
             // face's far rim, or refuses it.
-            if !spine.is_closed()
-                || (check_contacts_on_faces(topo, face1, face2, &result.stripe.sections).is_ok()
-                    && contacts_inside_plane_faces(topo, face1, face2, &result.stripe.sections)?)
-            {
+            // An open one is too where the face it runs off is a narrow
+            // band between the rim and a far rim (a ledge cut through by
+            // the plane the round ends on).
+            // (An open one is kept with its contacts on its faces' edges, as
+            // at a round exactly the face's width: only a contact run off
+            // the face sends it to the walk.)
+            let on_faces = check_contacts_on_faces(topo, face1, face2, &result.stripe.sections)
+                .is_ok()
+                && (!spine.is_closed()
+                    || contacts_inside_plane_faces(topo, face1, face2, &result.stripe.sections)?);
+            let open_band = || -> Result<bool, BlendError> {
+                let Some(adjacency) = adjacency else {
+                    return Ok(false);
+                };
+                Ok(!swallow_narrow_face(
+                    topo,
+                    adjacency,
+                    face1,
+                    face2,
+                    &spine,
+                    &result.stripe.sections,
+                )?
+                .is_empty())
+            };
+            if on_faces || (!spine.is_closed() && !open_band()?) {
                 return Ok(result);
             }
         }
@@ -7517,15 +7538,20 @@ fn compute_stripe_for_spine(
     // its thickness) runs its contact off the face, past its far rim: the
     // ball, resting on the other face, pivots on that rim, the band meets
     // the face beyond there in place of the face, and the face goes.
-    let swallowed = if spine.is_closed()
-        && let Err(error) = check_contacts_on_faces(topo, face1, face2, &walk_result.sections)
+    // An open round does so where the face is a band between the rim and a
+    // far rim, its ends in the round's end sections (see
+    // [`open_band_far_run`]); with no such face, its contacts are left as
+    // walked.
+    let off_faces = check_contacts_on_faces(topo, face1, face2, &walk_result.sections).err();
+    let candidates = match (&off_faces, adjacency) {
+        (Some(_), Some(adjacency)) => {
+            swallow_narrow_face(topo, adjacency, face1, face2, &spine, &walk_result.sections)?
+        }
+        _ => Vec::new(),
+    };
+    let swallowed = if let Some(error) = off_faces
+        && (spine.is_closed() || !candidates.is_empty())
     {
-        let candidates = adjacency
-            .map(|adjacency| {
-                swallow_narrow_face(topo, adjacency, face1, face2, &spine, &walk_result.sections)
-            })
-            .transpose()?
-            .unwrap_or_default();
         // Each face the contacts run off is tried in turn: the first whose
         // pivot keeps both contacts on their faces.
         let mut pivoted = None;
@@ -7612,7 +7638,7 @@ fn compute_stripe_for_spine(
     })
 }
 
-/// A narrow face a closed round swallows (see
+/// A narrow face a round swallows (see
 /// [`swallow_narrow_face`]).
 struct SwallowedFace {
     /// Which side of the stripe the face was (0: `face1`).
@@ -7623,12 +7649,14 @@ struct SwallowedFace {
     far: Vec<EdgeId>,
 }
 
-/// The faces a closed round's contact runs off past their far loop all
+/// The faces a round's contact runs off past their far loop all
 /// round, each the face a narrow annulus between the rim
 /// rounded and one other loop (a thin shell's rim, a counterbore's ledge),
 /// or a wall lower than the round running up its seam from the rim to its
-/// far rim (a thin disc's edge), its far loop all shared with one face
-/// beyond. Each section's arc, from the contact on the other face towards
+/// far rim (a thin disc's edge), or, for an open round, a narrow plane band
+/// between the rim and a far rim whose ends lie in the round's end sections
+/// (a ledge cut through by the plane the round ends on), its far loop all
+/// shared with one face beyond. Each section's arc, from the contact on the other face towards
 /// the narrow face's, then crosses the face beyond's surface before it
 /// reaches the narrow face's: it is cut there.
 fn swallow_narrow_face(
@@ -7651,7 +7679,20 @@ fn swallow_narrow_face(
             })
             .collect::<Result<_, _>>()?;
         let rim_loop = |edges: &[EdgeId]| edges.iter().all(|e| spine_edges.contains(e));
-        let far: Vec<EdgeId> = if face.surface().is_planar() {
+        let far: Vec<EdgeId> = if face.surface().is_planar() && !spine.is_closed() {
+            // An open round of a narrow band's edge (a ledge between two
+            // coaxial walls, cut through by a plane the round ends on): the
+            // band's one loop runs along the rim, out along an end edge in
+            // the round's end section, back along its far rim and in along
+            // the other end edge.
+            let [wire] = &loops[..] else {
+                continue;
+            };
+            match open_band_far_run(topo, spine, wire)? {
+                Some(far) => far,
+                None => continue,
+            }
+        } else if face.surface().is_planar() {
             let [first, second] = &loops[..] else {
                 continue;
             };
@@ -7782,6 +7823,67 @@ fn swallow_narrow_face(
         });
     }
     Ok(found)
+}
+
+/// The far run of a narrow plane band an open round's spine runs along:
+/// `wire` (the band's one loop) is the spine's edges, one edge at each of
+/// the spine's ends lying in that end's section plane, and the rest, its
+/// far rim. `None` when the loop is not that.
+fn open_band_far_run(
+    topo: &Topology,
+    spine: &Spine,
+    wire: &[EdgeId],
+) -> Result<Option<Vec<EdgeId>>, BlendError> {
+    let spine_edges: HashSet<EdgeId> = spine.edges().iter().copied().collect();
+    if wire.iter().filter(|e| spine_edges.contains(e)).count() != spine_edges.len() {
+        return Ok(None);
+    }
+    let length = spine.length();
+    let ends = [
+        (spine.evaluate(topo, 0.0)?, spine.tangent(topo, 0.0)?),
+        (spine.evaluate(topo, length)?, spine.tangent(topo, length)?),
+    ];
+    let size = length.max(1e-9);
+    let at_end = |p: Point3| {
+        ends.iter()
+            .position(|(q, _)| (p - *q).length() < 1e-6 * size)
+    };
+    let mut far = Vec::new();
+    let mut end_edges = [false; 2];
+    for &edge_id in wire {
+        if spine_edges.contains(&edge_id) {
+            continue;
+        }
+        let edge = topo.edge(edge_id)?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (end, other) = match (at_end(a), at_end(b)) {
+            (Some(end), None) => (end, b),
+            (None, Some(end)) => (end, a),
+            (None, None) => {
+                far.push(edge_id);
+                continue;
+            }
+            (Some(_), Some(_)) => return Ok(None),
+        };
+        // The end edge is straight and lies in the end's section plane, so
+        // the band's end section closes the end face where it was.
+        let (point, tangent) = ends[end];
+        let run = other - point;
+        let Ok(tangent) = tangent.normalize() else {
+            return Ok(None);
+        };
+        if !matches!(edge.curve(), EdgeCurve::Line)
+            || end_edges[end]
+            || run.dot(tangent).abs() > 1e-6 * run.length().max(1e-9)
+        {
+            return Ok(None);
+        }
+        end_edges[end] = true;
+    }
+    Ok((end_edges == [true, true] && !far.is_empty()).then_some(far))
 }
 
 /// The round's sections where it swallows a narrow face: the ball

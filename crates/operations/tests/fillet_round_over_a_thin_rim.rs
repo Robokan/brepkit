@@ -16,6 +16,7 @@
 use std::f64::consts::PI;
 
 use brepkit_math::mat::Mat4;
+use brepkit_math::vec::Point3;
 use brepkit_operations::blend_ops::fillet_v2;
 use brepkit_operations::boolean::{BooleanOp, boolean};
 use brepkit_operations::measure::solid_volume;
@@ -44,7 +45,7 @@ fn tube(topo: &mut Topology, pose: &Mat4) -> SolidId {
 
 /// The tube's inner top rim, placed by `pose`.
 fn inner_top_rim(topo: &Topology, solid: SolidId, pose: &Mat4) -> EdgeId {
-    let top = pose.mul_point(brepkit_math::vec::Point3::new(0.0, 0.0, H));
+    let top = pose.mul_point(Point3::new(0.0, 0.0, H));
     solid_edges(topo, solid)
         .unwrap()
         .into_iter()
@@ -226,6 +227,67 @@ fn a_round_past_a_counterbore_ledge_pivots_on_the_wide_bore() {
         let centre = NARROW + r;
         let depth = (r * r - (centre - WIDE).powi(2)).sqrt();
         let expected = pivoted(r, NARROW, centre, depth);
+        assert!(
+            (lost - expected).abs() <= 1e-3 * expected,
+            "r = {r}: removed {lost}, the pivoting ball takes off {expected}"
+        );
+    }
+}
+
+/// The counterbore above cut to a quarter by two planes through its axis:
+/// the ledge's inner rim is an arc ending on the cut faces, and the ledge
+/// a quarter ring whose ends lie in the round's end sections. The ball
+/// still rests on the narrow bore's wall and pivots on the wide bore's
+/// rim, the ledge goes, and the round ends on the cut faces in its end
+/// sections.
+#[test]
+fn a_round_past_a_cut_counterbore_ledge_pivots_on_the_wide_bore() {
+    const NARROW: f64 = 3.0;
+    const WIDE: f64 = 3.4;
+    const LEDGE: f64 = 6.0;
+    for r in [0.5, 0.6] {
+        let mut topo = Topology::new();
+        let block = brepkit_operations::primitives::make_box(&mut topo, 20.0, 20.0, 10.0).unwrap();
+        let narrow = make_cylinder(&mut topo, NARROW, 12.0).unwrap();
+        transform_solid(&mut topo, narrow, &Mat4::translation(10.0, 10.0, -1.0)).unwrap();
+        let wide = make_cylinder(&mut topo, WIDE, 6.0).unwrap();
+        transform_solid(&mut topo, wide, &Mat4::translation(10.0, 10.0, LEDGE)).unwrap();
+        // All but the quarter with x and y past 10 cut away, through the
+        // bores' seams, so each rim kept is one arc.
+        let front = brepkit_operations::primitives::make_box(&mut topo, 22.0, 11.0, 12.0).unwrap();
+        transform_solid(&mut topo, front, &Mat4::translation(-1.0, -1.0, -1.0)).unwrap();
+        let side = brepkit_operations::primitives::make_box(&mut topo, 11.0, 22.0, 12.0).unwrap();
+        transform_solid(&mut topo, side, &Mat4::translation(-1.0, -1.0, -1.0)).unwrap();
+        let bored = boolean(&mut topo, BooleanOp::Cut, block, narrow).unwrap();
+        let bored = boolean(&mut topo, BooleanOp::Cut, bored, wide).unwrap();
+        let bored = boolean(&mut topo, BooleanOp::Cut, bored, front).unwrap();
+        let solid = boolean(&mut topo, BooleanOp::Cut, bored, side).unwrap();
+        let before = solid_volume(&topo, solid, 1e-3).unwrap();
+        let faces_before = solid_faces(&topo, solid).unwrap().len();
+        let rim: Vec<EdgeId> = solid_edges(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .filter(|&e| {
+                matches!(topo.edge(e).unwrap().curve(), EdgeCurve::Circle(c)
+                    if (c.radius() - NARROW).abs() < 1e-9 && (c.center().z() - LEDGE).abs() < 1e-9)
+            })
+            .collect();
+        assert_eq!(rim.len(), 1, "the ledge's inner rim, whole");
+        let result = fillet_v2(&mut topo, solid, &rim, r).unwrap();
+        assert!(result.failed.is_empty(), "r = {r}: {:?}", result.failed);
+        let faces = solid_faces(&topo, result.solid).unwrap().len();
+        assert_eq!(
+            faces, faces_before,
+            "r = {r}: the ledge gives way to the round"
+        );
+        let report = validate_solid(&topo, result.solid).unwrap();
+        assert!(report.is_valid(), "r = {r}: {:?}", report.issues);
+        let mesh = tessellate_solid(&topo, result.solid, 0.01).unwrap();
+        assert!(is_watertight(&mesh), "r = {r}: mesh open");
+        let lost = before - solid_volume(&topo, result.solid, 1e-3).unwrap();
+        let centre = NARROW + r;
+        let depth = (r * r - (centre - WIDE).powi(2)).sqrt();
+        let expected = 0.25 * pivoted(r, NARROW, centre, depth);
         assert!(
             (lost - expected).abs() <= 1e-3 * expected,
             "r = {r}: removed {lost}, the pivoting ball takes off {expected}"
