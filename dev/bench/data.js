@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794427129698,
+  "lastUpdate": 1794433569306,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3293,6 +3293,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 25147428,
             "range": "± 2135300",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "a366790bb970455328dca530e8a6caa5e612be0e",
+          "message": "docs(buzzcad): #15 open-band pivot and open-round hole guard, fillet replay 20261111-131808\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-11T13:42:02-08:00",
+          "tree_id": "9ddee1ecad2e577bbe60964e2e4d2cff42bc2ecb",
+          "url": "https://github.com/Robokan/brepkit/commit/a366790bb970455328dca530e8a6caa5e612be0e"
+        },
+        "date": 1794433568609,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1114515,
+            "range": "± 3333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1219741,
+            "range": "± 4752",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12980,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 953355,
+            "range": "± 9112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29031953,
+            "range": "± 193101",
             "unit": "ns/iter"
           }
         ]
