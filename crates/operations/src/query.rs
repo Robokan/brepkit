@@ -150,14 +150,53 @@ fn edge_is_tangent(
     }
 }
 
+/// Whether the two faces of an edge run on smoothly into the two faces of
+/// another edge at `vertex`, where both pairs are split (a face cut into
+/// pieces along an edge leaving the vertex, as a rim in quarters on a wall
+/// in quarters): each face of the one pair meets a face of the other with
+/// normals within `angle` there.
+fn faces_run_on(
+    topo: &Topology,
+    faces: &HashSet<FaceId>,
+    others: &HashSet<FaceId>,
+    vertex: brepkit_topology::vertex::VertexId,
+    angle: f64,
+) -> Result<bool, OperationsError> {
+    let at = topo.vertex(vertex)?.point();
+    let normal = |fid: FaceId| -> Option<brepkit_math::vec::Vec3> {
+        let face = topo.face(fid).ok()?;
+        let n = match face.surface() {
+            FaceSurface::Plane { normal, .. } => *normal,
+            other => {
+                let (u, v) = other.project_point(at)?;
+                other.normal(u, v)
+            }
+        };
+        let n = if face.is_reversed() { -n } else { n };
+        n.normalize().ok()
+    };
+    let smooth = |f: FaceId, g: FaceId| match (normal(f), normal(g)) {
+        (Some(n), Some(m)) => n.dot(m) >= angle.cos(),
+        _ => false,
+    };
+    let (Some(&f1), Some(&f2)) = (faces.iter().next(), faces.iter().nth(1)) else {
+        return Ok(false);
+    };
+    let (Some(&g1), Some(&g2)) = (others.iter().next(), others.iter().nth(1)) else {
+        return Ok(false);
+    };
+    Ok((smooth(f1, g1) && smooth(f2, g2)) || (smooth(f1, g2) && smooth(f2, g1)))
+}
+
 /// The edges a round of `edges` runs along: each picked edge, and every
 /// edge that runs on from one tangent to it, as some kernels round a picked
 /// edge along its whole smooth chain.
 ///
 /// An edge runs on from a chain edge at their shared vertex when it leaves
 /// that vertex the opposite way, within `angle` radians, shares a face with
-/// it, has two faces meeting at a crease (not a smooth edge, which has no
-/// round), and is the only such edge there. The result keeps the picks in
+/// it (or has two faces running on smoothly, within `angle`, from its two:
+/// faces split at the vertex), has two faces meeting at a crease (not a
+/// smooth edge, which has no round), and is the only such edge there. The result keeps the picks in
 /// their order, followed by the edges added.
 ///
 /// # Errors
@@ -245,7 +284,10 @@ pub fn tangent_chain(
                 let Some(other_faces) = edge_faces.get(&other) else {
                     continue;
                 };
-                if other_faces.len() != 2 || other_faces.is_disjoint(&faces) {
+                if other_faces.len() != 2
+                    || (other_faces.is_disjoint(&faces)
+                        && !faces_run_on(topo, &faces, other_faces, vertex, angle)?)
+                {
                     continue;
                 }
                 let tangent = leaving(other)?
@@ -347,6 +389,54 @@ mod tests {
             tangent_chain(&topo, boxed, &[edge], 1e-3).unwrap(),
             vec![edge]
         );
+    }
+
+    /// A box imprinted across its length: the top front edge is in two
+    /// pieces, and both its faces are split where they meet, so the pieces
+    /// share no face. A picked piece still runs on to the other (its faces
+    /// carry on smoothly from the pick's), and to nothing else.
+    #[test]
+    fn tangent_chain_runs_on_over_split_faces() {
+        use brepkit_math::vec::Point3;
+
+        let mut topo = Topology::new();
+        let boxed = crate::primitives::make_box(&mut topo, 4.0, 1.0, 1.0).unwrap();
+        let wall = brepkit_topology::builder::make_planar_face(
+            &mut topo,
+            &[
+                Point3::new(2.0, -1.0, -1.0),
+                Point3::new(2.0, 2.0, -1.0),
+                Point3::new(2.0, 2.0, 2.0),
+                Point3::new(2.0, -1.0, 2.0),
+            ],
+            1e-7,
+        )
+        .unwrap();
+        let solid = crate::imprint::imprint_faces(
+            &mut topo,
+            boxed,
+            &[crate::imprint::ImprintTool::Face(wall)],
+        )
+        .unwrap();
+        // The top front edge's pieces: y = 0 and z = 1 at both ends.
+        let along = |e: EdgeId| {
+            let edge = topo.edge(e).unwrap();
+            [edge.start(), edge.end()].iter().all(|&v| {
+                let p = topo.vertex(v).unwrap().point();
+                p.y().abs() < 1e-9 && (p.z() - 1.0).abs() < 1e-9
+            })
+        };
+        let mut pieces: Vec<EdgeId> = solid_edges(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .filter(|&e| along(e))
+            .collect();
+        assert_eq!(pieces.len(), 2, "the imprint cuts the edge in two");
+        let chain = tangent_chain(&topo, solid, &pieces[..1], 1e-3).unwrap();
+        let mut got = chain;
+        got.sort_unstable_by_key(|e| e.index());
+        pieces.sort_unstable_by_key(|e| e.index());
+        assert_eq!(got, pieces, "both pieces, and nothing else");
     }
 
     #[test]
