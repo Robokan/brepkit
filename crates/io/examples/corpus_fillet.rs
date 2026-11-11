@@ -811,6 +811,41 @@ fn main() {
             if std::env::var("THIRD").is_ok() || std::env::var("TABLE").is_ok() {
                 face_table(&topo, r.solid, "ours", 0.05);
             }
+            // FOLDS lists edges two plane faces meet at facing opposite
+            // ways (the solid folding back on itself there).
+            if std::env::var("FOLDS").is_ok() {
+                let adjacency = topo.build_adjacency(r.solid).unwrap();
+                let outward = |f: brepkit_topology::face::FaceId| {
+                    let face = topo.face(f).unwrap();
+                    match face.surface() {
+                        brepkit_topology::face::FaceSurface::Plane { normal, .. } => {
+                            Some(if face.is_reversed() {
+                                -*normal
+                            } else {
+                                *normal
+                            })
+                        }
+                        _ => None,
+                    }
+                };
+                for e in solid_edges(&topo, r.solid).unwrap() {
+                    let faces = adjacency.faces_for_edge(e);
+                    if let [a, b] = faces
+                        && let (Some(na), Some(nb)) = (outward(*a), outward(*b))
+                        && na.dot(nb) < -0.999
+                    {
+                        let edge = topo.edge(e).unwrap();
+                        println!(
+                            "  fold at e{} {:?} -> {:?} between f{} and f{}",
+                            e.index(),
+                            topo.vertex(edge.start()).unwrap().point(),
+                            topo.vertex(edge.end()).unwrap().point(),
+                            a.index(),
+                            b.index()
+                        );
+                    }
+                }
+            }
             if std::env::var("FACES").is_ok() {
                 for fid in solid_faces(&topo, r.solid).unwrap() {
                     let face = topo.face(fid).unwrap();
