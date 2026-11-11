@@ -446,11 +446,18 @@ pub fn normalize_face_normals(
     // every face's boundary the same way about its effective normal, so the
     // few that disagree are the ones built backwards. Seeds that read but
     // disagree among themselves still decide nothing.
+    // A tied vote still takes a side: the faces then at least agree with
+    // each other, and a shell that comes out facing inward as a whole is
+    // the caller's to turn (left mixed, half the faces face in and no
+    // whole-shell test can tell).
     if !seed_read {
         convention = readings
             .iter()
             .map(|&(_, positive)| if positive { 1.0 } else { -1.0 })
             .sum();
+        if convention == 0.0 && !readings.is_empty() {
+            convention = 1.0;
+        }
     }
     let flips: Vec<FaceId> = if convention == 0.0 {
         Vec::new()
@@ -630,6 +637,31 @@ mod tests {
         turn_inside_out(&mut topo, faces[2]);
         assert_eq!(normalize_face_normals(&mut topo, &faces, &[]).unwrap(), 1);
         assert_eq!(flags(&topo), before);
+    }
+
+    /// Half the faces turned: the vote ties, and it still takes a side, so
+    /// the faces come out agreeing (either all as built or all turned; a
+    /// whole shell facing in is the caller's to turn).
+    #[test]
+    fn a_tied_vote_still_takes_a_side() {
+        let mut topo = Topology::new();
+        let cube = make_unit_cube_manifold(&mut topo);
+        let faces = solid_faces(&topo, cube).unwrap();
+        let flags = |topo: &Topology| -> Vec<bool> {
+            faces
+                .iter()
+                .map(|&f| topo.face(f).unwrap().is_reversed())
+                .collect()
+        };
+        let before = flags(&topo);
+        for &face_id in &faces[..3] {
+            turn_inside_out(&mut topo, face_id);
+        }
+        assert_eq!(normalize_face_normals(&mut topo, &faces, &[]).unwrap(), 3);
+        let after = flags(&topo);
+        let all_as_built = after == before;
+        let all_turned = after.iter().zip(&before).all(|(a, b)| a != b);
+        assert!(all_as_built || all_turned, "faces disagree: {after:?}");
     }
 
     #[test]

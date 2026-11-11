@@ -569,8 +569,48 @@ fn main() {
                         share += a.dot(b.cross(e)) / 6.0;
                     }
                     total += share;
+                    // Whether the face's mesh faces out: a point just off its
+                    // largest triangle, along that triangle's normal, crosses
+                    // the mesh an even number of times on a ray.
+                    let tris = &mesh.indices[w[0] as usize..w[1] as usize];
+                    let largest = tris.chunks_exact(3).max_by(|x, y| {
+                        let area = |t: &[u32]| {
+                            let [a, b, e] = [t[0], t[1], t[2]].map(|i| mesh.positions[i as usize]);
+                            (b - a).cross(e - a).length()
+                        };
+                        area(x).total_cmp(&area(y))
+                    });
+                    let outward = largest.map(|t| {
+                        let [a, b, e] = [t[0], t[1], t[2]].map(|i| mesh.positions[i as usize]);
+                        let n = (b - a).cross(e - a).normalize().unwrap();
+                        let size = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2]);
+                        let from = a + ((b - a) + (e - a)) * (1.0 / 3.0) + n * (1e-5 * size);
+                        let dir = brepkit_math::vec::Vec3::new(0.5741, 0.6123, 0.5435)
+                            .normalize()
+                            .unwrap();
+                        let mut hits = 0;
+                        for q in mesh.indices.chunks_exact(3) {
+                            let [p0, p1, p2] =
+                                [q[0], q[1], q[2]].map(|i| mesh.positions[i as usize]);
+                            let (e1, e2) = (p1 - p0, p2 - p0);
+                            let h = dir.cross(e2);
+                            let det = e1.dot(h);
+                            if det.abs() < 1e-18 {
+                                continue;
+                            }
+                            let s0 = from - p0;
+                            let u = s0.dot(h) / det;
+                            let qv = s0.cross(e1);
+                            let v = dir.dot(qv) / det;
+                            let t = e2.dot(qv) / det;
+                            if u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t > 0.0 {
+                                hits += 1;
+                            }
+                        }
+                        hits % 2 == 0
+                    });
                     println!(
-                        "   mesh face {} {}: {share:.4}",
+                        "   mesh face {} {}: {share:.4} out {outward:?}",
                         faces.get(g).map_or(usize::MAX, |f| f.index()),
                         faces
                             .get(g)
