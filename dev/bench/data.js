@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794513947859,
+  "lastUpdate": 1794518936302,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3941,6 +3941,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 18326215,
             "range": "± 625857",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "9c399e8f606cf2b1e2a62ad6963b4d57fb1bdd5a",
+          "message": "docs(buzzcad): chamfers through the blend engine and whole rims, #2379 and #2380 in flight\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T13:25:52-08:00",
+          "tree_id": "015523600f50b0844c5abc07e7a7b06b8818a9a6",
+          "url": "https://github.com/Robokan/brepkit/commit/9c399e8f606cf2b1e2a62ad6963b4d57fb1bdd5a"
+        },
+        "date": 1794518935496,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 665363,
+            "range": "± 3090",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 738745,
+            "range": "± 29386",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8616,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 573974,
+            "range": "± 25120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18379391,
+            "range": "± 607890",
             "unit": "ns/iter"
           }
         ]
