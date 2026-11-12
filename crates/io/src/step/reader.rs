@@ -750,29 +750,18 @@ impl<'a> StepBuilder<'a> {
         let surface = match surface {
             Extrusion::Surface(surface) => surface,
             Extrusion::Spline(curve, along) => {
-                let mut span = (f64::INFINITY, f64::NEG_INFINITY);
-                for wire in std::iter::once(outer).chain(inner_wires.iter().copied()) {
-                    for oe in self.topo.wire(wire)?.edges() {
-                        let edge = self.topo.edge(oe.edge())?;
-                        let (lo, hi) = edge_height_span(
-                            edge.curve(),
-                            self.topo.vertex(edge.start())?.point(),
-                            self.topo.vertex(edge.end())?.point(),
-                            along,
-                        );
-                        span = (span.0.min(lo), span.1.max(hi));
-                    }
-                }
-                if !(span.0.is_finite() && span.1.is_finite()) {
-                    return Err(IoError::ParseError {
+                self.swept_face_surface(&curve, along, outer, &inner_wires, surface_ref)?
+            }
+            Extrusion::Conic(conic, along) => {
+                let curve = self
+                    .conic_cover(&conic, along, outer, &inner_wires)
+                    .and_then(|(t0, t1)| conic_arc_nurbs(&conic, t0, t1).ok())
+                    .ok_or_else(|| IoError::ParseError {
                         reason: format!(
                             "SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: face has no extent"
                         ),
-                    });
-                }
-                spline_extrusion(&curve, along, span).map_err(|e| IoError::ParseError {
-                    reason: format!("SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: {e}"),
-                })?
+                    })?;
+                self.swept_face_surface(&curve, along, outer, &inner_wires, surface_ref)?
             }
         };
 
@@ -1315,6 +1304,127 @@ impl<'a> StepBuilder<'a> {
         Ok(EdgeCurve::NurbsCurve(nurbs))
     }
 
+    /// The B-spline surface of `curve` swept along `along` over the heights
+    /// the face's edges span.
+    fn swept_face_surface(
+        &self,
+        curve: &brepkit_math::nurbs::NurbsCurve,
+        along: Vec3,
+        outer: brepkit_topology::wire::WireId,
+        inner_wires: &[brepkit_topology::wire::WireId],
+        surface_ref: u64,
+    ) -> Result<FaceSurface, IoError> {
+        let mut span = (f64::INFINITY, f64::NEG_INFINITY);
+        for wire in std::iter::once(outer).chain(inner_wires.iter().copied()) {
+            for oe in self.topo.wire(wire)?.edges() {
+                let edge = self.topo.edge(oe.edge())?;
+                let (lo, hi) = edge_height_span(
+                    edge.curve(),
+                    self.topo.vertex(edge.start())?.point(),
+                    self.topo.vertex(edge.end())?.point(),
+                    along,
+                );
+                span = (span.0.min(lo), span.1.max(hi));
+            }
+        }
+        if !(span.0.is_finite() && span.1.is_finite()) {
+            return Err(IoError::ParseError {
+                reason: format!("SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: face has no extent"),
+            });
+        }
+        spline_extrusion(curve, along, span).map_err(|e| IoError::ParseError {
+            reason: format!("SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: {e}"),
+        })
+    }
+
+    /// The arc of `conic` (a circle or an ellipse) that a face swept from it
+    /// along `along` covers: its edges' points slid along `along` on to the
+    /// conic's plane, read as angles, and the turn less its widest gap. A
+    /// face closing round the conic takes the whole turn from the conic's
+    /// start. A surface wrapping on past its face would carry the rest of
+    /// the conic's sweep, which a neighbouring face (the other half of a
+    /// split tube) lies on.
+    fn conic_cover(
+        &self,
+        conic: &EdgeCurve,
+        along: Vec3,
+        outer: brepkit_topology::wire::WireId,
+        inner_wires: &[brepkit_topology::wire::WireId],
+    ) -> Option<(f64, f64)> {
+        use std::f64::consts::{PI, TAU};
+        const GAP: f64 = 1e-6;
+        let (centre, normal) = match conic {
+            EdgeCurve::Circle(c) => (c.center(), c.normal()),
+            EdgeCurve::Ellipse(e) => (e.center(), e.normal()),
+            EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => return None,
+        };
+        let slide = along.dot(normal);
+        if slide.abs() < 1e-9 {
+            return None;
+        }
+        let angle = |p: Point3| {
+            let q = p - along * ((p - centre).dot(normal) / slide);
+            let t = match conic {
+                EdgeCurve::Circle(c) => c.project(q),
+                EdgeCurve::Ellipse(e) => e.project(q),
+                EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => 0.0,
+            };
+            t.rem_euclid(TAU)
+        };
+        // Each edge covers the arcs between its consecutive samples, read
+        // the short way round; they are laid in one turn, split at its end.
+        let mut covered: Vec<(f64, f64)> = Vec::new();
+        for wire in std::iter::once(outer).chain(inner_wires.iter().copied()) {
+            for oe in self.topo.wire(wire).ok()?.edges() {
+                let edge = self.topo.edge(oe.edge()).ok()?;
+                let start = self.topo.vertex(edge.start()).ok()?.point();
+                let end = self.topo.vertex(edge.end()).ok()?.point();
+                let (t0, t1) = edge.curve().domain_with_endpoints(start, end);
+                let at = |k: u32| {
+                    let t = t0 + (t1 - t0) * f64::from(k) / 16.0;
+                    angle(edge.curve().evaluate_with_endpoints(t, start, end))
+                };
+                for k in 0..16 {
+                    let (a, b) = (at(k), at(k + 1));
+                    let step = (b - a + PI).rem_euclid(TAU) - PI;
+                    let (lo, hi) = if step >= 0.0 {
+                        (a, a + step)
+                    } else {
+                        (a + step, a)
+                    };
+                    if lo < 0.0 {
+                        covered.push((lo + TAU, TAU));
+                        covered.push((0.0, hi));
+                    } else if hi > TAU {
+                        covered.push((lo, TAU));
+                        covered.push((0.0, hi - TAU));
+                    } else {
+                        covered.push((lo, hi));
+                    }
+                }
+            }
+        }
+        covered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // The widest stretch no edge covers, the wrap included: the arc runs
+        // from its far side round to its near side.
+        let (first, _) = *covered.first()?;
+        let mut reach = first;
+        let mut gap = (0.0, 0.0, 0.0);
+        for &(lo, hi) in &covered {
+            if lo - reach > gap.0 {
+                gap = (lo - reach, lo, reach + TAU);
+            }
+            reach = reach.max(hi);
+        }
+        if first + TAU - reach > gap.0 {
+            gap = (first + TAU - reach, first, reach);
+        }
+        if gap.0 < GAP {
+            return Some((0.0, TAU));
+        }
+        Some((gap.1, gap.2))
+    }
+
     /// A surface of linear extrusion: its swept curve moved along a vector.
     /// A line sweeps a plane, a circle swept along its axis a cylinder, and a
     /// B-spline curve the B-spline surface that is linear across the sweep.
@@ -1366,18 +1476,11 @@ impl<'a> StepBuilder<'a> {
                 ))
             }
             EdgeCurve::NurbsCurve(curve) => Ok((Extrusion::Spline(curve, along), false)),
-            // An elliptic cylinder, or a circle swept aslant: the conic as its
-            // exact rational B-spline, swept as a spline is.
-            EdgeCurve::Ellipse(e) => conic_nurbs(|t| e.evaluate(t))
-                .map(|curve| (Extrusion::Spline(curve, along), false))
-                .map_err(|e| IoError::ParseError {
-                    reason: format!("SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: {e}"),
-                }),
-            EdgeCurve::Circle(c) => conic_nurbs(|t| c.evaluate(t))
-                .map(|curve| (Extrusion::Spline(curve, along), false))
-                .map_err(|e| IoError::ParseError {
-                    reason: format!("SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: {e}"),
-                }),
+            // An elliptic cylinder, or a circle swept aslant: the conic as a
+            // rational B-spline over the arc each face takes of it.
+            conic @ (EdgeCurve::Ellipse(_) | EdgeCurve::Circle(_)) => {
+                Ok((Extrusion::Conic(conic, along), false))
+            }
             EdgeCurve::Line => Err(IoError::UnsupportedEntity {
                 entity: format!(
                     "SURFACE_OF_LINEAR_EXTRUSION #{surface_ref} of this curve and direction"
@@ -1846,6 +1949,9 @@ fn spans_lie_on_sphere(
 enum Extrusion {
     Surface(FaceSurface),
     Spline(brepkit_math::nurbs::NurbsCurve, Vec3),
+    /// A circle or an ellipse swept along a direction: a B-spline over the
+    /// arc each face covers.
+    Conic(EdgeCurve, Vec3),
 }
 
 /// The lowest and highest heights along unit `along` that an edge from
@@ -1900,41 +2006,49 @@ fn conic_height_span(h0: f64, a: f64, b: f64, (t0, t1): (f64, f64)) -> (f64, f64
     span
 }
 
-/// A whole circle or ellipse, given by its point at each angle, as the
-/// rational quadratic B-spline of its four quarters: it passes the conic's
-/// points at angles 0, a quarter, a half and three quarters of a turn at
-/// knots of those values, so its seam stays where the conic's starts.
-fn conic_nurbs(
-    at: impl Fn(f64) -> Point3,
+/// The arc `t0..t1` of a circle or an ellipse as a rational quadratic
+/// B-spline, in pieces of at most a quarter turn: each piece's middle
+/// control point is the conic's point at its middle angle pushed out from
+/// the centre by the secant of half its sweep, as a circle's is (an ellipse
+/// is a circle's affine image), weighted by that cosine. Its knots are the
+/// pieces' angles.
+fn conic_arc_nurbs(
+    conic: &EdgeCurve,
+    t0: f64,
+    t1: f64,
 ) -> Result<brepkit_math::nurbs::NurbsCurve, brepkit_math::MathError> {
-    use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, PI, TAU};
-    let quarter: Vec<Point3> = (0..4).map(|k| at(f64::from(k) * FRAC_PI_2)).collect();
-    let centre = quarter[0] + (quarter[2] - quarter[0]) * 0.5;
-    let mut control_points = Vec::with_capacity(9);
-    let mut weights = Vec::with_capacity(9);
-    for k in 0..4 {
-        let (p, q) = (quarter[k], quarter[(k + 1) % 4]);
-        control_points.push(p);
+    use std::f64::consts::FRAC_PI_2;
+    let (centre, at): (Point3, Box<dyn Fn(f64) -> Point3 + '_>) = match conic {
+        EdgeCurve::Circle(c) => (c.center(), Box::new(|t| c.evaluate(t))),
+        EdgeCurve::Ellipse(e) => (e.center(), Box::new(|t| e.evaluate(t))),
+        EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => {
+            return Err(brepkit_math::MathError::ParameterOutOfRange {
+                value: t0,
+                min: t0,
+                max: t1,
+            });
+        }
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pieces = ((t1 - t0) / FRAC_PI_2 - 1e-9).ceil().max(1.0) as u32;
+    let sweep = (t1 - t0) / f64::from(pieces);
+    let w = (sweep / 2.0).cos();
+    let mut control_points = Vec::new();
+    let mut weights = Vec::new();
+    let mut knots = vec![t0; 3];
+    for k in 0..pieces {
+        let a = t0 + sweep * f64::from(k);
+        control_points.push(at(a));
         weights.push(1.0);
-        control_points.push(p + (q - centre));
-        weights.push(FRAC_1_SQRT_2);
+        control_points.push(centre + (at(a + sweep / 2.0) - centre) * (1.0 / w));
+        weights.push(w);
+        if k > 0 {
+            knots.extend([a, a]);
+        }
     }
-    control_points.push(quarter[0]);
+    control_points.push(at(t1));
     weights.push(1.0);
-    let knots = vec![
-        0.0,
-        0.0,
-        0.0,
-        FRAC_PI_2,
-        FRAC_PI_2,
-        PI,
-        PI,
-        3.0 * FRAC_PI_2,
-        3.0 * FRAC_PI_2,
-        TAU,
-        TAU,
-        TAU,
-    ];
+    knots.extend([t1; 3]);
     brepkit_math::nurbs::NurbsCurve::new(2, knots, control_points, weights)
 }
 
