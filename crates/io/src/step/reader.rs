@@ -776,6 +776,14 @@ impl<'a> StepBuilder<'a> {
             }
         };
 
+        // A face with holes keeps the file's frame only where its circles fit
+        // it.
+        let surface = match surface {
+            FaceSurface::Sphere(sphere) if !inner_wires.is_empty() => {
+                FaceSurface::Sphere(self.holed_sphere_frame(sphere, outer, &inner_wires)?)
+            }
+            surface => surface,
+        };
         // A cap written as its rim and a seam run out to a pole and back reads
         // as one written with a vertex loop at that pole: the rim alone.
         let (outer, cap_pole) = match (&surface, loop_vertex) {
@@ -812,6 +820,43 @@ impl<'a> StepBuilder<'a> {
             self.vertex_loops.insert(face_id, vertex);
         }
         Ok(face_id)
+    }
+
+    /// A sphere face with holes keeps the file's frame when its circles fit
+    /// it: each a latitude (about the frame's axis) or a meridian (through
+    /// its poles). Otherwise it takes the sphere's default frame, about
+    /// `+Z`, as every sphere face read before: in a frame its holes cross
+    /// at random, a seam the wire runs both ways (from a rim to the pole)
+    /// can cross a hole a later boolean cuts, which neither the face
+    /// splitter nor the mesher takes, and the result's dome is written
+    /// wrong.
+    fn holed_sphere_frame(
+        &self,
+        sphere: brepkit_math::surfaces::SphericalSurface,
+        outer: brepkit_topology::wire::WireId,
+        inner: &[brepkit_topology::wire::WireId],
+    ) -> Result<brepkit_math::surfaces::SphericalSurface, IoError> {
+        let (center, radius, axis) = (sphere.center(), sphere.radius(), sphere.z_axis());
+        let tol = 1e-6 * radius;
+        let mut circles = 0_usize;
+        for &wire in std::iter::once(&outer).chain(inner) {
+            for oe in self.topo.wire(wire)?.edges() {
+                let EdgeCurve::Circle(circle) = self.topo.edge(oe.edge())?.curve() else {
+                    continue;
+                };
+                let (n, off) = (circle.normal(), circle.center() - center);
+                let latitude = n.cross(axis).length() <= 1e-6 && off.cross(axis).length() <= tol;
+                let meridian = n.dot(axis).abs() <= 1e-6 && off.length() <= tol;
+                if !(latitude || meridian) {
+                    return Self::default_sphere(center, radius);
+                }
+                circles += 1;
+            }
+        }
+        if circles > 0 {
+            return Ok(sphere);
+        }
+        Self::default_sphere(center, radius)
     }
 
     fn default_sphere(
