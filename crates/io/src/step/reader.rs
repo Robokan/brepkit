@@ -1354,16 +1354,59 @@ impl<'a> StepBuilder<'a> {
                 }
                 let (start, end) = (point_of(refs[0])?, point_of(refs[1])?);
                 boundary.points.extend([start, end]);
-                if self.plain_curve_ref(refs[2])? == profile {
+                // The profile itself, or the same circle written again (a
+                // seam some writers give its own CIRCLE entity), running
+                // the profile's way round or the other.
+                let curve = self.plain_curve_ref(refs[2])?;
+                let along = if curve == profile {
+                    Some(true)
+                } else {
+                    self.same_circle(curve, profile)?
+                };
+                if let Some(along) = along {
                     let tail = attrs.trim_end_matches(')').trim();
                     let against = tail.ends_with(".F.") || tail.ends_with(".FALSE.");
-                    boundary
-                        .on_profile
-                        .push(if against { (end, start) } else { (start, end) });
+                    boundary.on_profile.push(if against == along {
+                        (end, start)
+                    } else {
+                        (start, end)
+                    });
                 }
             }
         }
         Ok(boundary)
+    }
+
+    /// Whether CIRCLE entities `a` and `b` are one circle (the same centre,
+    /// radius and plane, to a file's digits): `Some(true)` where they run
+    /// the same way round, `Some(false)` where they run opposite ways, and
+    /// `None` where they differ or either is not a circle.
+    fn same_circle(&self, a: u64, b: u64) -> Result<Option<bool>, IoError> {
+        let circle = |r: u64| -> Result<Option<(Point3, Vec3, f64)>, IoError> {
+            let entity = self.get_entity(r)?;
+            if entity.entity_type != "CIRCLE" {
+                return Ok(None);
+            }
+            let (Some(&axis), Some(&radius)) = (
+                parse_refs(&entity.attrs).first(),
+                parse_floats(&entity.attrs).first(),
+            ) else {
+                return Ok(None);
+            };
+            let (center, normal, _) = self.build_axis2_placement(axis)?;
+            Ok(normal
+                .normalize()
+                .ok()
+                .map(|normal| (center, normal, radius)))
+        };
+        let (Some((ca, na, ra)), Some((cb, nb, rb))) = (circle(a)?, circle(b)?) else {
+            return Ok(None);
+        };
+        let tol = 1e-9 * (1.0 + ra.abs() + (ca - Point3::new(0.0, 0.0, 0.0)).length());
+        if (ca - cb).length() > tol || (ra - rb).abs() > tol || na.cross(nb).length() > 1e-9 {
+            return Ok(None);
+        }
+        Ok(Some(na.dot(nb) > 0.0))
     }
 
     /// The unit direction of a VECTOR entity.
