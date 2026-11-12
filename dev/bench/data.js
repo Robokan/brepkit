@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794498687293,
+  "lastUpdate": 1794500227620,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3671,6 +3671,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29804605,
             "range": "± 370360",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "c08284074405f6e3f1dadea763c4b72bef649137",
+          "message": "Merge remote-tracking branch 'origin/main'",
+          "timestamp": "2026-11-12T07:56:14-08:00",
+          "tree_id": "1c00fd77b4a42557496b6cf9338590786d4e47bc",
+          "url": "https://github.com/Robokan/brepkit/commit/c08284074405f6e3f1dadea763c4b72bef649137"
+        },
+        "date": 1794500227226,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 950706,
+            "range": "± 6279",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 990161,
+            "range": "± 1916",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11518,
+            "range": "± 352",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 758065,
+            "range": "± 3757",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 23546125,
+            "range": "± 97178",
             "unit": "ns/iter"
           }
         ]
