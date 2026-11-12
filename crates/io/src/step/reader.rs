@@ -922,11 +922,16 @@ impl<'a> StepBuilder<'a> {
                 let radius = floats.first().copied().ok_or_else(|| IoError::ParseError {
                     reason: format!("SPHERICAL_SURFACE #{surface_ref} missing radius"),
                 })?;
-                let (center, _axis, _ref_dir) = self.build_axis2_placement(axis_ref)?;
-                let sphere = brepkit_math::surfaces::SphericalSurface::new(center, radius)
-                    .map_err(|e| IoError::ParseError {
-                        reason: format!("SPHERICAL_SURFACE #{surface_ref}: {e}"),
-                    })?;
+                // The file's frame: its latitude circles and meridian seams
+                // then lie on the (u, v) grid, however the sphere is turned.
+                let (center, axis, ref_dir) = self.build_axis2_placement(axis_ref)?;
+                let sphere = brepkit_math::surfaces::SphericalSurface::with_axis_and_ref_dir(
+                    center, radius, axis, ref_dir,
+                )
+                .or_else(|_| brepkit_math::surfaces::SphericalSurface::new(center, radius))
+                .map_err(|e| IoError::ParseError {
+                    reason: format!("SPHERICAL_SURFACE #{surface_ref}: {e}"),
+                })?;
                 Ok(FaceSurface::Sphere(sphere))
             }
             "TOROIDAL_SURFACE" => {
