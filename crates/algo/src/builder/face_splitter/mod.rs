@@ -4347,10 +4347,53 @@ fn arrangement_regions_from_inputs(
     if faces.len() < 2 {
         return None;
     }
+    // UV polygon of a traced face, for containment/probe tests. Whole-arc
+    // sub-edges are densified by sampling their true 3D curve through the
+    // frame (orientation-unambiguous): on a thin arc-bounded region (the
+    // groove-mouth corner sliver, two lines + one r=4 arc) the chord polygon
+    // misplaces the interior probe across the arc, misclassifying the region.
+    let face_poly = |face: &[usize]| -> Vec<Point2> {
+        let mut pts: Vec<Point2> = Vec::with_capacity(face.len() * 2);
+        for &h in face {
+            let he = &halfs[h];
+            let su = vert_pos[&he.from];
+            pts.push(su);
+            let Some(&(input_idx, whole)) = sub_edge_src.get(he.seg_id) else {
+                continue;
+            };
+            let inp = &inputs[input_idx];
+            if !(whole && inp.is_arc) {
+                continue;
+            }
+            let e = &inp.edge;
+            let (a3, b3) = if e.forward {
+                (e.start_3d, e.end_3d)
+            } else {
+                (e.end_3d, e.start_3d)
+            };
+            let (d0, d1) = e.curve_3d.domain_with_endpoints(a3, b3);
+            let fwd_uv = frame.project(a3);
+            let rev_uv = frame.project(b3);
+            let from_matches_fwd = (fwd_uv - su).length() <= (rev_uv - su).length();
+            for k in 1..8 {
+                let f = f64::from(k) / 8.0;
+                let f = if from_matches_fwd { f } else { 1.0 - f };
+                let p3 = e
+                    .curve_3d
+                    .evaluate_with_endpoints(d0 + (d1 - d0) * f, a3, b3);
+                pts.push(frame.project(p3));
+            }
+        }
+        pts
+    };
+    // Measured with its arcs: a boundary of long arcs (a plate's rounded
+    // outline) has a chord polygon smaller than a component inside it (a
+    // disc's rim through the plate's holes), whose unbounded cycle the
+    // chords would then keep as a region while dropping the face's own.
     let outer_idx = (0..faces.len()).max_by(|&a, &b| {
-        face_area(&faces[a])
+        signed_area_2d(&face_poly(&faces[a]))
             .abs()
-            .partial_cmp(&face_area(&faces[b]).abs())
+            .partial_cmp(&signed_area_2d(&face_poly(&faces[b])).abs())
             .unwrap_or(std::cmp::Ordering::Equal)
     })?;
 
@@ -4498,45 +4541,6 @@ fn arrangement_regions_from_inputs(
             wire.push(mk_edge(from, to, he.seg_id)?);
         }
         Some(wire)
-    };
-    // UV polygon of a traced face, for containment/probe tests. Whole-arc
-    // sub-edges are densified by sampling their true 3D curve through the
-    // frame (orientation-unambiguous): on a thin arc-bounded region (the
-    // groove-mouth corner sliver, two lines + one r=4 arc) the chord polygon
-    // misplaces the interior probe across the arc, misclassifying the region.
-    let face_poly = |face: &[usize]| -> Vec<Point2> {
-        let mut pts: Vec<Point2> = Vec::with_capacity(face.len() * 2);
-        for &h in face {
-            let he = &halfs[h];
-            let su = vert_pos[&he.from];
-            pts.push(su);
-            let Some(&(input_idx, whole)) = sub_edge_src.get(he.seg_id) else {
-                continue;
-            };
-            let inp = &inputs[input_idx];
-            if !(whole && inp.is_arc) {
-                continue;
-            }
-            let e = &inp.edge;
-            let (a3, b3) = if e.forward {
-                (e.start_3d, e.end_3d)
-            } else {
-                (e.end_3d, e.start_3d)
-            };
-            let (d0, d1) = e.curve_3d.domain_with_endpoints(a3, b3);
-            let fwd_uv = frame.project(a3);
-            let rev_uv = frame.project(b3);
-            let from_matches_fwd = (fwd_uv - su).length() <= (rev_uv - su).length();
-            for k in 1..8 {
-                let f = f64::from(k) / 8.0;
-                let f = if from_matches_fwd { f } else { 1.0 - f };
-                let p3 = e
-                    .curve_3d
-                    .evaluate_with_endpoints(d0 + (d1 - d0) * f, a3, b3);
-                pts.push(frame.project(p3));
-            }
-        }
-        pts
     };
 
     if nesting == ArrNesting::Cells {
@@ -12228,6 +12232,118 @@ mod tests {
                 seen.iter().filter(|&(_, &c)| c > 1).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// A stadium of long arcs (its chord polygon a thin rectangle) holding a
+    /// circle of four quarter arcs, a component apart from it (a disc's rim
+    /// woven through two holes): the stadium's region has the circle as its
+    /// hole, and the disc inside is a region of its own. Read by chords, the
+    /// circle's unbounded cycle had the larger area and was dropped in place
+    /// of the stadium's, which then came out twice, facing both ways, and
+    /// neither with the hole.
+    #[test]
+    fn a_component_inside_an_outline_of_long_arcs_is_its_hole() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_topology::edge::Edge;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut topo = Topology::new();
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let (half, r) = (1.0, 20.0);
+        let mut vertex = |p: Point3| topo.add_vertex(Vertex::new(p, 1e-7));
+        let corners = [
+            Point3::new(half, -r, 0.0),
+            Point3::new(half, r, 0.0),
+            Point3::new(-half, r, 0.0),
+            Point3::new(-half, -r, 0.0),
+        ]
+        .map(&mut vertex);
+        let rim = [0.0, 1.0, 2.0, 3.0].map(|k| {
+            let a = k * std::f64::consts::FRAC_PI_2;
+            vertex(Point3::new(8.0 * a.cos(), 8.0 * a.sin(), 0.0))
+        });
+        let circle = |topo: &mut Topology, c: Point3, radius: f64, a, b| {
+            let curve = Circle3D::new_with_ref(c, z, radius, x).unwrap();
+            topo.add_edge(Edge::new(a, b, EdgeCurve::Circle(curve)))
+        };
+        let right = circle(
+            &mut topo,
+            Point3::new(half, 0.0, 0.0),
+            r,
+            corners[0],
+            corners[1],
+        );
+        let top = topo.add_edge(Edge::new(corners[1], corners[2], EdgeCurve::Line));
+        let left = circle(
+            &mut topo,
+            Point3::new(-half, 0.0, 0.0),
+            r,
+            corners[2],
+            corners[3],
+        );
+        let bottom = topo.add_edge(Edge::new(corners[3], corners[0], EdgeCurve::Line));
+        let outline = topo.add_wire(
+            Wire::new(
+                [right, top, left, bottom]
+                    .map(|e| OrientedEdge::new(e, true))
+                    .to_vec(),
+                true,
+            )
+            .unwrap(),
+        );
+        let quarters: Vec<_> = (0..4)
+            .map(|k| {
+                circle(
+                    &mut topo,
+                    Point3::new(0.0, 0.0, 0.0),
+                    8.0,
+                    rim[k],
+                    rim[(k + 1) % 4],
+                )
+            })
+            .collect();
+        let ring = topo.add_wire(
+            Wire::new(
+                quarters
+                    .iter()
+                    .map(|&e| OrientedEdge::new(e, true))
+                    .collect(),
+                true,
+            )
+            .unwrap(),
+        );
+        let surface = FaceSurface::Plane { normal: z, d: 0.0 };
+        let face_id = topo.add_face(Face::new(outline, vec![], surface.clone()));
+        let wire_pts = collect_wire_points(&topo, outline);
+        let frame = PlaneFrame::from_plane_face(z, &wire_pts);
+        let mut edges = boundary_edges_to_pcurve(&topo, outline, &surface, &wire_pts, Some(&frame));
+        edges.extend(boundary_edges_to_pcurve(
+            &topo,
+            ring,
+            &surface,
+            &wire_pts,
+            Some(&frame),
+        ));
+        let regions = arrangement_regions_from_combined(
+            &surface,
+            &edges,
+            &[],
+            Rank::A,
+            false,
+            face_id,
+            &frame,
+            1e-7,
+        )
+        .expect("the arrangement traces its regions");
+        let holes: Vec<usize> = regions.iter().map(|r| r.inner_wires.len()).collect();
+        assert_eq!(regions.len(), 2, "regions with holes {holes:?}");
+        assert!(
+            holes.contains(&1) && holes.contains(&0),
+            "regions with holes {holes:?}"
+        );
     }
 
     fn cyl_edge(curve_3d: EdgeCurve, start_3d: Point3, end_3d: Point3) -> OrientedPCurveEdge {
