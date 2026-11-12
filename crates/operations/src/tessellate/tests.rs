@@ -3431,6 +3431,77 @@ fn a_fillet_closed_along_v_meshes_with_its_top() {
     }
 }
 
+/// A hemisphere lying on its side, its one face bounded by its rim alone in
+/// four arcs (as a boolean leaves a dome it splits the rim of), meshed face
+/// by face. The face is no grid box, and which pole it reaches was read from
+/// its rim's winding projected on the XY plane, which sees a rim standing
+/// upright edge on: the mesh covered either hemisphere.
+#[test]
+fn a_sphere_cap_on_its_side_meshes_toward_its_own_pole() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_math::surfaces::SphericalSurface;
+    let r = 27.0;
+    let origin = Point3::new(-165.0, -380.0, 0.0);
+    for axis in [
+        Vec3::new(0.6, 0.8, 0.0),
+        Vec3::new(-0.6, -0.8, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+    ] {
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let x = z.cross(axis);
+        let rim = Circle3D::new_with_ref(origin, axis, r, x).unwrap();
+        let mut topo = Topology::new();
+        let corners: Vec<_> = (0..4)
+            .map(|k| {
+                let p = rim.evaluate(f64::from(k) * std::f64::consts::FRAC_PI_2);
+                topo.add_vertex(Vertex::new(p, 1e-7))
+            })
+            .collect();
+        let arcs: Vec<_> = (0..4)
+            .map(|k| {
+                topo.add_edge(Edge::new(
+                    corners[k],
+                    corners[(k + 1) % 4],
+                    EdgeCurve::Circle(rim.clone()),
+                ))
+            })
+            .collect();
+        let wire = topo.add_wire(
+            Wire::new(
+                arcs.iter().map(|&e| OrientedEdge::new(e, true)).collect(),
+                true,
+            )
+            .unwrap(),
+        );
+        let sphere = SphericalSurface::with_axis_and_ref_dir(origin, r, axis, x).unwrap();
+        let cap = topo.add_face(Face::new(wire, vec![], FaceSurface::Sphere(sphere)));
+        let mesh = tessellate(&topo, cap, 0.1).unwrap();
+        let reach = mesh
+            .positions
+            .iter()
+            .map(|&p| (p - origin).dot(axis))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            reach >= -1e-6,
+            "axis {axis:?}: the cap reaches {reach} below its rim"
+        );
+        let area: f64 = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let [a, b, c] = [0, 1, 2].map(|i| mesh.positions[t[i] as usize]);
+                (b - a).cross(c - a).length() / 2.0
+            })
+            .sum();
+        let truth = 2.0 * std::f64::consts::PI * r * r;
+        assert!(
+            (area - truth).abs() <= 0.01 * truth,
+            "axis {axis:?}: cap mesh area {area}, truth {truth}"
+        );
+    }
+}
+
 /// A hemisphere written with a seam: its one face bounded by the equator
 /// and a meridian run up to the pole and back, as files carry sphere caps.
 /// The seam's two copies meet at the pole, so they are one run of seam

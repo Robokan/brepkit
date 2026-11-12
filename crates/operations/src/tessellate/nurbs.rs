@@ -300,11 +300,12 @@ pub fn compute_sphere_v_range(
 ) -> (f64, f64) {
     use std::f64::consts::FRAC_PI_2;
 
+    // Each edge's start as the wire runs it.
     let mut wire_pts = Vec::new();
     if let Ok(wire) = topo.wire(face_data.outer_wire()) {
         for oe in wire.edges() {
             if let Ok(edge) = topo.edge(oe.edge())
-                && let Ok(vertex) = topo.vertex(edge.start())
+                && let Ok(vertex) = topo.vertex(oe.oriented_start(edge))
             {
                 wire_pts.push(vertex.point());
             }
@@ -350,25 +351,23 @@ pub fn compute_sphere_v_range(
         .sum::<f64>()
         / wire_pts.len() as f64;
 
-    let signed_area = projected_signed_area(&wire_pts);
+    // A cap under one latitude: the wire winds counter-clockwise about the
+    // sphere's own axis round a cap toward its north pole. Read about that
+    // axis, not +Z, which a cap turned on its side sees edge on.
+    let centre = sphere.center();
+    let axis = sphere.z_axis();
+    let signed_area: f64 = (0..wire_pts.len())
+        .map(|i| {
+            let a = wire_pts[i] - centre;
+            let b = wire_pts[(i + 1) % wire_pts.len()] - centre;
+            a.cross(b).dot(axis)
+        })
+        .sum();
     if signed_area > 0.0 {
         (avg_v, FRAC_PI_2)
     } else {
         (-FRAC_PI_2, avg_v)
     }
-}
-
-/// Signed area of a polygon projected onto the XY plane.
-/// Positive = CCW winding from +Z, negative = CW.
-#[must_use]
-pub fn projected_signed_area(pts: &[Point3]) -> f64 {
-    let n = pts.len();
-    let mut area = 0.0;
-    for i in 0..n {
-        let j = (i + 1) % n;
-        area += pts[i].x() * pts[j].y() - pts[j].x() * pts[i].y();
-    }
-    area * 0.5
 }
 
 /// Determine the [`AnalyticKind`] for sphere tessellation based on v-range.
