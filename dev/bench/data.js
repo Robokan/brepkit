@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794509586877,
+  "lastUpdate": 1794513947859,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3887,6 +3887,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 17775223,
             "range": "± 601361",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "6b86238ba350d931cd1edeb36b42a1283e6ed94f",
+          "message": "docs(buzzcad): the chamfer past its face, #2378 in flight\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T12:02:46-08:00",
+          "tree_id": "1bbbe70e7db27af1e0c2490a89c25565949f91f4",
+          "url": "https://github.com/Robokan/brepkit/commit/6b86238ba350d931cd1edeb36b42a1283e6ed94f"
+        },
+        "date": 1794513947122,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 679044,
+            "range": "± 2810",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 738191,
+            "range": "± 44918",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8854,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 583682,
+            "range": "± 11821",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18326215,
+            "range": "± 625857",
             "unit": "ns/iter"
           }
         ]
