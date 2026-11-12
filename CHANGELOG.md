@@ -1,5 +1,19 @@
 # Changelog
 
+## [4.11.4](https://github.com/andymai/brepkit/compare/v4.11.3...v4.11.4) (2026-11-12)
+
+
+### Bug Fixes
+
+* **render:** find offscreen adapters once per process ([#2366](https://github.com/andymai/brepkit/issues/2366)) ([69c9f8a](https://github.com/andymai/brepkit/commit/69c9f8a9aa151517c85c79b537d656998e16e96f))
+
+## [4.11.3](https://github.com/andymai/brepkit/compare/v4.11.2...v4.11.3) (2026-11-11)
+
+
+### Bug Fixes
+
+* **blend:** let a round end on a curved wall with an opening behind it ([#2364](https://github.com/andymai/brepkit/issues/2364)) ([7943354](https://github.com/andymai/brepkit/commit/794335439ea1a03d2e269278798f862464635f0f))
+
 ## [4.11.2](https://github.com/andymai/brepkit/compare/v4.11.1...v4.11.2) (2026-11-10)
 
 
