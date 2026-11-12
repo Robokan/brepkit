@@ -186,6 +186,21 @@ pub fn build_solid_with_origins(
         return Err(AlgoError::AssemblyFailed("no shells formed".into()));
     }
 
+    // A shell of faces lying on each other in pairs, facing apart over the
+    // same edges, holds no material: closed by edge count, its volume is
+    // zero and its growth/hole reading the sign of rounding.
+    let count = shells.len();
+    let shells: Vec<Vec<FaceId>> = shells
+        .into_iter()
+        .filter(|shell| {
+            let fold = count > 1 && is_fold_shell(topo, shell);
+            if fold {
+                log::debug!("BuilderSolid: dropping a {}-face fold shell", shell.len());
+            }
+            !fold
+        })
+        .collect();
+
     // Phase 3: Classify Growth vs Hole
     let (growth, holes) = perform_areas(topo, &shells);
 
@@ -1583,6 +1598,50 @@ fn shell_edge_point(topo: &Topology, faces: &[FaceId]) -> Option<Point3> {
     let b = topo.vertex(edge.end()).ok()?.point();
     let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
     Some(edge.curve().evaluate_with_endpoints(0.5 * (t0 + t1), a, b))
+}
+
+/// Whether every face of `shell` pairs off with another lying on it over
+/// the same edges, the two facing apart: a fold of no thickness.
+fn is_fold_shell(topo: &Topology, shell: &[FaceId]) -> bool {
+    if shell.len() < 2 || !shell.len().is_multiple_of(2) {
+        return false;
+    }
+    let edge_set = |fid: FaceId| -> Option<Vec<EdgeId>> {
+        let face = topo.face(fid).ok()?;
+        let mut edges = Vec::new();
+        for wire in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            edges.extend(topo.wire(wire).ok()?.edges().iter().map(OrientedEdge::edge));
+        }
+        edges.sort_unstable();
+        Some(edges)
+    };
+    let Some(sets): Option<Vec<Vec<EdgeId>>> = shell.iter().map(|&f| edge_set(f)).collect() else {
+        return false;
+    };
+    let tol = brepkit_math::tolerance::Tolerance::new();
+    let mut paired = vec![false; shell.len()];
+    for i in 0..shell.len() {
+        if paired[i] {
+            continue;
+        }
+        let Ok(fi) = topo.face(shell[i]) else {
+            return false;
+        };
+        let twin = (i + 1..shell.len()).find(|&j| {
+            !paired[j]
+                && sets[i] == sets[j]
+                && topo.face(shell[j]).is_ok_and(|fj| {
+                    super::same_domain::surfaces_same_domain(fi.surface(), fj.surface(), tol)
+                        .is_some_and(|same_dir| same_dir == (fi.is_reversed() != fj.is_reversed()))
+                })
+        });
+        let Some(j) = twin else {
+            return false;
+        };
+        paired[i] = true;
+        paired[j] = true;
+    }
+    true
 }
 
 /// Classify shells as Growth (outer) or Hole (inner).
@@ -5503,6 +5562,25 @@ mod tests {
                 if out > 0.0 { "out" } else { "in" }
             );
         }
+    }
+
+    /// A square and its twin over the same edges, facing the other way, is a
+    /// fold of no thickness; the same square twice facing one way, or a
+    /// cube, is not.
+    #[test]
+    fn a_face_and_its_reversed_twin_are_a_fold() {
+        let mut topo = Topology::new();
+        let square = brepkit_topology::test_utils::make_unit_square_face(&mut topo);
+        let snapshot = topo.face(square).unwrap().clone();
+        let mut twin = snapshot.clone();
+        twin.set_reversed(true);
+        let twin = topo.add_face(twin);
+        assert!(is_fold_shell(&topo, &[square, twin]));
+        let copy = topo.add_face(snapshot);
+        assert!(!is_fold_shell(&topo, &[square, copy]));
+        let solid = brepkit_topology::test_utils::make_unit_cube_manifold(&mut topo);
+        let faces = brepkit_topology::explorer::solid_faces(&topo, solid).unwrap();
+        assert!(!is_fold_shell(&topo, &faces));
     }
 
     #[test]

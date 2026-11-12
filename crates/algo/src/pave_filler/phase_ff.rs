@@ -20,6 +20,7 @@ use brepkit_topology::solid::SolidId;
 use brepkit_topology::vertex::Vertex;
 
 use crate::builder::face_splitter::edge_curve_is_straight;
+use crate::builder::same_domain::nurbs_patch_lies_on;
 use crate::ds::{GfaArena, Interference, IntersectionCurveDS, Pave, PaveBlock};
 use crate::error::AlgoError;
 
@@ -389,8 +390,15 @@ pub fn perform(
 
             let v_range_a = v_ranges_a[idx_a];
             let v_range_b = v_ranges_b[idx_b];
-            let raw_curves =
-                compute_raw_curves(surf_a, surf_b, bbox_a, bbox_b, v_range_a, v_range_b)?;
+            let raw_curves = match (surf_a, surf_b) {
+                (FaceSurface::Nurbs(na), FaceSurface::Nurbs(nb))
+                    if nurbs_patch_lies_on(na, nb, bbox_a, bbox_b)
+                        || nurbs_patch_lies_on(nb, na, bbox_b, bbox_a) =>
+                {
+                    coincident_boundary_curves(topo, (fa, na), (fb, nb))
+                }
+                _ => compute_raw_curves(surf_a, surf_b, bbox_a, bbox_b, v_range_a, v_range_b)?,
+            };
             if std::env::var("BK_RAWC").is_ok() {
                 log::debug!(
                     "RAWC a[{idx_a}]={} b[{idx_b}]={} n={}",
@@ -824,11 +832,17 @@ pub fn perform(
                 .map(|raw| {
                     pull_ends_onto_corners(topo, arena, (fa, surf_a), (fb, surf_b), raw, tol)
                 })
-                .filter_map(|raw| {
-                    if matches!(raw.curve, EdgeCurve::NurbsCurve(_)) {
-                        onto_lying_boundary_edge(topo, (fa, surf_a), (fb, surf_b), raw, tol)
-                    } else {
-                        Some(raw)
+                .flat_map(|raw| {
+                    if !matches!(raw.curve, EdgeCurve::NurbsCurve(_)) {
+                        return vec![raw];
+                    }
+                    match onto_flush_spline_edges(topo, (fa, surf_a), (fb, surf_b), &raw, tol) {
+                        Some(edges) => edges,
+                        None => {
+                            onto_lying_boundary_edge(topo, (fa, surf_a), (fb, surf_b), raw, tol)
+                                .into_iter()
+                                .collect()
+                        }
                     }
                 })
                 .flat_map(|raw| split_lens_off_boundary_edge(topo, fa, fb, raw, tol))
@@ -1181,6 +1195,115 @@ fn face_boundary_edges(
         .filter_map(|wid| topo.wire(wid).ok())
         .flat_map(|wire| wire.edges().iter())
         .filter_map(|oe| topo.edge(oe.edge()).ok())
+}
+
+/// A section along an edge's curve, its range running forward: an edge
+/// stored against its curve reads its domain backwards, and the section's
+/// trims split the curve at its start and then its end.
+fn forward_raw(
+    curve: EdgeCurve,
+    bbox: Aabb3,
+    (t0, t1): (f64, f64),
+    (a, b): (Point3, Point3),
+) -> RawCurve {
+    let (t_range, p_start, p_end) = if t0 <= t1 {
+        ((t0, t1), a, b)
+    } else {
+        ((t1, t0), b, a)
+    };
+    RawCurve {
+        curve,
+        bbox,
+        t_range,
+        p_start,
+        p_end,
+    }
+}
+
+/// A marched section running along B-spline boundary edges of one face that
+/// lie on the other face's surface end to end (a tool's outline flush on a
+/// part's B-spline wall), re-emitted as those edges whole. The march along
+/// them stops wherever its solve gives out, or runs on past the corner
+/// where its trim to the faces' outlines reads the spline by chords; left
+/// so, it ends off every vertex, and the edges themselves, which the
+/// coincident faces' own pair imprints, are taken as its duplicates.
+fn onto_flush_spline_edges(
+    topo: &Topology,
+    (fa, surf_a): (FaceId, &FaceSurface),
+    (fb, surf_b): (FaceId, &FaceSurface),
+    raw: &RawCurve,
+    tol: Tolerance,
+) -> Option<Vec<RawCurve>> {
+    const PROBES: u32 = 32;
+    let band = JunctionRegistry::ADOPT_MAX;
+    let probes: Vec<Point3> = (0..=PROBES)
+        .map(|k| {
+            let t = (raw.t_range.1 - raw.t_range.0)
+                .mul_add(f64::from(k) / f64::from(PROBES), raw.t_range.0);
+            raw.curve.evaluate_with_endpoints(t, raw.p_start, raw.p_end)
+        })
+        .collect();
+    for (owner, other) in [(fa, surf_b), (fb, surf_a)] {
+        // The owner's B-spline edges lying on the other surface.
+        let flush: Vec<(
+            &brepkit_topology::edge::Edge,
+            Point3,
+            Point3,
+            Vec<Point3>,
+            f64,
+        )> = face_boundary_edges(topo, owner)
+            .filter(|e| matches!(e.curve(), EdgeCurve::NurbsCurve(_)))
+            .filter_map(|e| {
+                let a = topo.vertex(e.start()).ok()?.point();
+                let b = topo.vertex(e.end()).ok()?.point();
+                let (along, sag) = edge_chords(topo, e)?;
+                ((a - b).length() > band
+                    && along
+                        .iter()
+                        .all(|&p| surface_gap(other, p).is_some_and(|g| g <= 10.0 * tol.linear)))
+                .then_some((e, a, b, along, sag))
+            })
+            .collect();
+        if flush.is_empty() {
+            continue;
+        }
+        let length: f64 = probes.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        let reach = 2e-2 * length;
+        let mut used = vec![false; flush.len()];
+        let mut covered = true;
+        for (k, &q) in probes.iter().enumerate() {
+            let interior = k >= 2 && k + 2 <= probes.len();
+            let allow = |sag: f64| if interior { band + sag } else { reach + sag };
+            let Some(i) = flush
+                .iter()
+                .position(|(_, _, _, along, sag)| polyline_gap(along, q) <= allow(*sag))
+            else {
+                covered = false;
+                break;
+            };
+            used[i] |= interior;
+        }
+        if !covered || !used.iter().any(|&u| u) {
+            continue;
+        }
+        return Some(
+            flush
+                .iter()
+                .zip(&used)
+                .filter(|(_, u)| **u)
+                .map(|((e, a, b, along, _), _)| {
+                    let (t0, t1) = e.curve().domain_with_endpoints(*a, *b);
+                    forward_raw(
+                        e.curve().clone(),
+                        Aabb3::from_points(along.iter().copied()),
+                        (t0, t1),
+                        (*a, *b),
+                    )
+                })
+                .collect(),
+        );
+    }
+    None
 }
 
 /// A marched section lying along an analytic boundary edge of one face that
@@ -7394,6 +7517,54 @@ fn plane_nurbs_section(
 }
 
 /// NURBS-NURBS intersection.
+/// The sections of two coincident B-spline faces: each face's boundary
+/// edges lying on the other's surface. Where one face lies on the other
+/// (a tool's side flush on a part's wall) these are the outline the wall
+/// is split along; the trim to both faces that follows keeps the stretch
+/// inside each.
+fn coincident_boundary_curves(
+    topo: &Topology,
+    (fa, na): (FaceId, &brepkit_math::nurbs::surface::NurbsSurface),
+    (fb, nb): (FaceId, &brepkit_math::nurbs::surface::NurbsSurface),
+) -> Vec<RawCurve> {
+    const GAP: f64 = 1e-6;
+    let mut out: Vec<RawCurve> = Vec::new();
+    for (face, onto) in [(fb, na), (fa, nb)] {
+        for edge in face_boundary_edges(topo, face) {
+            let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+                continue;
+            };
+            let (sp, ep) = (sv.point(), ev.point());
+            let curve = edge.curve();
+            let (t0, t1) = curve.domain_with_endpoints(sp, ep);
+            let samples: Vec<Point3> = (0..=16)
+                .map(|k| {
+                    curve.evaluate_with_endpoints(t0 + (t1 - t0) * f64::from(k) / 16.0, sp, ep)
+                })
+                .collect();
+            let lies = samples.iter().all(|&p| {
+                brepkit_math::nurbs::projection::project_point_to_surface(onto, p, GAP * 1e-2)
+                    .is_ok_and(|proj| proj.distance <= GAP)
+            });
+            // An edge both faces hold is already shared.
+            let dup = out.iter().any(|r| {
+                ((r.p_start - sp).length() <= GAP && (r.p_end - ep).length() <= GAP)
+                    || ((r.p_start - ep).length() <= GAP && (r.p_end - sp).length() <= GAP)
+            });
+            if !lies || dup || (sp - ep).length() <= GAP {
+                continue;
+            }
+            out.push(forward_raw(
+                curve.clone(),
+                Aabb3::from_points(samples.iter().copied()),
+                (t0, t1),
+                (sp, ep),
+            ));
+        }
+    }
+    out
+}
+
 fn nurbs_nurbs_intersection(
     na: &brepkit_math::nurbs::surface::NurbsSurface,
     nb: &brepkit_math::nurbs::surface::NurbsSurface,

@@ -892,36 +892,33 @@ fn boolean_inner(
                 // edges and vertices, so neither closes on its own and the
                 // whole reads as one non-manifold piece. With their own copies
                 // they are separate pieces, which the gate above accepts.
-                if op != BooleanOp::Intersect
-                    && crate::boolean::assembly::separate_touching_pieces(topo, result)? >= 2
-                {
-                    let pieces = crate::boolean::assembly::face_components(topo, result);
-                    let (f, e, v) = brepkit_topology::explorer::solid_entity_counts(topo, result)?;
-                    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
-                    let euler = count(v) - count(e) + count(f);
-                    let holes = solid_inner_wire_count(topo, result)?;
-                    let cut_safe = op != BooleanOp::Cut
-                        || brepkit_algo::classifier::try_build_analytic_classifier(topo, b)
-                            .as_ref()
-                            .is_none_or(|cls_b| {
-                                all_component_centers_outside(topo, result, &pieces, cls_b, tol)
-                            });
-                    if pieces.len() >= 2
-                        && euler_balanced(euler, holes, count(pieces.len()))
-                        && components_are_disjoint_pieces(topo, &pieces)
-                        && cut_safe
-                        && is_closed_manifold(topo, result)?
-                        && pieces_only_touch(topo, &pieces)
-                        && validate_boolean_result(topo, result).is_ok()
-                    {
-                        log::info!(
-                            "GFA touching pieces succeeded in {:.1}ms ({} pieces)",
-                            timer_elapsed_ms(gfa_start),
-                            pieces.len()
-                        );
-                        return Ok(result);
-                    }
-                }
+                let touching_pieces =
+                    |topo: &mut Topology| -> Result<bool, crate::OperationsError> {
+                        if op == BooleanOp::Intersect
+                            || crate::boolean::assembly::separate_touching_pieces(topo, result)? < 2
+                        {
+                            return Ok(false);
+                        }
+                        let pieces = crate::boolean::assembly::face_components(topo, result);
+                        let (f, e, v) =
+                            brepkit_topology::explorer::solid_entity_counts(topo, result)?;
+                        let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+                        let euler = count(v) - count(e) + count(f);
+                        let holes = solid_inner_wire_count(topo, result)?;
+                        let cut_safe = op != BooleanOp::Cut
+                            || brepkit_algo::classifier::try_build_analytic_classifier(topo, b)
+                                .as_ref()
+                                .is_none_or(|cls_b| {
+                                    all_component_centers_outside(topo, result, &pieces, cls_b, tol)
+                                });
+                        Ok(pieces.len() >= 2
+                            && euler_balanced(euler, holes, count(pieces.len()))
+                            && components_are_disjoint_pieces(topo, &pieces)
+                            && cut_safe
+                            && is_closed_manifold(topo, result)?
+                            && pieces_only_touch(topo, &pieces)
+                            && validate_boolean_result(topo, result).is_ok())
+                    };
                 // One piece pinched along an edge (two solids pressed together
                 // over a face and also meeting along a line beside it): with
                 // each wedge of material round the edge taking its own copy,
@@ -950,6 +947,17 @@ fn boolean_inner(
                         );
                         return Ok(result);
                     }
+                }
+                // Pinched or not, the faces may then join into pieces that
+                // only touch: two lenses' caps meeting only on their common
+                // circle, another piece's faces on it too, have each taken
+                // their wedge's copy of it above.
+                if touching_pieces(topo)? {
+                    log::info!(
+                        "GFA touching pieces succeeded in {:.1}ms",
+                        timer_elapsed_ms(gfa_start)
+                    );
+                    return Ok(result);
                 }
                 // Which gate refused? Both acceptance paths are conjunctions,
                 // so the bare rejection below says nothing about the cause —

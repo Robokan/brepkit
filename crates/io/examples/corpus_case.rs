@@ -30,6 +30,75 @@ use brepkit_topology::Topology;
 use brepkit_topology::explorer::solid_faces;
 use brepkit_topology::solid::SolidId;
 
+/// PERFACE=<deflection>: each face's signed volume and area in the solid's
+/// mesh (as the bridge meshes it) against its own face mesh.
+fn per_face(topo: &Topology, sid: SolidId, deflection: f64) {
+    let faces = solid_faces(topo, sid).unwrap();
+    let (mesh, tri_faces) =
+        brepkit_operations::tessellate::tessellate_solid_grouped_with_tolerance(
+            topo, sid, deflection, 0.2,
+        )
+        .unwrap();
+    let flux = |m: &brepkit_operations::tessellate::TriangleMesh, keep: &dyn Fn(usize) -> bool| {
+        let (mut v, mut a) = (0.0, 0.0);
+        let mut c = [0.0_f64; 3];
+        let mut nsum = [0.0_f64; 3];
+        for (t, tri) in m.indices.chunks(3).enumerate() {
+            if !keep(t) {
+                continue;
+            }
+            let [p, q, r] = [0, 1, 2].map(|k| m.positions[tri[k] as usize]);
+            let (e1, e2) = (q - p, r - p);
+            let n = e1.cross(e2);
+            a += 0.5 * n.length();
+            let w = 0.5 * n.length();
+            c[0] += w * (p.x() + q.x() + r.x()) / 3.0;
+            c[1] += w * (p.y() + q.y() + r.y()) / 3.0;
+            c[2] += w * (p.z() + q.z() + r.z()) / 3.0;
+            nsum[0] += n.x();
+            nsum[1] += n.y();
+            nsum[2] += n.z();
+            v += (p - brepkit_math::vec::Point3::new(0.0, 0.0, 0.0)).dot(n) / 6.0;
+        }
+        if std::env::var("PF_WHERE").is_ok() {
+            println!(
+                "pf   centroid ({:.2}, {:.2}, {:.2}) normal sum ({:.1}, {:.1}, {:.1})",
+                c[0] / a,
+                c[1] / a,
+                c[2] / a,
+                nsum[0] / 2.0,
+                nsum[1] / 2.0,
+                nsum[2] / 2.0
+            );
+        }
+        (v, a)
+    };
+    let mut total = 0.0;
+    for (i, &fid) in faces.iter().enumerate() {
+        // Offsets per face, in triangles or in indices (three per triangle).
+        let scale = if tri_faces.last().copied().unwrap_or(0) as usize == mesh.indices.len() {
+            3
+        } else {
+            1
+        };
+        let (lo, hi) = (
+            tri_faces[i] as usize / scale,
+            tri_faces[i + 1] as usize / scale,
+        );
+        let (v, a) = flux(&mesh, &|t| t >= lo && t < hi);
+        total += v;
+        let own = brepkit_operations::tessellate::tessellate(topo, fid, deflection).unwrap();
+        let (ov, oa) = flux(&own, &|_| true);
+        let face = topo.face(fid).unwrap();
+        println!(
+            "pf {i:3} {:8} rev={} solid v={v:14.3} a={a:12.3} | own v={ov:14.3} a={oa:12.3}",
+            face.surface().type_tag(),
+            u8::from(face.is_reversed())
+        );
+    }
+    println!("pf total {total:.3}");
+}
+
 fn census(topo: &Topology, sid: SolidId) -> String {
     let mut mix: BTreeMap<&'static str, usize> = BTreeMap::new();
     for fid in solid_faces(topo, sid).unwrap() {
@@ -584,6 +653,13 @@ fn main() {
                 "brepkit (fallback={fell_back}): {} {valid}",
                 census(&topo, s)
             );
+            // OUT=<file.step>: the result as brepkit writes it
+            if let Ok(out) = std::env::var("OUT") {
+                std::fs::write(&out, brepkit_io::step::write_step(&topo, &[s]).unwrap()).unwrap();
+            }
+            if let Ok(d) = std::env::var("PERFACE") {
+                per_face(&topo, s, d.parse().unwrap_or(0.1));
+            }
             if std::env::var("FACES").is_ok() {
                 face_table(&topo, s);
             }
