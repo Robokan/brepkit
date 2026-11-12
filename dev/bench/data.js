@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794450711424,
+  "lastUpdate": 1794463874316,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3509,6 +3509,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19246183,
             "range": "± 193715",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "87b130ad2f71aca08553a5d3fabcef4c23af6257",
+          "message": "docs(buzzcad): SPEED.md records the first speed changes\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-11T22:07:30-08:00",
+          "tree_id": "de5ef42cac0ba0f8babc8a1d2d32320f0aacf92b",
+          "url": "https://github.com/Robokan/brepkit/commit/87b130ad2f71aca08553a5d3fabcef4c23af6257"
+        },
+        "date": 1794463873317,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1125441,
+            "range": "± 5027",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1216699,
+            "range": "± 3731",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13241,
+            "range": "± 1112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 938684,
+            "range": "± 15934",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29171837,
+            "range": "± 132600",
             "unit": "ns/iter"
           }
         ]
