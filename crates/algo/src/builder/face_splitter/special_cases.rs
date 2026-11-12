@@ -4331,6 +4331,7 @@ pub(super) fn split_face_with_internal_loops(
     // Group edges into closed loops by chaining: edge.end_3d approx next.start_3d.
     let mut used = vec![false; forward_edges.len()];
     let mut loops: Vec<Vec<OrientedPCurveEdge>> = Vec::new();
+    let mut open_chains: Vec<(Point3, Point3)> = Vec::new();
 
     for start_idx in 0..forward_edges.len() {
         if used[start_idx] {
@@ -4384,7 +4385,24 @@ pub(super) fn split_face_with_internal_loops(
         let chain_end = chain.last().map_or(loop_start_3d, |e| e.end_3d);
         if !chain.is_empty() && (chain_end - loop_start_3d).length() < tol_3d * 100.0 {
             loops.push(chain);
+        } else if !chain.is_empty() {
+            open_chains.push((loop_start_3d, chain_end));
         }
+    }
+    // An open chain meeting a loop's vertex is part of a chord across it,
+    // or of the loop the chaining closed the other way (a tool's two faces
+    // flush on a B-spline wall, the edge between them): the loops alone
+    // would drop it, and the pieces on either side would not match the
+    // faces lying on them. The general splitter takes it.
+    let on_loop = |p: Point3| {
+        loops
+            .iter()
+            .flatten()
+            .any(|e| (e.start_3d - p).length() < tol_3d * 100.0)
+    };
+    if open_chains.iter().any(|&(a, b)| on_loop(a) || on_loop(b)) {
+        log::debug!("split_face_with_internal_loops: face {face_id:?} has a chord across a loop");
+        return None;
     }
 
     log::debug!(

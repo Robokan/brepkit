@@ -376,6 +376,7 @@ pub fn fill_images_faces<S: BuildHasher, S2: BuildHasher>(
         // route it through the split that adopts the shared edges.
         let sections =
             drop_boundary_duplicates_beside_real_sections(topo, face_id, sections, tol.linear);
+        let sections = drop_sections_covered_by_others(topo, face_id, sections);
         log::debug!(
             "fill_images_faces: face {:?} has_sections={} sections={}",
             face_id,
@@ -2912,18 +2913,37 @@ fn build_section_edges(
                                 // pair parts, while the coplanar phase does
                                 // for planes.
                                 let curved = !matches!(face.surface(), FaceSurface::Plane { .. });
+                                // So is a run along the opposing face's edge
+                                // where that face itself lies on this one (a
+                                // tool's B-spline side flush on a part's
+                                // wall): its outline is where the wall parts.
+                                let of_on_this = match (
+                                    face.surface(),
+                                    topo.face(of).map(brepkit_topology::face::Face::surface),
+                                ) {
+                                    (FaceSurface::Nurbs(this), Ok(FaceSurface::Nurbs(other))) => {
+                                        crate::builder::same_domain::nurbs_patch_lies_on(
+                                            this,
+                                            other,
+                                            &this.aabb(),
+                                            &other.aabb(),
+                                        )
+                                    }
+                                    _ => false,
+                                };
                                 let across_on_this = |e: EdgeId| {
-                                    curved
-                                        && adjacency.get(topo).is_some_and(|adj| {
-                                            face_across_lies_on(
-                                                topo,
-                                                adj,
-                                                e,
-                                                of,
-                                                face.surface(),
-                                                op_tol,
-                                            )
-                                        })
+                                    of_on_this
+                                        || curved
+                                            && adjacency.get(topo).is_some_and(|adj| {
+                                                face_across_lies_on(
+                                                    topo,
+                                                    adj,
+                                                    e,
+                                                    of,
+                                                    face.surface(),
+                                                    op_tol,
+                                                )
+                                            })
                                 };
                                 clip_line_to_face_boundary(
                                     topo,
@@ -3392,6 +3412,70 @@ fn section_on_existing_boundary(
 
 /// `sections` less those duplicating one of a curved face's outer-wire edges
 /// end to end, when at least one section is not such a duplicate.
+/// On a B-spline face, a section every point of which lies on the other
+/// sections (the same edge reached from two face pairs, or an edge and the
+/// same curve in two pieces) is dropped: a tool's outline flush on a part's
+/// B-spline wall arrives once from each face it bounds and again from the
+/// planes meeting it, and the loops through the copies never close.
+fn drop_sections_covered_by_others(
+    topo: &Topology,
+    face_id: FaceId,
+    mut sections: Vec<SectionEdge>,
+) -> Vec<SectionEdge> {
+    const GAP: f64 = 1e-5;
+    if !topo
+        .face(face_id)
+        .is_ok_and(|f| matches!(f.surface(), FaceSurface::Nurbs(_)))
+        || sections.len() < 2
+    {
+        return sections;
+    }
+    let at = |sec: &SectionEdge, t: f64| {
+        let (t0, t1) = sec.curve_3d.domain_with_endpoints(sec.start, sec.end);
+        sec.curve_3d
+            .evaluate_with_endpoints(t0 + (t1 - t0) * t, sec.start, sec.end)
+    };
+    let gap = |sec: &SectionEdge, p: Point3| -> f64 {
+        const N: u32 = 64;
+        let (mut best, mut k_best) = (f64::INFINITY, 0);
+        for k in 0..=N {
+            let d = (at(sec, f64::from(k) / f64::from(N)) - p).length();
+            if d < best {
+                (best, k_best) = (d, k);
+            }
+        }
+        let (mut lo, mut hi) = (
+            f64::from(k_best.saturating_sub(1)) / f64::from(N),
+            f64::from((k_best + 1).min(N)) / f64::from(N),
+        );
+        for _ in 0..60 {
+            let (a, b) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+            if (at(sec, a) - p).length() <= (at(sec, b) - p).length() {
+                hi = b;
+            } else {
+                lo = a;
+            }
+        }
+        best.min((at(sec, 0.5 * (lo + hi)) - p).length())
+    };
+    let mut i = 0;
+    while i < sections.len() {
+        let covered = (0..=8).all(|k| {
+            let p = at(&sections[i], f64::from(k) / 8.0);
+            sections
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && gap(other, p) <= GAP)
+        }) && (sections[i].start - sections[i].end).length() > GAP;
+        if covered {
+            sections.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    sections
+}
+
 fn drop_boundary_duplicates_beside_real_sections(
     topo: &Topology,
     face_id: FaceId,
@@ -4308,6 +4392,19 @@ fn clip_line_to_face_boundary(
 
     if let Some(inside) = ruling_inside_band(topo, face, line_start, line_end, tol) {
         return inside.then(|| vec![(line_start, line_end)]);
+    }
+    // A line lying on a B-spline face, inside its outline in (u, v) (a
+    // tool's edge flush on a part's wall): the chord clip below reads the
+    // face's outline in 3D, which a curved wall's is not.
+    if matches!(face.surface(), FaceSurface::Nurbs(_))
+        && let Some(loops) = face_loops.get(topo, face_id)
+        && (1..8).all(|k| {
+            let p = line_start + (line_end - line_start) * (f64::from(k) / 8.0);
+            loops.distance_to_surface(p).is_some_and(|d| d <= 1e-6)
+                && loops.to_uv(p).is_some_and(|q| loops.contains(q))
+        })
+    {
+        return Some(vec![(line_start, line_end)]);
     }
 
     // Collect boundary edges as line segments (vertex positions in traversal
