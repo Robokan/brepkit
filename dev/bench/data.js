@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794523277727,
+  "lastUpdate": 1794527073298,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4103,6 +4103,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 21988851,
             "range": "± 52005",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "ba73527ddca1987f03f76855853f38245a527e2a",
+          "message": "docs(buzzcad): chamfers into inside corners, onto slanted ends, across whole faces and two-distance flat bevels; #2381-#2384 in flight\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T15:41:09-08:00",
+          "tree_id": "78f6c60f2741012f9823b8ad31c95c0fc3da0554",
+          "url": "https://github.com/Robokan/brepkit/commit/ba73527ddca1987f03f76855853f38245a527e2a"
+        },
+        "date": 1794527072962,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1120269,
+            "range": "± 1427",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1217125,
+            "range": "± 5551",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13498,
+            "range": "± 1278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 937407,
+            "range": "± 39931",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29203710,
+            "range": "± 366223",
             "unit": "ns/iter"
           }
         ]
