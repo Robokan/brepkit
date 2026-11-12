@@ -4827,6 +4827,69 @@ pub(super) fn split_face_with_internal_loops(
             }
         }
     }
+    // On a cylinder or cone wall a loop that does not wind the axis lies
+    // in one stretch of `(u, v)`: laid out about one `u`, the loops nest as
+    // they would on a plane (a ring standing on the wall: its bore's section
+    // inside its outer wall's).
+    if matches!(surface, FaceSurface::Cylinder(_) | FaceSurface::Cone(_))
+        && parent_loop.iter().all(Option::is_none)
+    {
+        let raw: Vec<Vec<(f64, f64)>> = loops
+            .iter()
+            .map(|l| {
+                if loop_winds_cylinder(surface, l) {
+                    return Vec::new();
+                }
+                sample_edges_3d(l)
+                    .iter()
+                    .filter_map(|p| surface.project_point(*p))
+                    .collect()
+            })
+            .collect();
+        if let Some(&(u0, _)) = raw.iter().find_map(|l| l.first()) {
+            let near = |u: f64| {
+                u0 + (u - u0 + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+                    - std::f64::consts::PI
+            };
+            let polygons: Vec<Vec<Point2>> = raw
+                .iter()
+                .map(|l| l.iter().map(|&(u, v)| Point2::new(near(u), v)).collect())
+                .collect();
+            let area = |poly: &[Point2]| -> f64 {
+                poly.iter()
+                    .zip(poly.iter().cycle().skip(1))
+                    .map(|(a, b)| a.x() * b.y() - b.x() * a.y())
+                    .sum::<f64>()
+                    .abs()
+            };
+            for lj in 0..loops.len() {
+                if polygons[lj].len() < 3 {
+                    continue;
+                }
+                let mut best: Option<(f64, usize)> = None;
+                for li in 0..loops.len() {
+                    if li == lj || polygons[li].len() < 3 {
+                        continue;
+                    }
+                    let inside = polygons[lj]
+                        .iter()
+                        .all(|p| super::super::classify_2d::point_in_polygon_2d(*p, &polygons[li]));
+                    if inside {
+                        let a = area(&polygons[li]);
+                        if best.is_none_or(|(ba, _)| a < ba) {
+                            best = Some((a, li));
+                        }
+                    }
+                }
+                if let Some((_, li)) = best {
+                    log::debug!(
+                        "split_face_with_internal_loops: face {face_id:?} loop {li} encloses loop {lj} on the wall"
+                    );
+                    parent_loop[lj] = Some(li);
+                }
+            }
+        }
+    }
     let into_solid = |p: Point3| -> Point3 {
         match surface {
             FaceSurface::Plane { normal, .. } => {
