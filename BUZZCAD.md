@@ -55,6 +55,60 @@ holds:
 - the inputs and Open CASCADE's result, in Open CASCADE's binary format;
 - the operation's parameters, and the edges or faces that were picked.
 
+## Order of work
+
+Work through the queue in this order. It is the order in the corpus's
+`buzzcad-corpus/PRIORITIES.md`, which numbers the families. If the two
+disagree, the user's latest word wins; update both.
+
+1. **What Open CASCADE fails, where brepkit's result is the only one
+   BuzzCAD has.** BuzzCAD hands brepkit every fillet and chamfer Open
+   CASCADE fails (`engine.fillet_rescue`, `engine.chamfer_rescue`):
+   - **#15, fillets.** These are mostly steps of the user's third-engine
+     designs that do not rebuild.
+   - **#17, chamfers.**
+2. **Silently wrong results.** brepkit returns a valid solid that is the
+   wrong part:
+   - #2, imported bodies measured wrong;
+   - #3, booleans;
+   - #4, fillets.
+3. **#5, booleans that fall back to a mesh.** Open CASCADE makes these, so
+   they wait, but they are most of brepkit's failures and of its time.
+4. **Speed:** S1, S2, S3, S5, S6, S4. The speed agent's brief is
+   [SPEED.md](SPEED.md).
+5. **The rest of PRIORITIES.md's table**, top down.
+
+Within a family, fix silently wrong results first, then failures, then
+face counts. Skip rows marked fixed or in progress.
+
+Each fix goes round the same cycle:
+
+1. **Bring main up to date.** Merge `upstream/main` into main before a
+   session of fixes, and fetch `origin/main` and merge the speed agent's
+   commits before every replay.
+2. **Pick the bug** from `buzzcad-corpus/PRIORITIES.md`, in the order
+   above.
+3. **Fix it.** Reproduce it in Rust, write a regression test that fails
+   without the fix, then make the fix.
+4. **Verify it:**
+   - the five crates' tests (algo, operations, blend, io, topology), the
+     pose sweep and the truth audit, against main before the fix;
+   - clippy and fmt;
+   - rebuild the bridge;
+   - a replay with no regressions (timeouts rerun alone at 300 s);
+   - BuzzCAD's two tests (step 5 of the loop below).
+5. **Record it:** a progress row in this file, a note in PRIORITIES.md,
+   then `./scripts/sync-buzzcad-corpus.sh`.
+6. **Check it in:** commit and push brepkit's main, and BuzzCAD if it
+   changed. Before pushing main, check that the commit the user said to
+   keep off it is not in its history.
+7. **Send it upstream:** cherry-pick the fix onto a branch off
+   `upstream/main`, test that branch on its own, and run the text checks
+   (see "Sending fixes upstream"). Then push the branch, open the PR and
+   bind it.
+8. **Follow up:** answer review comments. When the maintainer lands it,
+   merge upstream back into main. Then take the next bug.
+
 ## The loop
 
 Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`.
@@ -95,8 +149,8 @@ Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`
    .venv/bin/python tools/brepkit_corpus/record_examples.py
    ```
 
-3. **Pick the next problem and reproduce it here in Rust.** Take it from
-   the corpus's work queue, `buzzcad-corpus/PRIORITIES.md`: the top open
+3. **Pick the next problem and reproduce it here in Rust.** Follow "Order of work" above. Take it
+   from the corpus's work queue, `buzzcad-corpus/PRIORITIES.md`: the top open
    family first (it ranks silently wrong results, then failures, then face
    counts, by how often each hits real work), and mark the family in
    progress or fixed there when you commit. If the queue is empty or older
