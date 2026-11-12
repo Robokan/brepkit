@@ -64,6 +64,13 @@ In order:
 Pick by measuring, not by this list: profile the slowest cases first and go
 where the time is.
 
+The corpus also keeps a speed queue: the "Speed" section of
+`buzzcad-corpus/PRIORITIES.md` (S1 to S6: spline extrudes and revolves,
+boolean time growing with face count, the bridge's result checks, chamfers,
+sphere meshes finer than asked, and one kernel call at a time). Take work
+from it as the fix agent takes it from the families above it, mark a row in
+progress or fixed there when you commit, and add rows for what you find.
+
 ## What counts as a speedup
 
 A speed change is accepted only when **every result stays the same**:
@@ -107,6 +114,14 @@ instead of recomputed) are the safe kind.
 - **One case, with its log:** `crates/io/examples/corpus_case.rs <case dir>`
   (`LOG=debug` for brepkit's log; it prints which path a boolean took and
   how long the exact attempt ran before giving up).
+- **The whole corpus, by tier:** `buzzcad-corpus/tools/profile_corpus.py`
+  (run from `../BuzzCAD` with its `.venv/bin/python`) classifies every case
+  by the surfaces it works on (tier A planes only to D freeform), times
+  brepkit and Open CASCADE one case at a time, and reports where the time
+  goes; the speed queue's numbers come from it. For numbers to trust:
+  `--times-only --redo --jobs 1` on a quiet machine. Its report goes outside
+  the repositories and must not be published (it holds the third engine's
+  times).
 - **The replay's own timing:**
   `replay.py --speed N` times the booleans one case at a time, the median
   of N runs each, and adds a speed section to the report.
