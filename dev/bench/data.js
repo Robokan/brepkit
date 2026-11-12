@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794503960749,
+  "lastUpdate": 1794508354295,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3779,6 +3779,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29202054,
             "range": "± 101951",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "8a1bbd924bbf77e945970243f97c575fdb22a8d4",
+          "message": "docs(buzzcad): progress on the pinched side face and the notch hull\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T10:29:40-08:00",
+          "tree_id": "fbafef99f3a4b458304a7d4989850e572bb43c60",
+          "url": "https://github.com/Robokan/brepkit/commit/8a1bbd924bbf77e945970243f97c575fdb22a8d4"
+        },
+        "date": 1794508353504,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 628182,
+            "range": "± 1612",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 702870,
+            "range": "± 33054",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8259,
+            "range": "± 100",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 556116,
+            "range": "± 19443",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 17306268,
+            "range": "± 150494",
             "unit": "ns/iter"
           }
         ]
