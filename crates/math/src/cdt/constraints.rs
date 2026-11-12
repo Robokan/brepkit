@@ -1,5 +1,6 @@
 use crate::MathError;
 use crate::predicates::orient2d;
+use crate::vec::Point2;
 
 use super::{Cdt, segment_intersection_point, segments_properly_intersect, sorted_pair};
 
@@ -412,6 +413,17 @@ impl Cdt {
     fn flip_any_crossing_edge(&mut self, v0: usize, v1: usize) {
         let p0 = self.vertices[v0];
         let p1 = self.vertices[v1];
+        // An edge whose box lies wholly to one side of the segment's cannot
+        // cross it (the crossing test is exact), so most edges are passed
+        // over before the crossing test and the constraint lookup.
+        let (lo_x, hi_x) = (p0.x().min(p1.x()), p0.x().max(p1.x()));
+        let (lo_y, hi_y) = (p0.y().min(p1.y()), p0.y().max(p1.y()));
+        let apart = |a: Point2, b: Point2| {
+            a.x().max(b.x()) < lo_x
+                || a.x().min(b.x()) > hi_x
+                || a.y().max(b.y()) < lo_y
+                || a.y().min(b.y()) > hi_y
+        };
         for ti in 0..self.triangles.len() {
             if self.triangles[ti].removed {
                 continue;
@@ -422,8 +434,10 @@ impl Cdt {
                 if ea == v0 || ea == v1 || eb == v0 || eb == v1 {
                     continue;
                 }
-                if self.constraints.contains(&sorted_pair(ea, eb))
-                    || !segments_properly_intersect(p0, p1, self.vertices[ea], self.vertices[eb])
+                let (pa, pb) = (self.vertices[ea], self.vertices[eb]);
+                if apart(pa, pb)
+                    || !segments_properly_intersect(p0, p1, pa, pb)
+                    || self.constraints.contains(&sorted_pair(ea, eb))
                 {
                     continue;
                 }
