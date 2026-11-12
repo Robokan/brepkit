@@ -240,8 +240,10 @@ fn main() {
     let dir = Path::new(&dir);
     let case: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("case.json")).unwrap()).unwrap();
+    // A chamfer case runs the blend engine's chamfer, its length on both faces.
+    let chamfer = case["op"].as_str() == Some("chamfer");
     let radius = std::env::args().nth(2).map_or_else(
-        || json_f64(&case["params"]["radius"]),
+        || json_f64(&case["params"][if chamfer { "length" } else { "radius" }]),
         |r| r.parse().unwrap(),
     );
     let mut topo = Topology::new();
@@ -518,7 +520,22 @@ fn main() {
         edges.reverse();
     }
     let t = std::time::Instant::now();
-    match brepkit_operations::blend_ops::fillet_v2(&mut topo, sid, &edges, radius) {
+    // FLAT=1 runs `chamfer::chamfer`, as the bridge does for an equal chamfer.
+    let built = if chamfer && std::env::var("FLAT").is_ok() {
+        brepkit_operations::chamfer::chamfer(&mut topo, sid, &edges, radius).map(|solid| {
+            brepkit_blend::BlendResult {
+                solid,
+                succeeded: edges.clone(),
+                failed: Vec::new(),
+                is_partial: false,
+            }
+        })
+    } else if chamfer {
+        brepkit_operations::blend_ops::chamfer_v2(&mut topo, sid, &edges, radius, radius)
+    } else {
+        brepkit_operations::blend_ops::fillet_v2(&mut topo, sid, &edges, radius)
+    };
+    match built {
         Err(e) => println!("fillet r={radius}: error: {e}"),
         Ok(r) => {
             for (eid, why) in &r.failed {
