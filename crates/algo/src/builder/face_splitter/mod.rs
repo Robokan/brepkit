@@ -6797,7 +6797,12 @@ fn split_face_2d_impl(
                 !matches!(e.curve_3d, EdgeCurve::Line)
                     && (e.start_3d - e.end_3d).length() < tol.linear * 100.0
             });
-            if edges.is_empty() || (iw_pts.len() < 3 && !has_closed_curve) {
+            // Two vertices bound an area too when an edge between them is
+            // curved (a D-shaped hole: its flat and its arc).
+            let curved_pair = iw_pts.len() == 2
+                && edges.len() >= 2
+                && edges.iter().any(|e| !edge_curve_is_straight(&e.curve_3d));
+            if edges.is_empty() || (iw_pts.len() < 3 && !has_closed_curve && !curved_pair) {
                 None
             } else {
                 Some(edges)
