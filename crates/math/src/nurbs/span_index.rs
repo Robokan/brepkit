@@ -148,13 +148,8 @@ impl SpanIndex {
             stack.push((span.u, span.v, 0));
             while let Some((u, v, depth)) = stack.pop() {
                 let mid = (f64::midpoint(u.0, u.1), f64::midpoint(v.0, v.1));
-                let ders = surface.derivatives(mid.0, mid.1, 1);
-                let p = ders[0][0];
-                let reach = REACH
-                    * 0.5
-                    * ders[1][0]
-                        .length()
-                        .mul_add(u.1 - u.0, ders[0][1].length() * (v.1 - v.0));
+                let (p, su, sv) = surface.first_derivatives(mid.0, mid.1);
+                let reach = REACH * 0.5 * su.length().mul_add(u.1 - u.0, sv.length() * (v.1 - v.0));
                 if off_line(Point3::new(p.x(), p.y(), p.z())) > reach + 1e-9 * self.scale.max(1.0) {
                     continue;
                 }
@@ -353,10 +348,8 @@ impl SpanIndex {
         let mut t = (p - origin).dot(dir) / dd;
         let tol = 1e-12 * self.scale.max(1.0);
         for _ in 0..MAX_ITER {
-            let ders = surface.derivatives(u, v, 1);
-            let p = ders[0][0];
+            let (p, su, sv) = surface.first_derivatives(u, v);
             let r = Point3::new(p.x(), p.y(), p.z()) - (origin + dir * t);
-            let (su, sv) = (ders[1][0], ders[0][1]);
             let back = -dir;
             let det = su.dot(sv.cross(back));
             let size = su.length() * sv.length() * dir.length();
@@ -397,10 +390,8 @@ fn closest_from(
     let (mut u, mut v) = start;
     let gap = |u: f64, v: f64| (surface.evaluate(u, v) - p).length();
     for _ in 0..MAX_ITER {
-        let ders = surface.derivatives(u, v, 1);
-        let s = ders[0][0];
+        let (s, su, sv) = surface.first_derivatives(u, v);
         let r = Vec3::new(s.x() - p.x(), s.y() - p.y(), s.z() - p.z());
-        let (su, sv) = (ders[1][0], ders[0][1]);
         let (a11, a12, a22) = (su.dot(su), su.dot(sv), sv.dot(sv));
         let (b1, b2) = (-su.dot(r), -sv.dot(r));
         let det = a11.mul_add(a22, -(a12 * a12));
