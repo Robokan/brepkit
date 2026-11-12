@@ -71,6 +71,37 @@ sphere meshes finer than asked, and one kernel call at a time). Take work
 from it as the fix agent takes it from the families above it, mark a row in
 progress or fixed there when you commit, and add rows for what you find.
 
+## The loop
+
+One change at a time, each taken all the way through, as the fix agent
+takes a fix (BUZZCAD.md, "The loop"):
+
+1. **Bring main up to date.** Merge `upstream/main` and `origin/main` (the
+   fix agent's pushes) into main before starting, and again before every
+   replay.
+2. **Pick the work.** From the Speed section of
+   `buzzcad-corpus/PRIORITIES.md` (S1 to S6) and from profiling the slowest
+   cases (see "How to measure").
+3. **Make the change.** Its test is proof that nothing changed: against the
+   old algorithm bit for bit where it can be, and the slow cases' outputs
+   compared before and after.
+4. **Verify** it as "What counts as a speedup" says: the tests, the pose
+   sweep and the truth audit, clippy and fmt, the bridge rebuilt, the time
+   one case at a time before and after, a full replay with no status
+   changed but timeouts (each flip rerun alone at 300 s), BuzzCAD's two
+   tests.
+5. **Record it.** A row in "Progress" below, a note on the Speed queue in
+   PRIORITIES.md, then `scripts/sync-buzzcad-corpus.sh`.
+6. **Check in.** Commit and push brepkit main, and BuzzCAD if it changed.
+   Fetch and merge first, so the tree pushed is the tree tested.
+7. **Send it upstream** at once, not in a batch ("Rules", Upstream):
+   cherry-pick onto a branch off `upstream/main`, test that branch alone,
+   run the banned-name grep and `scripts/check-pr-text.sh`, push the branch
+   to `origin`, open the PR against `andymai/brepkit` and bind it. A change
+   to code only this fork has stays here.
+8. **Follow up.** Answer review comments; when the maintainer lands it,
+   merge upstream back into main, then start the next change.
+
 ## What counts as a speedup
 
 A speed change is accepted only when **every result stays the same**:
