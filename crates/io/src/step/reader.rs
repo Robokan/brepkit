@@ -776,13 +776,18 @@ impl<'a> StepBuilder<'a> {
             }
         };
 
-        let surface = match surface {
-            FaceSurface::Sphere(sphere) => {
-                FaceSurface::Sphere(self.sphere_frame_for(sphere, outer, &inner_wires)?)
+        // A cap written as its rim and a seam run out to a pole and back reads
+        // as one written with a vertex loop at that pole: the rim alone.
+        let (outer, cap_pole) = match (&surface, loop_vertex) {
+            (FaceSurface::Sphere(sphere), None) if inner_wires.is_empty() => {
+                match self.cap_rim_and_spur(sphere, outer)? {
+                    Some((rim, pole)) => (rim, Some(pole)),
+                    None => (outer, None),
+                }
             }
-            surface => surface,
+            _ => (outer, None),
         };
-        let surface = match (surface, loop_vertex) {
+        let surface = match (surface, loop_vertex.or(cap_pole)) {
             (FaceSurface::Sphere(sphere), Some(pole)) if inner_wires.is_empty() => {
                 FaceSurface::Sphere(self.sphere_about_cap(sphere, outer, pole)?)
             }
@@ -809,42 +814,6 @@ impl<'a> StepBuilder<'a> {
         Ok(face_id)
     }
 
-    /// A sphere keeps the file's frame when the face's circles fit it: each a
-    /// latitude (about the frame's axis) or a meridian (through its poles).
-    /// Then its rims and seam lie on the `(u, v)` grid. A face cut from a
-    /// turned sphere by some other circle (a hemisphere whose rim is no
-    /// latitude of the frame it was written in) takes the sphere's default
-    /// frame, about `+Z`, as before: the file's frame only turns its rim
-    /// further from the grid, and its seam on to a meridian its rim crosses.
-    fn sphere_frame_for(
-        &self,
-        sphere: brepkit_math::surfaces::SphericalSurface,
-        outer: brepkit_topology::wire::WireId,
-        inner: &[brepkit_topology::wire::WireId],
-    ) -> Result<brepkit_math::surfaces::SphericalSurface, IoError> {
-        let (center, radius, axis) = (sphere.center(), sphere.radius(), sphere.z_axis());
-        let tol = 1e-6 * radius;
-        let mut circles = 0_usize;
-        for &wire in std::iter::once(&outer).chain(inner) {
-            for oe in self.topo.wire(wire)?.edges() {
-                let EdgeCurve::Circle(circle) = self.topo.edge(oe.edge())?.curve() else {
-                    continue;
-                };
-                let (n, off) = (circle.normal(), circle.center() - center);
-                let latitude = n.cross(axis).length() <= 1e-6 && off.cross(axis).length() <= tol;
-                let meridian = n.dot(axis).abs() <= 1e-6 && off.length() <= tol;
-                if !(latitude || meridian) {
-                    return Self::default_sphere(center, radius);
-                }
-                circles += 1;
-            }
-        }
-        if circles > 0 {
-            return Ok(sphere);
-        }
-        Self::default_sphere(center, radius)
-    }
-
     fn default_sphere(
         center: Point3,
         radius: f64,
@@ -854,6 +823,59 @@ impl<'a> StepBuilder<'a> {
                 reason: format!("sphere: {e}"),
             }
         })
+    }
+
+    /// A loop of one closed circle and one edge run out from its vertex and
+    /// back (a cap's seam, written up to a pole of the frame the file chose):
+    /// the loop of the circle alone, and the spur's far end. The spur bounds
+    /// no area, and off the frame brepkit gives the sphere it is no seam.
+    /// `None` too for a rim that is a latitude of the file's frame.
+    fn cap_rim_and_spur(
+        &mut self,
+        sphere: &brepkit_math::surfaces::SphericalSurface,
+        outer: brepkit_topology::wire::WireId,
+    ) -> Result<
+        Option<(
+            brepkit_topology::wire::WireId,
+            brepkit_topology::vertex::VertexId,
+        )>,
+        IoError,
+    > {
+        let edges = self.topo.wire(outer)?.edges().to_vec();
+        if edges.len() != 3 {
+            return Ok(None);
+        }
+        for k in 0..3 {
+            let rim = edges[k];
+            let (a, b) = (edges[(k + 1) % 3], edges[(k + 2) % 3]);
+            if a.edge() != b.edge() || a.is_forward() == b.is_forward() || rim.edge() == a.edge() {
+                continue;
+            }
+            let rim_edge = self.topo.edge(rim.edge())?;
+            let EdgeCurve::Circle(circle) = rim_edge.curve() else {
+                continue;
+            };
+            if rim_edge.start() != rim_edge.end() {
+                continue;
+            }
+            // A rim that is a latitude of the file's frame already lies on
+            // the grid, its seam on the frame's own: the cap reads as written.
+            if circle.normal().cross(sphere.z_axis()).length() <= 1e-9 {
+                return Ok(None);
+            }
+            let at = rim_edge.start();
+            let spur = self.topo.edge(a.edge())?;
+            let pole = match (spur.start() == at, spur.end() == at) {
+                (true, false) => spur.end(),
+                (false, true) => spur.start(),
+                _ => continue,
+            };
+            let wire = Wire::new(vec![rim], true).map_err(|e| IoError::ParseError {
+                reason: format!("sphere cap rim: {e}"),
+            })?;
+            return Ok(Some((self.topo.add_wire(wire), pole)));
+        }
+        Ok(None)
     }
 
     /// A sphere face bounded by one circle and a vertex loop is the cap on
@@ -3497,9 +3519,11 @@ mod tests {
         )
     }
 
-    /// The axis of the sphere a hemisphere reads on, after checking that it
-    /// reads as the hemisphere.
-    fn hemisphere_axis(step: &str) -> Vec3 {
+    /// The axis of the sphere a hemisphere reads on and the number of edge
+    /// uses in its sphere face's loop, after checking that it reads as the
+    /// hemisphere and that cutting off its bottom (below z = -1) leaves the
+    /// slab.
+    fn hemisphere_axis(step: &str) -> (Vec3, usize) {
         let mut topo = Topology::new();
         let solids = read_step(step, &mut topo).unwrap();
         assert_eq!(solids.len(), 1);
@@ -3508,44 +3532,62 @@ mod tests {
         let half = 16.0 * std::f64::consts::PI / 3.0;
         let volume = brepkit_operations::measure::solid_volume(&topo, solids[0], 0.001).unwrap();
         assert!((volume - half).abs() < 1e-3 * half, "{volume} vs {half}");
-        brepkit_topology::explorer::solid_faces(&topo, solids[0])
+        let (axis, rim) = brepkit_topology::explorer::solid_faces(&topo, solids[0])
             .unwrap()
             .into_iter()
-            .find_map(|f| match topo.face(f).unwrap().surface() {
-                FaceSurface::Sphere(sphere) => Some(sphere.z_axis()),
-                _ => None,
+            .find_map(|f| {
+                let face = topo.face(f).unwrap();
+                match face.surface() {
+                    FaceSurface::Sphere(sphere) => Some((
+                        sphere.z_axis(),
+                        topo.wire(face.outer_wire()).unwrap().edges().len(),
+                    )),
+                    _ => None,
+                }
             })
-            .unwrap()
+            .unwrap();
+
+        let block = brepkit_operations::primitives::make_box(&mut topo, 6.0, 6.0, 2.0).unwrap();
+        let shift = brepkit_math::mat::Mat4::translation(-3.0, -3.0, -3.0);
+        brepkit_operations::transform::transform_solid(&mut topo, block, &shift).unwrap();
+        let slab = brepkit_operations::boolean::boolean(
+            &mut topo,
+            brepkit_operations::boolean::BooleanOp::Cut,
+            solids[0],
+            block,
+        )
+        .unwrap();
+        let report = brepkit_operations::validate::validate_solid(&topo, slab).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        // pi times the integral of 4 - z^2 over -1..0.
+        let want = 11.0 * std::f64::consts::PI / 3.0;
+        let volume = brepkit_operations::measure::solid_volume(&topo, slab, 0.001).unwrap();
+        assert!((volume - want).abs() < 1e-3 * want, "{volume} vs {want}");
+        (axis, rim)
     }
 
-    /// A sphere keeps its file's frame where the face's circles are its
-    /// latitudes and meridians. A hemisphere whose rim is no latitude of the
-    /// frame it was written in (a turned ball cut in half) reads about `+Z`
-    /// as before: read in that frame, its rim lay off the `(u, v)` grid and
-    /// booleans with it fell back to the mesh.
+    /// A hemisphere written as its rim and a seam run down to the pole of
+    /// the frame its sphere is written in, out and back, reads as a cap about
+    /// its rim's axis, the rim alone its loop: the rim is then the sphere's
+    /// equator. Read in a frame its rim is no latitude of, its rim lay off
+    /// the `(u, v)` grid and a ball's mirror image cut differently from it.
+    /// A rim already a latitude keeps the file's frame and its seam.
     #[test]
-    fn a_sphere_keeps_its_file_s_frame_where_its_rims_fit_it() {
-        // Turned: a = (0, 0.6, 0.8), the seam its meridian through (2, 0, 0)
-        // down to its pole -2a.
-        let turned = hemisphere_axis(&hemisphere_step(
-            [0.0, 0.6, 0.8],
-            [0.0, 0.8, -0.6],
-            [0.0, -1.2, -1.6],
-        ));
-        assert!(
-            (turned - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-9,
-            "{turned:?}"
-        );
-        // About -Z, the rim its equator and the seam its meridian: kept.
-        let fitted = hemisphere_axis(&hemisphere_step(
-            [0.0, 0.0, -1.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, -2.0],
-        ));
-        assert!(
-            (fitted - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-9,
-            "{fitted:?}"
-        );
+    fn a_hemisphere_s_seam_to_its_frame_s_pole_reads_as_a_cap() {
+        for (axis, seam, pole, uses) in [
+            // Turned: a = (0, 0.6, 0.8), the seam its meridian through
+            // (2, 0, 0) down to its pole -2a.
+            ([0.0, 0.6, 0.8], [0.0, 0.8, -0.6], [0.0, -1.2, -1.6], 1),
+            // About -Z, the rim its equator and the seam its meridian.
+            ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [0.0, 0.0, -2.0], 3),
+        ] {
+            let (read, rim) = hemisphere_axis(&hemisphere_step(axis, seam, pole));
+            assert!(
+                (read - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-9,
+                "{axis:?}: {read:?}"
+            );
+            assert_eq!(rim, uses, "{axis:?}");
+        }
     }
 
     /// A ball cut by a tilted plane, its sphere face written with the
