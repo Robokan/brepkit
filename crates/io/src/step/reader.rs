@@ -1366,13 +1366,23 @@ impl<'a> StepBuilder<'a> {
                 ))
             }
             EdgeCurve::NurbsCurve(curve) => Ok((Extrusion::Spline(curve, along), false)),
-            EdgeCurve::Line | EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => {
-                Err(IoError::UnsupportedEntity {
-                    entity: format!(
-                        "SURFACE_OF_LINEAR_EXTRUSION #{surface_ref} of this curve and direction"
-                    ),
-                })
-            }
+            // An elliptic cylinder, or a circle swept aslant: the conic as its
+            // exact rational B-spline, swept as a spline is.
+            EdgeCurve::Ellipse(e) => conic_nurbs(|t| e.evaluate(t))
+                .map(|curve| (Extrusion::Spline(curve, along), false))
+                .map_err(|e| IoError::ParseError {
+                    reason: format!("SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: {e}"),
+                }),
+            EdgeCurve::Circle(c) => conic_nurbs(|t| c.evaluate(t))
+                .map(|curve| (Extrusion::Spline(curve, along), false))
+                .map_err(|e| IoError::ParseError {
+                    reason: format!("SURFACE_OF_LINEAR_EXTRUSION #{surface_ref}: {e}"),
+                }),
+            EdgeCurve::Line => Err(IoError::UnsupportedEntity {
+                entity: format!(
+                    "SURFACE_OF_LINEAR_EXTRUSION #{surface_ref} of this curve and direction"
+                ),
+            }),
         }
     }
 
@@ -1888,6 +1898,44 @@ fn conic_height_span(h0: f64, a: f64, b: f64, (t0, t1): (f64, f64)) -> (f64, f64
         }
     }
     span
+}
+
+/// A whole circle or ellipse, given by its point at each angle, as the
+/// rational quadratic B-spline of its four quarters: it passes the conic's
+/// points at angles 0, a quarter, a half and three quarters of a turn at
+/// knots of those values, so its seam stays where the conic's starts.
+fn conic_nurbs(
+    at: impl Fn(f64) -> Point3,
+) -> Result<brepkit_math::nurbs::NurbsCurve, brepkit_math::MathError> {
+    use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, PI, TAU};
+    let quarter: Vec<Point3> = (0..4).map(|k| at(f64::from(k) * FRAC_PI_2)).collect();
+    let centre = quarter[0] + (quarter[2] - quarter[0]) * 0.5;
+    let mut control_points = Vec::with_capacity(9);
+    let mut weights = Vec::with_capacity(9);
+    for k in 0..4 {
+        let (p, q) = (quarter[k], quarter[(k + 1) % 4]);
+        control_points.push(p);
+        weights.push(1.0);
+        control_points.push(p + (q - centre));
+        weights.push(FRAC_1_SQRT_2);
+    }
+    control_points.push(quarter[0]);
+    weights.push(1.0);
+    let knots = vec![
+        0.0,
+        0.0,
+        0.0,
+        FRAC_PI_2,
+        FRAC_PI_2,
+        PI,
+        PI,
+        3.0 * FRAC_PI_2,
+        3.0 * FRAC_PI_2,
+        TAU,
+        TAU,
+        TAU,
+    ];
+    brepkit_math::nurbs::NurbsCurve::new(2, knots, control_points, weights)
 }
 
 /// `curve` swept along unit `along` far enough to cover heights `lo..=hi`
