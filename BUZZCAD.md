@@ -6,6 +6,9 @@ parametric CAD app for robots. BuzzCAD records every modeling operation it
 does with Open CASCADE. Your job is to take the newest recordings, find
 where brepkit gets those operations wrong, and fix brepkit.
 
+A second agent may work on speed alone, on another machine: its brief is
+[SPEED.md](SPEED.md).
+
 ## How the pieces fit
 
 ```
