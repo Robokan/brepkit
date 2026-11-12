@@ -11223,7 +11223,15 @@ fn plane_internal_line_loops(
                     && (s.start + d * t - p).length() <= margin
             })
     });
-    if through_hole {
+    // So does a loop that meets a hole at its vertices (a disc whose rim
+    // runs along a hole's arc: the rim's other arcs end where the hole's
+    // edges do).
+    let meets_hole = hole_points.iter().any(|&p| {
+        deduped
+            .iter()
+            .any(|s| (s.start - p).length() <= margin || (s.end - p).length() <= margin)
+    });
+    if through_hole || meets_hole {
         return None;
     }
 
