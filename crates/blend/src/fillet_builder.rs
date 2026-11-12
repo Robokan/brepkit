@@ -2627,7 +2627,45 @@ fn drop_coincident_loops(
     if (kept_forward != kept_reversed) == (along != dropped_reversed) {
         return Ok(false);
     }
-    let pieces: Vec<OrientedEdge> = if kept_edge.start() == dropped_edge.start() {
+    // Loops starting at one point, as separate vertices (a walked contact
+    // closed a hair from where the other starts), start together: the
+    // hole's round takes the outline whole, and its edges ending at the
+    // hole's vertex (its seam) end at the outline's.
+    let (kept_start, dropped_start) = (kept_edge.start(), dropped_edge.start());
+    let start_gap =
+        (topo.vertex(kept_start)?.point() - topo.vertex(dropped_start)?.point()).length();
+    let pieces: Vec<OrientedEdge> = if kept_start == dropped_start
+        || start_gap <= on_edge * span.max(1e-2)
+    {
+        if kept_start != dropped_start {
+            let mut moved = HashSet::new();
+            for &other in faces {
+                let f = topo.face(other)?;
+                let wires: Vec<WireId> = std::iter::once(f.outer_wire())
+                    .chain(f.inner_wires().iter().copied())
+                    .collect();
+                for w in wires {
+                    let edges: Vec<EdgeId> = topo
+                        .wire(w)?
+                        .edges()
+                        .iter()
+                        .map(OrientedEdge::edge)
+                        .collect();
+                    for e in edges {
+                        if e == dropped.edge() || !moved.insert(e) {
+                            continue;
+                        }
+                        let edge = topo.edge_mut(e)?;
+                        if edge.start() == dropped_start {
+                            edge.set_start(kept_start);
+                        }
+                        if edge.end() == dropped_start {
+                            edge.set_end(kept_start);
+                        }
+                    }
+                }
+            }
+        }
         vec![OrientedEdge::new(kept.edge(), along)]
     } else {
         // Cut the outline at the hole's vertex, which must lie on it.
