@@ -315,6 +315,35 @@ pub fn compute_sphere_v_range(
         return (-FRAC_PI_2, FRAC_PI_2);
     }
 
+    // A face of latitudes and meridians (the grid's faces) spans exactly
+    // the latitudes its boundary reaches: a band between two circles, a cap
+    // whose seam runs to its pole.
+    let mut lo = f64::MAX;
+    let mut hi = f64::MIN;
+    if let Ok(wire) = topo.wire(face_data.outer_wire()) {
+        for oe in wire.edges() {
+            let Ok(edge) = topo.edge(oe.edge()) else {
+                continue;
+            };
+            let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+                continue;
+            };
+            let (p0, p1) = (sv.point(), ev.point());
+            let (t0, t1) = edge.curve().domain_with_endpoints(p0, p1);
+            for k in 0..=8 {
+                let t = (t1 - t0).mul_add(f64::from(k) / 8.0, t0);
+                let v = sphere
+                    .project_point(edge.curve().evaluate_with_endpoints(t, p0, p1))
+                    .1;
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+    }
+    if hi - lo > 1e-9 {
+        return (lo.max(-FRAC_PI_2), hi.min(FRAC_PI_2));
+    }
+
     let avg_v: f64 = wire_pts
         .iter()
         .map(|pt| sphere.project_point(*pt).1)

@@ -1240,8 +1240,14 @@ pub(super) fn separate_pinched_edges(
         for (k, &(fid, _, _, forward)) in edge_uses.iter().enumerate() {
             let face = topo.face(fid)?;
             let normal = face_normal_at_point(face, at);
+            // A curved face's wire winds about its surface's own normal,
+            // reversed or not (its region lies to the left in `(u, v)`);
+            // reversing it turns its material side alone. A plane's winds
+            // about its outward normal.
+            let flips = face.is_reversed() && !matches!(face.surface(), FaceSurface::Plane { .. });
+            let surface_normal = if flips { -normal } else { normal };
             let sense = if forward { tangent } else { -tangent };
-            let Ok(into) = normal.cross(sense).normalize() else {
+            let Ok(into) = surface_normal.cross(sense).normalize() else {
                 break;
             };
             let probe = at + into * step;
@@ -1290,10 +1296,15 @@ pub(super) fn separate_pinched_edges(
                 (round[i % n].1, round[(i + 1) % n].1)
             })
             .collect();
-        if wedges
-            .iter()
-            .any(|&(a, b)| edge_uses[a].3 == edge_uses[b].3)
-        {
+        // Read about the faces' surface normals, a reversed curved face's
+        // sense is the other way.
+        let mut flipped = Vec::with_capacity(edge_uses.len());
+        for u in &edge_uses {
+            let face = topo.face(u.0)?;
+            let flips = face.is_reversed() && !matches!(face.surface(), FaceSurface::Plane { .. });
+            flipped.push(u.3 != flips);
+        }
+        if wedges.iter().any(|&(a, b)| flipped[a] == flipped[b]) {
             continue;
         }
         for &(a, b) in wedges.iter().skip(1) {
