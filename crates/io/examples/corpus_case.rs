@@ -631,9 +631,11 @@ fn main() {
         a[0],
         b[0],
         // NOUNIFY=1: leave co-surface faces split, to tell the merge's
-        // effect from the boolean's
+        // effect from the boolean's; NOFALLBACK=1: decline the mesh
+        // fallback, as the BuzzCAD bridge does
         BooleanOptions {
             unify_faces: std::env::var("NOUNIFY").is_err(),
+            mesh_fallback: std::env::var("NOFALLBACK").is_err(),
             ..BooleanOptions::default()
         },
     );
