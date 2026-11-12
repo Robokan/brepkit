@@ -6757,8 +6757,58 @@ fn cap_edge_reaches_triangle(
             }
             let hull: Vec<(f64, f64)> = curve.control_points().iter().map(|&p| flat(p)).collect();
             hull_overlaps_triangle(&hull, triangle)
+                && nurbs_pieces_reach_triangle(curve, t0, t1, flat, triangle)
         }
     }
+}
+
+/// Whether the edge's stretch `t0..t1` of a B-spline with positive weights
+/// reaches into the triangle, its pieces certified by their own Bezier
+/// hulls. The whole curve's hull is loose on a long curve of many spans (a
+/// cap's outline bowing away from a corner its chord passes close to), so
+/// each span's piece is tested, and halved while its hull overlaps, down
+/// to a limit at which an overlap counts as reaching.
+fn nurbs_pieces_reach_triangle(
+    curve: &brepkit_math::nurbs::curve::NurbsCurve,
+    t0: f64,
+    t1: f64,
+    flat: &impl Fn(Point3) -> (f64, f64),
+    triangle: [(f64, f64); 3],
+) -> bool {
+    const DEPTH: u32 = 16;
+    let (d0, d1) = curve.domain();
+    let (lo, hi) = (t0.min(t1).max(d0), t0.max(t1).min(d1));
+    if lo.partial_cmp(&hi) != Some(std::cmp::Ordering::Less) {
+        return true;
+    }
+    let mut cuts: Vec<f64> = std::iter::once(lo)
+        .chain(curve.knots().iter().copied().filter(|&k| k > lo && k < hi))
+        .chain(std::iter::once(hi))
+        .collect();
+    cuts.dedup();
+    let mut pending: Vec<(f64, f64, u32)> = cuts.windows(2).map(|w| (w[0], w[1], 0)).collect();
+    while let Some((a, b, depth)) = pending.pop() {
+        let Ok(points) = brepkit_math::nurbs::decompose::curve_bezier_between(curve, a, b) else {
+            return true;
+        };
+        let mut hull = Vec::with_capacity(points.len());
+        for [x, y, z, w] in points {
+            if !(w.is_finite() && w > 0.0) {
+                return true;
+            }
+            hull.push(flat(Point3::new(x / w, y / w, z / w)));
+        }
+        if !hull_overlaps_triangle(&hull, triangle) {
+            continue;
+        }
+        if depth >= DEPTH {
+            return true;
+        }
+        let mid = 0.5 * (a + b);
+        pending.push((a, mid, depth + 1));
+        pending.push((mid, b, depth + 1));
+    }
+    false
 }
 
 /// Whether a polyline comes within `margin` of a triangle, its inside
@@ -9670,6 +9720,42 @@ mod tests {
             &[0.501],
         );
         assert!(straight_edge(&topo, &straight, 1e-6).unwrap());
+    }
+
+    /// A cubic B-spline edge of two spans from `(8, -4)` to `(-4, 8)`, its
+    /// chord across the notch triangle, bowing through `bow`.
+    fn bowed_edge(topo: &mut Topology, bow: [(f64, f64); 3]) -> (Edge, Point3, Point3) {
+        let (a, b) = (Point3::new(8.0, -4.0, 0.0), Point3::new(-4.0, 8.0, 0.0));
+        let mut points = vec![a];
+        points.extend(bow.iter().map(|&(x, y)| Point3::new(x, y, 0.0)));
+        points.push(b);
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            3,
+            vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+            points,
+            vec![1.0; 5],
+        )
+        .unwrap();
+        let va = topo.add_vertex(Vertex::new(a, 1e-7));
+        let vb = topo.add_vertex(Vertex::new(b, 1e-7));
+        (Edge::new(va, vb, EdgeCurve::NurbsCurve(curve)), a, b)
+    }
+
+    #[test]
+    fn a_curve_bowing_away_is_clear_though_its_whole_hull_is_not() {
+        // A cap's long outline whose chord passes the corner: the hull of
+        // all its control points holds the notch, its spans' hulls do not.
+        let mut topo = Topology::new();
+        let flat = |p: Point3| (p.x(), p.y());
+        let bow = [(12.0, 4.0), (12.0, 12.0), (4.0, 12.0)];
+        let (edge, a, b) = bowed_edge(&mut topo, bow);
+        let mut hull = vec![(8.0, -4.0), (-4.0, 8.0)];
+        hull.extend(bow);
+        assert!(hull_overlaps_triangle(&hull, NOTCH));
+        assert!(!cap_edge_reaches_triangle(&edge, a, b, &flat, NOTCH));
+        // Bowed into the notch, it reaches it.
+        let (edge, a, b) = bowed_edge(&mut topo, [(2.0, -1.0), (1.0, 1.0), (-1.0, 2.0)]);
+        assert!(cap_edge_reaches_triangle(&edge, a, b, &flat, NOTCH));
     }
 
     #[test]
