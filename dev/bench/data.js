@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794433569306,
+  "lastUpdate": 1794446826544,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3347,6 +3347,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29031953,
             "range": "± 193101",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "be72e8bfb53f4907f1ac54c36e85b97517d85e02",
+          "message": "docs(buzzcad): SPEED.md, the brief for an agent speeding brepkit up\n\nTargets from replay 20261111-150832 (boolean timeouts, mesh-fallback\ntime, measure timeouts), what counts as a speedup (no case changes\nstatus), how to measure, and the rules for working beside the fix agent.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-11T17:23:54-08:00",
+          "tree_id": "47ea423766e61f8316e456417d2638e5a40b380d",
+          "url": "https://github.com/Robokan/brepkit/commit/be72e8bfb53f4907f1ac54c36e85b97517d85e02"
+        },
+        "date": 1794446826022,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 921518,
+            "range": "± 22230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 993414,
+            "range": "± 1694",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11309,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 774778,
+            "range": "± 10662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 23583833,
+            "range": "± 44590",
             "unit": "ns/iter"
           }
         ]
