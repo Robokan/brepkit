@@ -247,6 +247,11 @@ fn main() {
     let mut topo = Topology::new();
     let text = std::fs::read_to_string(dir.join("input0.step")).unwrap();
     let sid = brepkit_io::step::read_step(&text, &mut topo).unwrap()[0];
+    // INOUT=<step> writes the input as brepkit reads it, through its own
+    // STEP writer (test data).
+    if let Ok(out) = std::env::var("INOUT") {
+        std::fs::write(&out, brepkit_io::step::write_step(&topo, &[sid]).unwrap()).unwrap();
+    }
     // THIRD=<step> lists another engine's result of the case face by face.
     let mut other = Topology::new();
     let theirs = if let Ok(path) = std::env::var("THIRD") {
