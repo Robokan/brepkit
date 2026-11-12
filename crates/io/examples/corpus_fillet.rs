@@ -543,7 +543,13 @@ fn main() {
                 let face = topo.face(f).unwrap();
                 let borders = std::iter::once(face.outer_wire())
                     .chain(face.inner_wires().iter().copied())
-                    .any(|w| topo.wire(w).unwrap().edges().iter().any(|oe| oe.edge() == e));
+                    .any(|w| {
+                        topo.wire(w)
+                            .unwrap()
+                            .edges()
+                            .iter()
+                            .any(|oe| oe.edge() == e)
+                    });
                 if !borders {
                     continue;
                 }
