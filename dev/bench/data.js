@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794446826544,
+  "lastUpdate": 1794448101338,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -3401,6 +3401,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 23583833,
             "range": "± 44590",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "4a89c5605b6e0a0eb95de58980244ea5e106f07f",
+          "message": "fix(io): a sphere keeps its file's frame, read and written\n\nThe STEP reader built every SPHERICAL_SURFACE about +Z, whatever its\nplacement said, so a turned sphere's latitude circles and meridian seams\ncame in off the (u, v) grid: sections with them were windowed wrong, and\na lens (two balls' common part) fused with a collar touching its rim had\nits caps cut along circles they do not hold, the result a whole ball and\nmore, ten times too big, and valid. The sphere is now read in the file's\nframe (falling back to +Z only where the frame is degenerate), and the\nwriter writes the sphere's own frame, so its latitudes read back as such.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-11T17:43:20-08:00",
+          "tree_id": "c2582411e58e027ad1b6812b17b8ff6aa2301886",
+          "url": "https://github.com/Robokan/brepkit/commit/4a89c5605b6e0a0eb95de58980244ea5e106f07f"
+        },
+        "date": 1794448100387,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1119759,
+            "range": "± 63408",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1212601,
+            "range": "± 38534",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13435,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 938667,
+            "range": "± 10514",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29282360,
+            "range": "± 55876",
             "unit": "ns/iter"
           }
         ]
