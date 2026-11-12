@@ -766,6 +766,24 @@ fn main() {
                         u8::from(f.is_reversed())
                     );
                     let _ = bb;
+                    for (h, &w) in f.inner_wires().iter().enumerate() {
+                        let hs: Vec<String> = topo
+                            .wire(w)
+                            .unwrap()
+                            .edges()
+                            .iter()
+                            .map(|oe| {
+                                let e = topo.edge(oe.edge()).unwrap();
+                                format!(
+                                    "e{}{}{}",
+                                    oe.edge().index(),
+                                    if oe.is_forward() { "+" } else { "-" },
+                                    &e.curve().type_tag()[..1]
+                                )
+                            })
+                            .collect();
+                        println!("    hole {h}: {hs:?}");
+                    }
                     if std::env::var("EDGES").is_ok() {
                         for oe in topo.wire(f.outer_wire()).unwrap().edges() {
                             let e = topo.edge(oe.edge()).unwrap();
