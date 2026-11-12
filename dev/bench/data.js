@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794520879147,
+  "lastUpdate": 1794523277727,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4049,6 +4049,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29388505,
             "range": "± 40633",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "ebe9398db4e64a2fec4f568e09526f045df65ff3",
+          "message": "chore(io): corpus_fillet runs two-distance chamfers with the bridge's reference faces\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T14:37:52-08:00",
+          "tree_id": "9dc421ddf50af34cb1bb1f18584788170909756a",
+          "url": "https://github.com/Robokan/brepkit/commit/ebe9398db4e64a2fec4f568e09526f045df65ff3"
+        },
+        "date": 1794523277260,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 835837,
+            "range": "± 3062",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 904681,
+            "range": "± 2317",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9581,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 704976,
+            "range": "± 1830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 21988851,
+            "range": "± 52005",
             "unit": "ns/iter"
           }
         ]
