@@ -134,6 +134,10 @@ struct StepBuilder<'a> {
     legacy_cones: bool,
 }
 
+/// A hole of a face read as lunes: its loop and the arc round the closed
+/// direction it covers, as angles `lo..hi` with `lo` in `[0, TAU)`.
+type PoleClosedHole = (brepkit_topology::wire::WireId, f64, f64);
+
 impl<'a> StepBuilder<'a> {
     fn new(
         topo: &'a mut Topology,
@@ -408,8 +412,12 @@ impl<'a> StepBuilder<'a> {
     /// (a ball or a lemon written as one face) has no edge to bound it. It
     /// reads as the lunes brepkit's revolve builds: the surface cut along
     /// meridians where it is only C0 (knots raised to full multiplicity), each
-    /// piece a face between two meridian edges from pole to pole. `None` for
-    /// any other face.
+    /// piece a face between two meridian edges from pole to pole. The face
+    /// may also have edge loops that do not wind round the closed direction
+    /// (a ball with a cap cut off beside its axis): with a vertex loop at a
+    /// pole the face holds both poles, so each such loop is a hole, carried
+    /// by the lune it lies in, the meridians moved off it. `None` for any
+    /// other face.
     #[allow(clippy::too_many_lines)]
     fn build_pole_closed_face(
         &mut self,
@@ -424,14 +432,21 @@ impl<'a> StepBuilder<'a> {
         if list_refs.is_empty() {
             return Ok(None);
         }
+        // Edge loops are holes the lunes carry: (bound, loop).
+        let mut hole_loops = Vec::new();
         for &bound_ref in &list_refs {
             let Some(&loop_ref) = parse_refs(&self.get_entity(bound_ref)?.attrs.clone()).first()
             else {
                 return Ok(None);
             };
-            if self.get_entity(loop_ref)?.entity_type != "VERTEX_LOOP" {
-                return Ok(None);
+            match self.get_entity(loop_ref)?.entity_type.as_str() {
+                "VERTEX_LOOP" => {}
+                "EDGE_LOOP" => hole_loops.push((bound_ref, loop_ref)),
+                _ => return Ok(None),
             }
+        }
+        if hole_loops.len() == list_refs.len() {
+            return Ok(None);
         }
         let list_set: std::collections::HashSet<u64> = list_refs.iter().copied().collect();
         let Some(&surface_ref) = parse_refs(&attrs)
@@ -500,6 +515,10 @@ impl<'a> StepBuilder<'a> {
             }
         };
 
+        let orient_tail = attrs.trim_end_matches(')').trim();
+        let file_reversed = orient_tail.ends_with(".F.") || orient_tail.ends_with(".FALSE.");
+        let face_reversed = file_reversed != swapped;
+
         // Split values round v: its ends and its interior knots, or its
         // middle when it has none, each raised to multiplicity p.
         let p = n.degree_v();
@@ -507,16 +526,47 @@ impl<'a> StepBuilder<'a> {
         if v1 <= v0 {
             return Ok(None);
         }
+        // Each hole, a loop that does not wind round v (the face holds both
+        // poles, as the vertex loop says), and the arc round v it covers.
+        let Some(holes) = self.pole_closed_holes(&n, &hole_loops, file_reversed != swapped)? else {
+            return Ok(None);
+        };
+        let angle = |v: f64| std::f64::consts::TAU * (v - v0) / (v1 - v0);
+        let covered = |v: f64| {
+            let a = angle(v);
+            holes.iter().any(|&(_, lo, hi)| {
+                let margin = 1e-2;
+                (a - (lo - margin)).rem_euclid(std::f64::consts::TAU) <= hi - lo + 2.0 * margin
+            })
+        };
+        if covered(v0) {
+            return Ok(None);
+        }
         // Relative to the domain: a file's knots can all lie within 1e-12.
         let eps = 1e-12 * (v1 - v0);
         let mut splits = vec![v0];
         for &k in n.knots_v() {
-            if k > v0 + eps && k < v1 - eps && splits.last().is_none_or(|&l| k > l + eps) {
+            if k > v0 + eps
+                && k < v1 - eps
+                && splits.last().is_none_or(|&l| k > l + eps)
+                && !covered(k)
+            {
                 splits.push(k);
             }
         }
         if splits.len() < 2 {
-            splits.push(0.5 * (v0 + v1));
+            // The free value farthest round from v0.
+            let far = (1..64)
+                .map(|k| (v1 - v0).mul_add(f64::from(k) / 64.0, v0))
+                .filter(|&v| !covered(v))
+                .min_by(|a, b| {
+                    let mid = 0.5 * (v0 + v1);
+                    (a - mid).abs().total_cmp(&(b - mid).abs())
+                });
+            let Some(far) = far else {
+                return Ok(None);
+            };
+            splits.push(far);
         }
         splits.push(v1);
         let run = |n: &NurbsSurface, v: f64| -> (usize, usize) {
@@ -576,9 +626,6 @@ impl<'a> StepBuilder<'a> {
                     .add_edge(Edge::new(pole_a, pole_b, EdgeCurve::NurbsCurve(curve))),
             );
         }
-        let orient_tail = attrs.trim_end_matches(')').trim();
-        let face_reversed =
-            (orient_tail.ends_with(".F.") || orient_tail.ends_with(".FALSE.")) != swapped;
         let mut lunes = Vec::with_capacity(edges.len());
         for k in 0..edges.len() {
             let (a, b) = (splits[k], splits[k + 1]);
@@ -619,14 +666,84 @@ impl<'a> StepBuilder<'a> {
             })?;
             let wire = self.topo.add_wire(wire);
             let surface = FaceSurface::Nurbs(piece);
+            let inner: Vec<_> = holes
+                .iter()
+                .filter(|&&(_, lo, hi)| {
+                    let mid = 0.5 * (lo + hi);
+                    mid > angle(a) && mid < angle(b)
+                })
+                .map(|&(wire, _, _)| wire)
+                .collect();
             lunes.push(if face_reversed == flip {
-                self.topo.add_face(Face::new(wire, Vec::new(), surface))
+                self.topo.add_face(Face::new(wire, inner, surface))
             } else {
-                self.topo
-                    .add_face(Face::new_reversed(wire, Vec::new(), surface))
+                self.topo.add_face(Face::new_reversed(wire, inner, surface))
             });
         }
         Ok(Some(lunes))
+    }
+
+    /// The holes of a face [`Self::build_pole_closed_face`] cuts into
+    /// lunes: each edge loop built about the surface's normal (`turned`
+    /// when the surface's u and v were swapped or the face is reversed) and
+    /// the arc round `n`'s closed v it covers, as angles `lo..hi` with `lo`
+    /// in `[0, TAU)`. `None` when a loop winds round v (it is a rim, not a
+    /// hole) or does not project.
+    fn pole_closed_holes(
+        &mut self,
+        n: &brepkit_math::nurbs::surface::NurbsSurface,
+        loops: &[(u64, u64)],
+        turned: bool,
+    ) -> Result<Option<Vec<PoleClosedHole>>, IoError> {
+        use brepkit_math::nurbs::projection::project_point_to_surface;
+        use std::f64::consts::{PI, TAU};
+
+        let (v0, v1) = n.domain_v();
+        let mut holes = Vec::with_capacity(loops.len());
+        for &(bound_ref, loop_ref) in loops {
+            let bound_tail = self.get_entity(bound_ref)?.attrs.clone();
+            let bound_tail = bound_tail.trim_end_matches(')').trim();
+            let bound_reversed = bound_tail.ends_with(".F.") || bound_tail.ends_with(".FALSE.");
+            let reverse = (!self.legacy_bounds && bound_reversed) != turned;
+            let wire = self.build_edge_loop(loop_ref, reverse)?;
+            let mut angles = Vec::new();
+            for oe in self.topo.wire(wire)?.edges() {
+                let e = self.topo.edge(oe.edge())?;
+                let (a, b) = (
+                    self.topo.vertex(e.start())?.point(),
+                    self.topo.vertex(e.end())?.point(),
+                );
+                let (t0, t1) = e.curve().domain_with_endpoints(a, b);
+                for k in 0..32 {
+                    let t = (t1 - t0).mul_add(f64::from(k) / 32.0, t0);
+                    let p = e.curve().evaluate_with_endpoints(t, a, b);
+                    let Ok(proj) = project_point_to_surface(n, p, 1e-9) else {
+                        return Ok(None);
+                    };
+                    angles.push((TAU * (proj.v - v0) / (v1 - v0)).rem_euclid(TAU));
+                }
+            }
+            if angles.len() < 3 {
+                return Ok(None);
+            }
+            let turn: f64 = (0..angles.len())
+                .map(|i| (angles[(i + 1) % angles.len()] - angles[i] + PI).rem_euclid(TAU) - PI)
+                .sum();
+            if turn.abs() > PI {
+                return Ok(None);
+            }
+            // The loop covers all but the widest gap between its angles.
+            angles.sort_by(f64::total_cmp);
+            let (mut gap, mut after) = (TAU + angles[0] - angles[angles.len() - 1], angles[0]);
+            for w in angles.windows(2) {
+                if w[1] - w[0] > gap {
+                    gap = w[1] - w[0];
+                    after = w[1];
+                }
+            }
+            holes.push((wire, after, after + TAU - gap));
+        }
+        Ok(Some(holes))
     }
 
     #[allow(clippy::too_many_lines)]
