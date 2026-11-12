@@ -5,7 +5,9 @@
 //! boolean then runs `REPEAT` times (default 5) on copies of them, and the
 //! median is kept, so the time is the operation alone with its inputs
 //! loaded. Cases whose inputs hold several solids are skipped. Prints one
-//! line per case and a summary.
+//! line per case and a summary. `FALLBACK=0` declines the mesh fallback
+//! (`BooleanOptions::mesh_fallback`), so a case that needs it errors in the
+//! time its exact attempt takes.
 //!
 //! ```sh
 //! cargo run --release -p brepkit-io --example corpus_bench -- <case dir>...
@@ -23,6 +25,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    let opts = BooleanOptions {
+        mesh_fallback: std::env::var("FALLBACK").map_or(true, |v| v != "0"),
+        ..BooleanOptions::default()
+    };
     let mut times: Vec<(f64, String)> = Vec::new();
     for arg in std::env::args().skip(1) {
         let dir = Path::new(&arg);
@@ -51,7 +57,7 @@ fn main() {
             .map(|_| {
                 let mut copy = topo.clone();
                 let t = Instant::now();
-                let _ = boolean_with_options(&mut copy, op, a[0], b[0], BooleanOptions::default());
+                let _ = boolean_with_options(&mut copy, op, a[0], b[0], opts);
                 t.elapsed().as_secs_f64()
             })
             .collect();
