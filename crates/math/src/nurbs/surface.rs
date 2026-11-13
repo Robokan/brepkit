@@ -47,6 +47,23 @@ struct Caches {
     /// The Bezier patches rays are cast against.
     ray_surface:
         std::sync::OnceLock<Option<std::sync::Arc<crate::nurbs::intersection::RaySurface>>>,
+    /// Points projected onto the surface (see [`NurbsSurface::projected`]).
+    projections: ProjectionMemo,
+}
+
+/// Points already projected onto a surface, by their coordinates' bits, at
+/// most [`ProjectionMemo::LIMIT`] of them. A clone starts empty.
+#[derive(Debug, Default)]
+struct ProjectionMemo(std::sync::Mutex<std::collections::HashMap<[u64; 3], (f64, f64)>>);
+
+impl ProjectionMemo {
+    const LIMIT: usize = 1 << 14;
+}
+
+impl Clone for ProjectionMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl PartialEq for NurbsSurface {
@@ -670,6 +687,40 @@ impl NurbsSurface {
                 crate::nurbs::intersection::RaySurface::new(self).map(std::sync::Arc::new)
             })
             .clone()
+    }
+
+    /// `(u, v)` of `point`'s projection by `project`, kept for the same
+    /// point (its coordinates bit for bit): a surface's projection of a
+    /// point does not change, and several classifiers project the same
+    /// boundary points onto it in turn.
+    pub(crate) fn projected(
+        &self,
+        point: Point3,
+        project: impl FnOnce() -> (f64, f64),
+    ) -> (f64, f64) {
+        let key = [
+            point.x().to_bits(),
+            point.y().to_bits(),
+            point.z().to_bits(),
+        ];
+        if let Some(&uv) = self
+            .caches
+            .projections
+            .0
+            .lock()
+            .ok()
+            .as_ref()
+            .and_then(|m| m.get(&key))
+        {
+            return uv;
+        }
+        let uv = project();
+        if let Ok(mut m) = self.caches.projections.0.lock()
+            && m.len() < ProjectionMemo::LIMIT
+        {
+            m.insert(key, uv);
+        }
+        uv
     }
 
     /// The surface's coarse grid for projections, evaluated on first use.
