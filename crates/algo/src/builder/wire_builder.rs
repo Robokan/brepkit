@@ -6,6 +6,7 @@
 //!
 //! Uses the minimum clockwise angle traversal algorithm for face splitting.
 
+use brepkit_math::madd::Madd;
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 
@@ -465,11 +466,18 @@ pub fn build_wire_loops_dcel_measured(
                 prev.x() + step(d.x(), u_period),
                 prev.y() + step(d.y(), v_period),
             );
-            area += prev.x().mul_add(b.y(), -(b.x() * prev.y()));
+            // Taken from the first vertex: far from the origin the
+            // products of raw parameters round away a small orbit's area.
+            let (p, q) = (prev - first, b - first);
+            area += p.x().madd(q.y(), -(q.x() * p.y()));
             perimeter += (b - prev).length();
             prev = b;
         }
         let lifted_first = prev;
+        // An orbit that winds a period ends a period from its start, and
+        // its sum about the origin holds this term for the gap between.
+        let gap = lifted_first - first;
+        area += first.x().madd(gap.y(), -(gap.x() * first.y()));
         let area = area_of.map_or(area * 0.5, |f| {
             f(&orbit.iter().map(|&i| halves[i].clone()).collect::<Vec<_>>())
         });
@@ -749,7 +757,7 @@ fn pcurve_tangent_at_endpoint(edge: &OrientedPCurveEdge, at_start: bool) -> (f64
     // For NURBS pcurves, sample near the endpoint for tangent direction.
     if let Some((nurbs, t, inward, span)) = nurbs_endpoint(edge, at_start) {
         let p0 = nurbs.evaluate(t);
-        let p1 = nurbs.evaluate(inward.mul_add(span * 0.01, t));
+        let p1 = nurbs.evaluate(inward.madd(span * 0.01, t));
         return (p1.x() - p0.x(), p1.y() - p0.y());
     }
 

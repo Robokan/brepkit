@@ -1035,6 +1035,7 @@ use super::basis::binomial;
 #[allow(clippy::expect_used, clippy::cast_lossless, clippy::suboptimal_flops)]
 mod tests {
     use super::*;
+    use crate::madd::Madd;
 
     /// A bilinear surface (degree 1x1): a flat quadrilateral.
     fn bilinear_surface() -> NurbsSurface {
@@ -1167,7 +1168,7 @@ mod tests {
                 let mut k = vec![0.0; p + 1];
                 for i in 1..n - p {
                     let t = i as f64 / (n - p) as f64;
-                    k.push(t * t.mul_add(0.3, 0.7));
+                    k.push(t * t.madd(0.3, 0.7));
                 }
                 k.extend(vec![1.0; p + 1]);
                 k
@@ -1212,11 +1213,11 @@ mod tests {
             let (u0, u1) = s.domain_u();
             let (v0, v1) = s.domain_v();
             let mut us: Vec<f64> = (0..=40)
-                .map(|i| (u1 - u0).mul_add(f64::from(i) / 40.0, u0))
+                .map(|i| (u1 - u0).madd(f64::from(i) / 40.0, u0))
                 .collect();
             us.extend(s.knots_u().iter().copied());
             let mut vs: Vec<f64> = (0..=12)
-                .map(|i| (v1 - v0).mul_add(f64::from(i) / 12.0, v0))
+                .map(|i| (v1 - v0).madd(f64::from(i) / 12.0, v0))
                 .collect();
             vs.extend(s.knots_v().iter().copied());
             for &v in &vs {
