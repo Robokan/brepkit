@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794560882495,
+  "lastUpdate": 1794592006142,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4427,6 +4427,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 21899696,
             "range": "± 44927",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "1ddad1defb84cc2baac041aa51da4c6e770e12dc",
+          "message": "docs(buzzcad): SPEED.md records the kept sections, the parallel seeds and survey, and the Bezier split's rows\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-13T09:43:16-08:00",
+          "tree_id": "f0d6020d755afcc2a422883c72ded0d10335f9c3",
+          "url": "https://github.com/Robokan/brepkit/commit/1ddad1defb84cc2baac041aa51da4c6e770e12dc"
+        },
+        "date": 1794592005404,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 751403,
+            "range": "± 8648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 816837,
+            "range": "± 13610",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8195,
+            "range": "± 571",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 667141,
+            "range": "± 23810",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18511830,
+            "range": "± 396152",
             "unit": "ns/iter"
           }
         ]
