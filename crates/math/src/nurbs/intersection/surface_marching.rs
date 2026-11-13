@@ -1252,7 +1252,7 @@ pub(super) fn near_existing_segment(
             // (a turn of `MAX_SAG_TURN`), so a chord farther than this
             // cannot pass it and its bulge is not worked out.
             let chord = (w[1].point - w[0].point).length();
-            if d > 2.0f64.mul_add(dist, 0.5 * chord) + 1e-9 * (1.0 + d) {
+            if d > 2.0f64.madd(dist, 0.5 * chord) + 1e-9 * (1.0 + d) {
                 continue;
             }
             // Off the chord by its sag, toward the side the arc bulges.

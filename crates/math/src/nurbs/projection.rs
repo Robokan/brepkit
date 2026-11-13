@@ -655,10 +655,10 @@ impl CoarseGrid {
 
         let n = SURFACE_GRID_SIZE;
         let us: Vec<f64> = (0..=n)
-            .map(|i| (i as f64 / n as f64).mul_add(u_max - u_min, u_min))
+            .map(|i| (i as f64 / n as f64).madd(u_max - u_min, u_min))
             .collect();
         let vs: Vec<f64> = (0..=n)
-            .map(|j| (j as f64 / n as f64).mul_add(v_max - v_min, v_min))
+            .map(|j| (j as f64 / n as f64).madd(v_max - v_min, v_min))
             .collect();
         let grid: Vec<Vec<Point3>> = us
             .iter()
