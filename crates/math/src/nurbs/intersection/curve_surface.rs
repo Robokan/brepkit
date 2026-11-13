@@ -4,7 +4,7 @@ use crate::MathError;
 use crate::aabb::Aabb3;
 use crate::nurbs::curve::NurbsCurve;
 use crate::nurbs::decompose::{curve_to_bezier_segments, surface_to_bezier_patches};
-use crate::nurbs::span_index::{SpanIndex, knot_spans};
+use crate::nurbs::span_index::knot_spans;
 use crate::nurbs::surface::NurbsSurface;
 use crate::vec::{Point3, Vec3};
 
@@ -48,7 +48,7 @@ pub fn intersect_curve_surface(
 ) -> Result<Vec<CurveSurfaceHit>, MathError> {
     const DEPTH: u32 = 12;
     const REACH: f64 = 1.5;
-    let Some(index) = SpanIndex::new(surface) else {
+    let Some(index) = surface.span_index() else {
         return intersect_curve_surface_patches(curve, surface, tolerance);
     };
     // Use a generous dedup threshold: many seeds converge to the same root,
