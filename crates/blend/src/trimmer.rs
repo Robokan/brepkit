@@ -1612,6 +1612,7 @@ fn mapped_surface_uv(
     surface: &FaceSurface,
     point: Point3,
     face_id: FaceId,
+    allowance: f64,
 ) -> Result<(f64, f64), BlendError> {
     if let FaceSurface::Plane { normal, d } = surface {
         let reference = if normal.x().abs() < 0.9 {
@@ -1642,10 +1643,51 @@ fn mapped_surface_uv(
     let evaluated = surface
         .evaluate(projected.0, projected.1)
         .ok_or(BlendError::TrimmingFailure { face: face_id })?;
-    if (evaluated - point).length() > 1e-4 {
+    if (evaluated - point).length() > allowance {
         return Err(BlendError::TrimmingFailure { face: face_id });
     }
     Ok(projected)
+}
+
+/// How far a point mapped onto a curved face may stand off its surface. A
+/// contact ends on the face's boundary, and a face read from a file can
+/// have its edges stand off its surface by more than the 1e-4 a point
+/// otherwise may (a B-spline skin's edges 3e-3 off it): the allowance
+/// grows by the farthest the boundary stands off, read at its vertices and
+/// at points along each edge.
+fn mapped_uv_allowance(
+    topo: &Topology,
+    face_id: FaceId,
+    surface: &FaceSurface,
+) -> Result<f64, BlendError> {
+    const BASE: f64 = 1e-4;
+    const SAMPLES: u32 = 8;
+    if surface.is_planar() {
+        return Ok(BASE);
+    }
+    let face = topo.face(face_id)?;
+    let mut farthest: f64 = 0.0;
+    for wire_id in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+        for oriented in topo.wire(wire_id)?.edges() {
+            let edge = topo.edge(oriented.edge())?;
+            let (sp, ep) = (
+                topo.vertex(edge.start())?.point(),
+                topo.vertex(edge.end())?.point(),
+            );
+            let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
+            for k in 0..=SAMPLES {
+                let t = (t1 - t0).mul_add(f64::from(k) / f64::from(SAMPLES), t0);
+                let p = edge.curve().evaluate_with_endpoints(t, sp, ep);
+                if let Some(q) = surface
+                    .project_point(p)
+                    .and_then(|(u, v)| surface.evaluate(u, v))
+                {
+                    farthest = farthest.max((q - p).length());
+                }
+            }
+        }
+    }
+    Ok(BASE + farthest)
 }
 
 fn mapped_vertex_for_point(
@@ -1674,9 +1716,10 @@ fn mapped_connector_geometry(
     start: Point3,
     end: Point3,
     face_id: FaceId,
+    allowance: f64,
 ) -> Result<(EdgeCurve, brepkit_topology::pcurve::PCurve), BlendError> {
-    let start_uv = mapped_surface_uv(surface, start, face_id)?;
-    let mut end_uv = mapped_surface_uv(surface, end, face_id)?;
+    let start_uv = mapped_surface_uv(surface, start, face_id, allowance)?;
+    let mut end_uv = mapped_surface_uv(surface, end, face_id, allowance)?;
     // A connector is short: it takes the near way across a seam, in `v` as
     // in `u` (straight across the `v` range it ran the long way round).
     if let Some(period) = surface_u_period(surface) {
@@ -1748,6 +1791,7 @@ fn mapped_planar_corner_geometry(
     start: Point3,
     end: Point3,
     face_id: FaceId,
+    allowance: f64,
 ) -> Result<Option<(EdgeCurve, brepkit_topology::pcurve::PCurve)>, BlendError> {
     let FaceSurface::Plane { normal, .. } = surface else {
         return Ok(None);
@@ -1780,9 +1824,9 @@ fn mapped_planar_corner_geometry(
 
     let circle = brepkit_math::curves::Circle3D::new(center, circle_normal, radius)
         .map_err(|_| BlendError::TrimmingFailure { face: face_id })?;
-    let center_uv = mapped_surface_uv(surface, center, face_id)?;
-    let start_uv = mapped_surface_uv(surface, start, face_id)?;
-    let end_uv = mapped_surface_uv(surface, end, face_id)?;
+    let center_uv = mapped_surface_uv(surface, center, face_id, allowance)?;
+    let start_uv = mapped_surface_uv(surface, start, face_id, allowance)?;
+    let end_uv = mapped_surface_uv(surface, end, face_id, allowance)?;
     let circle_2d = brepkit_math::curves2d::Circle2D::new(
         brepkit_math::vec::Point2::new(center_uv.0, center_uv.1),
         radius,
@@ -2220,6 +2264,7 @@ fn rebuild_mapped_parametric_face(
 
     let face = topo.face(face_id)?.clone();
     let surface = face.surface().clone();
+    let allowance = mapped_uv_allowance(topo, face_id, &surface)?;
     let wire_ids: Vec<WireId> = std::iter::once(face.outer_wire())
         .chain(face.inner_wires().iter().copied())
         .collect();
@@ -2320,7 +2365,7 @@ fn rebuild_mapped_parametric_face(
                 .contact_3d
                 .iter()
                 .copied()
-                .any(|point| mapped_surface_uv(&surface, point, face_id).is_err())
+                .any(|point| mapped_surface_uv(&surface, point, face_id, allowance).is_err())
         {
             return Err(BlendError::TrimmingFailure { face: face_id });
         }
@@ -2532,7 +2577,8 @@ fn rebuild_mapped_parametric_face(
                     };
                     let on_edge = curve.evaluate_with_endpoints(tt, sp, tp);
                     let gap = dist_at(tt);
-                    if gap > 1e-6 && (gap > 1e-4 || (on_face(on_edge) - point).length() > 1e-6) {
+                    if gap > 1e-6 && (gap > allowance || (on_face(on_edge) - point).length() > 1e-6)
+                    {
                         continue;
                     }
                     let f = (tt - d0) / (d1 - d0);
@@ -2855,15 +2901,20 @@ fn rebuild_mapped_parametric_face(
                 return Err(BlendError::TrimmingFailure { face: face_id });
             }
             let (curve, pcurve) = if current.1 && next.1 {
-                if let Some(geometry) =
-                    mapped_planar_corner_geometry(&surface, &source_vertices, start, end, face_id)?
-                {
+                if let Some(geometry) = mapped_planar_corner_geometry(
+                    &surface,
+                    &source_vertices,
+                    start,
+                    end,
+                    face_id,
+                    allowance,
+                )? {
                     geometry
                 } else {
-                    mapped_connector_geometry(&surface, start, end, face_id)?
+                    mapped_connector_geometry(&surface, start, end, face_id, allowance)?
                 }
             } else {
-                mapped_connector_geometry(&surface, start, end, face_id)?
+                mapped_connector_geometry(&surface, start, end, face_id, allowance)?
             };
             if let Some(_period_value) = period {
                 // Periodic supports wrap onto themselves: the seam is one
@@ -2957,7 +3008,7 @@ fn rebuild_mapped_parametric_face(
             }
             let start = topo.vertex(contact.start())?.point();
             let end = topo.vertex(contact.end())?.point();
-            mapped_connector_geometry(&surface, start, end, face_id)?.1
+            mapped_connector_geometry(&surface, start, end, face_id, allowance)?.1
         };
         topo.pcurves_mut().set(contact_edge, trimmed_face, pcurve);
     }
@@ -4565,7 +4616,7 @@ mod tests {
         // projection reads, one of them crosses its seam.
         for v in [0.0, std::f64::consts::PI] {
             let (start, end) = (torus.evaluate(0.5, v - 0.1), torus.evaluate(0.5, v + 0.1));
-            let (curve, _) = mapped_connector_geometry(&surface, start, end, face).unwrap();
+            let (curve, _) = mapped_connector_geometry(&surface, start, end, face, 1e-4).unwrap();
             let EdgeCurve::NurbsCurve(curve) = curve else {
                 panic!("a connector on a torus is a polyline");
             };
