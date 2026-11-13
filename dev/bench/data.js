@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794543035541,
+  "lastUpdate": 1794550718939,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4265,6 +4265,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 23733460,
             "range": "± 31589",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "9ab80c3715cf4c9d3959f50c39fabf000ed7af90",
+          "message": "docs(buzzcad): rounds along faces whose edges stand off their surface; the trimming failures triaged\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T22:14:56-08:00",
+          "tree_id": "90c551d718468fd95d269522cd5e3956bceb2959",
+          "url": "https://github.com/Robokan/brepkit/commit/9ab80c3715cf4c9d3959f50c39fabf000ed7af90"
+        },
+        "date": 1794550718234,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1129487,
+            "range": "± 12359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1220567,
+            "range": "± 18947",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13090,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 929696,
+            "range": "± 2667",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29256511,
+            "range": "± 128916",
             "unit": "ns/iter"
           }
         ]
