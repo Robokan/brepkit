@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794603980019,
+  "lastUpdate": 1794606642386,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4589,6 +4589,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 20560349,
             "range": "± 90541",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b794bf9846b2c9049d801038d6bc3333ce73b20a",
+          "message": "docs(buzzcad): upstream 4.11.13 merged; three fix PRs opened\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-13T13:47:21-08:00",
+          "tree_id": "450f89b72c82882359af284b29b682ea9a4a63e0",
+          "url": "https://github.com/Robokan/brepkit/commit/b794bf9846b2c9049d801038d6bc3333ce73b20a"
+        },
+        "date": 1794606641974,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 806773,
+            "range": "± 22756",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 864329,
+            "range": "± 24132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8417,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 544279,
+            "range": "± 31014",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 18579828,
+            "range": "± 80119",
             "unit": "ns/iter"
           }
         ]
