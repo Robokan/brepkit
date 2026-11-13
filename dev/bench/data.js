@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794592006142,
+  "lastUpdate": 1794599826443,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4481,6 +4481,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 18511830,
             "range": "± 396152",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "e6ff0ce68ed5ed26377c04d35645a32ce67d0325",
+          "message": "Merge remote-tracking branch 'origin/main'\n\n# Conflicts:\n#\tbuzzcad-corpus\n#\tcrates/algo/src/pave_filler/phase_ef.rs",
+          "timestamp": "2026-11-13T11:53:06-08:00",
+          "tree_id": "c8c2ca9a759011ecebcc7cade381f19d16be6e26",
+          "url": "https://github.com/Robokan/brepkit/commit/e6ff0ce68ed5ed26377c04d35645a32ce67d0325"
+        },
+        "date": 1794599825514,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 907878,
+            "range": "± 4207",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 956142,
+            "range": "± 19433",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 10003,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 593531,
+            "range": "± 3325",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 21099013,
+            "range": "± 270053",
             "unit": "ns/iter"
           }
         ]
