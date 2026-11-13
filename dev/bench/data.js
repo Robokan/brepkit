@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794537395295,
+  "lastUpdate": 1794543035541,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4211,6 +4211,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29188292,
             "range": "± 156228",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "4cb2048f12996a4e5dd8a0bb2e9697ed23d6a403",
+          "message": "docs(buzzcad): SPEED.md records the one-pass point and partials\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T20:07:15-08:00",
+          "tree_id": "40f6594dff31479590703ff094791bea2b3d8ef2",
+          "url": "https://github.com/Robokan/brepkit/commit/4cb2048f12996a4e5dd8a0bb2e9697ed23d6a403"
+        },
+        "date": 1794543034971,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 921193,
+            "range": "± 5071",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1001053,
+            "range": "± 868",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11104,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 764562,
+            "range": "± 2495",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 23733460,
+            "range": "± 31589",
             "unit": "ns/iter"
           }
         ]
