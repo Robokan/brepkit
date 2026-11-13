@@ -25,17 +25,28 @@ pub struct NurbsSurface {
     control_points: Vec<Vec<Point3>>,
     /// Weight grid matching `control_points` dimensions.
     weights: Vec<Vec<f64>>,
+    /// What the surface keeps once worked out (see [`Caches`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    caches: Box<Caches>,
+}
+
+/// What a surface keeps once worked out, each part made on first use: a
+/// surface is never changed once made. Boxed, so the surface stays small
+/// (enums hold surfaces by value), and cloned with it, not shared (the ray
+/// patches hold a clone of their surface, which must not hold them back).
+#[derive(Debug, Clone, Default)]
+struct Caches {
     /// The knot spans indexed by their control boxes, built on first use by
     /// a projection onto a surface with more spans than its coarse grid
     /// samples.
-    #[cfg_attr(feature = "serde", serde(skip))]
     span_index: std::sync::OnceLock<Option<std::sync::Arc<crate::nurbs::span_index::SpanIndex>>>,
-    /// The grid every projection seeds from, evaluated on first use.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// The grid every projection seeds from.
     coarse_grid: std::sync::OnceLock<std::sync::Arc<crate::nurbs::projection::CoarseGrid>>,
-    /// The control points' box, taken on first use.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    control_box: std::sync::OnceLock<std::sync::Arc<Aabb3>>,
+    /// The control points' box.
+    control_box: std::sync::OnceLock<Aabb3>,
+    /// The Bezier patches rays are cast against.
+    ray_surface:
+        std::sync::OnceLock<Option<std::sync::Arc<crate::nurbs::intersection::RaySurface>>>,
 }
 
 impl PartialEq for NurbsSurface {
@@ -124,9 +135,7 @@ impl NurbsSurface {
             knots_v,
             control_points,
             weights,
-            span_index: std::sync::OnceLock::new(),
-            coarse_grid: std::sync::OnceLock::new(),
-            control_box: std::sync::OnceLock::new(),
+            caches: Box::default(),
         })
     }
 
@@ -617,18 +626,33 @@ impl NurbsSurface {
     /// Compute an axis-aligned bounding box from control point extrema.
     #[must_use]
     pub fn aabb(&self) -> Aabb3 {
-        **self.control_box.get_or_init(|| {
-            std::sync::Arc::new(Aabb3::from_points(
+        *self.caches.control_box.get_or_init(|| {
+            Aabb3::from_points(
                 self.control_points
                     .iter()
                     .flat_map(|row| row.iter().copied()),
-            ))
+            )
         })
+    }
+
+    /// The surface split into Bezier patches for casting rays at it
+    /// ([`RaySurface::new`](crate::nurbs::intersection::RaySurface::new)),
+    /// made on first use and shared from then on: a surface is never
+    /// changed once made. `None` where `RaySurface::new` declines it.
+    #[must_use]
+    pub fn ray_surface(&self) -> Option<std::sync::Arc<crate::nurbs::intersection::RaySurface>> {
+        self.caches
+            .ray_surface
+            .get_or_init(|| {
+                crate::nurbs::intersection::RaySurface::new(self).map(std::sync::Arc::new)
+            })
+            .clone()
     }
 
     /// The surface's coarse grid for projections, evaluated on first use.
     pub(crate) fn coarse_grid(&self) -> &crate::nurbs::projection::CoarseGrid {
-        self.coarse_grid
+        self.caches
+            .coarse_grid
             .get_or_init(|| std::sync::Arc::new(crate::nurbs::projection::CoarseGrid::new(self)))
     }
 
@@ -636,7 +660,8 @@ impl NurbsSurface {
     /// first use; `None` when a weight is not positive.
     #[must_use]
     pub fn span_index(&self) -> Option<&crate::nurbs::span_index::SpanIndex> {
-        self.span_index
+        self.caches
+            .span_index
             .get_or_init(|| crate::nurbs::span_index::SpanIndex::new(self).map(std::sync::Arc::new))
             .as_deref()
     }
