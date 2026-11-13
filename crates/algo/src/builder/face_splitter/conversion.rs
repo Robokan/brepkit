@@ -1,5 +1,6 @@
 //! Coordinate/type conversions between 3D, UV, and topology types.
 
+use brepkit_math::madd::Madd;
 use brepkit_math::vec::{Point2, Point3, Vec3};
 use brepkit_topology::Topology;
 use brepkit_topology::face::FaceSurface;
@@ -495,7 +496,7 @@ fn resolve_seam_endpoint_uv(edges: &mut [OrientedPCurveEdge], surface: &FaceSurf
             let shift = nearest(e.start_uv.x(), cur) - e.start_uv.x();
             e.start_uv = Point2::new(e.start_uv.x() + shift, e.start_uv.y());
             e.end_uv = Point2::new(e.end_uv.x() + shift, e.end_uv.y());
-            cur = if e.forward { native } else { -native }.mul_add(TAU, e.start_uv.x());
+            cur = if e.forward { native } else { -native }.madd(TAU, e.start_uv.x());
             continue;
         }
         if is_closed && !matches!(surface, FaceSurface::Cone(_)) {

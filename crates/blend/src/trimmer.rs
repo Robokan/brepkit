@@ -8,6 +8,7 @@
 //! straight contact lines, creating new edges, vertices, and wires for the
 //! trimmed result.
 
+use brepkit_math::madd::Madd;
 use brepkit_math::vec::Point3;
 use brepkit_topology::Topology;
 use brepkit_topology::edge::{Edge, EdgeCurve, EdgeId};
@@ -551,9 +552,9 @@ fn trim_to_inside_corners(
         let p = project(ends[j]);
         let on_boundary = chords.iter().any(|&(a, b)| {
             let ab = sub2(b, a);
-            let len2 = ab.0.mul_add(ab.0, ab.1 * ab.1);
+            let len2 = ab.0.madd(ab.0, ab.1 * ab.1);
             let t = if len2 > 0.0 {
-                (sub2(p, a).0.mul_add(ab.0, sub2(p, a).1 * ab.1) / len2).clamp(0.0, 1.0)
+                (sub2(p, a).0.madd(ab.0, sub2(p, a).1 * ab.1) / len2).clamp(0.0, 1.0)
             } else {
                 0.0
             };
@@ -837,7 +838,7 @@ fn sinusoid_range(s0: f64, (a, b): (f64, f64), (t0, t1): (f64, f64)) -> (f64, f6
         let reach = a.hypot(b);
         return (s0 - reach, s0 + reach);
     }
-    let at = |t: f64| a.mul_add(t.cos(), b.mul_add(t.sin(), s0));
+    let at = |t: f64| a.madd(t.cos(), b.madd(t.sin(), s0));
     let mut range = (at(lo).min(at(hi)), at(lo).max(at(hi)));
     let peak = b.atan2(a);
     for t in [peak, peak + PI] {
@@ -1676,7 +1677,7 @@ fn mapped_uv_allowance(
             );
             let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
             for k in 0..=SAMPLES {
-                let t = (t1 - t0).mul_add(f64::from(k) / f64::from(SAMPLES), t0);
+                let t = (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0);
                 let p = edge.curve().evaluate_with_endpoints(t, sp, ep);
                 if let Some(q) = surface
                     .project_point(p)
@@ -1896,7 +1897,7 @@ fn contact_crosses_own_seam(
                 let step = (s1 - s0) / f64::from(samples);
                 let mut best = (s0, (at(s0) - q).length());
                 for i in 1..=samples {
-                    let s = step.mul_add(f64::from(i), s0);
+                    let s = step.madd(f64::from(i), s0);
                     let d = (at(s) - q).length();
                     if d < best.1 {
                         best = (s, d);
@@ -1924,7 +1925,7 @@ fn contact_crosses_own_seam(
             let step = (d1 - d0) / f64::from(samples);
             let mut best = (d0, off(d0));
             for i in 1..=samples {
-                let t = step.mul_add(f64::from(i), d0);
+                let t = step.madd(f64::from(i), d0);
                 let d = off(t);
                 if d < best.1 {
                     best = (t, d);
@@ -2028,7 +2029,7 @@ fn closed_pcurve_piece(
     let step = (t1 - t0) / f64::from(samples);
     let mut best = (t0, gap(t0));
     for i in 1..=samples {
-        let t = step.mul_add(f64::from(i), t0);
+        let t = step.madd(f64::from(i), t0);
         let d = gap(t);
         if d < best.1 {
             best = (t, d);
@@ -3075,13 +3076,13 @@ fn flat_segment_distance(a0: Flat, a1: Flat, b0: Flat, b1: Flat) -> f64 {
     }
     let to_segment = |p: Flat, s0: Flat, s1: Flat| {
         let (dx, dy) = (s1.0 - s0.0, s1.1 - s0.1);
-        let length2 = dx.mul_add(dx, dy * dy);
+        let length2 = dx.madd(dx, dy * dy);
         let t = if length2 > 0.0 {
-            ((p.0 - s0.0).mul_add(dx, (p.1 - s0.1) * dy) / length2).clamp(0.0, 1.0)
+            ((p.0 - s0.0).madd(dx, (p.1 - s0.1) * dy) / length2).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        (p.0 - t.mul_add(dx, s0.0)).hypot(p.1 - t.mul_add(dy, s0.1))
+        (p.0 - t.madd(dx, s0.0)).hypot(p.1 - t.madd(dy, s0.1))
     };
     to_segment(a0, b0, b1)
         .min(to_segment(a1, b0, b1))
@@ -3105,7 +3106,7 @@ fn polylines_lie_on_each_other(a: &FlatPolyline, b: &FlatPolyline, margin: f64) 
             })
             .sum::<f64>()
     };
-    let tol = FULL_ROUND.mul_add(length(a).min(length(b)), margin);
+    let tol = FULL_ROUND.madd(length(a).min(length(b)), margin);
     let near = |p: Flat, line: &FlatPolyline| {
         (0..line.points.len()).any(|k| {
             let (s0, s1) = (line.points[k], line.points[(k + 1) % line.points.len()]);
@@ -3189,7 +3190,7 @@ fn check_holes_clear_of_closed_contacts(
         let (t0, t1) = curve.domain_with_endpoints(a, b);
         let at = |k: f64| {
             let k = if forward { k } else { f64::from(n) - k };
-            flat(curve.evaluate_with_endpoints((t1 - t0).mul_add(k / f64::from(n), t0), a, b))
+            flat(curve.evaluate_with_endpoints((t1 - t0).madd(k / f64::from(n), t0), a, b))
         };
         for k in 0..n {
             let (p, q) = (at(f64::from(k)), at(f64::from(k + 1)));
@@ -3271,7 +3272,7 @@ fn check_holes_clear_of_closed_contacts(
                 let area: f64 = (0..line.points.len())
                     .map(|k| {
                         let (p, q) = (line.points[k], line.points[(k + 1) % line.points.len()]);
-                        p.0.mul_add(q.1, -(p.1 * q.0))
+                        p.0.madd(q.1, -(p.1 * q.0))
                     })
                     .sum();
                 (area > 0.0) == matches!(side, TrimSide::Left)
@@ -3398,12 +3399,12 @@ struct OpenContact {
 /// The point of the segment `a b` nearest `p`.
 fn flat_closest_on_segment(p: Flat, a: Flat, b: Flat) -> Flat {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx.mul_add(dx, dy * dy);
+    let len2 = dx.madd(dx, dy * dy);
     if len2 <= f64::MIN_POSITIVE {
         return a;
     }
-    let t = ((p.0 - a.0).mul_add(dx, (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
-    (t.mul_add(dx, a.0), t.mul_add(dy, a.1))
+    let t = ((p.0 - a.0).madd(dx, (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
+    (t.madd(dx, a.0), t.madd(dy, a.1))
 }
 
 /// The distance between two points of the plane.
@@ -3432,13 +3433,13 @@ fn space_segment_distance(a0: Point3, a1: Point3, b0: Point3, b1: Point3) -> f64
             ((-c / a).clamp(0.0, 1.0), 0.0)
         } else {
             let b = d1.dot(d2);
-            let denom = a.mul_add(e, -(b * b));
+            let denom = a.madd(e, -(b * b));
             let mut s = if denom > f64::EPSILON * a * e {
-                (b.mul_add(f, -(c * e)) / denom).clamp(0.0, 1.0)
+                (b.madd(f, -(c * e)) / denom).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let mut t = b.mul_add(s, f) / e;
+            let mut t = b.madd(s, f) / e;
             if t < 0.0 {
                 t = 0.0;
                 s = (-c / a).clamp(0.0, 1.0);
@@ -3516,7 +3517,7 @@ fn same_side_on_wall(
     let cross = |o: Flat, a: Flat, b: Flat| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
     let (from, to) = ((pu, pv), (qu, qv));
     let run = (to.0 - from.0, to.1 - from.1);
-    let length2 = run.0.mul_add(run.0, run.1 * run.1);
+    let length2 = run.0.madd(run.0, run.1 * run.1);
     // The path's ends and the ring's first point are read within a turn of
     // each other and the ring spans at most four turns, so six turns either
     // way reach every copy the path can cross.
@@ -3537,8 +3538,8 @@ fn same_side_on_wall(
                 continue;
             }
             let f = side_a / (side_a - side_b);
-            let (x, y) = ((b.0 - a.0).mul_add(f, a.0), (b.1 - a.1).mul_add(f, a.1));
-            let t = (x - from.0).mul_add(run.0, (y - from.1) * run.1) / length2;
+            let (x, y) = ((b.0 - a.0).madd(f, a.0), (b.1 - a.1).madd(f, a.1));
+            let t = (x - from.0).madd(run.0, (y - from.1) * run.1) / length2;
             if (0.0..=1.0).contains(&t) {
                 crossings += 1;
             }
@@ -3576,7 +3577,7 @@ fn check_holes_clear_in_space(
         let (t0, t1) = curve.domain_with_endpoints(a, b);
         let at = |k: f64| {
             let k = if forward { k } else { f64::from(n) - k };
-            curve.evaluate_with_endpoints((t1 - t0).mul_add(k / f64::from(n), t0), a, b)
+            curve.evaluate_with_endpoints((t1 - t0).madd(k / f64::from(n), t0), a, b)
         };
         for k in 0..n {
             let (p, q) = (at(f64::from(k)), at(f64::from(k + 1)));
@@ -5912,7 +5913,7 @@ mod tests {
         let wave: Vec<(f64, f64)> = (0..64)
             .map(|k| {
                 let u = tau * f64::from(k) / 64.0;
-                (u, 0.5f64.mul_add(u.cos(), 5.0))
+                (u, 0.5f64.madd(u.cos(), 5.0))
             })
             .collect();
         let (wall, contact) = wall_with(&wave);

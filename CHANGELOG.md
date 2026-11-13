@@ -1,5 +1,74 @@
 # Changelog
 
+## [4.11.13](https://github.com/andymai/brepkit/compare/v4.11.12...v4.11.13) (2026-11-13)
+
+
+### Performance
+
+* **blend:** multiply then add in two steps in the new chamfer code ([#2421](https://github.com/andymai/brepkit/issues/2421)) ([f9d453e](https://github.com/andymai/brepkit/commit/f9d453e965b66964693ac36beb46fd5fd5edbe66))
+
+## [4.11.12](https://github.com/andymai/brepkit/compare/v4.11.11...v4.11.12) (2026-11-13)
+
+
+### Performance
+
+* **math:** a B-spline surface or curve keeps what it has worked out ([#2418](https://github.com/andymai/brepkit/issues/2418)) ([4b250e5](https://github.com/andymai/brepkit/commit/4b250e557bf2ed7994f73460c14eb3385197d5ac))
+
+## [4.11.11](https://github.com/andymai/brepkit/compare/v4.11.10...v4.11.11) (2026-11-13)
+
+
+### Performance
+
+* faster boolean steps on B-spline geometry ([#2417](https://github.com/andymai/brepkit/issues/2417)) ([13142ac](https://github.com/andymai/brepkit/commit/13142acdb6aa5c1db8148416806cee46b20e0211))
+
+## [4.11.10](https://github.com/andymai/brepkit/compare/v4.11.9...v4.11.10) (2026-11-13)
+
+
+### Bug Fixes
+
+* **blend:** a chamfer ending at a face's inside corner trims back to the corner ([#2381](https://github.com/andymai/brepkit/issues/2381)) ([0eafbb9](https://github.com/andymai/brepkit/commit/0eafbb9dab9911f39cc1c7c8eede96b03a43e679))
+* **blend:** a chamfer reaching exactly across a face takes its far edge ([#2416](https://github.com/andymai/brepkit/issues/2416)) ([1b9bd63](https://github.com/andymai/brepkit/commit/1b9bd63c8e9dab702011bafdb7042cd2f0f0c530))
+* **blend:** a flat chamfer runs its contacts to a slanted end face's plane ([#2382](https://github.com/andymai/brepkit/issues/2382)) ([187b122](https://github.com/andymai/brepkit/commit/187b12240215ded92f86441fde068d3fa15aefb7))
+* **blend:** split a face pinched along a contact over its own edge ([#2373](https://github.com/andymai/brepkit/issues/2373)) ([a350cdb](https://github.com/andymai/brepkit/commit/a350cdb7d18f9b65f585c855db9eaeb721f18ddd))
+* **operations:** a two-distance chamfer the blend engine refuses rebuilds planes with flat bevels ([#2384](https://github.com/andymai/brepkit/issues/2384)) ([70f7982](https://github.com/andymai/brepkit/commit/70f7982e93e0eeb24354d13d6ba4e6cc93c90c41))
+* **operations:** chamfer a body with curved edges through the blend engine ([#2379](https://github.com/andymai/brepkit/issues/2379)) ([66e2b61](https://github.com/andymai/brepkit/commit/66e2b616016d2ef62fa50c1354d9cd0c08274c68))
+* **operations:** chamfer a rim whose wall or cap goes whole ([#2380](https://github.com/andymai/brepkit/issues/2380)) ([1183628](https://github.com/andymai/brepkit/commit/11836285487e5c2f02fc55ab42b5754c5b4b996b))
+* **operations:** refuse a chamfer distance no face can hold ([#2378](https://github.com/andymai/brepkit/issues/2378)) ([88c1cd7](https://github.com/andymai/brepkit/commit/88c1cd7617700aa5dee5bf7bff35bd349861e6cc))
+
+
+### Performance
+
+* faster B-spline evaluation, derivatives and exact volume ([#2414](https://github.com/andymai/brepkit/issues/2414)) ([9ea56d9](https://github.com/andymai/brepkit/commit/9ea56d9fe5dac919c790d78394c070893db8f201))
+* **math:** multiply then add in two steps, with no call to a software fma ([a34c384](https://github.com/andymai/brepkit/commit/a34c38483258dc81862ee6f634cbf0cf91ee8071))
+
+## [4.11.9](https://github.com/andymai/brepkit/compare/v4.11.8...v4.11.9) (2026-11-13)
+
+
+### Performance
+
+* **algo:** cut a revolved spline solid through its axis without a fit or a search per sample ([#2408](https://github.com/andymai/brepkit/issues/2408)) ([206ec36](https://github.com/andymai/brepkit/commit/206ec368098e160eec6eb6cbc7f9049547d5d69c))
+
+## [4.11.8](https://github.com/andymai/brepkit/compare/v4.11.7...v4.11.8) (2026-11-13)
+
+
+### Bug Fixes
+
+* **algo:** split a plane face along a NURBS face's edge that lies in it ([#2402](https://github.com/andymai/brepkit/issues/2402)) ([87d3e44](https://github.com/andymai/brepkit/commit/87d3e445a9576e7d28980906b3853289b52d9a55))
+
+## [4.11.7](https://github.com/andymai/brepkit/compare/v4.11.6...v4.11.7) (2026-11-13)
+
+
+### Performance
+
+* **operations:** cut a NURBS tool out of a NURBS blank it lies inside without a section search ([#2403](https://github.com/andymai/brepkit/issues/2403)) ([0a14545](https://github.com/andymai/brepkit/commit/0a1454523e43794d76f269ee05957d0118783933))
+
+## [4.11.6](https://github.com/andymai/brepkit/compare/v4.11.5...v4.11.6) (2026-11-13)
+
+
+### Bug Fixes
+
+* **operations:** loft profiles with spline edges along their curves ([#2399](https://github.com/andymai/brepkit/issues/2399)) ([3de6c91](https://github.com/andymai/brepkit/commit/3de6c917db754d8ea514bdc57914ae8c7cdfc60d))
+
 ## [4.11.5](https://github.com/andymai/brepkit/compare/v4.11.4...v4.11.5) (2026-11-12)
 
 

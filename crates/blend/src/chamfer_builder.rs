@@ -4,6 +4,7 @@
 //! planar face pairs (v1). Reuses the analytic fast path and face trimming
 //! infrastructure from the fillet pipeline.
 
+use brepkit_math::madd::Madd;
 use std::collections::{HashMap, HashSet};
 
 use brepkit_math::vec::{Point3, Vec3};
@@ -435,6 +436,37 @@ impl<'a> ChamferBuilder<'a> {
     }
 }
 
+/// The far edge of a trimmed face left as that edge and the contact along
+/// it: a two-edge loop whose edges share their ends and both lie on one
+/// line. `None` for any other face.
+fn consumed_face_edge(
+    topo: &Topology,
+    face: FaceId,
+    contact: Option<EdgeId>,
+) -> Result<Option<EdgeId>, BlendError> {
+    let Some(contact) = contact else {
+        return Ok(None);
+    };
+    let edges = topo.wire(topo.face(face)?.outer_wire())?.edges();
+    let [a, b] = edges else {
+        return Ok(None);
+    };
+    let far = if a.edge() == contact {
+        b.edge()
+    } else {
+        a.edge()
+    };
+    let (c, f) = (topo.edge(contact)?, topo.edge(far)?);
+    if !matches!(c.curve(), brepkit_topology::edge::EdgeCurve::Line)
+        || !matches!(f.curve(), brepkit_topology::edge::EdgeCurve::Line)
+    {
+        return Ok(None);
+    }
+    let same_ends = (c.start() == f.start() && c.end() == f.end())
+        || (c.start() == f.end() && c.end() == f.start());
+    Ok(same_ends.then_some(far))
+}
+
 /// A flat chamfer's contacts end in the section square to its edge at each
 /// end, which is the end face's plane only where that face stands square to
 /// the edge. Where one plane face closes the edge's end at a slant (a prism
@@ -538,37 +570,6 @@ fn run_to_end_planes(
         section.center = p1 + (p2 - p1) * 0.5;
     }
     Ok(())
-}
-
-/// The far edge of a trimmed face left as that edge and the contact along
-/// it: a two-edge loop whose edges share their ends and both lie on one
-/// line. `None` for any other face.
-fn consumed_face_edge(
-    topo: &Topology,
-    face: FaceId,
-    contact: Option<EdgeId>,
-) -> Result<Option<EdgeId>, BlendError> {
-    let Some(contact) = contact else {
-        return Ok(None);
-    };
-    let edges = topo.wire(topo.face(face)?.outer_wire())?.edges();
-    let [a, b] = edges else {
-        return Ok(None);
-    };
-    let far = if a.edge() == contact {
-        b.edge()
-    } else {
-        a.edge()
-    };
-    let (c, f) = (topo.edge(contact)?, topo.edge(far)?);
-    if !matches!(c.curve(), brepkit_topology::edge::EdgeCurve::Line)
-        || !matches!(f.curve(), brepkit_topology::edge::EdgeCurve::Line)
-    {
-        return Ok(None);
-    }
-    let same_ends = (c.start() == f.start() && c.end() == f.end())
-        || (c.start() == f.end() && c.end() == f.start());
-    Ok(same_ends.then_some(far))
 }
 
 /// A chamfer surface's normal follows the spine tangent and the order of the
@@ -738,7 +739,7 @@ fn splice_end_face(
                 let scale = 1.0 + p.x().abs().max(p.y().abs()).max(p.z().abs());
                 (normal
                     .x()
-                    .mul_add(p.x(), normal.y().mul_add(p.y(), normal.z() * p.z()))
+                    .madd(p.x(), normal.y().madd(p.y(), normal.z() * p.z()))
                     - d)
                     .abs()
                     <= 1e-6 * scale
