@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794527073298,
+  "lastUpdate": 1794537395295,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4157,6 +4157,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29203710,
             "range": "± 366223",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b13af9e277b370da85d9789f3cabb92a19adb7ea",
+          "message": "docs(buzzcad): SPEED.md records the ray patches and section ranges kept\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T18:32:48-08:00",
+          "tree_id": "2f92bafe8259039097949499c3a9e66439d08b29",
+          "url": "https://github.com/Robokan/brepkit/commit/b13af9e277b370da85d9789f3cabb92a19adb7ea"
+        },
+        "date": 1794537394554,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1127682,
+            "range": "± 19820",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1216000,
+            "range": "± 8574",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12779,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 929005,
+            "range": "± 13213",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29188292,
+            "range": "± 156228",
             "unit": "ns/iter"
           }
         ]
