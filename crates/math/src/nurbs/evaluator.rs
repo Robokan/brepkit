@@ -177,9 +177,9 @@ impl<'a> SurfaceEvaluator<'a> {
     #[allow(clippy::many_single_char_names)]
     pub fn point_and_partials(&mut self, u: f64, v: f64) -> Option<(Point3, Vec3, Vec3)> {
         if self.surface.degree_u().max(self.surface.degree_v()) > basis::MAX_STACK_OUTPUT {
-            let d = self.surface.derivatives(u, v, 1);
-            let p = d[0][0];
-            return Some((Point3::new(p.x(), p.y(), p.z()), d[1][0], d[0][1]));
+            let d = self.surface.first_derivatives(u, v);
+            let p = d.0;
+            return Some((Point3::new(p.x(), p.y(), p.z()), d.1, d.2));
         }
         self.ensure_power_basis();
 

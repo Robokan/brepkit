@@ -77,11 +77,11 @@ pub fn intersect_curve_surface(
                 let tm = f64::midpoint(ts.0, ts.1);
                 let (um, vm) = (f64::midpoint(us.0, us.1), f64::midpoint(vs.0, vs.1));
                 let cd = curve.derivatives(tm, 1);
-                let sd = surface.derivatives(um, vm, 1);
+                let sd = surface.first_derivatives(um, vm);
                 let reach_t = cd[1].length() * (ts.1 - ts.0);
-                let reach_u = sd[1][0].length() * (us.1 - us.0);
-                let reach_v = sd[0][1].length() * (vs.1 - vs.0);
-                let gap = (cd[0] - sd[0][0]).length();
+                let reach_u = sd.1.length() * (us.1 - us.0);
+                let reach_v = sd.2.length() * (vs.1 - vs.0);
+                let gap = (cd[0] - sd.0).length();
                 if gap > REACH * 0.5 * (reach_t + reach_u + reach_v) + dedup_dist {
                     continue;
                 }
@@ -249,9 +249,9 @@ fn refine_curve_surface_point(
             return None;
         };
 
-        let s_derivs = surface.derivatives(u, v, 1);
-        let su = s_derivs[1][0];
-        let sv = s_derivs[0][1];
+        let s_derivs = surface.first_derivatives(u, v);
+        let su = s_derivs.1;
+        let sv = s_derivs.2;
 
         // J = [ct | -su | -sv], F = residual (as Vec3)
         // Solve J * [dt, du, dv]^T = -F
