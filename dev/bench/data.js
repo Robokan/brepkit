@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794599826443,
+  "lastUpdate": 1794603980019,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4535,6 +4535,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 21099013,
             "range": "± 270053",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b15136bfb9cd62d0e6982246302a3e877f318868",
+          "message": "Merge remote-tracking branch 'upstream/main'\n\n# Conflicts:\n#\tcrates/math/src/nurbs/intersection/surface_marching.rs\n#\tcrates/math/src/nurbs/projection.rs\n#\tcrates/math/src/nurbs/surface.rs",
+          "timestamp": "2026-11-13T12:12:48-08:00",
+          "tree_id": "b33e68e7f1493024f1ae0e92e6439e9c69a7fb37",
+          "url": "https://github.com/Robokan/brepkit/commit/b15136bfb9cd62d0e6982246302a3e877f318868"
+        },
+        "date": 1794603979313,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 914453,
+            "range": "± 2241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 965317,
+            "range": "± 103825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 10199,
+            "range": "± 86",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 600078,
+            "range": "± 4582",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 20560349,
+            "range": "± 90541",
             "unit": "ns/iter"
           }
         ]
