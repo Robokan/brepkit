@@ -7,7 +7,7 @@ use crate::MathError;
 use crate::aabb::Aabb3;
 use crate::bvh::Bvh;
 use crate::nurbs::curve::NurbsCurve;
-use crate::nurbs::decompose::{BezierPatch, surface_to_bezier_patches};
+use crate::nurbs::decompose::BezierPatch;
 use crate::nurbs::projection::{
     SurfaceProjection, project_point_to_surface, project_point_to_surface_from,
 };
@@ -86,10 +86,10 @@ pub(super) fn planar_patch_sections(
             .flatten()
             .map(|&p| super::plane::plane_terms(normal, offset, p))
             .fold(0.0, f64::max);
-    let Ok(patches) = surface_to_bezier_patches(other) else {
+    let Ok(patches) = other.bezier_patches() else {
         return Ok(None);
     };
-    for patch in patches {
+    for patch in patches.iter() {
         let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
         for p in patch.surface.control_points().iter().flatten() {
             let side = normal.dot(Vec3::new(p.x(), p.y(), p.z())) - offset;
@@ -595,11 +595,11 @@ pub(super) fn find_ssi_seeds_subdivision(
     s2: &NurbsSurface,
     tolerance: f64,
 ) -> Vec<IntersectionPoint> {
-    let patches_a = match surface_to_bezier_patches(s1) {
+    let patches_a = match s1.bezier_patches() {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
-    let patches_b = match surface_to_bezier_patches(s2) {
+    let patches_b = match s2.bezier_patches() {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
@@ -614,7 +614,7 @@ pub(super) fn find_ssi_seeds_subdivision(
 
     // Collect candidate pairs by AABB overlap.
     let mut candidate_pairs: Vec<(BezierPatch, BezierPatch)> = Vec::new();
-    for pa in &patches_a {
+    for pa in patches_a.iter() {
         let aabb_a = pa.aabb();
         let candidates = bvh.query_overlap(&aabb_a);
         for &b_idx in &candidates {

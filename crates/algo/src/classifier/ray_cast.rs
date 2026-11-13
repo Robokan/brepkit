@@ -1659,7 +1659,7 @@ fn collect_geoms_of(
 /// face.
 pub struct SpanTrim {
     surface: brepkit_math::nurbs::surface::NurbsSurface,
-    index: brepkit_math::nurbs::SpanIndex,
+    index: std::sync::Arc<brepkit_math::nurbs::SpanIndex>,
     /// Each wire as a closed polyline (its first point not repeated).
     loops_3d: Vec<Vec<Point3>>,
     /// How far a polyline may stand from its wire: a hit within this of one
@@ -1748,7 +1748,7 @@ impl SpanTrim {
     ) -> Result<Option<Self>, AlgoError> {
         use brepkit_topology::edge::EdgeCurve;
         const PIECES: u32 = 64;
-        let Some(index) = brepkit_math::nurbs::SpanIndex::new(surface) else {
+        let Some(index) = surface.span_index_shared() else {
             return Ok(None);
         };
         let mut loops_3d = Vec::new();
