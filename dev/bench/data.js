@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794606642386,
+  "lastUpdate": 1794611155831,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4643,6 +4643,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 18579828,
             "range": "± 80119",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "a2b2ab50f60a986202961ae0cd4476ede73ed3c8",
+          "message": "docs(buzzcad): SPEED.md records the upstream 4.11.13 merge, the arrangement's chord tie and the replay\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-13T15:02:55-08:00",
+          "tree_id": "6d4cf17ec59b2592f92ba3e2f70f9ad26a7e78d7",
+          "url": "https://github.com/Robokan/brepkit/commit/a2b2ab50f60a986202961ae0cd4476ede73ed3c8"
+        },
+        "date": 1794611155081,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 637717,
+            "range": "± 1856",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 677265,
+            "range": "± 6125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 6913,
+            "range": "± 595",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 432947,
+            "range": "± 6938",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 14384445,
+            "range": "± 121817",
             "unit": "ns/iter"
           }
         ]
