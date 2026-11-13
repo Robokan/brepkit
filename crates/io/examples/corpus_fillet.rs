@@ -521,7 +521,65 @@ fn main() {
     }
     let t = std::time::Instant::now();
     // FLAT=1 runs `chamfer::chamfer`, as the bridge does for an equal chamfer.
-    let built = if chamfer && std::env::var("FLAT").is_ok() {
+    // PROBES="x,y,z;..." with D2=<d2>: a two-distance chamfer, each edge's
+    // reference face the one of its two passing nearest its point, as the
+    // bridge's `chamfer_two` picks it (the points and D2 come from BuzzCAD's
+    // own `chamfer_faces`).
+    let probes: Option<Vec<Point3>> = std::env::var("PROBES").ok().map(|s| {
+        s.split(';')
+            .map(|p| {
+                let c: Vec<f64> = p.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                Point3::new(c[0], c[1], c[2])
+            })
+            .collect()
+    });
+    let built = if let Some(probes) = probes {
+        let d2: f64 = std::env::var("D2").unwrap().parse().unwrap();
+        let faces = solid_faces(&topo, sid).unwrap();
+        let mut picked = Vec::new();
+        for (&e, &probe) in edges.iter().zip(&probes) {
+            let mut best: Option<(f64, brepkit_topology::face::FaceId)> = None;
+            for &f in &faces {
+                let face = topo.face(f).unwrap();
+                let borders = std::iter::once(face.outer_wire())
+                    .chain(face.inner_wires().iter().copied())
+                    .any(|w| {
+                        topo.wire(w)
+                            .unwrap()
+                            .edges()
+                            .iter()
+                            .any(|oe| oe.edge() == e)
+                    });
+                if !borders {
+                    continue;
+                }
+                let surf = face.surface();
+                let gap = match surf {
+                    brepkit_topology::face::FaceSurface::Plane { normal, d } => {
+                        (normal.dot(probe - Point3::new(0.0, 0.0, 0.0)) - d).abs()
+                    }
+                    _ => surf
+                        .project_point(probe)
+                        .and_then(|(u, v)| surf.evaluate(u, v))
+                        .map_or(f64::INFINITY, |p| (p - probe).length()),
+                };
+                if best.is_none_or(|(g, _)| gap < g) {
+                    best = Some((gap, f));
+                }
+            }
+            let (_, f) = best.unwrap();
+            println!("edge {} reference face {}", e.index(), f.index());
+            picked.push((e, f));
+        }
+        brepkit_operations::chamfer::chamfer_two_on(&mut topo, sid, &picked, radius, d2).map(
+            |solid| brepkit_blend::BlendResult {
+                solid,
+                succeeded: edges.clone(),
+                failed: Vec::new(),
+                is_partial: false,
+            },
+        )
+    } else if chamfer && std::env::var("FLAT").is_ok() {
         brepkit_operations::chamfer::chamfer(&mut topo, sid, &edges, radius).map(|solid| {
             brepkit_blend::BlendResult {
                 solid,
