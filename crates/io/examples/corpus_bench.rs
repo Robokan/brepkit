@@ -7,7 +7,8 @@
 //! loaded. Cases whose inputs hold several solids are skipped. Prints one
 //! line per case and a summary. `FALLBACK=0` declines the mesh fallback
 //! (`BooleanOptions::mesh_fallback`), so a case that needs it errors in the
-//! time its exact attempt takes.
+//! time its exact attempt takes. A thread is started before anything is
+//! timed (`THREADED=0` does not): see `main`.
 //!
 //! ```sh
 //! cargo run --release -p brepkit-io --example corpus_bench -- <case dir>...
@@ -21,6 +22,13 @@ use brepkit_operations::boolean::{BooleanOp, BooleanOptions, boolean_with_option
 use brepkit_topology::Topology;
 
 fn main() {
+    // A process that has never started a thread allocates without locks;
+    // the app always runs threads, and parallel steps start them, so a
+    // thread is started first and every build is timed alike. THREADED=0
+    // leaves the process single-threaded.
+    if std::env::var("THREADED").map_or(true, |v| v != "0") {
+        std::thread::spawn(|| {}).join().ok();
+    }
     let repeat: usize = std::env::var("REPEAT")
         .ok()
         .and_then(|v| v.parse().ok())
