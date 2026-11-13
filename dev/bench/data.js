@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794550718939,
+  "lastUpdate": 1794558530393,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4319,6 +4319,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 29256511,
             "range": "± 128916",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "6c76425fbd7e9bcc50efd7a5808438b7e00407b7",
+          "message": "docs(buzzcad): rounds over through-bores cut back; torus bands split at coaxial circles\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-13T00:25:07-08:00",
+          "tree_id": "5869fae4601c0f8de569f08c50cbb345d01c10ed",
+          "url": "https://github.com/Robokan/brepkit/commit/6c76425fbd7e9bcc50efd7a5808438b7e00407b7"
+        },
+        "date": 1794558529882,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1137237,
+            "range": "± 4492",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1229493,
+            "range": "± 1103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13406,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 954900,
+            "range": "± 4724",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 29870808,
+            "range": "± 122172",
             "unit": "ns/iter"
           }
         ]
