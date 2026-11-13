@@ -440,7 +440,6 @@ pub fn intersect_plane_nurbs_in_region(
         off: &off,
         settle: &settle,
     };
-    // Windowed to the region, where there is one.
     let chains: Vec<Vec<IntersectionPoint>> = match region {
         None => ordered_chains,
         Some(region) => ordered_chains
