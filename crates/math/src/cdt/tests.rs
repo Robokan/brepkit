@@ -1076,3 +1076,37 @@ fn constraint_splits_at_a_vertex_on_it_beside_its_end() {
         );
     }
 }
+
+/// Several vertices exactly on a constraint, a hair apart beside its end, are
+/// a cluster of near-duplicates, not one vertex in its way: splitting through
+/// them would chain the constraint into slivers, and the region's fill came
+/// out a fan. The constraint is left to the bisection, as before.
+#[test]
+fn constraint_is_not_chained_through_a_cluster_on_it() {
+    for dir in [Point2::new(0.0, 1.0), Point2::new(1.0, 1.0)] {
+        let at = |s: f64| Point2::new(dir.x() * s, dir.y() * s);
+        let mut cdt = Cdt::new((Point2::new(-20.0, -20.0), Point2::new(20.0, 20.0)));
+        let v0 = cdt.insert_point(at(0.0)).unwrap();
+        let v1 = cdt.insert_point(at(10.0)).unwrap();
+        for k in 1..=5 {
+            cdt.insert_point(at(1.5e-8 * f64::from(k))).unwrap();
+        }
+        for p in [
+            Point2::new(-3.0, 4.0),
+            Point2::new(3.0, 6.0),
+            Point2::new(-4.0, 9.0),
+        ] {
+            cdt.insert_point(p).unwrap();
+        }
+        let _ = cdt.insert_constraint(v0, v1);
+        let vs = cdt.vertices();
+        let sliver = cdt
+            .constraint_edges()
+            .iter()
+            .find(|&&(a, b)| (vs[a] - vs[b]).length() < 1e-7);
+        assert!(
+            sliver.is_none(),
+            "{dir:?}: constraint chained through the cluster: {sliver:?}"
+        );
+    }
+}
