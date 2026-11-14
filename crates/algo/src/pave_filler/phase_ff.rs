@@ -1240,7 +1240,7 @@ fn onto_flush_spline_edges(
     let probes: Vec<Point3> = (0..=PROBES)
         .map(|k| {
             let t = (raw.t_range.1 - raw.t_range.0)
-                .mul_add(f64::from(k) / f64::from(PROBES), raw.t_range.0);
+                .madd(f64::from(k) / f64::from(PROBES), raw.t_range.0);
             raw.curve.evaluate_with_endpoints(t, raw.p_start, raw.p_end)
         })
         .collect();
@@ -7889,7 +7889,7 @@ fn circle_exits_plane_boundary(
                 const PIECES: u32 = 64;
                 let curve = edge.curve();
                 let (t0, t1) = curve.domain_with_endpoints(sp, ep);
-                let at = |f: f64| curve.evaluate_with_endpoints((t1 - t0).mul_add(f, t0), sp, ep);
+                let at = |f: f64| curve.evaluate_with_endpoints((t1 - t0).madd(f, t0), sp, ep);
                 let off = |f: f64| (at(f) - circle.center()).length() - circle.radius();
                 for k in 0..PIECES {
                     let (mut lo, mut hi) = (
@@ -8136,7 +8136,7 @@ fn circle_face_hits(
                 // both sides. One running along the circle (a fillet's
                 // contact curve) only wavers about it.
                 let at = |f: f64| {
-                    curve.evaluate_with_endpoints((t1 - t0).mul_add(f, t0), sv.point(), ev.point())
+                    curve.evaluate_with_endpoints((t1 - t0).madd(f, t0), sv.point(), ev.point())
                 };
                 let in_plane = (0..=PIECES).all(|k| {
                     circle

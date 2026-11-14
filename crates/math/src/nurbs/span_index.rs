@@ -10,6 +10,7 @@
 
 use crate::aabb::Aabb3;
 use crate::bvh::Bvh;
+use crate::madd::Madd;
 use crate::nurbs::surface::NurbsSurface;
 use crate::vec::{Point3, Vec3};
 
@@ -149,7 +150,7 @@ impl SpanIndex {
             while let Some((u, v, depth)) = stack.pop() {
                 let mid = (f64::midpoint(u.0, u.1), f64::midpoint(v.0, v.1));
                 let (p, su, sv) = surface.first_derivatives(mid.0, mid.1);
-                let reach = REACH * 0.5 * su.length().mul_add(u.1 - u.0, sv.length() * (v.1 - v.0));
+                let reach = REACH * 0.5 * su.length().madd(u.1 - u.0, sv.length() * (v.1 - v.0));
                 if off_line(Point3::new(p.x(), p.y(), p.z())) > reach + 1e-9 * self.scale.max(1.0) {
                     continue;
                 }
@@ -394,12 +395,12 @@ fn closest_from(
         let r = Vec3::new(s.x() - p.x(), s.y() - p.y(), s.z() - p.z());
         let (a11, a12, a22) = (su.dot(su), su.dot(sv), sv.dot(sv));
         let (b1, b2) = (-su.dot(r), -sv.dot(r));
-        let det = a11.mul_add(a22, -(a12 * a12));
+        let det = a11.madd(a22, -(a12 * a12));
         if det.abs() <= 1e-300 {
             break;
         }
-        let du = b1.mul_add(a22, -(b2 * a12)) / det;
-        let dv = a11.mul_add(b2, -(a12 * b1)) / det;
+        let du = b1.madd(a22, -(b2 * a12)) / det;
+        let dv = a11.madd(b2, -(a12 * b1)) / det;
         let (nu, nv) = (
             (u + du).clamp(u_win.0, u_win.1),
             (v + dv).clamp(v_win.0, v_win.1),

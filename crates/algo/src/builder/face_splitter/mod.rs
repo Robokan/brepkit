@@ -3140,6 +3140,10 @@ struct ArrHalfEdge {
     seg_id: usize,
     /// Direction angle at `from`.
     angle: f64,
+    /// Direction angle at `from` along the edge itself: a whole arc's
+    /// tangent, else `angle`. It orders edges whose chords leave a vertex
+    /// along one line.
+    tangent: f64,
 }
 
 /// One input edge to the arrangement (a boundary edge or a section), carrying
@@ -4231,6 +4235,29 @@ fn arrangement_regions_from_inputs(
     let sub_edge_src: Vec<(usize, bool)> = sub_edges.iter().map(|&(_, _, i, w)| (i, w)).collect();
     let sub_edges: Vec<(UvKey, UvKey)> = sub_edges.iter().map(|&(a, b, _, _)| (a, b)).collect();
 
+    // A whole arc's direction where it leaves vertex `at`, along the arc
+    // rather than its chord. An arc's chord can lie on the line of another
+    // edge at the same vertex (a disc's rim arc over a section and a chord
+    // in one line), and the chords alone then leave the trace to rounding.
+    // A whole sub-edge runs its input's way, so `forward` leaves its start.
+    let arc_leaving_angle = |seg_id: usize, forward: bool, at: Point2| -> Option<f64> {
+        let (i, whole) = sub_edge_src[seg_id];
+        if !(inputs[i].is_arc && whole) {
+            return None;
+        }
+        let e = &inputs[i].edge;
+        let (d0, d1) = e.curve_3d.domain_with_endpoints(e.start_3d, e.end_3d);
+        let (t_end, t_far) = if forward { (d0, d1) } else { (d1, d0) };
+        let uv =
+            |t: f64| frame.project(e.curve_3d.evaluate_with_endpoints(t, e.start_3d, e.end_3d));
+        let end = uv(t_end);
+        if (end - at).length() > tol * 1000.0 {
+            return None;
+        }
+        let dir = uv((t_far - t_end).madd(1e-4, t_end)) - end;
+        (dir.length() > 0.0).then(|| dir.y().atan2(dir.x()))
+    };
+
     // Build the directed half-edge adjacency. Each undirected sub-edge id maps
     // to two directed half-edges; both carry that id so adjacent regions share
     // one topology edge. Half-edge index 2*k = forward (va->vb), 2*k+1 = reverse.
@@ -4240,17 +4267,21 @@ fn arrangement_regions_from_inputs(
         let pb = vert_pos[&kb];
         let fwd = pb - pa;
         let rev = pa - pb;
+        let angle = fwd.y().atan2(fwd.x());
+        let back = rev.y().atan2(rev.x());
         halfs.push(ArrHalfEdge {
             from: ka,
             to: kb,
             seg_id,
-            angle: fwd.y().atan2(fwd.x()),
+            angle,
+            tangent: arc_leaving_angle(seg_id, true, pa).unwrap_or(angle),
         });
         halfs.push(ArrHalfEdge {
             from: kb,
             to: ka,
             seg_id,
-            angle: rev.y().atan2(rev.x()),
+            angle: back,
+            tangent: arc_leaving_angle(seg_id, false, pb).unwrap_or(back),
         });
     }
 
@@ -4299,14 +4330,43 @@ fn arrangement_regions_from_inputs(
             // Pick the candidate minimizing the CCW turn from `back_angle`,
             // excluding the immediate twin (which would U-turn). The smallest
             // positive CCW offset hugs the boundary on the left = minimal face.
+            //
+            // Chords leaving along one line (a whole arc's chord on another
+            // edge's line) tie, and are ordered by their true directions: a
+            // candidate along the way back sits just after it or just before
+            // a full turn, and two tied candidates go clockwise first.
+            let tie = 1e-9;
+            let turn = |a: f64, b: f64| {
+                (a - b + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+                    - std::f64::consts::PI
+            };
             let mut best: Option<usize> = None;
             let mut best_off = f64::MAX;
             for &c in cands {
                 if used[c] || c == twin {
                     continue;
                 }
-                let off = (halfs[c].angle - back_angle).rem_euclid(std::f64::consts::TAU);
-                if off < best_off {
+                let mut off = (halfs[c].angle - back_angle).rem_euclid(std::f64::consts::TAU);
+                if off < tie || off > std::f64::consts::TAU - tie {
+                    let side = turn(halfs[c].tangent, halfs[twin].tangent);
+                    if side > tie {
+                        off = 0.0;
+                    } else if side < -tie {
+                        off = std::f64::consts::TAU;
+                    }
+                }
+                let better = match best {
+                    Some(b) if (off - best_off).abs() <= tie => {
+                        let t = turn(halfs[c].tangent, halfs[b].tangent);
+                        if t.abs() > tie {
+                            t < 0.0
+                        } else {
+                            off < best_off
+                        }
+                    }
+                    _ => off < best_off,
+                };
+                if better {
                     best_off = off;
                     best = Some(c);
                 }
@@ -4659,8 +4719,9 @@ fn arrangement_regions_from_inputs(
         // OVERLAPPING faces (disconnected or bridge-connected components — a
         // holed cap's twin loops, the divider-lip weave) sums to MORE than the
         // outer area, and keeps the containment-depth nesting that resolves
-        // it.
-        let outer_area = face_area(&faces[outer_idx]).abs();
+        // it. The outer face is measured with its arcs, as the regions are: by
+        // its chords a rim of arcs reads smaller than the regions it holds.
+        let outer_area = signed_area_2d(&face_poly(&faces[outer_idx])).abs();
         let interior_area_sum: f64 = areas.iter().sum();
         let clean_tiling =
             (interior_area_sum - outer_area).abs() <= outer_area.madd(1e-6, tol * tol);
@@ -5273,12 +5334,14 @@ fn split_cylinder_band_by_arrangement(
             to: kb,
             seg_id,
             angle: fwd.y().atan2(fwd.x()),
+            tangent: fwd.y().atan2(fwd.x()),
         });
         halfs.push(ArrHalfEdge {
             from: kb,
             to: ka,
             seg_id,
             angle: rev.y().atan2(rev.x()),
+            tangent: rev.y().atan2(rev.x()),
         });
     }
 
@@ -7501,7 +7564,7 @@ fn split_face_2d_impl(
                     let run_lo = edge
                         .start_uv
                         .x()
-                        .min(std::f64::consts::TAU.mul_add(dir, edge.start_uv.x()));
+                        .min(std::f64::consts::TAU.madd(dir, edge.start_uv.x()));
                     let turns = (lo - run_lo) / std::f64::consts::TAU;
                     if (turns - turns.round()).abs() <= 1e-6 {
                         let by = turns.round() * std::f64::consts::TAU;
@@ -8211,7 +8274,7 @@ fn split_face_2d_impl(
                 // The circle lies at one v, so each third's point is the
                 // surface's at its UV.
                 let at = |k: f64| {
-                    let uv = Point2::new((eu.x() - su.x()).mul_add(k / 3.0, su.x()), su.y());
+                    let uv = Point2::new((eu.x() - su.x()).madd(k / 3.0, su.x()), su.y());
                     (surface.evaluate(uv.x(), uv.y()).unwrap_or(s.start), uv)
                 };
                 let pts = [at(0.0), at(1.0), at(2.0), at(3.0)];
@@ -11806,6 +11869,80 @@ mod tests {
                 (swept - 4.0 * std::f64::consts::PI).abs() < 1e-6,
                 "from {start_at}: its cells run {swept} round the circle, not once each way"
             );
+        }
+    }
+
+    /// A disc's rim, its upper half one arc, a line across it along that
+    /// arc's chord, and a small half disc on the line: at each end of the line
+    /// the arc and the line leave along one direction, and the arc's own
+    /// direction orders them. A half annulus, the small half disc and the
+    /// lower half disc, in turns that leave the chords tied exactly and only
+    /// to rounding.
+    #[test]
+    fn rim_arcs_whose_chords_run_along_a_line_bound_their_own_regions() {
+        use brepkit_math::curves::Circle3D;
+        use std::f64::consts::PI;
+
+        for turn in [0.0, 0.7, 1.3, PI / 2.0, 2.9, 4.4] {
+            let (s, c) = turn.sin_cos();
+            let at = |x: f64, y: f64| Point3::new(c * x - s * y, s * x + c * y, 0.0);
+            let normal = Vec3::new(0.0, 0.0, 1.0);
+            let surface = FaceSurface::Plane { normal, d: 0.0 };
+            let rim = [at(5.0, 0.0), at(0.0, 5.0), at(-5.0, 0.0), at(0.0, -5.0)];
+            let frame = PlaneFrame::from_plane_face(normal, &rim);
+            let edge = |curve_3d: EdgeCurve, from: Point3, to: Point3| OrientedPCurveEdge {
+                pcurve: compute_pcurve_on_surface(
+                    &curve_3d,
+                    from,
+                    to,
+                    &surface,
+                    &rim,
+                    Some(&frame),
+                ),
+                curve_3d,
+                start_uv: frame.project(from),
+                end_uv: frame.project(to),
+                start_3d: from,
+                end_3d: to,
+                forward: true,
+                source_edge_idx: None,
+                pave_block_id: None,
+            };
+            let round = |r: f64| {
+                EdgeCurve::Circle(Circle3D::new(Point3::new(0.0, 0.0, 0.0), normal, r).unwrap())
+            };
+            let edges = [
+                edge(round(5.0), at(5.0, 0.0), at(-5.0, 0.0)),
+                edge(round(5.0), at(-5.0, 0.0), at(0.0, -5.0)),
+                edge(round(5.0), at(0.0, -5.0), at(5.0, 0.0)),
+                edge(EdgeCurve::Line, at(-5.0, 0.0), at(-2.0, 0.0)),
+                edge(EdgeCurve::Line, at(-2.0, 0.0), at(2.0, 0.0)),
+                edge(EdgeCurve::Line, at(2.0, 0.0), at(5.0, 0.0)),
+                edge(round(2.0), at(2.0, 0.0), at(0.0, 2.0)),
+                edge(round(2.0), at(0.0, 2.0), at(-2.0, 0.0)),
+            ];
+            let pieces = arrangement_regions_from_combined(
+                &surface,
+                &edges,
+                &[],
+                Rank::B,
+                false,
+                make_unit_square_face(&mut Topology::new()),
+                &frame,
+                1e-7,
+            );
+            assert!(pieces.is_some(), "turn {turn}: no regions");
+            let pieces = pieces.unwrap();
+            let mut areas: Vec<f64> = pieces
+                .iter()
+                .map(|p| loop_area_in_frame(&p.outer_wire, &frame).abs())
+                .collect();
+            areas.sort_by(f64::total_cmp);
+            let want = [2.0 * PI, 10.5 * PI, 12.5 * PI];
+            assert_eq!(areas.len(), want.len(), "turn {turn}: regions {areas:?}");
+            for (got, want) in areas.iter().zip(want) {
+                assert!((got - want).abs() < 1e-6, "turn {turn}: regions {areas:?}");
+            }
         }
     }
 

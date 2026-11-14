@@ -223,7 +223,7 @@ pub(super) fn region_with_fitted_splines(
             let (t0, t1) = e.curve_3d.domain_with_endpoints(s3, e3);
             let mut pts: Vec<Point2> = (0..=64)
                 .map(|k| {
-                    let t = (t1 - t0).mul_add(f64::from(k) / 64.0, t0);
+                    let t = (t1 - t0).madd(f64::from(k) / 64.0, t0);
                     frame.project(e.curve_3d.evaluate_with_endpoints(t, s3, e3))
                 })
                 .collect();

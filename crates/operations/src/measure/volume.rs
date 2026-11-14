@@ -3300,7 +3300,7 @@ fn whole_patch_flux(
             for gu in gauss {
                 for gv in gauss {
                     let (p, s_u, s_v) =
-                        ev.point_and_partials(hu.mul_add(gu.x, mu), hv.mul_add(gv.x, mv))?;
+                        ev.point_and_partials(hu.madd(gu.x, mu), hv.madd(gv.x, mv))?;
                     let r = p - about;
                     let w = gu.w * gv.w * hu * hv * r.dot(s_u.cross(s_v));
                     flux += w;

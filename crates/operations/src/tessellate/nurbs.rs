@@ -333,7 +333,7 @@ pub fn compute_sphere_v_range(
             let (p0, p1) = (sv.point(), ev.point());
             let (t0, t1) = edge.curve().domain_with_endpoints(p0, p1);
             for k in 0..=8 {
-                let t = (t1 - t0).mul_add(f64::from(k) / 8.0, t0);
+                let t = (t1 - t0).madd(f64::from(k) / 8.0, t0);
                 let v = sphere
                     .project_point(edge.curve().evaluate_with_endpoints(t, p0, p1))
                     .1;

@@ -110,7 +110,7 @@ pub fn intersect_curve_surface(
                 {
                     let dup = hits.iter().any(|h: &CurveSurfaceHit| {
                         let d = h.point - hit.point;
-                        d.x().mul_add(d.x(), d.y().mul_add(d.y(), d.z() * d.z())) < dedup_sq
+                        d.x().madd(d.x(), d.y().madd(d.y(), d.z() * d.z())) < dedup_sq
                     });
                     if !dup {
                         hits.push(hit);

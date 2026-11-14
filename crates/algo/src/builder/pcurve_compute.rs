@@ -188,8 +188,8 @@ fn plane_conic_arc(
     let mut knots = vec![0.0; 3];
     for k in 0..pieces {
         #[allow(clippy::cast_precision_loss)]
-        let lo = (k as f64).mul_add(step, ta);
-        let mid = 0.5f64.mul_add(step, lo);
+        let lo = (k as f64).madd(step, ta);
+        let mid = 0.5f64.madd(step, lo);
         points.push(c + (a * mid.cos() + b * mid.sin()) * (1.0 / w));
         weights.push(w);
         points.push(on(lo + step));

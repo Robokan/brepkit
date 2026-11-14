@@ -1677,7 +1677,7 @@ fn mapped_uv_allowance(
             );
             let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
             for k in 0..=SAMPLES {
-                let t = (t1 - t0).mul_add(f64::from(k) / f64::from(SAMPLES), t0);
+                let t = (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0);
                 let p = edge.curve().evaluate_with_endpoints(t, sp, ep);
                 if let Some(q) = surface
                     .project_point(p)
@@ -1897,7 +1897,7 @@ fn contact_crosses_own_seam(
                 let step = (s1 - s0) / f64::from(samples);
                 let mut best = (s0, (at(s0) - q).length());
                 for i in 1..=samples {
-                    let s = step.mul_add(f64::from(i), s0);
+                    let s = step.madd(f64::from(i), s0);
                     let d = (at(s) - q).length();
                     if d < best.1 {
                         best = (s, d);
@@ -1925,7 +1925,7 @@ fn contact_crosses_own_seam(
             let step = (d1 - d0) / f64::from(samples);
             let mut best = (d0, off(d0));
             for i in 1..=samples {
-                let t = step.mul_add(f64::from(i), d0);
+                let t = step.madd(f64::from(i), d0);
                 let d = off(t);
                 if d < best.1 {
                     best = (t, d);
@@ -2029,7 +2029,7 @@ fn closed_pcurve_piece(
     let step = (t1 - t0) / f64::from(samples);
     let mut best = (t0, gap(t0));
     for i in 1..=samples {
-        let t = step.mul_add(f64::from(i), t0);
+        let t = step.madd(f64::from(i), t0);
         let d = gap(t);
         if d < best.1 {
             best = (t, d);
@@ -3106,7 +3106,7 @@ fn polylines_lie_on_each_other(a: &FlatPolyline, b: &FlatPolyline, margin: f64) 
             })
             .sum::<f64>()
     };
-    let tol = FULL_ROUND.mul_add(length(a).min(length(b)), margin);
+    let tol = FULL_ROUND.madd(length(a).min(length(b)), margin);
     let near = |p: Flat, line: &FlatPolyline| {
         (0..line.points.len()).any(|k| {
             let (s0, s1) = (line.points[k], line.points[(k + 1) % line.points.len()]);
@@ -3399,12 +3399,12 @@ struct OpenContact {
 /// The point of the segment `a b` nearest `p`.
 fn flat_closest_on_segment(p: Flat, a: Flat, b: Flat) -> Flat {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx.mul_add(dx, dy * dy);
+    let len2 = dx.madd(dx, dy * dy);
     if len2 <= f64::MIN_POSITIVE {
         return a;
     }
-    let t = ((p.0 - a.0).mul_add(dx, (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
-    (t.mul_add(dx, a.0), t.mul_add(dy, a.1))
+    let t = ((p.0 - a.0).madd(dx, (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
+    (t.madd(dx, a.0), t.madd(dy, a.1))
 }
 
 /// The distance between two points of the plane.

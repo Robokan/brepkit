@@ -792,8 +792,8 @@ impl NurbsSurface {
 
     /// The surface split into Bezier patches
     /// ([`surface_to_bezier_patches`](crate::nurbs::decompose::surface_to_bezier_patches)),
-    /// kept among the last few split anywhere (at most `SPLIT_PATCHES`
-    /// patches in all) and found again by the surface's data bit for bit: a
+    /// kept among the last few split anywhere (at most 50,000 patches in
+    /// all) and found again by the surface's data bit for bit: a
     /// boolean's result rebuilds its faces' surfaces, so a body cut by one
     /// tool after another would otherwise split the same surface for each.
     /// Not kept on the surface, which can outlive its use by far.

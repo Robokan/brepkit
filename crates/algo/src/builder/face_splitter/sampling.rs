@@ -185,8 +185,8 @@ pub(super) fn sample_wire_loop_uv_periodic(
                     for i in 1..steps {
                         let t = i as f64 / steps as f64;
                         pts.push(Point2::new(
-                            d.x().mul_add(t, edge.start_uv.x()),
-                            d.y().mul_add(t, edge.start_uv.y()),
+                            d.x().madd(t, edge.start_uv.x()),
+                            d.y().madd(t, edge.start_uv.y()),
                         ));
                     }
                     pts.push(edge.end_uv);

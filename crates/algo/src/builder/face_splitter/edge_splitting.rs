@@ -212,7 +212,7 @@ pub(super) fn split_boundary_edges_at_3d_points(
                 // section on the hole's seam).
                 brepkit_math::vec::Point2::new(
                     edge.start_uv.x(),
-                    (edge.end_uv.y() - edge.start_uv.y()).mul_add(t, edge.start_uv.y()),
+                    (edge.end_uv.y() - edge.start_uv.y()).madd(t, edge.start_uv.y()),
                 )
             } else {
                 project_point_on_surface(split_3d, surface, &[], None)

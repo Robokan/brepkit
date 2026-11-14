@@ -3243,7 +3243,7 @@ fn loop_length(topo: &Topology, edge: &Edge) -> Result<f64, BlendError> {
     let (t0, t1) = curve.domain_with_endpoints(at, at);
     let point = |k: u32| {
         curve.evaluate_with_endpoints(
-            (t1 - t0).mul_add(f64::from(k) / f64::from(SAMPLES), t0),
+            (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0),
             at,
             at,
         )
@@ -5169,7 +5169,7 @@ fn cylinder_meets_cap(
             if f.abs() <= 1e-3 * tol {
                 return Some((w, s));
             }
-            let g2 = gw.mul_add(gw, gs * gs);
+            let g2 = gw.madd(gw, gs * gs);
             if g2 <= 1e-24 {
                 return None;
             }
@@ -5210,14 +5210,14 @@ fn cylinder_meets_cap(
             }
             let (mut tw, mut ts) = (-gs / g, gw / g);
             let backwards = heading.map_or_else(
-                || tw.mul_add(target.0 - w, ts * (target.1 - s)) < 0.0,
-                |(hw, hs)| tw.mul_add(hw, ts * hs) < 0.0,
+                || tw.madd(target.0 - w, ts * (target.1 - s)) < 0.0,
+                |(hw, hs)| tw.madd(hw, ts * hs) < 0.0,
             );
             if backwards {
                 (tw, ts) = (-tw, -ts);
             }
             heading = Some((tw, ts));
-            (w, s) = settle(tw.mul_add(h, w), ts.mul_add(h, s))?;
+            (w, s) = settle(tw.madd(h, w), ts.madd(h, s))?;
             points.push(at(w, s));
         }
         let curve = brepkit_math::nurbs::fitting::interpolate(&points, 3).ok()?;
@@ -6297,7 +6297,7 @@ fn torus_parallel_meets_plane(
     v: f64,
     near: f64,
 ) -> Option<f64> {
-    let rho = torus.minor_radius().mul_add(v.cos(), torus.major_radius());
+    let rho = torus.minor_radius().madd(v.cos(), torus.major_radius());
     let centre = torus.center();
     let a = rho * normal.dot(torus.x_axis());
     let b = rho * normal.dot(torus.y_axis());
@@ -6333,7 +6333,7 @@ fn torus_parallel_meets_surface(
     near: f64,
     tol: f64,
 ) -> Option<f64> {
-    let rho = torus.minor_radius().mul_add(v.cos(), torus.major_radius());
+    let rho = torus.minor_radius().madd(v.cos(), torus.major_radius());
     if rho <= 0.0 {
         return None;
     }
@@ -6527,7 +6527,7 @@ fn torus_run_on(
             break;
         }
         let reached = torus.evaluate(u_new, v);
-        let rho = torus.minor_radius().mul_add(v.cos(), torus.major_radius());
+        let rho = torus.minor_radius().madd(v.cos(), torus.major_radius());
         if rho <= 0.0 {
             break;
         }
@@ -6785,7 +6785,7 @@ fn edge_off_surface(
     let (t0, t1) = curve.domain_with_endpoints(a, b);
     let mut farthest: f64 = 0.0;
     for k in 0..=SAMPLES {
-        let t = (t1 - t0).mul_add(f64::from(k) / f64::from(SAMPLES), t0);
+        let t = (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0);
         let p = curve.evaluate_with_endpoints(t, a, b);
         let off = match surface {
             FaceSurface::Plane { normal, d } => {
@@ -9034,7 +9034,7 @@ fn check_apart_contacts_do_not_cross(
         })
         .collect();
     let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
-        (q.0 - p.0).mul_add(r.1 - p.1, -((q.1 - p.1) * (r.0 - p.0)))
+        (q.0 - p.0).madd(r.1 - p.1, -((q.1 - p.1) * (r.0 - p.0)))
     };
     let cross = |a: &[(f64, f64)], b: &[(f64, f64)]| {
         a.windows(2).any(|s| {
@@ -9085,7 +9085,7 @@ fn contact_points(restriction: &trimmer::ParametricRestriction) -> Vec<Point3> {
     let (t0, t1) = curve.domain_with_endpoints(first, last);
     (0..=CONTACT_CURVE_SAMPLES)
         .map(|k| {
-            let t = (t1 - t0).mul_add(f64::from(k) / f64::from(CONTACT_CURVE_SAMPLES), t0);
+            let t = (t1 - t0).madd(f64::from(k) / f64::from(CONTACT_CURVE_SAMPLES), t0);
             curve.evaluate_with_endpoints(t, first, last)
         })
         .collect()

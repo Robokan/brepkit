@@ -84,30 +84,12 @@ fn cut(turn: f64, seam: f64, slots: bool) -> (u64, Topology, brepkit_topology::s
     (mesh_fallback_count() - before, topo, result)
 }
 
-/// The pose whose slotted disc leaves the plate's hole chords running on
-/// along its slots' chords to its rim: the disc's underside splits into
-/// slivers between the slots' arcs and the rim, which the splitter does not
-/// yet build (it passed on a fused multiply-add's rounding alone).
-const SLIVER_POSE: (f64, f64, bool) = (0.7, 3.0, true);
-
 #[test]
 fn a_disc_whose_rim_runs_along_segment_holes_cuts_its_circle() {
-    check_poses(
-        (0..12)
-            .map(|k| ([0.0, 0.7][k % 2], [0.0, 1.0, 3.0][k / 2 % 3], k >= 6))
-            .filter(|&pose| pose != SLIVER_POSE),
-    );
-}
-
-#[test]
-#[ignore = "the slotted disc's underside slivers are not split yet"]
-fn a_slotted_disc_whose_slot_chords_run_on_to_its_rim() {
-    check_poses(std::iter::once(SLIVER_POSE));
-}
-
-fn check_poses(poses: impl Iterator<Item = (f64, f64, bool)>) {
     let seg = segment_area();
-    for (turn, seam, slots) in poses {
+    for (turn, seam, slots) in
+        (0..12).map(|k| ([0.0, 0.7][k % 2], [0.0, 1.0, 3.0][k / 2 % 3], k >= 6))
+    {
         let plate = W * W;
         let want = plate.mul_add(H, -2.0 * seg * H) - PI.mul_add(R * R, -2.0 * seg) * DEPTH;
         // The underside: the plate less the disc.

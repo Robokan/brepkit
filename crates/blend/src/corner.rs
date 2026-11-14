@@ -583,13 +583,13 @@ fn surface_distance(surface: &FaceSurface, point: Point3) -> Option<f64> {
         let r = surface.evaluate(u, v)? - point;
         let (su, sv) = (surface.partial_u(u, v)?, surface.partial_v(u, v)?);
         let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
-        let det = a.mul_add(c, -b * b);
+        let det = a.madd(c, -b * b);
         if det.abs() <= 1e-300 {
             break;
         }
         let (gu, gv) = (su.dot(r), sv.dot(r));
-        u -= c.mul_add(gu, -b * gv) / det;
-        v -= a.mul_add(gv, -b * gu) / det;
+        u -= c.madd(gu, -b * gv) / det;
+        v -= a.madd(gv, -b * gu) / det;
     }
     Some((surface.evaluate(u, v)? - point).length())
 }

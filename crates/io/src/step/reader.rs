@@ -558,7 +558,7 @@ impl<'a> StepBuilder<'a> {
         if splits.len() < 2 {
             // The free value farthest round from v0.
             let far = (1..64)
-                .map(|k| (v1 - v0).mul_add(f64::from(k) / 64.0, v0))
+                .map(|k| (v1 - v0).madd(f64::from(k) / 64.0, v0))
                 .filter(|&v| !covered(v))
                 .min_by(|a, b| {
                     let mid = 0.5 * (v0 + v1);
@@ -716,7 +716,7 @@ impl<'a> StepBuilder<'a> {
                 );
                 let (t0, t1) = e.curve().domain_with_endpoints(a, b);
                 for k in 0..32 {
-                    let t = (t1 - t0).mul_add(f64::from(k) / 32.0, t0);
+                    let t = (t1 - t0).madd(f64::from(k) / 32.0, t0);
                     let p = e.curve().evaluate_with_endpoints(t, a, b);
                     let Ok(proj) = project_point_to_surface(n, p, 1e-9) else {
                         return Ok(None);

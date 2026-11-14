@@ -5,6 +5,7 @@
 //! sharing. Post-assembly passes refine boundary edges and split non-manifold
 //! edges to ensure a valid manifold result.
 
+use brepkit_math::madd::Madd;
 use std::collections::{HashMap, HashSet};
 
 use brepkit_math::aabb::Aabb3;
@@ -809,7 +810,7 @@ fn loop_winds_round_axis(
             let f = if oe.is_forward() { f } else { 1.0 - f };
             let p = edge
                 .curve()
-                .evaluate_with_endpoints((t1 - t0).mul_add(f, t0), sp, ep);
+                .evaluate_with_endpoints((t1 - t0).madd(f, t0), sp, ep);
             let Some((u, _)) = surface.project_point(p) else {
                 return Ok(false);
             };
@@ -1240,7 +1241,7 @@ pub(super) fn separate_pinched_edges(
         // A step into each face, on its surface, for the angle it leaves
         // the edge at: two faces tangent along the edge (a rod lying on a
         // plate) leave it alike at first and part only as one curves away.
-        let step = (p1 - p0).length().mul_add(1e-3, 0.0).clamp(1e-4, 0.1);
+        let step = (p1 - p0).length().madd(1e-3, 0.0).clamp(1e-4, 0.1);
         let mut round: Vec<(f64, usize, bool)> = Vec::with_capacity(edge_uses.len());
         for (k, &(fid, _, _, forward)) in edge_uses.iter().enumerate() {
             let face = topo.face(fid)?;

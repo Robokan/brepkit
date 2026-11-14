@@ -1770,11 +1770,7 @@ impl SpanTrim {
                 };
                 let (t0, t1) = curve.domain_with_endpoints(sp, ep);
                 let at = |k: f64| {
-                    curve.evaluate_with_endpoints(
-                        (t1 - t0).mul_add(k / f64::from(pieces), t0),
-                        sp,
-                        ep,
-                    )
+                    curve.evaluate_with_endpoints((t1 - t0).madd(k / f64::from(pieces), t0), sp, ep)
                 };
                 let mut along: Vec<Point3> = (0..=pieces).map(|k| at(f64::from(k))).collect();
                 for k in 0..pieces {
@@ -1802,7 +1798,7 @@ impl SpanTrim {
         );
         let mut loops_uv: Vec<Vec<Point2>> = Vec::with_capacity(loops_3d.len());
         let unwrap = |prev: f64, next: f64, period: Option<f64>| {
-            period.map_or(next, |p| p.mul_add(-((next - prev) / p).round(), next))
+            period.map_or(next, |p| p.madd(-((next - prev) / p).round(), next))
         };
         // Each sample is placed from the one before it, as a curve on the
         // patch runs on; a search over the whole patch can settle on a far
@@ -1899,12 +1895,12 @@ impl SpanTrim {
                 } else {
                     (a.x() + du, a.x())
                 };
-                let at = period.map_or(u, |p| ((u - lo) / p).floor().mul_add(-p, u));
+                let at = period.map_or(u, |p| ((u - lo) / p).floor().madd(-p, u));
                 if at < lo || at >= hi {
                     continue;
                 }
                 let t = (at - a.x()) / du;
-                if t.mul_add(b.y() - a.y(), a.y()) > v {
+                if t.madd(b.y() - a.y(), a.y()) > v {
                     crossings += 1;
                 }
             }
@@ -1926,7 +1922,7 @@ impl SpanTrim {
                 f64::midpoint(lo, hi)
             };
             let near = |m: f64, x: f64, period: Option<f64>| {
-                period.map_or(x, |p| p.mul_add(-((x - m) / p).round(), x))
+                period.map_or(x, |p| p.madd(-((x - m) / p).round(), x))
             };
             point_in_polygon(
                 Point2::new(
