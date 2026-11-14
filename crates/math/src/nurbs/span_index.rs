@@ -30,9 +30,81 @@ pub struct SpanIndex {
     spans: Vec<Span>,
     /// Each span's padded control box, by span index.
     boxes: Vec<Aabb3>,
+    /// Each span's padded control box in a frame of its own, by span index.
+    frames: Vec<SpanFrame>,
     bvh: Bvh,
     /// The largest control box diagonal, the scale of the surface's pieces.
     scale: f64,
+}
+
+/// A box about a span's control points in axes along its own net: across a
+/// fitted surface turned to the world axes the span's world box is fat, and
+/// many spans' boxes hold a point on the surface, while these hold it only
+/// near the span.
+#[derive(Debug, Clone, Copy)]
+struct SpanFrame {
+    origin: Point3,
+    axes: [Vec3; 3],
+    lo: [f64; 3],
+    hi: [f64; 3],
+}
+
+impl SpanFrame {
+    /// The box about `points` in axes along the net's `u` and `v` rows (from
+    /// its corners) and their normal, each side padded by `pad`; the world
+    /// axes where the net's corners give no frame.
+    fn of(points: &[Point3], corners: [Point3; 4], pad: f64) -> Self {
+        let [c00, c10, c01, c11] = corners;
+        let along_u = (c10 - c00) + (c11 - c01);
+        let along_v = (c01 - c00) + (c11 - c10);
+        let world = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        let axes = along_u
+            .normalize()
+            .ok()
+            .and_then(|e1| {
+                let e2 = (along_v - e1 * e1.dot(along_v)).normalize().ok()?;
+                Some([e1, e2, e1.cross(e2)])
+            })
+            .unwrap_or(world);
+        let origin = c00;
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for &q in points {
+            let d = q - origin;
+            for k in 0..3 {
+                let c = axes[k].dot(d);
+                lo[k] = lo[k].min(c);
+                hi[k] = hi[k].max(c);
+            }
+        }
+        for k in 0..3 {
+            lo[k] -= pad;
+            hi[k] += pad;
+        }
+        Self {
+            origin,
+            axes,
+            lo,
+            hi,
+        }
+    }
+
+    /// A lower bound on the distance from `p` to the span: its distance to
+    /// the box.
+    fn distance_to(&self, p: Point3) -> f64 {
+        let d = p - self.origin;
+        let mut sum = 0.0_f64;
+        for k in 0..3 {
+            let c = self.axes[k].dot(d);
+            let gap = (self.lo[k] - c).max(c - self.hi[k]).max(0.0);
+            sum = gap.madd(gap, sum);
+        }
+        sum.sqrt()
+    }
 }
 
 /// A point where a line meets the surface.
@@ -75,13 +147,14 @@ impl SpanIndex {
         let mut spans = Vec::with_capacity(spans_u.len() * spans_v.len());
         let mut boxes = Vec::with_capacity(spans.capacity());
         let mut scale = 0.0_f64;
+        let net = |last_row: usize, last_col: usize| {
+            cps[last_row - pu..=last_row]
+                .iter()
+                .flat_map(move |row| row[last_col - pv..=last_col].iter().copied())
+        };
         for &(u0, u1, last_row) in &spans_u {
             for &(v0, v1, last_col) in &spans_v {
-                let aabb = Aabb3::from_points(
-                    cps[last_row - pu..=last_row]
-                        .iter()
-                        .flat_map(|row| row[last_col - pv..=last_col].iter().copied()),
-                );
+                let aabb = Aabb3::from_points(net(last_row, last_col));
                 scale = scale.max((aabb.max - aabb.min).length());
                 boxes.push((spans.len(), aabb));
                 spans.push(Span {
@@ -97,10 +170,27 @@ impl SpanIndex {
             .into_iter()
             .map(|(i, b)| (i, b.expanded(pad)))
             .collect();
+        let mut frames = Vec::with_capacity(spans.len());
+        let mut points = Vec::with_capacity((pu + 1) * (pv + 1));
+        for &(_, _, last_row) in &spans_u {
+            for &(_, _, last_col) in &spans_v {
+                points.clear();
+                points.extend(net(last_row, last_col));
+                let (r0, c0) = (last_row - pu, last_col - pv);
+                let corners = [
+                    cps[r0][c0],
+                    cps[last_row][c0],
+                    cps[r0][last_col],
+                    cps[last_row][last_col],
+                ];
+                frames.push(SpanFrame::of(&points, corners, pad));
+            }
+        }
         Some(Self {
             spans,
             bvh: Bvh::build(&boxes),
             boxes: boxes.into_iter().map(|(_, b)| b).collect(),
+            frames,
             scale,
         })
     }
@@ -219,6 +309,11 @@ impl SpanIndex {
     /// distance)`: only spans whose boxes come nearer than the best point
     /// so far are searched, nearest box first. `None` when no span comes
     /// nearer than `bound`.
+    ///
+    /// A span whose box in its own frame lies no nearer than the best point
+    /// so far is passed over: its own closest point, kept within the span,
+    /// lies at least that far, so it could not replace the best, and the
+    /// answer is the one searching it would give.
     #[must_use]
     pub fn closest_point_within(
         &self,
@@ -241,8 +336,12 @@ impl SpanIndex {
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut best: Option<(f64, f64, f64)> = None;
         for (box_gap, i) in near {
-            if box_gap >= best.map_or(bound, |b| b.2) {
+            let best_gap = best.map_or(bound, |b| b.2);
+            if box_gap >= best_gap {
                 break;
+            }
+            if self.frames[i].distance_to(p) >= best_gap {
+                continue;
             }
             let span = self.spans[i];
             let found = closest_from(
