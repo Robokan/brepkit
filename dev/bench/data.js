@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794617442712,
+  "lastUpdate": 1794649162393,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4751,6 +4751,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 25509504,
             "range": "± 75919",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "3fd8163049d5a9da33ad2a6a5c1dc46e7084b2c8",
+          "message": "docs(buzzcad): the four measures and the B-spline side edges fixed; replay 20261114-003322\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-14T01:35:35-08:00",
+          "tree_id": "7f3a4021f37784077cb1069a5f11a27c792b235b",
+          "url": "https://github.com/Robokan/brepkit/commit/3fd8163049d5a9da33ad2a6a5c1dc46e7084b2c8"
+        },
+        "date": 1794649161720,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1112110,
+            "range": "± 6146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1183349,
+            "range": "± 15427",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 10658,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 748854,
+            "range": "± 5458",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 23875190,
+            "range": "± 126842",
             "unit": "ns/iter"
           }
         ]
