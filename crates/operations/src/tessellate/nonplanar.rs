@@ -2973,21 +2973,34 @@ fn cdt_in_surface_frame(
 
         let boundary_uv_ref = &boundary_uv;
         let hole_polys = &hole_polys;
+        // Each row's crossings of the boundary and the holes, found once.
+        let rows: Vec<(RowCrossings, Vec<RowCrossings>)> = (1..n_v)
+            .map(|iv| {
+                let v = v_min + dv * (iv as f64 / n_v as f64);
+                (
+                    row_crossings(boundary_uv_ref, v),
+                    hole_polys.iter().map(|h| row_crossings(h, v)).collect(),
+                )
+            })
+            .collect();
+        let rows = &rows;
         let interior_pts: Vec<Point2> = (1..n_u)
             .flat_map(|iu| {
                 (1..n_v).filter_map(move |iv| {
                     let u = u_min + du * (iu as f64 / n_u as f64);
                     let v = v_min + dv * (iv as f64 / n_v as f64);
                     let parameter = Point2::new(u, v);
+                    let (outer, holes) = &rows[iv - 1];
                     // Nested inner wires alternate void and island, so a
                     // point is void at odd depth.
                     let in_hole = hole_polys
                         .iter()
-                        .filter(|h| point_in_polygon_2d(h, parameter))
+                        .zip(holes)
+                        .filter(|(h, row)| point_in_polygon_row(h, row, parameter))
                         .count()
                         % 2
                         == 1;
-                    (point_in_polygon_2d(boundary_uv_ref, parameter) && !in_hole)
+                    (point_in_polygon_row(boundary_uv_ref, outer, parameter) && !in_hole)
                         .then_some(to_cdt(parameter))
                 })
             })
@@ -5359,6 +5372,54 @@ fn interior_grid_resolution(
 
 /// Check if a 2D point is inside a polygon defined by (u, v) coordinates.
 /// Uses the winding number algorithm for robustness.
+/// A polygon's edges a grid row crosses: each edge's first vertex, and
+/// whether it runs upward.
+type RowCrossings = Vec<(usize, bool)>;
+
+/// The edges of `polygon` that [`point_in_polygon_2d`] counts for a point at
+/// height `y`, each as the index of its first vertex and whether it runs
+/// upward: a grid row's points share their height, so its crossings are
+/// found once for the row.
+fn row_crossings(polygon: &[(f64, f64)], y: f64) -> RowCrossings {
+    let n = polygon.len();
+    (0..n)
+        .filter_map(|i| {
+            let (yi, yj) = (polygon[i].1, polygon[(i + 1) % n].1);
+            if yi <= y {
+                (yj > y).then_some((i, true))
+            } else {
+                (yj <= y).then_some((i, false))
+            }
+        })
+        .collect()
+}
+
+/// [`point_in_polygon_2d`] of `pt`, from the crossings [`row_crossings`]
+/// found at its height: the same edges, each read as it reads them.
+fn point_in_polygon_row(
+    polygon: &[(f64, f64)],
+    row: &[(usize, bool)],
+    pt: brepkit_math::vec::Point2,
+) -> bool {
+    let n = polygon.len();
+    let mut winding = 0i32;
+    for &(i, up) in row {
+        let j = (i + 1) % n;
+        let yi = polygon[i].1;
+        let yj = polygon[j].1;
+        let cross =
+            (polygon[j].0 - polygon[i].0) * (pt.y() - yi) - (pt.x() - polygon[i].0) * (yj - yi);
+        if up {
+            if cross > 0.0 {
+                winding += 1;
+            }
+        } else if cross < 0.0 {
+            winding -= 1;
+        }
+    }
+    winding != 0
+}
+
 pub(super) fn point_in_polygon_2d(polygon: &[(f64, f64)], pt: brepkit_math::vec::Point2) -> bool {
     let n = polygon.len();
     let mut winding = 0i32;
@@ -5513,6 +5574,40 @@ pub(super) fn tessellate_nonplanar_snap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grid row's crossings give every point of the row the answer the
+    /// whole polygon does, points level with vertices and on edges included.
+    #[test]
+    fn row_crossings_answer_as_the_whole_polygon() {
+        use brepkit_math::vec::Point2;
+        // A star with vertices at the grid's own heights and a horizontal
+        // edge, walked one way and then the other.
+        let mut star: Vec<(f64, f64)> = (0..14)
+            .map(|k| {
+                let a = f64::from(k) * std::f64::consts::TAU / 14.0;
+                let r = if k % 2 == 0 { 1.0 } else { 0.45 };
+                (
+                    (r * a.cos() * 8.0).round() / 8.0,
+                    (r * a.sin() * 8.0).round() / 8.0,
+                )
+            })
+            .collect();
+        star.insert(3, (0.5, star[2].1));
+        for polygon in [star.clone(), star.into_iter().rev().collect()] {
+            for iv in -10..=10 {
+                let y = f64::from(iv) / 8.0;
+                let row = row_crossings(&polygon, y);
+                for iu in -100..=100 {
+                    let pt = Point2::new(f64::from(iu) / 80.0, y);
+                    assert_eq!(
+                        point_in_polygon_row(&polygon, &row, pt),
+                        point_in_polygon_2d(&polygon, pt),
+                        "{pt:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_seam_beside_coinciding_samples_takes_bounded_spans() {
