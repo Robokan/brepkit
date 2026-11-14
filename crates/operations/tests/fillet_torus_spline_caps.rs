@@ -223,7 +223,10 @@ fn round_and_check(r: f64, drop: f64, bow: f64) {
             .set_curve(EdgeCurve::NurbsCurve(moved));
     }
     let edge = top_edge(&topo, solid, true);
-    let before = solid_volume(&topo, solid, 1e-3).unwrap();
+    // Measured finer than the 1e-4 asked of the round: the wall's notch is
+    // a curved trim, and the measure's slivers along its chords grow with
+    // the mesh's size (at 1e-3 they came to 5.7e-4).
+    let before = solid_volume(&topo, solid, 1e-4).unwrap();
     let faces_before = solid_faces(&topo, solid).unwrap().len();
 
     let result = fillet_v2(&mut topo, solid, &[edge], r).unwrap();
@@ -245,7 +248,7 @@ fn round_and_check(r: f64, drop: f64, bow: f64) {
         "{case}: the round is a torus"
     );
 
-    let lost = before - solid_volume(&topo, result.solid, 1e-3).unwrap();
+    let lost = before - solid_volume(&topo, result.solid, 1e-4).unwrap();
     let want = removed(r);
     assert!(
         (lost - want).abs() <= 1e-4 * want.max(1.0),
