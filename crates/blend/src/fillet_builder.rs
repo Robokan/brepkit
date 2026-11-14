@@ -3884,6 +3884,8 @@ fn stays_within(topo: &Topology, edge: &Edge, on: &Edge, tol: f64) -> Result<boo
     // distance to the nearer end stands in, which is never less than its
     // distance to `on`.
     let nearer_end = |at: Point3| (p - at).length().min((q - at).length());
+    // The bound only grows with `worst`, so once one sample puts it past
+    // `tol` the answer is settled.
     let mut worst: f64 = 0.0;
     for k in 0..=count {
         let at = edge
@@ -3926,6 +3928,10 @@ fn stays_within(topo: &Topology, edge: &Edge, on: &Edge, tol: f64) -> Result<boo
             }
         };
         worst = worst.max(off);
+        if (0.5 * speed).madd(step.abs(), worst) > tol {
+            log::debug!("edge stands {worst:e} off its neighbour at a sample, past {tol:e}");
+            return Ok(false);
+        }
     }
     let bound = (0.5 * speed).madd(step.abs(), worst);
     log::debug!("edge lies within {bound:e} of its neighbour ({worst:e} at its samples)");
