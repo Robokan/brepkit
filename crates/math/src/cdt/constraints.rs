@@ -170,6 +170,20 @@ impl Cdt {
             }
         }
 
+        // A vertex lying exactly on the constraint, between its ends, is
+        // crossed by no edge, and no flip makes the constraint an edge: it
+        // runs through the vertex. Bisection cannot pass it either when it
+        // sits a hair from an end (a boundary's two vertices 2e-7 apart on
+        // one line). Split the constraint there, real progress like a
+        // crossing split.
+        if let Some(on) = self.vertex_on_segment(v0, v1) {
+            self.recover_edge_depth(v0, on, 0, level + 1)?;
+            self.constraints.insert(sorted_pair(v0, on));
+            self.recover_edge_depth(on, v1, 0, level + 1)?;
+            self.constraints.insert(sorted_pair(on, v1));
+            return Ok(());
+        }
+
         // Flip recovery did not converge. Bisect: insert the constraint's
         // midpoint and recover both (strictly shorter) halves.
         if depth >= MAX_SPLIT_DEPTH {
@@ -192,6 +206,26 @@ impl Cdt {
         self.recover_edge_depth(mid, v1, depth + 1, level + 1)?;
         self.constraints.insert(sorted_pair(mid, v1));
         Ok(())
+    }
+
+    /// The vertex nearest `v0` lying exactly on the open segment from `v0`
+    /// to `v1` (`orient2d` reads it on the line, and it falls strictly
+    /// between the ends), if any.
+    fn vertex_on_segment(&self, v0: usize, v1: usize) -> Option<usize> {
+        let (p0, p1) = (self.vertices[v0], self.vertices[v1]);
+        let d = p1 - p0;
+        let len_sq = d.dot(d);
+        let mut best: Option<(f64, usize)> = None;
+        for (i, &q) in self.vertices.iter().enumerate().skip(self.super_count) {
+            if i == v0 || i == v1 || orient2d(p0, p1, q) != 0.0 {
+                continue;
+            }
+            let t = (q - p0).dot(d);
+            if t > 0.0 && t < len_sq && best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, i));
+            }
+        }
+        best.map(|(_, i)| i)
     }
 
     /// `insert_point` charged against the recovery budget.

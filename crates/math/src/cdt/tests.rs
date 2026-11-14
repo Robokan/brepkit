@@ -1036,3 +1036,43 @@ fn many_hole_constraints_match_a_full_scan() {
     }
     assert!(!cdt.vertex_grid.cells.is_empty(), "grid not in use");
 }
+
+/// A vertex lying exactly on a constraint a hair from its end (a face's
+/// boundary with two vertices 2e-7 apart on one line) is too near the end
+/// for the up-front collinear split, and no flip makes the constraint an
+/// edge through it; bisection only halves toward it. Recovery splits the
+/// constraint at the vertex.
+#[test]
+fn constraint_splits_at_a_vertex_on_it_beside_its_end() {
+    for dir in [Point2::new(0.0, 1.0), Point2::new(1.0, 1.0)] {
+        let at = |s: f64| Point2::new(dir.x() * s, dir.y() * s);
+        let mut cdt = Cdt::new((Point2::new(-20.0, -20.0), Point2::new(20.0, 20.0)));
+        let v0 = cdt.insert_point(at(0.0)).unwrap();
+        let v1 = cdt.insert_point(at(10.0)).unwrap();
+        let on = cdt.insert_point(at(10.0 - 2e-7)).unwrap();
+        for p in [
+            Point2::new(-3.0, 4.0),
+            Point2::new(3.0, 6.0),
+            Point2::new(-4.0, 9.0),
+        ] {
+            cdt.insert_point(p).unwrap();
+        }
+        cdt.insert_constraint(v0, v1).unwrap();
+        let edges = cdt.constraint_edges();
+        assert!(
+            edges.contains(&sorted_pair(v0, on)) && edges.contains(&sorted_pair(on, v1)),
+            "{dir:?}: constraint not split at the vertex on it: {edges:?}"
+        );
+        let has = |a: usize, b: usize| {
+            cdt.triangles().iter().any(|&(x, y, z)| {
+                [(x, y), (y, z), (z, x)]
+                    .iter()
+                    .any(|&e| sorted_pair(e.0, e.1) == sorted_pair(a, b))
+            })
+        };
+        assert!(
+            has(v0, on) && has(on, v1),
+            "{dir:?}: constraint pieces are not edges"
+        );
+    }
+}
