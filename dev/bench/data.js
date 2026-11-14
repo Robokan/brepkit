@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794669687688,
+  "lastUpdate": 1794678447304,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4859,6 +4859,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 25421589,
             "range": "± 250878",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "eb62ac79a63a8e2f6db1ffcc8e5a8a2fb8a0cb72",
+          "message": "docs(speed): span bound, grid rows and lie-on early exit; replay 20261114-090830\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-14T09:44:14-08:00",
+          "tree_id": "777bb2722759dbc6dff4771a912dd889107df1dd",
+          "url": "https://github.com/Robokan/brepkit/commit/eb62ac79a63a8e2f6db1ffcc8e5a8a2fb8a0cb72"
+        },
+        "date": 1794678446388,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 909142,
+            "range": "± 9075",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 956240,
+            "range": "± 6819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9966,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 594808,
+            "range": "± 2440",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 20413146,
+            "range": "± 90152",
             "unit": "ns/iter"
           }
         ]
