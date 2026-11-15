@@ -4,7 +4,8 @@
 //! `input1.step`, as a replay exports them). Inputs are read once; the
 //! boolean then runs `REPEAT` times (default 5) on copies of them, and the
 //! median is kept, so the time is the operation alone with its inputs
-//! loaded. Cases whose inputs hold several solids are skipped. Prints one
+//! loaded. Inputs of several solids run solid by solid as the bridge
+//! runs them (`multi`). Prints one
 //! line per case and a summary. `FALLBACK=0` declines the mesh fallback
 //! (`BooleanOptions::mesh_fallback`), so a case that needs it errors in the
 //! time its exact attempt takes. A thread is started before anything is
@@ -19,7 +20,10 @@ use std::path::Path;
 use std::time::Instant;
 
 use brepkit_operations::boolean::{BooleanOp, BooleanOptions, boolean_with_options};
+use brepkit_operations::measure::solid_bounding_box;
 use brepkit_topology::Topology;
+use brepkit_topology::explorer::solid_faces;
+use brepkit_topology::solid::SolidId;
 
 fn main() {
     // A process that has never started a thread allocates without locks;
@@ -58,17 +62,33 @@ fn main() {
         let (Some(a), Some(b)) = (read("input0.step"), read("input1.step")) else {
             continue;
         };
-        if a.len() != 1 || b.len() != 1 {
-            continue;
-        }
         let mut runs: Vec<f64> = (0..repeat)
             .map(|_| {
                 let mut copy = topo.clone();
                 let t = Instant::now();
-                let _ = boolean_with_options(&mut copy, op, a[0], b[0], opts);
+                if a.len() == 1 && b.len() == 1 {
+                    let _ = boolean_with_options(&mut copy, op, a[0], b[0], opts);
+                } else {
+                    let _ = multi(&mut copy, op, &a, &b, opts);
+                }
                 t.elapsed().as_secs_f64()
             })
             .collect();
+        // OUT=<dir>: the result written as STEP, to compare builds by.
+        if let Ok(dir_out) = std::env::var("OUT") {
+            let mut copy = topo.clone();
+            let ids = if a.len() == 1 && b.len() == 1 {
+                boolean_with_options(&mut copy, op, a[0], b[0], opts)
+                    .map(|r| vec![r])
+                    .unwrap_or_default()
+            } else {
+                multi(&mut copy, op, &a, &b, opts)
+            };
+            let key = dir.file_name().unwrap().to_string_lossy().into_owned();
+            let text =
+                brepkit_io::step::write_step(&copy, &ids).unwrap_or_else(|e| format!("error {e}"));
+            std::fs::write(Path::new(&dir_out).join(format!("{key}.step")), text).unwrap();
+        }
         runs.sort_by(f64::total_cmp);
         let median = runs[runs.len() / 2];
         let key = dir.file_name().unwrap().to_string_lossy().into_owned();
@@ -85,4 +105,89 @@ fn main() {
             sorted[sorted.len() / 2]
         );
     }
+}
+
+fn boxes_meet(topo: &Topology, x: SolidId, y: SolidId) -> bool {
+    let (Ok(p), Ok(q)) = (solid_bounding_box(topo, x), solid_bounding_box(topo, y)) else {
+        return true;
+    };
+    let pad = 1e-6
+        * [p.min, p.max, q.min, q.max]
+            .iter()
+            .flat_map(|v| [v.x().abs(), v.y().abs(), v.z().abs()])
+            .fold(1.0, f64::max);
+    let c = |v: brepkit_math::vec::Point3| [v.x(), v.y(), v.z()];
+    let (a0, a1, b0, b1) = (c(p.min), c(p.max), c(q.min), c(q.max));
+    (0..3).all(|i| a0[i] <= b1[i] + pad && b0[i] <= a1[i] + pad)
+}
+
+/// Bodies of several solids, as BuzzCAD's bridge takes them
+/// (`engine._multi_boolean`): a fuse joins solids whose boxes meet, group
+/// by group; a cut takes each cutter from each solid its box meets; an
+/// intersection keeps each pair's common part.
+fn multi(
+    topo: &mut Topology,
+    op: BooleanOp,
+    a: &[SolidId],
+    b: &[SolidId],
+    opts: BooleanOptions,
+) -> Vec<SolidId> {
+    let mut out = Vec::new();
+    let empty = |topo: &Topology, s: SolidId| solid_faces(topo, s).map_or(true, |f| f.is_empty());
+    match op {
+        BooleanOp::Fuse => {
+            let mut groups: Vec<Vec<SolidId>> = Vec::new();
+            for &s in a.iter().chain(b) {
+                let (touching, rest): (Vec<_>, Vec<_>) = groups
+                    .into_iter()
+                    .partition(|g| g.iter().any(|&t| boxes_meet(topo, s, t)));
+                groups = rest;
+                let mut merged = vec![s];
+                merged.extend(touching.into_iter().flatten());
+                groups.push(merged);
+            }
+            for g in groups {
+                let mut acc = g[0];
+                for &s in &g[1..] {
+                    match boolean_with_options(topo, BooleanOp::Fuse, acc, s, opts) {
+                        Ok(r) => acc = r,
+                        Err(_) => break,
+                    }
+                }
+                out.push(acc);
+            }
+        }
+        BooleanOp::Cut => {
+            for &s0 in a {
+                let mut s = s0;
+                for &c in b {
+                    if boxes_meet(topo, s, c) {
+                        let Ok(r) = boolean_with_options(topo, BooleanOp::Cut, s, c, opts) else {
+                            break;
+                        };
+                        s = r;
+                        if empty(topo, s) {
+                            break;
+                        }
+                    }
+                }
+                if !empty(topo, s) {
+                    out.push(s);
+                }
+            }
+        }
+        BooleanOp::Intersect => {
+            for &s in a {
+                for &c in b {
+                    if boxes_meet(topo, s, c)
+                        && let Ok(r) = boolean_with_options(topo, BooleanOp::Intersect, s, c, opts)
+                        && !empty(topo, r)
+                    {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
