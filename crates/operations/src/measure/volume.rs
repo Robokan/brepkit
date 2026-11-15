@@ -3181,6 +3181,7 @@ fn surface_flux_over_mesh(
     deflection: f64,
     about: Point3,
 ) -> (f64, Vec3) {
+    use brepkit_math::traits::ParametricSurface;
     let mesh = &uv_mesh.mesh;
     let (idx, pos, uvs) = (&mesh.indices, &mesh.positions, &uv_mesh.uvs);
     let flat_flux = |i0: usize, i1: usize, i2: usize| {
@@ -3199,6 +3200,15 @@ fn surface_flux_over_mesh(
     if let Some(whole) = whole_patch_flux(uv_mesh, s, about) {
         return whole;
     }
+    // A closed surface's mesh can run its (u, v) on past the knot range
+    // (a seam unwrapped across): the surface there is the same a period back.
+    let period = |range: Option<(f64, f64)>| range.map(|(lo, hi)| (lo, hi - lo));
+    let periods = (period(s.closed_u()), period(s.closed_v()));
+    let wrap = move |u: f64, v: f64| {
+        let back =
+            |x: f64, p: Option<(f64, f64)>| p.map_or(x, |(lo, len)| lo + (x - lo).rem_euclid(len));
+        (back(u, periods.0), back(v, periods.1))
+    };
     // Each vertex's offset from the surface at its (u, v), or `None` past
     // what a sag can explain.
     let mut ev = s.evaluator();
@@ -3207,7 +3217,8 @@ fn surface_flux_over_mesh(
         .iter()
         .zip(uvs)
         .map(|(p, uv)| {
-            let d = *p - ev.point(uv[0], uv[1]);
+            let (u, v) = wrap(uv[0], uv[1]);
+            let d = *p - ev.point(u, v);
             (d.length() <= tol).then_some(d)
         })
         .collect();
@@ -3220,7 +3231,8 @@ fn surface_flux_over_mesh(
             continue;
         };
         let corners = [(i0, d0), (i1, d1), (i2, d2)];
-        let on_surface = triangle_flux_on_surface(&mut ev, uvs, pos, corners, deflection, about);
+        let on_surface =
+            triangle_flux_on_surface(&mut ev, &wrap, uvs, pos, corners, deflection, about);
         total = add(total, on_surface.unwrap_or(flat));
     }
     total
@@ -3318,6 +3330,7 @@ fn whole_patch_flux(
 /// `None` where the flat triangle is the better reading.
 fn triangle_flux_on_surface(
     ev: &mut brepkit_math::nurbs::evaluator::SurfaceEvaluator<'_>,
+    wrap: &dyn Fn(f64, f64) -> (f64, f64),
     uvs: &[[f64; 2]],
     pos: &[Point3],
     corners: [(usize, Vec3); 3],
@@ -3358,10 +3371,11 @@ fn triangle_flux_on_surface(
         .max((pos[i2] - pos[i1]).length())
         .max((pos[i0] - pos[i2]).length());
     let third = 1.0 / 3.0;
-    let mid = ev.point(
+    let (mu, mv) = wrap(
         (ua[0] + ub[0] + uc[0]) * third,
         (ua[1] + ub[1] + uc[1]) * third,
-    ) + (d0 + d1 + d2) * third;
+    );
+    let mid = ev.point(mu, mv) + (d0 + d1 + d2) * third;
     if (mid - centroid(pos[i0], pos[i1], pos[i2])).length() > (10.0 * deflection).max(0.5 * longest)
     {
         return None;
@@ -3376,7 +3390,8 @@ fn triangle_flux_on_surface(
         for (w0, w1, w2) in [(p, p, q), (p, q, p), (q, p, p)] {
             let u = w0 * ua[0] + w1 * ub[0] + w2 * uc[0];
             let v = w0 * ua[1] + w1 * ub[1] + w2 * uc[1];
-            let (p_uv, s_u, s_v) = ev.point_and_partials(u, v)?;
+            let (wu, wv) = wrap(u, v);
+            let (p_uv, s_u, s_v) = ev.point_and_partials(wu, wv)?;
             let n = (s_u + off_u).cross(s_v + off_v);
             agrees &= n.dot(flat_normal) * uv_area2 >= 0.0;
             let r = (p_uv - about) + d0 * w0 + d1 * w1 + d2 * w2;
