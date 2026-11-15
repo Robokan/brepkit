@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794678447304,
+  "lastUpdate": 1794726332827,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -4913,6 +4913,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 20413146,
             "range": "± 90152",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "acc6aceb6288f5c91f95a47f03220ffff87142cd",
+          "message": "docs(speed): upstream 4.11.14 and the spline mesh fix; replay 20261114-185906\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-14T23:01:59-08:00",
+          "tree_id": "150880767f280d533d20c721f84fe9bc93d6e489",
+          "url": "https://github.com/Robokan/brepkit/commit/acc6aceb6288f5c91f95a47f03220ffff87142cd"
+        },
+        "date": 1794726332337,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1123581,
+            "range": "± 36571",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1181705,
+            "range": "± 2929",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11935,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 745865,
+            "range": "± 21346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 25188471,
+            "range": "± 50816",
             "unit": "ns/iter"
           }
         ]
