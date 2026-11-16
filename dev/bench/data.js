@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794776910320,
+  "lastUpdate": 1794789525051,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5075,6 +5075,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 14518131,
             "range": "± 132710",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "092baeb7a5ac8194a0ab8fd2162b2d35d02437fc",
+          "message": "docs(speed): valley walk cycles and seed grid roots; replay 20261115-160737\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-15T16:34:55-08:00",
+          "tree_id": "2799d62609c05eb1e90bd27711ae017e768b379e",
+          "url": "https://github.com/Robokan/brepkit/commit/092baeb7a5ac8194a0ab8fd2162b2d35d02437fc"
+        },
+        "date": 1794789524045,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1100804,
+            "range": "± 4505",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1161619,
+            "range": "± 7472",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11621,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 739210,
+            "range": "± 5586",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 25100353,
+            "range": "± 56828",
             "unit": "ns/iter"
           }
         ]
