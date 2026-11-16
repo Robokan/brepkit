@@ -1,5 +1,103 @@
 # Changelog
 
+## [4.11.25](https://github.com/andymai/brepkit/compare/v4.11.24...v4.11.25) (2026-11-15)
+
+
+### Bug Fixes
+
+* **algo:** read a ball's loop past a pole round its own side ([#2499](https://github.com/andymai/brepkit/issues/2499)) ([a2b789c](https://github.com/andymai/brepkit/commit/a2b789c4e2f5eef42ce2913ac4e9b904990b6b46))
+* **wasm:** round and bevel past an edge that lies inside one surface ([#2491](https://github.com/andymai/brepkit/issues/2491)) ([9bd5edb](https://github.com/andymai/brepkit/commit/9bd5edb00d96eda31f8e117e9e631cba89f7e991))
+
+## [4.11.24](https://github.com/andymai/brepkit/compare/v4.11.23...v4.11.24) (2026-11-15)
+
+
+### Bug Fixes
+
+* **blend:** notch an end wall whose corner edge is an arc ([#2467](https://github.com/andymai/brepkit/issues/2467)) ([5c11689](https://github.com/andymai/brepkit/commit/5c11689c6970ead92df00035ccd19148b34d4bfb))
+
+## [4.11.23](https://github.com/andymai/brepkit/compare/v4.11.22...v4.11.23) (2026-11-15)
+
+
+### Bug Fixes
+
+* **operations:** mesh a spline face that bends back on its own surface ([#2471](https://github.com/andymai/brepkit/issues/2471)) ([b14ae65](https://github.com/andymai/brepkit/commit/b14ae6559bdf3cebb41be9b529dbdaf037cb4914))
+
+## [4.11.22](https://github.com/andymai/brepkit/compare/v4.11.21...v4.11.22) (2026-11-15)
+
+
+### Bug Fixes
+
+* **wasm:** leave a wall's seam out of a chamfer pick ([#2484](https://github.com/andymai/brepkit/issues/2484)) ([aa81177](https://github.com/andymai/brepkit/commit/aa8117781a4ef89af858102be15f635b90f2684a))
+
+## [4.11.21](https://github.com/andymai/brepkit/compare/v4.11.20...v4.11.21) (2026-11-15)
+
+
+### Bug Fixes
+
+* **algo:** classify a wall with a saddle hole that no section cuts ([#2480](https://github.com/andymai/brepkit/issues/2480)) ([a3505ba](https://github.com/andymai/brepkit/commit/a3505ba1cdd5891fcad96c691c310e3f5f3e4859))
+* **algo:** end a section at the vertex where two spline edges meet ([#2461](https://github.com/andymai/brepkit/issues/2461)) ([026bee5](https://github.com/andymai/brepkit/commit/026bee50f9c01da9457bc3b34a2f50745ead0234))
+* **algo:** keep a wall's arcs on a whole torus ring ([#2483](https://github.com/andymai/brepkit/issues/2483)) ([309dc70](https://github.com/andymai/brepkit/commit/309dc7028e71605fc7a718c498f175dbeb190318))
+* **algo:** split a ring's cap where a spoke from the bore ends in it ([#2481](https://github.com/andymai/brepkit/issues/2481)) ([7ea8e30](https://github.com/andymai/brepkit/commit/7ea8e30ee4ad2837aa9959116acb905d21d55ddd))
+* **algo:** split an opening's rim where a curved section ends on it ([#2482](https://github.com/andymai/brepkit/issues/2482)) ([df619c3](https://github.com/andymai/brepkit/commit/df619c3eba993aeb7a5097f2d1c8b021016a9141))
+
+## [4.11.20](https://github.com/andymai/brepkit/compare/v4.11.19...v4.11.20) (2026-11-15)
+
+
+### Performance
+
+* **blend:** a fillet and a chamfer cost the same among other shapes ([#2454](https://github.com/andymai/brepkit/issues/2454)) ([9c6f53f](https://github.com/andymai/brepkit/commit/9c6f53f0fbbdc30c46ffa8d4e4b5e1ac1cd17931))
+
+## [4.11.19](https://github.com/andymai/brepkit/compare/v4.11.18...v4.11.19) (2026-11-15)
+
+
+### Bug Fixes
+
+* **operations:** weld a hole's walls facing into the hole ([#2473](https://github.com/andymai/brepkit/issues/2473)) ([cc2dead](https://github.com/andymai/brepkit/commit/cc2dead1d053977e9f756fc60befc4af9abee093))
+
+## [4.11.18](https://github.com/andymai/brepkit/compare/v4.11.17...v4.11.18) (2026-11-15)
+
+
+### Bug Fixes
+
+* **algo:** edges on one curve do not cross at their sample points ([#2462](https://github.com/andymai/brepkit/issues/2462)) ([43dc136](https://github.com/andymai/brepkit/commit/43dc136d6503bb05a298fed55d2fbef18dfb6d10))
+* **algo:** split a ring by faces through its axis ([#2466](https://github.com/andymai/brepkit/issues/2466)) ([333663a](https://github.com/andymai/brepkit/commit/333663a71fa46d34a344e8f8c009ae106e10f724))
+* **check:** report a face whose hole crosses its outline ([#2452](https://github.com/andymai/brepkit/issues/2452)) ([06d64b3](https://github.com/andymai/brepkit/commit/06d64b37035e11b2269bf1906eb70e82437c91f5)), closes [#2444](https://github.com/andymai/brepkit/issues/2444)
+* **io:** join the triangles of an imported mesh at their edges ([#2448](https://github.com/andymai/brepkit/issues/2448)) ([c8b7eb1](https://github.com/andymai/brepkit/commit/c8b7eb138f710955f32c9e6ece1ee9d6e2e8bb0d))
+* **operations:** scale a solid by a small uniform factor ([#2447](https://github.com/andymai/brepkit/issues/2447)) ([8a37205](https://github.com/andymai/brepkit/commit/8a3720562f30eaf456c10170b8daab7dbd06f9ad))
+
+## [4.11.17](https://github.com/andymai/brepkit/compare/v4.11.16...v4.11.17) (2026-11-14)
+
+
+### Bug Fixes
+
+* **algo:** edges that run along each other do not cross ([#2438](https://github.com/andymai/brepkit/issues/2438)) ([6a4783f](https://github.com/andymai/brepkit/commit/6a4783fd8609d7d7307c5258b4a1d10de0690475))
+* **blend:** round along a face whose edges stand off its surface ([#2440](https://github.com/andymai/brepkit/issues/2440)) ([25e8f47](https://github.com/andymai/brepkit/commit/25e8f4787f6f7c026d8c3ceeebce327ed29f5a46))
+* **operations:** round over a through-bore, then cut the bore back ([#2442](https://github.com/andymai/brepkit/issues/2442)) ([d360d50](https://github.com/andymai/brepkit/commit/d360d501e3f01c7e617e9f1062d87e8b17875ac8))
+
+## [4.11.16](https://github.com/andymai/brepkit/compare/v4.11.15...v4.11.16) (2026-11-14)
+
+
+### Bug Fixes
+
+* **algo:** split a round's torus band at a coaxial circle ([#2439](https://github.com/andymai/brepkit/issues/2439)) ([eb5697e](https://github.com/andymai/brepkit/commit/eb5697e1e9494a1ebf6c4988d50a4523f9d78528))
+
+
+### Performance
+
+* B-spline surface pairs' sections kept, seeds and edge-face checks in parallel ([#2437](https://github.com/andymai/brepkit/issues/2437)) ([37dadc9](https://github.com/andymai/brepkit/commit/37dadc9480c477e36f757028ed324a02537d7e53))
+
+## [4.11.15](https://github.com/andymai/brepkit/compare/v4.11.14...v4.11.15) (2026-11-14)
+
+
+### Bug Fixes
+
+* **math:** split a constraint at a lone vertex lying on it ([#2436](https://github.com/andymai/brepkit/issues/2436)) ([daa4ace](https://github.com/andymai/brepkit/commit/daa4ace6ce9afecb44f698b32fc4e3b41aa0da9b))
+
+
+### Performance
+
+* **check:** a B-spline face's sides along its spline add nothing to its volume ([#2434](https://github.com/andymai/brepkit/issues/2434)) ([1a52276](https://github.com/andymai/brepkit/commit/1a522765852cdffb7aed13c9e1db884daa86637d))
+
 ## [4.11.14](https://github.com/andymai/brepkit/compare/v4.11.13...v4.11.14) (2026-11-13)
 
 

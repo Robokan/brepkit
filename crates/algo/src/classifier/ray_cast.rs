@@ -1158,6 +1158,40 @@ fn wire_polygon(
     wire_polygon_arcs(topo, wire_id, None).map(|(verts, _)| verts)
 }
 
+/// Points along a wire, each curved edge at `ARC_SAMPLES` places inside it,
+/// for reading the angle round an axis that a patch covers.
+///
+/// [`wire_polygon`] takes three points inside an open curve: along an arc
+/// of 324 degrees they stand 81 degrees apart, wider than the patch's real
+/// 36 degree gap, and the largest gap between them is then a stretch of the
+/// patch itself.
+fn wire_angle_samples(
+    topo: &Topology,
+    wire_id: brepkit_topology::wire::WireId,
+) -> Result<Vec<Point3>, AlgoError> {
+    /// Places inside each curved edge: a whole turn's samples stand under
+    /// 0.1 rad apart, under the smallest gap [`largest_u_gap`] reads.
+    const ARC_SAMPLES: i32 = 64;
+    let mut pts = Vec::new();
+    for oe in topo.wire(wire_id)?.edges() {
+        let edge = topo.edge(oe.edge())?;
+        let (start, end) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        pts.push(start);
+        if !matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line) {
+            let (t0, t1) = edge.curve().domain_with_endpoints(start, end);
+            for k in 1..=ARC_SAMPLES {
+                let t = (t1 - t0).madd(f64::from(k) / f64::from(ARC_SAMPLES + 1), t0);
+                pts.push(edge.curve().evaluate_with_endpoints(t, start, end));
+            }
+        }
+        pts.push(end);
+    }
+    Ok(pts)
+}
+
 /// [`wire_polygon`], with each curved edge of a face in `plane` (the face's
 /// normal) kept as its chord, or no chord for a closed one, and returned as a
 /// [`Segment`]: an [`ArcSegment`] for an arc of a circle in the plane, a
@@ -1338,13 +1372,15 @@ fn collect_geoms_of(
                 if verts.len() >= 3 {
                     let mut pv_min = f64::INFINITY;
                     let mut pv_max = f64::NEG_INFINITY;
-                    let mut u_samples = Vec::with_capacity(verts.len());
                     for p in &verts {
-                        let (u, v) = cyl.project_point(*p);
+                        let (_, v) = cyl.project_point(*p);
                         pv_min = pv_min.min(v);
                         pv_max = pv_max.max(v);
-                        u_samples.push(u);
                     }
+                    let u_samples: Vec<f64> = wire_angle_samples(topo, face.outer_wire())?
+                        .into_iter()
+                        .map(|p| cyl.project_point(p).0)
+                        .collect();
                     if pv_min.is_finite()
                         && pv_max > pv_min
                         && let Some(gap) = largest_u_gap(&u_samples)
@@ -1407,8 +1443,9 @@ fn collect_geoms_of(
                 // The apex has no `u` of its own, so it takes no part in the
                 // gap.
                 let apex = 1e-9 * pv_min.abs().max(pv_max.abs()).max(1.0);
-                let u_samples: Vec<f64> = uv
-                    .iter()
+                let u_samples: Vec<f64> = wire_angle_samples(topo, face.outer_wire())?
+                    .into_iter()
+                    .map(|p| cone.project_point(p))
                     .filter(|s| s.1.abs() > apex)
                     .map(|s| s.0)
                     .collect();
