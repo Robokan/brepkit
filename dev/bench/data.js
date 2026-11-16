@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794809084919,
+  "lastUpdate": 1794861493661,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5345,6 +5345,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 20626783,
             "range": "± 164883",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "6135b0553a8f5f07c7bcfd9b43f93a35fdd4c45f",
+          "message": "Merge upstream 4.11.28\n\nUpstream landed the speed PRs #2496 and #2537 (the span index and the\nclear-edge skip, with the maintainer's review fixes and a projection\nthat proves its foot nearest), and its own fixes since 4.11.25.\n\nResolutions:\n\n- math: the span index is upstream's, with the fork's line hits and\n  nearest-point lookups the classifier still reads; the fork's own\n  closest-point search goes, upstream's proven projection replaces it.\n- algo (face splitter): upstream's holes in a winding-chain band are\n  carried into the fork's split band builder, which the touching-saddle\n  split shares; a cylinder piece and a torus piece both read their\n  winding.\n- algo (builder_solid): upstream's new pass splits a curve that shares\n  its ends with another path. A coplanar face's section along a curved\n  edge reaches assembly as the edge's chord, on a plane the curve lies\n  in and on no face a curve of its group bounds; it stands for the\n  curve, as a ball's chord does for its arc, and joins its path\n  (`spline_cap_flush_fuse` fell back without it).\n- blend: upstream's plane/cylinder side round is tried first, the\n  fork's ruling round after it; the notch check reads a B-spline cap\n  edge piece by piece within upstream's convex region.\n- tessellate: upstream's chord splitting and edge breaks; the fork's\n  snap of curve ends to vertices a file's tolerance off stays.\n\nPose sweep and truth audit match upstream line for line. Tests: 4,588\npass; `rod_lying_on_a_plate_into_a_block_fuses_exactly` fails at pose 1,\nturn 0 as it does on main before this merge.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-16T12:34:23-08:00",
+          "tree_id": "4aa035b5f00b99349c5e0a70501c72be5fbada1d",
+          "url": "https://github.com/Robokan/brepkit/commit/6135b0553a8f5f07c7bcfd9b43f93a35fdd4c45f"
+        },
+        "date": 1794861493117,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 941844,
+            "range": "± 1587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 999781,
+            "range": "± 10171",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11423,
+            "range": "± 178",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 616717,
+            "range": "± 3027",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 21599394,
+            "range": "± 162277",
             "unit": "ns/iter"
           }
         ]
