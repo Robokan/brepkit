@@ -5655,7 +5655,16 @@ fn run_stripes_to_tilted_caps(
     const OBLIQUE: f64 = 0.05;
     carry_walked_rounds(topo, plan, stripe_results)?;
     let mut caps = TiltedCaps::new();
-    for junction in &plan.junctions {
+    // A terminal whose contact would run back past nearly all of it is tried
+    // again once the others are done: the far end may run on outward at the
+    // contour's other terminal (a cap leaning the same way at both ends), and
+    // the contact read from there is long enough.
+    let mut order: Vec<usize> = (0..plan.junctions.len()).collect();
+    let mut retried = vec![false; plan.junctions.len()];
+    let mut next = 0;
+    while let Some(&slot) = order.get(next) {
+        next += 1;
+        let junction = &plan.junctions[slot];
         if !matches!(
             junction.classification,
             crate::fillet_plan::CornerClassification::Terminal
@@ -5766,6 +5775,7 @@ fn run_stripes_to_tilted_caps(
         // end as before; the stripe is left alone unless both reach the
         // cap's corner edges.
         let mut contacts = Vec::with_capacity(2);
+        let mut short = false;
         for (contact, at) in [
             (&stripe.contact1, section.p1),
             (&stripe.contact2, section.p2),
@@ -5816,6 +5826,9 @@ fn run_stripes_to_tilted_caps(
                     reached = far + run * s;
                 }
             }
+            if fraction <= 0.05 && fraction > 0.0 && !retried[slot] && on_corner(reached)? {
+                short = true;
+            }
             if fraction <= 0.05 || !on_corner(reached)? {
                 break;
             }
@@ -5835,6 +5848,10 @@ fn run_stripes_to_tilted_caps(
             ));
         }
         let Ok([(contact1, p1), (contact2, p2)]) = <[_; 2]>::try_from(contacts) else {
+            if short {
+                retried[slot] = true;
+                order.push(slot);
+            }
             continue;
         };
         // The section's centre: where the axis meets the cap's plane (the
