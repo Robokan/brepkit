@@ -125,6 +125,7 @@ pub mod edge;
 pub mod explorer;
 pub mod face;
 pub mod orientation;
+mod owners;
 
 pub mod pcurve;
 pub mod planar;
@@ -144,7 +145,7 @@ pub use edge::EdgeId;
 pub use face::FaceId;
 pub use shell::ShellId;
 pub use solid::SolidId;
-pub use topology::Topology;
+pub use topology::{Checkpoint, Topology};
 pub use vertex::VertexId;
 pub use wire::{OrientedEdge, WireId};
 

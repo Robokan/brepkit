@@ -435,15 +435,19 @@ fn share_doubled_back_samples(
 /// almost together) can have an outline whose chords cross in its (u, v),
 /// and its mesh then loses the triangles past the crossing; and on a spline
 /// face whose (u, v) is skewed, a chord's straight line in (u, v) can run far
-/// off the edge on the surface, taking grid points outside the face. Each
-/// spline chord crossing another chord of its face's outline, or whose middle
-/// in (u, v) lies farther than the deflection from its curve's, is halved on
-/// its curve, round by round. The samples are shared, so the face across each
-/// edge takes them too.
+/// off the edge on the surface, taking grid points outside the face. A
+/// straight edge on a spline face strays in its (u, v) the same way. Each such
+/// chord, a spline's or a straight edge's on a spline face, crossing another
+/// chord of its face's outline, or whose middle in (u, v) lies farther than
+/// the deflection from its edge, is halved on its edge, round by round. The
+/// samples are shared, so the face across each edge takes them too.
 ///
-/// Two chords can cross in (u, v) only where each comes within its sag of the
-/// surface point both project to, so only chords nearer each other than
-/// their two sags are projected.
+/// Two chords can cross in (u, v) only where their lines in (u, v), read on
+/// the surface, meet: such a chord's reach covers how far that line strays
+/// from it, so only chords nearer each other than their two reaches are
+/// tested.
+///
+/// Returns whether it halved any chord.
 #[allow(clippy::too_many_lines)]
 pub(super) fn split_crossing_spline_chords(
     topo: &Topology,
@@ -451,26 +455,44 @@ pub(super) fn split_crossing_spline_chords(
     edge_points: &mut DetHashMap<usize, Vec<Point3>>,
     mut params: DetHashMap<usize, Vec<f64>>,
     deflection: f64,
-) -> Result<(), crate::OperationsError> {
-    // A face's projections of sample points, keyed by the point's bits.
-    type UvCache = DetHashMap<(u64, u64, u64), Option<(f64, f64)>>;
+) -> Result<bool, crate::OperationsError> {
+    // A face's projections of sample points, keyed by the point's bits, and
+    // the surface's point there once it is read.
+    type UvCache = DetHashMap<(u64, u64, u64), Option<((f64, f64), Option<Point3>)>>;
     const MAX_ROUNDS: usize = 8;
     // Chord ends closer than this are one sample.
     const SAME: f64 = 1e-9;
     // A sample off a chord by less than this fraction of its length lies on it.
     const TOUCH: f64 = 1e-9;
-    struct Chord {
+    // The edge a chord can be halved on.
+    #[derive(Clone, Copy)]
+    enum Span<'a> {
+        // A spline, with the parameters of the chord's two ends.
+        Spline(&'a brepkit_math::nurbs::curve::NurbsCurve, f64, f64),
+        // A straight edge on a spline face.
+        Line,
+    }
+    struct Chord<'a> {
         edge: usize,
         index: usize,
         a: Point3,
         b: Point3,
-        // How far the chord may stand off its curve.
+        // How far the chord's line in (u, v), read on the surface, may stand
+        // off it.
         reach: f64,
-        // Whether the chord is a spline's, and bows off its curve.
-        halvable: bool,
-        // The curve's point halfway along the chord, for a spline's.
-        middle: Option<Point3>,
+        span: Option<Span<'a>>,
     }
+    // How far a point stands off the segment from `a` to `b`.
+    let off_segment = |p: Point3, a: Point3, b: Point3| {
+        let (d, w) = (b - a, p - a);
+        let length2 = d.dot(d);
+        let t = if length2 > 0.0 {
+            (w.dot(d) / length2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (w - d * t).length()
+    };
     // The parameters of each spline edge's samples, where its samples are
     // still those they were taken at.
     params.retain(|idx, ts| {
@@ -478,8 +500,12 @@ pub(super) fn split_crossing_spline_chords(
             .get(idx)
             .is_some_and(|pts| pts.len() == ts.len())
     });
-    if params.is_empty() {
-        return Ok(());
+    let spline_face = |f: &FaceId| {
+        topo.face(*f)
+            .is_ok_and(|face| matches!(face.surface(), FaceSurface::Nurbs(_)))
+    };
+    if params.is_empty() && !faces.iter().any(spline_face) {
+        return Ok(false);
     }
     let orient = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
         (b.0 - a.0).madd(c.1 - a.1, -((b.1 - a.1) * (c.0 - a.0)))
@@ -488,6 +514,7 @@ pub(super) fn split_crossing_spline_chords(
     let mut caches: Vec<UvCache> = vec![UvCache::default(); faces.len()];
     // The edges the last round halved: a face none of them bound is as it was.
     let mut changed: Option<DetHashSet<usize>> = None;
+    let mut halved = false;
     for _ in 0..MAX_ROUNDS {
         let mut halve: DetHashSet<(usize, usize)> = DetHashSet::default();
         for (k, &face_id) in faces.iter().enumerate() {
@@ -517,7 +544,7 @@ pub(super) fn split_crossing_spline_chords(
                 }
                 FaceSurface::Torus(_) => (turn, turn),
             };
-            let mut chords: Vec<Chord> = Vec::new();
+            let mut chords: Vec<Chord<'_>> = Vec::new();
             let mut seen: DetHashSet<usize> = DetHashSet::default();
             for &wire_id in std::iter::once(&face.outer_wire()).chain(face.inner_wires()) {
                 for oe in topo.wire(wire_id)?.edges() {
@@ -531,14 +558,15 @@ pub(super) fn split_crossing_spline_chords(
                     let edge = topo.edge(oe.edge())?;
                     for (index, pair) in pts.windows(2).enumerate() {
                         let (a, b) = (pair[0], pair[1]);
-                        let (reach, halvable, middle) = match (edge.curve(), params.get(&idx)) {
-                            (EdgeCurve::Line, _) => (0.0, false, None),
-                            (EdgeCurve::NurbsCurve(nurbs), Some(ts)) => {
-                                let mid = nurbs.evaluate(0.5 * (ts[index] + ts[index + 1]));
-                                let sag = (mid - (a + (b - a) * 0.5)).length();
-                                (2.0 * sag, sag > SAME, Some(mid))
+                        let (reach, span) = match (edge.curve(), params.get(&idx)) {
+                            (EdgeCurve::Line, _) if matches!(surface, FaceSurface::Nurbs(_)) => {
+                                (SAME, Some(Span::Line))
                             }
-                            _ => (deflection, false, None),
+                            (EdgeCurve::Line, _) => (0.0, None),
+                            (EdgeCurve::NurbsCurve(nurbs), Some(ts)) => {
+                                (SAME, Some(Span::Spline(nurbs, ts[index], ts[index + 1])))
+                            }
+                            _ => (deflection, None),
                         };
                         chords.push(Chord {
                             edge: idx,
@@ -546,14 +574,95 @@ pub(super) fn split_crossing_spline_chords(
                             a,
                             b,
                             reach,
-                            halvable,
-                            middle,
+                            span,
                         });
                     }
                 }
             }
-            if !chords.iter().any(|c| c.halvable) {
+            if !chords.iter().any(|c| c.span.is_some()) {
                 continue;
+            }
+            let uv = &mut caches[k];
+            let mut read = |p: Point3, foot: bool| {
+                let entry = uv
+                    .entry((p.x().to_bits(), p.y().to_bits(), p.z().to_bits()))
+                    .or_insert_with(|| surface.project_point(p).map(|q| (q, None)));
+                if foot && let Some((q, at @ None)) = entry {
+                    *at = surface.evaluate(q.0, q.1);
+                }
+                *entry
+            };
+            // A curved face's (u, v) can stretch a chord's straight line in
+            // (u, v) far off the chord in space: the mesh's edge there is that
+            // line on the surface. Each spline chord's reach takes in how far
+            // that line strays from it, read at its quarters with a margin, so
+            // a pair whose lines meet is tested; and its line must hold the
+            // deflection of its curve at its middle. An edge can stand off its
+            // surface (a file's tolerance): the line is read with the ends'
+            // offsets carried along it. A plane's (u, v) is flat: there the
+            // line strays only as far as the chord's ends stand off the plane.
+            // A cone's apex and a sphere's poles have no u, so the middle of a
+            // chord on them is not read against its curve.
+            if let FaceSurface::Plane { normal, d } = surface {
+                let off = |p: Point3| (normal.dot(Vec3::new(p.x(), p.y(), p.z())) - d).abs();
+                for c in chords.iter_mut().filter(|c| c.span.is_some()) {
+                    c.reach += 2.0 * off(c.a).max(off(c.b));
+                }
+            } else {
+                let held = matches!(
+                    surface,
+                    FaceSurface::Nurbs(_) | FaceSurface::Cylinder(_) | FaceSurface::Torus(_)
+                );
+                for c in chords.iter_mut().filter(|c| c.span.is_some()) {
+                    let (Some((a, Some(at_a))), Some((b, Some(at_b)))) =
+                        (read(c.a, true), read(c.b, true))
+                    else {
+                        continue;
+                    };
+                    if (a.0 - b.0).abs() > 0.5 * su || (a.1 - b.1).abs() > 0.5 * sv {
+                        continue;
+                    }
+                    let (off_a, off_b) = (c.a - at_a, c.b - at_b);
+                    let line = |f: f64| {
+                        surface
+                            .evaluate((b.0 - a.0).madd(f, a.0), (b.1 - a.1).madd(f, a.1))
+                            .map(|p| p + off_a + (off_b - off_a) * f)
+                    };
+                    let quarters = [0.25, 0.5, 0.75];
+                    let on_line = quarters.map(line);
+                    let stray = on_line
+                        .iter()
+                        .zip(quarters)
+                        .filter_map(|(p, f)| p.map(|p| (p - (c.a + (c.b - c.a) * f)).length()))
+                        .fold(0.0, f64::max);
+                    c.reach += 2.0 * stray;
+                    if !held {
+                        continue;
+                    }
+                    let (Some(span), Some(on_line)) = (c.span, on_line[1]) else {
+                        continue;
+                    };
+                    // The line's middle is held against the edge's nearest
+                    // point, not its middle by parameter: a curve's parameter
+                    // need not run evenly along it.
+                    let strays = match span {
+                        Span::Spline(nurbs, t0, t1) => {
+                            (on_line - nurbs.evaluate(0.5 * (t0 + t1))).length() > deflection
+                                && brepkit_geometry::extrema::point_to_curve(
+                                    on_line,
+                                    nurbs,
+                                    t0.min(t1),
+                                    t0.max(t1),
+                                )
+                                .distance
+                                    > deflection
+                        }
+                        Span::Line => off_segment(on_line, c.a, c.b) > deflection,
+                    };
+                    if strays {
+                        halve.insert((c.edge, c.index));
+                    }
+                }
             }
             // Sweep the chords along the outline's widest axis (a face in a
             // plane square to one axis has every chord at one coordinate of
@@ -580,50 +689,14 @@ pub(super) fn split_crossing_spline_chords(
             let hi = |c: &Chord| high(c, along);
             let mut order: Vec<usize> = (0..chords.len()).collect();
             order.sort_by(|&i, &j| lo(&chords[i]).total_cmp(&lo(&chords[j])));
-            let uv = &mut caches[k];
-            let mut to_uv = |p: Point3| {
-                *uv.entry((p.x().to_bits(), p.y().to_bits(), p.z().to_bits()))
-                    .or_insert_with(|| surface.project_point(p))
-            };
-            // A curved face's (u, v) can stretch a chord's straight line in
-            // (u, v) far off the chord in space: the mesh's edge there is that
-            // line on the surface, so its middle must hold the deflection of
-            // the curve's. An edge can stand off its surface (a file's
-            // tolerance): the line is read with the ends' offsets carried
-            // along it. A cone's apex and a sphere's poles have no u.
-            if matches!(
-                surface,
-                FaceSurface::Nurbs(_) | FaceSurface::Cylinder(_) | FaceSurface::Torus(_)
-            ) {
-                for c in chords.iter().filter(|c| c.halvable) {
-                    let (Some(middle), Some(a), Some(b)) = (c.middle, to_uv(c.a), to_uv(c.b))
-                    else {
-                        continue;
-                    };
-                    if (a.0 - b.0).abs() > 0.5 * su || (a.1 - b.1).abs() > 0.5 * sv {
-                        continue;
-                    }
-                    let (Some(on_surface), Some(at_a), Some(at_b)) = (
-                        surface.evaluate(0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1)),
-                        surface.evaluate(a.0, a.1),
-                        surface.evaluate(b.0, b.1),
-                    ) else {
-                        continue;
-                    };
-                    let offset = ((c.a - at_a) + (c.b - at_b)) * 0.5;
-                    if (on_surface + offset - middle).length() > deflection {
-                        halve.insert((c.edge, c.index));
-                    }
-                }
-            }
-            // Only a pair with a spline chord in it can be halved. Each spline
-            // chord meets the chords starting within its span, and each chord
-            // the spline chords starting within its own: every overlapping pair
-            // with a spline chord in it is one or the other.
+            // Only a pair with a chord that can be halved in it is tested.
+            // Each such chord meets the chords starting within its span, and
+            // each chord the halvable chords starting within its own: every
+            // overlapping pair with a halvable chord in it is one or the other.
             let mut test = |i: usize, j: usize| {
                 let ci = &chords[i];
                 let cj = &chords[j];
-                if !(ci.halvable || cj.halvable)
+                if !(ci.span.is_some() || cj.span.is_some())
                     || (ci.edge == cj.edge && ci.index == cj.index)
                     || (0..3).any(|axis| {
                         low(ci, axis) > high(cj, axis) || low(cj, axis) > high(ci, axis)
@@ -642,6 +715,7 @@ pub(super) fn split_crossing_spline_chords(
                 if gap > ci.reach + cj.reach {
                     return;
                 }
+                let mut to_uv = |p: Point3| read(p, false).map(|(q, _)| q);
                 let (Some(a), Some(b), Some(c), Some(d)) =
                     (to_uv(ci.a), to_uv(ci.b), to_uv(cj.a), to_uv(cj.b))
                 else {
@@ -669,19 +743,20 @@ pub(super) fn split_crossing_spline_chords(
                     return;
                 }
                 for c in [ci, cj] {
-                    if c.halvable {
+                    if c.span.is_some() {
                         halve.insert((c.edge, c.index));
                     }
                 }
             };
             let starts: Vec<f64> = order.iter().map(|&i| lo(&chords[i])).collect();
-            let spline_order: Vec<usize> = order
+            let halvable_order: Vec<usize> = order
                 .iter()
                 .copied()
-                .filter(|&i| chords[i].halvable)
+                .filter(|&i| chords[i].span.is_some())
                 .collect();
-            let spline_starts: Vec<f64> = spline_order.iter().map(|&i| lo(&chords[i])).collect();
-            for &i in &spline_order {
+            let halvable_starts: Vec<f64> =
+                halvable_order.iter().map(|&i| lo(&chords[i])).collect();
+            for &i in &halvable_order {
                 let (from, to) = (lo(&chords[i]), hi(&chords[i]));
                 let first = starts.partition_point(|&x| x < from);
                 for &j in order[first..].iter().take_while(|&&j| lo(&chords[j]) <= to) {
@@ -692,8 +767,8 @@ pub(super) fn split_crossing_spline_chords(
             }
             for &j in &order {
                 let (from, to) = (lo(&chords[j]), hi(&chords[j]));
-                let first = spline_starts.partition_point(|&x| x <= from);
-                for &i in spline_order[first..]
+                let first = halvable_starts.partition_point(|&x| x <= from);
+                for &i in halvable_order[first..]
                     .iter()
                     .take_while(|&&i| lo(&chords[i]) <= to)
                 {
@@ -713,25 +788,49 @@ pub(super) fn split_crossing_spline_chords(
         let mut edges: Vec<usize> = by_edge.keys().copied().collect();
         edges.sort_unstable();
         changed = Some(edges.iter().copied().collect());
+        halved = true;
         for idx in edges {
-            let (Some(edge_id), Some(ts), Some(pts)) = (
-                topo.edge_id_from_index(idx),
-                params.get_mut(&idx),
-                edge_points.get_mut(&idx),
-            ) else {
-                continue;
-            };
-            let EdgeCurve::NurbsCurve(nurbs) = topo.edge(edge_id)?.curve() else {
+            let (Some(edge_id), Some(pts)) =
+                (topo.edge_id_from_index(idx), edge_points.get_mut(&idx))
+            else {
                 continue;
             };
             let mut indices = by_edge[&idx].clone();
             indices.sort_unstable_by(|x, y| y.cmp(x));
+            let curve = topo.edge(edge_id)?.curve();
+            if matches!(curve, EdgeCurve::Line) {
+                for index in indices {
+                    let middle = pts[index] + (pts[index + 1] - pts[index]) * 0.5;
+                    pts.insert(index + 1, middle);
+                }
+                continue;
+            }
+            let (EdgeCurve::NurbsCurve(nurbs), Some(ts)) = (curve, params.get_mut(&idx)) else {
+                continue;
+            };
             for index in indices {
                 let t = 0.5 * (ts[index] + ts[index + 1]);
                 ts.insert(index + 1, t);
                 pts.insert(index + 1, nurbs.evaluate(t));
             }
         }
+    }
+    Ok(halved)
+}
+
+/// [`split_crossing_spline_chords`], then the samples of edges that double
+/// back over each other shared again: a straight edge the split halved hands
+/// its new samples to the edge overlapping it, which a face across that edge
+/// alone need not have halved.
+pub(super) fn split_chords_and_share(
+    topo: &Topology,
+    faces: &[FaceId],
+    edge_points: &mut DetHashMap<usize, Vec<Point3>>,
+    params: DetHashMap<usize, Vec<f64>>,
+    deflection: f64,
+) -> Result<(), crate::OperationsError> {
+    if split_crossing_spline_chords(topo, faces, edge_points, params, deflection)? {
+        share_doubled_back_samples(topo, faces, edge_points)?;
     }
     Ok(())
 }
@@ -1037,7 +1136,7 @@ pub(super) fn tessellate_solid_core(
         }
     }
 
-    split_crossing_spline_chords(topo, &all_faces, &mut edge_points, edge_params, deflection)?;
+    split_chords_and_share(topo, &all_faces, &mut edge_points, edge_params, deflection)?;
     phase("circle_sync", &mut phase_t);
     let mut merged = TriangleMesh::default();
     let mut point_to_global: DetHashMap<(i64, i64, i64), u32> = DetHashMap::default();
@@ -1137,6 +1236,13 @@ pub(super) fn tessellate_solid_core(
 
             let (t_min, t_max) = edge_data.curve().domain_with_endpoints(start_pos, end_pos);
             let is_closed = edge_data.start() == edge_data.end();
+            let place = |t: f64| {
+                if is_closed {
+                    t
+                } else {
+                    along_arc(t, t_min, t_max - t_min)
+                }
+            };
 
             let existing_gids_vec: Vec<u32> = edge_global_indices
                 .get(&edge_idx)
@@ -1187,15 +1293,9 @@ pub(super) fn tessellate_solid_core(
                 if dist >= refine_tol {
                     continue;
                 }
-                let in_range = if is_closed {
-                    true
-                } else if t_min < t_max {
-                    t >= t_min - 1e-8 && t <= t_max + 1e-8
-                } else {
-                    t >= t_min - 1e-8 || t <= t_max + 1e-8
-                };
-                if in_range {
-                    insertions.push((t, gid32));
+                let along = place(t);
+                if is_closed || (-1e-8..=t_max - t_min + 1e-8).contains(&along) {
+                    insertions.push((along, gid32));
                 }
             }
 
@@ -1210,7 +1310,7 @@ pub(super) fn tessellate_solid_core(
                 .iter()
                 .map(|&gid| {
                     let pos = merged.positions[gid as usize];
-                    (circle.project(pos), gid)
+                    (place(circle.project(pos)), gid)
                 })
                 .collect();
             all_with_t.extend(insertions);
@@ -1722,6 +1822,20 @@ pub(super) fn tessellate_solid_core(
         #[cfg(test)]
         unmeshed,
     })
+}
+
+/// Where a sample at circle parameter `t` lies along an arc that starts at
+/// `start` and spans `span`: `t` unwrapped from the start, so the order of
+/// samples does not break where the parameter wraps (`project` gives an
+/// angle in `(-π, π]`). A sample just before the start reads a little below
+/// zero.
+pub(super) fn along_arc(t: f64, start: f64, span: f64) -> f64 {
+    let along = (t - start).rem_euclid(std::f64::consts::TAU);
+    if along > 0.5 * (span + std::f64::consts::TAU) {
+        along - std::f64::consts::TAU
+    } else {
+        along
+    }
 }
 
 /// `BK_TESS_PHASES` (any value): log per-phase wall clock of the solid

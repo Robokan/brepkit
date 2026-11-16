@@ -3738,6 +3738,10 @@ fn curve_endpoints(
 /// read as its marched curve end to end, and the face splitter cut it at
 /// its own start. Cut to the window, the whole curve is the window. Split
 /// operand edges keep their shared curve, which coincident faces pair on.
+///
+/// A window of a closed curve is cut out too. Its two ends split the loop
+/// into two arcs, and the edge run from end to start cannot tell which one
+/// it is: past half the loop it read the whole loop, through its own ends.
 fn window_curve(
     curve: &EdgeCurve,
     (t0, t1): (f64, f64),
@@ -3750,14 +3754,15 @@ fn window_curve(
     };
     let (d0, d1) = n.domain();
     let eps = 1e-9 * (d1 - d0);
-    if t1 - t0 <= eps || (t0 - d0 <= eps && d1 - t1 <= eps) {
+    if t1 - t0 <= eps || (t0 - d0 <= eps && d1 - t1 <= eps) || t0 < d0 - eps || t1 > d1 + eps {
         return None;
     }
     let off = |p: brepkit_math::vec::Point3| {
         brepkit_math::nurbs::projection::project_point_to_curve(n, p, 1e-9)
             .map_or(true, |c| c.distance >= ON_CURVE)
     };
-    if !off(start) && !off(end) {
+    let closed = (n.evaluate(d0) - n.evaluate(d1)).length() < ON_CURVE;
+    if !closed && !off(start) && !off(end) {
         return None;
     }
     let tail = if t0 - d0 > eps {
@@ -4801,6 +4806,32 @@ fn clip_line_to_face_boundary(
         poly
     });
 
+    // A window's midpoint is read against the face's curves first: the
+    // sampled polygon misses the sliver between each chord and its arc,
+    // 0.13 deep on a radius-249 rim, and a section across a ring a quarter
+    // wide lies in that sliver whole. The polygon reads only a midpoint
+    // within `margin` of the boundary, as it did before.
+    let region = std::cell::OnceCell::new();
+    let exact_side = |q: brepkit_math::vec::Point2, margin: f64| {
+        region
+            .get_or_init(|| {
+                plane_frame.as_ref().and_then(|frame| {
+                    brepkit_topology::planar::face_region_2d(
+                        topo,
+                        face_id,
+                        frame.origin(),
+                        frame.u_axis(),
+                        frame.v_axis(),
+                        tol,
+                    )
+                    .ok()
+                    .flatten()
+                })
+            })
+            .as_ref()
+            .and_then(|r| r.side(q, margin))
+    };
+
     // Midpoint classification only steers hole-free faces: a holed face's
     // sections are the hole weave's input, and that machinery (promotion,
     // coincidence splitting, re-trace discriminants) is calibrated on WHOLE
@@ -4810,6 +4841,7 @@ fn clip_line_to_face_boundary(
     let t_intervals: Vec<(f64, f64)> = if face.inner_wires().is_empty()
         && let (Some(frame), Some(poly)) = (plane_frame.as_ref(), poly.as_ref())
     {
+        let eps = crate::builder::classify_2d::boundary_eps(poly);
         // Every in-face sub-interval, not just one: a section can cross the
         // face in MULTIPLE material windows (the slot's z=-1.2 closer runs
         // across the socket bite, leaving material on both sides), and every
@@ -4831,9 +4863,11 @@ fn clip_line_to_face_boundary(
                 // whole-edge duplicate of the shelled-cup lip fuses) has
                 // every midpoint ON the polygon, where the even-odd test
                 // is unreliable.
-                let inside = crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly)
-                    || crate::builder::classify_2d::distance_to_polygon_boundary(mid_uv, poly)
-                        <= crate::builder::classify_2d::boundary_eps(poly);
+                let inside = exact_side(mid_uv, eps).unwrap_or_else(|| {
+                    crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly)
+                        || crate::builder::classify_2d::distance_to_polygon_boundary(mid_uv, poly)
+                            <= eps
+                });
                 inside.then_some((w[0], w[1]))
             })
             .collect()
@@ -4872,15 +4906,18 @@ fn clip_line_to_face_boundary(
             .collect();
         borders.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         borders.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let eps = crate::builder::classify_2d::boundary_eps(poly);
         borders
             .windows(2)
             .filter_map(|w| {
                 let mid_uv = frame.project(line_start + line_dir * f64::midpoint(w[0], w[1]));
-                let in_outer = crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly);
-                let in_hole = hole_polys
-                    .iter()
-                    .any(|h| crate::builder::classify_2d::point_in_polygon_2d(mid_uv, h));
-                (in_outer && !in_hole).then_some((w[0], w[1]))
+                let inside = exact_side(mid_uv, eps).unwrap_or_else(|| {
+                    crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly)
+                        && !hole_polys
+                            .iter()
+                            .any(|h| crate::builder::classify_2d::point_in_polygon_2d(mid_uv, h))
+                });
+                inside.then_some((w[0], w[1]))
             })
             .collect()
     } else if matches!(
@@ -5209,9 +5246,18 @@ fn build_surface_info(topo: &Topology, face_id: FaceId) -> Option<SurfaceInfo> {
                         .is_some_and(|span| span <= std::f64::consts::PI + 0.05)
             };
             let partial = small(false) && small(true);
+            // A band round the axis over part of the tube (a groove's inner
+            // half) has no seam across its tube: read periodic in v, a
+            // section running more than half a turn of v across it runs the
+            // short way round, through the part of the tube the face leaves
+            // out.
+            let tube_window = || {
+                crate::pave_filler::phase_ff::face_tube_window(topo, face_id, face.surface())
+                    .is_some()
+            };
             Some(SurfaceInfo::Parametric {
                 u_periodic: !partial,
-                v_periodic: !partial,
+                v_periodic: !partial && !tube_window(),
             })
         }
         FaceSurface::Nurbs(_) => Some(SurfaceInfo::Parametric {
@@ -6844,6 +6890,39 @@ mod tests {
         assert!((w0 - t0).abs() < 1e-12 && (w1 - t1).abs() < 1e-12);
         assert!((w.evaluate(w0) - a).length() < 1e-9);
         assert!((w.evaluate(w1) - b).length() < 1e-9);
+    }
+
+    /// A window over more than half of a closed curve is cut out of it, so
+    /// the edge run from its end back to its start reads the window, not the
+    /// whole loop through its own ends.
+    #[test]
+    fn a_window_of_a_closed_curve_is_cut_to_the_window() {
+        let pts: Vec<brepkit_math::vec::Point3> = (0..=12)
+            .map(|k| {
+                let a = std::f64::consts::TAU * f64::from(k) / 12.0;
+                brepkit_math::vec::Point3::new(3.0 * a.cos(), 2.0 * a.sin(), 1.0)
+            })
+            .collect();
+        let n = brepkit_math::nurbs::fitting::interpolate(&pts, 3).unwrap();
+        let (d0, d1) = n.domain();
+        let (t0, t1) = (0.2_f64.madd(d1 - d0, d0), 0.8_f64.madd(d1 - d0, d0));
+        let (a, b) = (n.evaluate(t0), n.evaluate(t1));
+        let middle = n.evaluate(f64::midpoint(t0, t1));
+        let curve = EdgeCurve::NurbsCurve(n);
+        let (r0, r1) = curve.domain_with_endpoints(b, a);
+        assert!(
+            (r0 - d0).abs() < 1e-12 && (r1 - d1).abs() < 1e-12,
+            "the loop's own reversed reading is the whole loop: ({r0}, {r1})"
+        );
+
+        let windowed = window_curve(&curve, (t0, t1), (a, b)).expect("the window was cut");
+        let (w0, w1) = windowed.domain_with_endpoints(b, a);
+        assert!(
+            (w0 - t1).abs() < 1e-9 && (w1 - t0).abs() < 1e-9,
+            "({w0}, {w1})"
+        );
+        let mid = windowed.evaluate_with_endpoints(f64::midpoint(w0, w1), b, a);
+        assert!((mid - middle).length() < 1e-9, "{mid:?} against {middle:?}");
     }
 
     /// The pool's grid must hand the weld every entry within its reach, in

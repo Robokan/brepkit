@@ -36,10 +36,6 @@ pub struct NurbsSurface {
 /// patches hold a clone of their surface, which must not hold them back).
 #[derive(Clone, Default)]
 struct Caches {
-    /// The knot spans indexed by their control boxes, built on first use by
-    /// a projection onto a surface with more spans than its coarse grid
-    /// samples.
-    span_index: std::sync::OnceLock<Option<std::sync::Arc<crate::nurbs::span_index::SpanIndex>>>,
     /// The grid every projection seeds from.
     coarse_grid: std::sync::OnceLock<std::sync::Arc<crate::nurbs::projection::CoarseGrid>>,
     /// The control points' box.
@@ -49,6 +45,8 @@ struct Caches {
         std::sync::OnceLock<Option<std::sync::Arc<crate::nurbs::intersection::RaySurface>>>,
     /// Points projected onto the surface (see [`NurbsSurface::projected`]).
     projections: ProjectionMemo,
+    /// The knot spans by their control boxes (see [`NurbsSurface::span_index`]).
+    span_index: std::sync::OnceLock<Option<std::sync::Arc<crate::nurbs::span_index::SpanIndex>>>,
 }
 
 /// Points already projected onto a surface, by their coordinates' bits, at
@@ -879,6 +877,18 @@ impl NurbsSurface {
         }
     }
 
+    /// The surface's coarse grid for projections, evaluated on first use.
+    /// The surface's knot spans indexed by their control boxes, made on
+    /// first use; `None` where a weight is not positive, where the boxes
+    /// need not bound the surface.
+    #[must_use]
+    pub fn span_index(&self) -> Option<&crate::nurbs::span_index::SpanIndex> {
+        self.caches
+            .span_index
+            .get_or_init(|| crate::nurbs::span_index::SpanIndex::new(self).map(std::sync::Arc::new))
+            .as_deref()
+    }
+
     /// The surface's knot spans indexed by their control boxes, shared (see
     /// [`Self::span_index`]).
     #[must_use]
@@ -889,21 +899,10 @@ impl NurbsSurface {
             .clone()
     }
 
-    /// The surface's coarse grid for projections, evaluated on first use.
     pub(crate) fn coarse_grid(&self) -> &crate::nurbs::projection::CoarseGrid {
         self.caches
             .coarse_grid
             .get_or_init(|| std::sync::Arc::new(crate::nurbs::projection::CoarseGrid::new(self)))
-    }
-
-    /// The surface's knot spans indexed by their control boxes, built on
-    /// first use; `None` when a weight is not positive.
-    #[must_use]
-    pub fn span_index(&self) -> Option<&crate::nurbs::span_index::SpanIndex> {
-        self.caches
-            .span_index
-            .get_or_init(|| crate::nurbs::span_index::SpanIndex::new(self).map(std::sync::Arc::new))
-            .as_deref()
     }
 
     /// Create a cached evaluator for repeated evaluation.
