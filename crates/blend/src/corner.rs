@@ -2863,6 +2863,11 @@ fn face_edge_forward(topo: &Topology, face_id: FaceId, edge_id: EdgeId) -> Optio
 }
 
 /// Return the source vertices at the ends of an open spine in traversal order.
+///
+/// Each edge's sense along the chain is the spine's own: read again from the
+/// edges, an edge running back along the chain read as running forward, the
+/// spine ended at the near end of its last edge, and that terminal was never
+/// closed.
 fn source_spine_endpoints(
     topo: &Topology,
     stripe: &Stripe,
@@ -2871,31 +2876,7 @@ fn source_spine_endpoints(
         return Ok(None);
     }
     let edges = stripe.spine.edges();
-    let mut directions = vec![true; edges.len()];
-    if edges.len() > 1 {
-        let first = topo.edge(edges[0])?;
-        let next = topo.edge(edges[1])?;
-        if first.end() != next.start()
-            && first.end() != next.end()
-            && (first.start() == next.start() || first.start() == next.end())
-        {
-            directions[0] = false;
-        }
-    }
-    for index in 1..edges.len() {
-        let previous = topo.edge(edges[index - 1])?;
-        let previous_end = if directions[index - 1] {
-            previous.end()
-        } else {
-            previous.start()
-        };
-        let edge = topo.edge(edges[index])?;
-        directions[index] = if edge.start() == previous_end {
-            true
-        } else {
-            edge.end() == previous_end
-        };
-    }
+    let directions = stripe.spine.directions();
     let first = topo.edge(edges[0])?;
     let last = topo.edge(edges[edges.len() - 1])?;
     let start = if directions[0] {
@@ -7795,6 +7776,45 @@ mod tests {
                 "t={t}: signed normal dot {dot} != sin^2(t)={expected}"
             );
         }
+    }
+    /// A spine whose middle edge is stored running back along the chain
+    /// ends at the far end of its last edge: read as running forward, the
+    /// middle edge sent the chain back to the last edge's near end, and the
+    /// round's far terminal was never closed.
+    #[test]
+    fn spine_ends_read_past_an_edge_stored_backwards() {
+        let mut topo = Topology::new();
+        let points = [0.0, 1.0, 2.0, 3.0].map(|x| Point3::new(x, 0.0, 0.0));
+        let v = points.map(|p| topo.add_vertex(Vertex::new(p, TOL)));
+        let edges = vec![
+            topo.add_edge(Edge::new(v[0], v[1], EdgeCurve::Line)),
+            topo.add_edge(Edge::new(v[2], v[1], EdgeCurve::Line)),
+            topo.add_edge(Edge::new(v[2], v[3], EdgeCurve::Line)),
+        ];
+        let spine = Spine::from_chain(&topo, edges).unwrap();
+        assert_eq!(spine.directions(), &[true, false, true]);
+        // Any face: the spine's ends are read from its edges alone.
+        let solid = make_box(&mut topo, Vec3::new(1.0, 1.0, 1.0));
+        let face = solid_shell_faces(&topo, solid)[0];
+        let stripe = Stripe {
+            spine,
+            surface: FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+            pcurve1: line_pcurve(),
+            pcurve2: line_pcurve(),
+            contact1: line_curve(points[0], points[3]),
+            contact2: line_curve(points[0], points[3]),
+            face1: face,
+            face2: face,
+            beyond: Default::default(),
+            sections: Vec::new(),
+        };
+        assert_eq!(
+            source_spine_endpoints(&topo, &stripe).unwrap(),
+            Some((v[0], v[3]))
+        );
     }
 }
 
