@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794789525051,
+  "lastUpdate": 1794794121278,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5129,6 +5129,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 25100353,
             "range": "± 56828",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "8a8c7b0c15568c6aa96941873894d1f01965c96c",
+          "message": "docs(speed): bodies of PRs #2478 and #2496\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-15T17:51:42-08:00",
+          "tree_id": "8f6436e0109d120fe14af6bfd14b11fa43d1b539",
+          "url": "https://github.com/Robokan/brepkit/commit/8a8c7b0c15568c6aa96941873894d1f01965c96c"
+        },
+        "date": 1794794120584,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1152169,
+            "range": "± 7095",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1218174,
+            "range": "± 9982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12119,
+            "range": "± 111",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 768634,
+            "range": "± 5491",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 25742698,
+            "range": "± 130002",
             "unit": "ns/iter"
           }
         ]
