@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794906764378,
+  "lastUpdate": 1794931968890,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5831,6 +5831,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 20994703,
             "range": "± 47108",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b55aacc949ac7b50d70f2f5494c6199bd5348fd3",
+          "message": "docs(speed): S5, a big body's query mesh scales with it, creases exact\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-17T08:08:52-08:00",
+          "tree_id": "aed01be099145052ee59a0c9a169339d836f2e46",
+          "url": "https://github.com/Robokan/brepkit/commit/b55aacc949ac7b50d70f2f5494c6199bd5348fd3"
+        },
+        "date": 1794931968112,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1281848,
+            "range": "± 185496",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1238216,
+            "range": "± 4094",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13578,
+            "range": "± 315",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 770026,
+            "range": "± 3169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 26345143,
+            "range": "± 242814",
             "unit": "ns/iter"
           }
         ]
