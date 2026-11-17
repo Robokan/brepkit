@@ -1700,11 +1700,32 @@ pub(super) fn point_triangle_distance(p: Point3, a: Point3, b: Point3, c: Point3
 }
 
 /// The parameters of a point of a face's boundary on the face's surface.
+///
+/// The point lies on the surface to the tolerance of the boundary's edges,
+/// which a file's or a fitted section's edges can pass (a section 8e-5 off a
+/// fitted wing skin). Where the proof of a nearest point does not settle
+/// for such a point, the nearest point found, unproven, still places it:
+/// without it the point, and the face's mesh around it, is lost.
 pub(super) fn project_boundary_point(
     surface: &brepkit_math::nurbs::surface::NurbsSurface,
     point: Point3,
 ) -> Result<brepkit_math::nurbs::projection::SurfaceProjection, brepkit_math::MathError> {
-    brepkit_math::nurbs::projection::project_point_to_surface(surface, point, 1e-6)
+    use brepkit_math::nurbs::projection::{
+        project_point_to_surface, project_point_to_surface_from,
+    };
+    project_point_to_surface(surface, point, 1e-6).or_else(|err| {
+        // An unbounded tolerance takes the search's point without the
+        // proof; Newton from there settles it.
+        let size = {
+            let b = surface.aabb();
+            (b.max - b.min).length()
+        };
+        project_point_to_surface(surface, point, f64::MAX)
+            .and_then(|q| project_point_to_surface_from(surface, point, (q.u, q.v), 1e-6))
+            .ok()
+            .filter(|q| q.distance <= 1e-3 * size.max(1.0))
+            .ok_or(err)
+    })
 }
 
 /// Tessellate a NURBS surface via curvature-adaptive subdivision.
