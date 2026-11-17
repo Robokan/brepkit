@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794883681940,
+  "lastUpdate": 1794901326471,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5723,6 +5723,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 21268559,
             "range": "± 54197",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b47b7aa11583b197f8aabba9a446f388669f9439",
+          "message": "chore: corpus with the volume replay\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-16T23:39:00-08:00",
+          "tree_id": "27662ac457447bfe18d94d1e55cf1f82ff3c8b20",
+          "url": "https://github.com/Robokan/brepkit/commit/b47b7aa11583b197f8aabba9a446f388669f9439"
+        },
+        "date": 1794901325709,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 783958,
+            "range": "± 86560",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 891016,
+            "range": "± 103792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8370,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 539943,
+            "range": "± 54525",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 16116161,
+            "range": "± 1439709",
             "unit": "ns/iter"
           }
         ]
