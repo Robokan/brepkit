@@ -2870,8 +2870,31 @@ fn build_section_edges(
 
                 let intervals: Vec<(Point3, Point3)> =
                     if matches!(edge.curve(), brepkit_topology::edge::EdgeCurve::Line) {
+                        // The coplanar phase gives a partner's curved edge
+                        // as its chord, as a section of both faces: a chord
+                        // along a curved edge of either face is that edge,
+                        // and splits nothing.
+                        let coplanar = opposing_face.is_some_and(|of| {
+                            match (
+                                face.surface(),
+                                topo.face(of).map(brepkit_topology::face::Face::surface),
+                            ) {
+                                (
+                                    FaceSurface::Plane { normal, d },
+                                    Ok(FaceSurface::Plane {
+                                        normal: other,
+                                        d: other_d,
+                                    }),
+                                ) => {
+                                    let same = normal.dot(*other);
+                                    (same.abs() - 1.0).abs() <= 1e-9
+                                        && (d - same.signum() * other_d).abs() <= tol
+                                }
+                                _ => false,
+                            }
+                        });
                         let Some(clipped_list) = clip_line_to_face_boundary(
-                            topo, face_id, raw_start, raw_end, tol, face_loops, None,
+                            topo, face_id, raw_start, raw_end, tol, face_loops, None, coplanar,
                         ) else {
                             continue;
                         };
@@ -2962,6 +2985,7 @@ fn build_section_edges(
                                     tol,
                                     face_loops,
                                     Some(&across_on_this),
+                                    coplanar,
                                 )
                             }) {
                                 Some(subs) => {
@@ -3714,6 +3738,10 @@ fn curve_endpoints(
 /// read as its marched curve end to end, and the face splitter cut it at
 /// its own start. Cut to the window, the whole curve is the window. Split
 /// operand edges keep their shared curve, which coincident faces pair on.
+///
+/// A window of a closed curve is cut out too. Its two ends split the loop
+/// into two arcs, and the edge run from end to start cannot tell which one
+/// it is: past half the loop it read the whole loop, through its own ends.
 fn window_curve(
     curve: &EdgeCurve,
     (t0, t1): (f64, f64),
@@ -3726,14 +3754,15 @@ fn window_curve(
     };
     let (d0, d1) = n.domain();
     let eps = 1e-9 * (d1 - d0);
-    if t1 - t0 <= eps || (t0 - d0 <= eps && d1 - t1 <= eps) {
+    if t1 - t0 <= eps || (t0 - d0 <= eps && d1 - t1 <= eps) || t0 < d0 - eps || t1 > d1 + eps {
         return None;
     }
     let off = |p: brepkit_math::vec::Point3| {
         brepkit_math::nurbs::projection::project_point_to_curve(n, p, 1e-9)
             .map_or(true, |c| c.distance >= ON_CURVE)
     };
-    if !off(start) && !off(end) {
+    let closed = (n.evaluate(d0) - n.evaluate(d1)).length() < ON_CURVE;
+    if !closed && !off(start) && !off(end) {
         return None;
     }
     let tail = if t0 - d0 > eps {
@@ -4390,6 +4419,48 @@ fn ruling_inside_band(
     Some(inside(line_start) && inside(line_end))
 }
 
+impl BoundaryArc {
+    /// Whether `p` is on the edge's own curve, within `tol`.
+    fn holds(&self, p: Point3, tol: f64) -> bool {
+        use brepkit_math::nurbs::knot_ops::curve_split;
+        use brepkit_math::nurbs::projection::project_point_to_curve;
+        use brepkit_math::traits::ParametricCurve;
+        let (start, end) = if self.forward {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        };
+        match &self.curve {
+            EdgeCurve::Line => point_to_segment_dist_3d(p, self.start, self.end) < tol,
+            curve @ (EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_)) => {
+                point_on_edge(curve, start, end, p, tol)
+            }
+            curve @ EdgeCurve::NurbsCurve(whole) => {
+                // The edge can run on a part of its curve, in either
+                // direction. The rest of the curve is not the edge.
+                let (t0, t1) = curve.domain_with_endpoints(start, end);
+                let (lo, hi) = (t0.min(t1), t0.max(t1));
+                let (d0, d1) = ParametricCurve::domain(whole);
+                let slack = 1e-9 * (d1 - d0);
+                let mut span = whole.clone();
+                if lo > d0 + slack {
+                    let Ok((_, rest)) = curve_split(&span, lo) else {
+                        return false;
+                    };
+                    span = rest;
+                }
+                if hi < d1 - slack {
+                    let Ok((kept, _)) = curve_split(&span, hi) else {
+                        return false;
+                    };
+                    span = kept;
+                }
+                project_point_to_curve(&span, p, tol * 1e-3).is_ok_and(|hit| hit.distance < tol)
+            }
+        }
+    }
+}
+
 /// Clip a 3D line segment to a face's boundary polygon.
 ///
 /// Collects the outer wire vertices as line segments, then finds where
@@ -4397,7 +4468,11 @@ fn ruling_inside_band(
 /// Every in-face `(start, end)` interval of the line (a section can cross a
 /// face in multiple material windows), or `None` when nothing lies inside.
 /// A piece lying on one of the face's boundary edges is dropped unless
-/// `keep_run_along` accepts that edge.
+/// `keep_run_along` accepts that edge. A piece along a curved edge's chord
+/// lies on the edge only where its middle is on the curve too, unless
+/// `chords_are_edges`: a coplanar partner's section stands for a curved
+/// edge of this face by its chord.
+#[allow(clippy::too_many_arguments)]
 fn clip_line_to_face_boundary(
     topo: &Topology,
     face_id: FaceId,
@@ -4406,6 +4481,7 @@ fn clip_line_to_face_boundary(
     tol: f64,
     face_loops: &FaceLoopsCache,
     keep_run_along: Option<&dyn Fn(EdgeId) -> bool>,
+    chords_are_edges: bool,
 ) -> Option<Vec<(Point3, Point3)>> {
     let face = topo.face(face_id).ok()?;
     let wire = topo.wire(face.outer_wire()).ok()?;
@@ -4730,6 +4806,32 @@ fn clip_line_to_face_boundary(
         poly
     });
 
+    // A window's midpoint is read against the face's curves first: the
+    // sampled polygon misses the sliver between each chord and its arc,
+    // 0.13 deep on a radius-249 rim, and a section across a ring a quarter
+    // wide lies in that sliver whole. The polygon reads only a midpoint
+    // within `margin` of the boundary, as it did before.
+    let region = std::cell::OnceCell::new();
+    let exact_side = |q: brepkit_math::vec::Point2, margin: f64| {
+        region
+            .get_or_init(|| {
+                plane_frame.as_ref().and_then(|frame| {
+                    brepkit_topology::planar::face_region_2d(
+                        topo,
+                        face_id,
+                        frame.origin(),
+                        frame.u_axis(),
+                        frame.v_axis(),
+                        tol,
+                    )
+                    .ok()
+                    .flatten()
+                })
+            })
+            .as_ref()
+            .and_then(|r| r.side(q, margin))
+    };
+
     // Midpoint classification only steers hole-free faces: a holed face's
     // sections are the hole weave's input, and that machinery (promotion,
     // coincidence splitting, re-trace discriminants) is calibrated on WHOLE
@@ -4739,6 +4841,7 @@ fn clip_line_to_face_boundary(
     let t_intervals: Vec<(f64, f64)> = if face.inner_wires().is_empty()
         && let (Some(frame), Some(poly)) = (plane_frame.as_ref(), poly.as_ref())
     {
+        let eps = crate::builder::classify_2d::boundary_eps(poly);
         // Every in-face sub-interval, not just one: a section can cross the
         // face in MULTIPLE material windows (the slot's z=-1.2 closer runs
         // across the socket bite, leaving material on both sides), and every
@@ -4760,9 +4863,11 @@ fn clip_line_to_face_boundary(
                 // whole-edge duplicate of the shelled-cup lip fuses) has
                 // every midpoint ON the polygon, where the even-odd test
                 // is unreliable.
-                let inside = crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly)
-                    || crate::builder::classify_2d::distance_to_polygon_boundary(mid_uv, poly)
-                        <= crate::builder::classify_2d::boundary_eps(poly);
+                let inside = exact_side(mid_uv, eps).unwrap_or_else(|| {
+                    crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly)
+                        || crate::builder::classify_2d::distance_to_polygon_boundary(mid_uv, poly)
+                            <= eps
+                });
                 inside.then_some((w[0], w[1]))
             })
             .collect()
@@ -4801,15 +4906,18 @@ fn clip_line_to_face_boundary(
             .collect();
         borders.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         borders.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let eps = crate::builder::classify_2d::boundary_eps(poly);
         borders
             .windows(2)
             .filter_map(|w| {
                 let mid_uv = frame.project(line_start + line_dir * f64::midpoint(w[0], w[1]));
-                let in_outer = crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly);
-                let in_hole = hole_polys
-                    .iter()
-                    .any(|h| crate::builder::classify_2d::point_in_polygon_2d(mid_uv, h));
-                (in_outer && !in_hole).then_some((w[0], w[1]))
+                let inside = exact_side(mid_uv, eps).unwrap_or_else(|| {
+                    crate::builder::classify_2d::point_in_polygon_2d(mid_uv, poly)
+                        && !hole_polys
+                            .iter()
+                            .any(|h| crate::builder::classify_2d::point_in_polygon_2d(mid_uv, h))
+                });
+                inside.then_some((w[0], w[1]))
             })
             .collect()
     } else if matches!(
@@ -4890,8 +4998,24 @@ fn clip_line_to_face_boundary(
         for (k, (seg_start, seg_end)) in boundary_segments.iter().enumerate() {
             let start_dist = point_to_segment_dist_3d(clipped_start, *seg_start, *seg_end);
             let end_dist = point_to_segment_dist_3d(clipped_end, *seg_start, *seg_end);
+            // The chord stands for a straight edge only. A piece between the
+            // ends of a spline edge lies on its chord, and across the face
+            // (the chord of an aerofoil cap, from its nose to its trailing
+            // edge), unless its middle is on the curve too. A circle's or an
+            // ellipse's chord is still read as the edge: a section along it
+            // runs between the arc's own split vertices, cut there by the
+            // face the section comes from (a D's flat across a disc's rim),
+            // and kept, it split the disc a second time.
+            let on_edge = || {
+                chords_are_edges
+                    || boundary_arcs[k].as_ref().is_none_or(|arc| {
+                        !matches!(arc.curve, EdgeCurve::NurbsCurve(_))
+                            || arc.holds(clipped_start + (clipped_end - clipped_start) * 0.5, tol)
+                    })
+            };
             if start_dist < tol
                 && end_dist < tol
+                && on_edge()
                 && !keep_run_along.is_some_and(|keep| keep(boundary_edge_ids[k]))
             {
                 continue 'interval;
@@ -5122,9 +5246,18 @@ fn build_surface_info(topo: &Topology, face_id: FaceId) -> Option<SurfaceInfo> {
                         .is_some_and(|span| span <= std::f64::consts::PI + 0.05)
             };
             let partial = small(false) && small(true);
+            // A band round the axis over part of the tube (a groove's inner
+            // half) has no seam across its tube: read periodic in v, a
+            // section running more than half a turn of v across it runs the
+            // short way round, through the part of the tube the face leaves
+            // out.
+            let tube_window = || {
+                crate::pave_filler::phase_ff::face_tube_window(topo, face_id, face.surface())
+                    .is_some()
+            };
             Some(SurfaceInfo::Parametric {
                 u_periodic: !partial,
-                v_periodic: !partial,
+                v_periodic: !partial && !tube_window(),
             })
         }
         FaceSurface::Nurbs(_) => Some(SurfaceInfo::Parametric {
@@ -5881,6 +6014,7 @@ mod clip_tests {
             1e-7,
             &FaceLoopsCache::default(),
             None,
+            false,
         )
         .expect("the ruling crosses the face");
         let high = out
@@ -5950,6 +6084,7 @@ mod clip_tests {
             1e-7,
             &FaceLoopsCache::default(),
             None,
+            false,
         );
         assert!(
             out.iter()
@@ -5978,6 +6113,7 @@ mod clip_tests {
             1e-7,
             &FaceLoopsCache::default(),
             None,
+            false,
         );
         let segs = out.expect("a through-chord far from the seam must be kept");
         assert_eq!(segs.len(), 1);
@@ -6005,6 +6141,7 @@ mod clip_tests {
             1e-7,
             &FaceLoopsCache::default(),
             None,
+            false,
         );
         let segs = out.expect("single-crossing interior→rim chord must be kept");
         assert_eq!(segs.len(), 1);
@@ -6032,6 +6169,7 @@ mod clip_tests {
             1e-7,
             &FaceLoopsCache::default(),
             None,
+            false,
         );
         assert!(out.is_none());
     }
@@ -6043,6 +6181,39 @@ mod tests {
     use super::*;
     use brepkit_math::curves::Circle3D;
     use brepkit_math::vec::Vec3;
+
+    /// An edge on the first two legs of a three-leg curve, whose third leg
+    /// comes back to the middle of the edge's chord. That middle is on the
+    /// curve and off the edge, in either direction of the edge.
+    #[test]
+    fn a_spline_edge_holds_only_points_of_its_own_span() {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        let at = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        let curve = NurbsCurve::new(
+            1,
+            vec![0.0, 0.0, 1.0, 2.0, 3.0, 3.0],
+            vec![at(0.0, 0.0), at(5.0, 4.0), at(10.0, 0.0), at(5.0, 0.0)],
+            vec![1.0; 4],
+        )
+        .unwrap();
+        for forward in [true, false] {
+            let (start, end) = if forward {
+                (at(0.0, 0.0), at(10.0, 0.0))
+            } else {
+                (at(10.0, 0.0), at(0.0, 0.0))
+            };
+            let arc = BoundaryArc {
+                curve: EdgeCurve::NurbsCurve(curve.clone()),
+                start,
+                end,
+                closed: false,
+                forward,
+            };
+            assert!(arc.holds(at(2.5, 2.0), 1e-7), "forward {forward}");
+            assert!(arc.holds(at(7.5, 2.0), 1e-7), "forward {forward}");
+            assert!(!arc.holds(at(5.0, 0.0), 1e-7), "forward {forward}");
+        }
+    }
 
     /// A unit circle in a 4 by 4 square lies on it; with a notch 0.01 wide
     /// reaching to radius 0.97 between the circle's samples it meets the
@@ -6719,6 +6890,39 @@ mod tests {
         assert!((w0 - t0).abs() < 1e-12 && (w1 - t1).abs() < 1e-12);
         assert!((w.evaluate(w0) - a).length() < 1e-9);
         assert!((w.evaluate(w1) - b).length() < 1e-9);
+    }
+
+    /// A window over more than half of a closed curve is cut out of it, so
+    /// the edge run from its end back to its start reads the window, not the
+    /// whole loop through its own ends.
+    #[test]
+    fn a_window_of_a_closed_curve_is_cut_to_the_window() {
+        let pts: Vec<brepkit_math::vec::Point3> = (0..=12)
+            .map(|k| {
+                let a = std::f64::consts::TAU * f64::from(k) / 12.0;
+                brepkit_math::vec::Point3::new(3.0 * a.cos(), 2.0 * a.sin(), 1.0)
+            })
+            .collect();
+        let n = brepkit_math::nurbs::fitting::interpolate(&pts, 3).unwrap();
+        let (d0, d1) = n.domain();
+        let (t0, t1) = (0.2_f64.madd(d1 - d0, d0), 0.8_f64.madd(d1 - d0, d0));
+        let (a, b) = (n.evaluate(t0), n.evaluate(t1));
+        let middle = n.evaluate(f64::midpoint(t0, t1));
+        let curve = EdgeCurve::NurbsCurve(n);
+        let (r0, r1) = curve.domain_with_endpoints(b, a);
+        assert!(
+            (r0 - d0).abs() < 1e-12 && (r1 - d1).abs() < 1e-12,
+            "the loop's own reversed reading is the whole loop: ({r0}, {r1})"
+        );
+
+        let windowed = window_curve(&curve, (t0, t1), (a, b)).expect("the window was cut");
+        let (w0, w1) = windowed.domain_with_endpoints(b, a);
+        assert!(
+            (w0 - t1).abs() < 1e-9 && (w1 - t0).abs() < 1e-9,
+            "({w0}, {w1})"
+        );
+        let mid = windowed.evaluate_with_endpoints(f64::midpoint(w0, w1), b, a);
+        assert!((mid - middle).length() < 1e-9, "{mid:?} against {middle:?}");
     }
 
     /// The pool's grid must hand the weld every entry within its reach, in

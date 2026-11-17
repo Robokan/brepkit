@@ -1794,12 +1794,17 @@ fn split_sections_at_seam_meridian(
 /// interior point per band. A bore through a tube's wall crosses the bore's
 /// own wall along two such loops, giving three bands.
 ///
+/// Sections that wind nothing close into loops clear of the seam: each is a
+/// hole in the band it lies in, and a disc of its own (a rail through a post
+/// whose end sits in another rail).
+///
 /// Returns `None` (caller falls through) unless: the boundary reads as a
-/// band stack; EVERY section belongs to a winding chain; each chain has a
+/// band stack; at least one section chain winds the lateral; each chain has a
 /// vertex on the seam meridian (the seam-anchoring pre-step guarantees this
 /// for winding chains); every chain sample stays strictly between the
-/// stack's ends; and the chains do not cross (their order along the seam is
-/// their order across the face).
+/// stack's ends; the chains do not cross (their order along the seam is
+/// their order across the face); and every other section belongs to a loop
+/// of winding zero clear of the seam inside one band.
 #[allow(clippy::too_many_lines)]
 fn split_periodic_face_by_winding_chain(
     surface: &FaceSurface,
@@ -1812,13 +1817,13 @@ fn split_periodic_face_by_winding_chain(
 ) -> Option<Vec<SplitSubFace>> {
     let (_, period) = special_cases::band_period(surface)?;
 
-    // Every section must belong to some winding chain; any other section
-    // would be silently dropped, so the face is deferred instead.
     let mut chains: Vec<Vec<(usize, bool)>> = Vec::new();
     let mut free: Vec<usize> = (0..sections.len()).collect();
     while !free.is_empty() {
         let subset: Vec<SectionEdge> = free.iter().map(|&i| sections[i].clone()).collect();
-        let (chain, _winding) = winding_chain_in(&subset, surface, tol, true, period)?;
+        let Some((chain, _winding)) = winding_chain_in(&subset, surface, tol, true, period) else {
+            break;
+        };
         let used: Vec<usize> = chain.iter().map(|&(k, _)| free[k]).collect();
         chains.push(chain.iter().map(|&(k, fwd)| (free[k], fwd)).collect());
         free.retain(|i| !used.contains(i));
@@ -1826,11 +1831,14 @@ fn split_periodic_face_by_winding_chain(
     if chains.is_empty() {
         return None;
     }
+    // The rest must close into holes; a section left out would be dropped.
+    let hole_loops = closed_section_loops(sections, &free, tol)?;
     bands_from_winding_chains(
         surface,
         boundary_edges,
         sections,
         chains,
+        &hole_loops,
         rank,
         reversed,
         face_id,
@@ -1839,16 +1847,20 @@ fn split_periodic_face_by_winding_chain(
 }
 
 /// The bands of a u-periodic lateral cut by `chains`, each a closed chain of
-/// `sections` (`(index, traversed start→end)`) winding the period once: the
-/// band builder of [`split_periodic_face_by_winding_chain`]. `None` unless
-/// every chain reaches the seam meridian, stays strictly between the rims,
-/// and the chains stack without crossing.
+/// `sections` (`(index, traversed start→end)`) winding the period once, and
+/// the discs of `hole_loops`, closed loops of sections winding nothing, each
+/// a hole in the band it lies in: the band builder of
+/// [`split_periodic_face_by_winding_chain`]. `None` unless every chain
+/// reaches the seam meridian, stays strictly between the rims, and the
+/// chains stack without crossing, and every loop lies clear of the seam
+/// inside one band.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn bands_from_winding_chains(
     surface: &FaceSurface,
     boundary_edges: &[OrientedPCurveEdge],
     sections: &[SectionEdge],
     chains: Vec<Vec<(usize, bool)>>,
+    hole_loops: &[Vec<(usize, bool)>],
     rank: Rank,
     reversed: bool,
     face_id: FaceId,
@@ -1859,6 +1871,8 @@ fn bands_from_winding_chains(
         v_opposite: f64,
         lower: Vec<OrientedPCurveEdge>,
         upper: Vec<OrientedPCurveEdge>,
+        /// `(u` past the seam, unwrapped along the chain`, v)`.
+        path: Vec<(f64, f64)>,
     }
 
     let (u_start, period) = special_cases::band_period(surface)?;
@@ -1970,11 +1984,27 @@ fn bands_from_winding_chains(
             }
             Some(out)
         };
+        // Read finer than the samples above: a hole may lie close beside it.
+        let mut path: Vec<(f64, f64)> = Vec::new();
+        for &(idx, fwd) in &chain {
+            let s = &sections[idx];
+            let (d0, d1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+            let uv_at = |f: f64| {
+                let t = if fwd { f } else { 1.0 - f };
+                surface.project_point(s.curve_3d.evaluate_with_endpoints(
+                    (d1 - d0).madd(t, d0),
+                    s.start,
+                    s.end,
+                ))
+            };
+            push_uv_path(&mut path, seam_u, period, 0.5 * close_tol, &uv_at)?;
+        }
         separators.push(Separator {
             v_seam,
             v_opposite,
             lower: build_chain(chain_is_lower_role)?,
             upper: build_chain(!chain_is_lower_role)?,
+            path,
         });
     }
 
@@ -2007,11 +2037,192 @@ fn bands_from_winding_chains(
         })
     };
 
+    // Each hole lies in one band: the one below every separator and rim
+    // that passes above it, read at each of its samples.
+    let n = separators.len();
+    let end_path = |end: &special_cases::BandEnd<'_>, v: f64| -> Option<Vec<(f64, f64)>> {
+        let special_cases::BandEnd::Rim(rim) = end else {
+            return Some(vec![(-half, v), (half, v)]);
+        };
+        let (t0, t1) = rim.curve_3d.domain_with_endpoints(rim.start_3d, rim.end_3d);
+        let uv_at = |f: f64| {
+            surface.project_point(rim.curve_3d.evaluate_with_endpoints(
+                (t1 - t0).madd(f, t0),
+                rim.start_3d,
+                rim.end_3d,
+            ))
+        };
+        let mut path: Vec<(f64, f64)> = Vec::new();
+        push_uv_path(&mut path, seam_u, period, 0.5 * close_tol, &uv_at)?;
+        Some(path)
+    };
+    let mut levels: Vec<Vec<(f64, f64)>> = Vec::with_capacity(n + 2);
+    levels.push(end_path(&bot, v_bot)?);
+    levels.extend(separators.iter().map(|s| s.path.clone()));
+    levels.push(end_path(&top, v_top)?);
+    let band_of = |d: f64, v: f64| -> Option<usize> {
+        let mut below = 0;
+        for level in &levels {
+            let at = winding_path_v_at(level, d, period)?;
+            if (at - v).abs() < close_tol {
+                return None;
+            }
+            if at < v {
+                below += 1;
+            }
+        }
+        (1..=n + 1).contains(&below).then(|| below - 1)
+    };
+    // Whether the band's lower edge runs toward increasing `u`, which makes
+    // its outer wire run counterclockwise in `(u, v)`.
+    let along_u = {
+        let mid = f64::midpoint(v_bot, v_top);
+        let du = surface.evaluate(seam_u + 1e-4, mid)? - surface.evaluate(seam_u - 1e-4, mid)?;
+        ref_tan.dot(du) > 0.0
+    };
+    // Each loop's band, `(u, v)` samples (`u` past the seam, kept on one side
+    // of it), disc and hole wires.
+    let mut holes: Vec<HoleLoop> = Vec::with_capacity(hole_loops.len());
+    for entries in hole_loops {
+        let mut uv: Vec<Point2> = Vec::new();
+        let mut band: Option<usize> = None;
+        for &(idx, fwd) in entries {
+            let s = &sections[idx];
+            let (d0, d1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+            for k in 0..HOLE_SAMPLES {
+                let f = f64::from(k) / f64::from(HOLE_SAMPLES);
+                let t = if fwd { f } else { 1.0 - f };
+                let p = s
+                    .curve_3d
+                    .evaluate_with_endpoints((d1 - d0).madd(t, d0), s.start, s.end);
+                let (u, v) = surface.project_point(p)?;
+                let raw = wrap_pi(u - seam_u);
+                let in_band = band_of(raw, v)?;
+                if band.is_some_and(|b| b != in_band) {
+                    return None;
+                }
+                band = Some(in_band);
+                let d = uv
+                    .last()
+                    .map_or(raw, |prev: &Point2| prev.x() + wrap_pi(raw - prev.x()));
+                uv.push(Point2::new(d, v));
+            }
+        }
+        let band = band?;
+        // An inner wire cannot cross the seam the face is cut open along.
+        let (lo, hi) = uv.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+            (lo.min(p.x()), hi.max(p.x()))
+        });
+        let clear = |a: f64, b: f64| a >= HOLE_SEAM_CLEARANCE && b <= period - HOLE_SEAM_CLEARANCE;
+        if !clear(lo, hi) && !clear(-hi, -lo) {
+            return None;
+        }
+        if hi < 0.0 {
+            for p in &mut uv {
+                *p = Point2::new(p.x() + period, p.y());
+            }
+        }
+        let face_left = (signed_area_2d(&uv) > 0.0) == along_u;
+        let reversed_entries: Vec<(usize, bool)> =
+            entries.iter().rev().map(|&(i, f)| (i, !f)).collect();
+        let (disc, hole) = if face_left {
+            (entries.clone(), reversed_entries)
+        } else {
+            (reversed_entries, entries.clone())
+        };
+        let materialize = |loop_entries: &[(usize, bool)]| -> Option<Vec<OrientedPCurveEdge>> {
+            let mut out = Vec::with_capacity(loop_entries.len());
+            let mut u_prev: Option<f64> = None;
+            for &(idx, fwd) in loop_entries {
+                let s = &sections[idx];
+                let (from, to) = if fwd {
+                    (s.start, s.end)
+                } else {
+                    (s.end, s.start)
+                };
+                let (u_raw0, v0) = surface.project_point(from)?;
+                let (u_raw1, v1) = surface.project_point(to)?;
+                let u0 = u_prev.map_or_else(
+                    || {
+                        let past = (u_raw0 - seam_u).rem_euclid(period);
+                        if along_u {
+                            seam_u + past
+                        } else {
+                            seam_u + past - period
+                        }
+                    },
+                    |prev| prev + wrap_pi(u_raw0 - prev),
+                );
+                let u1 = u0 + wrap_pi(u_raw1 - u_raw0);
+                u_prev = Some(u1);
+                out.push(OrientedPCurveEdge {
+                    curve_3d: s.curve_3d.clone(),
+                    pcurve: match rank {
+                        Rank::A => s.pcurve_a.clone(),
+                        Rank::B => s.pcurve_b.clone(),
+                    },
+                    start_uv: Point2::new(u0, v0),
+                    end_uv: Point2::new(u1, v1),
+                    start_3d: from,
+                    end_3d: to,
+                    forward: fwd,
+                    source_edge_idx: None,
+                    pave_block_id: s.pave_block_id,
+                });
+            }
+            Some(out)
+        };
+        holes.push(HoleLoop {
+            band,
+            disc: materialize(&disc)?,
+            hole: materialize(&hole)?,
+            uv,
+            parent: None,
+        });
+    }
+    // A loop inside another (a hollow rail's bore inside its wall) is a hole
+    // of the disc around it, not of the band: each loop's parent is the
+    // smallest loop holding it.
+    for i in 0..holes.len() {
+        let probe = *holes[i].uv.first()?;
+        holes[i].parent = (0..holes.len())
+            .filter(|&j| {
+                j != i
+                    && holes[j].band == holes[i].band
+                    && super::classify_2d::point_in_polygon_2d(probe, &holes[j].uv)
+            })
+            .min_by(|&a, &b| {
+                signed_area_2d(&holes[a].uv)
+                    .abs()
+                    .total_cmp(&signed_area_2d(&holes[b].uv).abs())
+            });
+    }
+    let mut band_holes: Vec<Vec<Vec<OrientedPCurveEdge>>> = vec![Vec::new(); n + 1];
+    let mut band_hole_uv: Vec<Vec<Vec<Point2>>> = vec![Vec::new(); n + 1];
+    let mut discs: Vec<SplitSubFace> = Vec::new();
+    for (i, h) in holes.iter().enumerate() {
+        let children: Vec<&HoleLoop> = holes.iter().filter(|c| c.parent == Some(i)).collect();
+        let child_uv: Vec<&[Point2]> = children.iter().map(|c| c.uv.as_slice()).collect();
+        let inside = point_inside_region_uv(&h.uv, &child_uv)?;
+        discs.push(SplitSubFace {
+            surface: surface.clone(),
+            outer_wire: h.disc.clone(),
+            inner_wires: children.iter().map(|c| c.hole.clone()).collect(),
+            reversed,
+            parent: face_id,
+            rank,
+            precomputed_interior: Some(surface.evaluate(seam_u + inside.x(), inside.y())?),
+        });
+        if h.parent.is_none() {
+            band_holes[h.band].push(h.hole.clone());
+            band_hole_uv[h.band].push(h.uv.clone());
+        }
+    }
+
     // Each band: its lower separator in the lower role, the seam up, its
     // upper separator in the upper role, the seam back down. The rims close
     // the end bands.
-    let n = separators.len();
-    let mut bands = Vec::with_capacity(n + 1);
+    let mut bands = Vec::with_capacity(n + 1 + discs.len());
     for k in 0..=n {
         let (mut wire, v_low, q_low) = if k == 0 {
             (bot.edges(), v_bot, q_bot)
@@ -2031,16 +2242,30 @@ fn bands_from_winding_chains(
             wire.extend(separators[k].upper.iter().cloned());
         }
         wire.push(mk_seam(v_high, v_low)?);
+        // A sample on the meridian opposite the seam, clear of the band's
+        // holes.
+        let d_opposite = wrap_pi(u_opposite - seam_u);
+        let v_inside = [0.5, 0.25, 0.75, 0.125, 0.375, 0.625, 0.875]
+            .into_iter()
+            .map(|f| (q_high - q_low).madd(f, q_low))
+            .find(|&v| {
+                band_hole_uv[k].iter().all(|uv| {
+                    [d_opposite - period, d_opposite, d_opposite + period]
+                        .into_iter()
+                        .all(|d| !super::classify_2d::point_in_polygon_2d(Point2::new(d, v), uv))
+                })
+            })?;
         bands.push(SplitSubFace {
             surface: surface.clone(),
             outer_wire: wire,
-            inner_wires: Vec::new(),
+            inner_wires: std::mem::take(&mut band_holes[k]),
             reversed,
             parent: face_id,
             rank,
-            precomputed_interior: Some(surface.evaluate(u_opposite, f64::midpoint(q_low, q_high))?),
+            precomputed_interior: Some(surface.evaluate(u_opposite, v_inside)?),
         });
     }
+    bands.extend(discs);
     Some(bands)
 }
 
@@ -2249,6 +2474,7 @@ fn split_periodic_face_by_touching_saddles(
         boundary_edges,
         &pieces,
         chains,
+        &[],
         rank,
         reversed,
         face_id,
@@ -2325,6 +2551,163 @@ fn split_periodic_face_by_touching_saddles(
         });
     }
     Some(out)
+}
+
+/// A loop of sections on a lateral that winds nothing: the band holding it,
+/// its wires as a disc and as a hole, its `(u, v)` samples, and the loop
+/// holding it, if any.
+struct HoleLoop {
+    band: usize,
+    disc: Vec<OrientedPCurveEdge>,
+    hole: Vec<OrientedPCurveEdge>,
+    uv: Vec<Point2>,
+    parent: Option<usize>,
+}
+
+/// Samples along each piece of a hole, or along a rim, read on a lateral.
+const HOLE_SAMPLES: u32 = 32;
+/// How near the seam meridian, in `u`, a hole may come: one crossing it
+/// would need cutting there, which an inner wire cannot take.
+const HOLE_SEAM_CLEARANCE: f64 = 1e-6;
+
+/// The sections at `free` chained by their ends into closed loops, as
+/// `(section, traversed start to end)` entries; `None` if one does not close.
+fn closed_section_loops(
+    sections: &[SectionEdge],
+    free: &[usize],
+    tol: f64,
+) -> Option<Vec<Vec<(usize, bool)>>> {
+    use std::collections::{HashMap, HashSet};
+
+    let qscale = 1.0 / tol.max(1e-12);
+    let q3 = |p: Point3| -> (i64, i64, i64) {
+        (
+            (p.x() * qscale).round() as i64,
+            (p.y() * qscale).round() as i64,
+            (p.z() * qscale).round() as i64,
+        )
+    };
+    let mut adj: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::new();
+    for &i in free {
+        adj.entry(q3(sections[i].start))
+            .or_default()
+            .push((i, true));
+        adj.entry(q3(sections[i].end)).or_default().push((i, false));
+    }
+    let mut used: HashSet<usize> = HashSet::new();
+    let mut loops = Vec::new();
+    for &first in free {
+        if used.contains(&first) {
+            continue;
+        }
+        let origin = q3(sections[first].start);
+        let (mut cur, mut fwd) = (first, true);
+        let mut entries = Vec::new();
+        loop {
+            used.insert(cur);
+            entries.push((cur, fwd));
+            let s = &sections[cur];
+            let to = if fwd { s.end } else { s.start };
+            if q3(to) == origin {
+                break;
+            }
+            let &(next, next_fwd) = adj.get(&q3(to))?.iter().find(|(j, _)| !used.contains(j))?;
+            cur = next;
+            fwd = next_fwd;
+        }
+        loops.push(entries);
+    }
+    Some(loops)
+}
+
+/// Appends to `path` the `(u` past `seam_u`, unwrapped along the path`, v)`
+/// samples of the curve that `uv_at` reads over `[0, 1]`: [`HOLE_SAMPLES`]
+/// even steps, each halved while the curve's middle lies farther than
+/// `within` in `v` from the line between its ends, so a `v` read between two
+/// samples lies about that close to the curve.
+fn push_uv_path(
+    path: &mut Vec<(f64, f64)>,
+    seam_u: f64,
+    period: f64,
+    within: f64,
+    uv_at: &dyn Fn(f64) -> Option<(f64, f64)>,
+) -> Option<()> {
+    /// Halvings of one even step at most.
+    const DEPTH: u32 = 10;
+    let half = 0.5 * period;
+    let past = |from: f64, u: f64| from + ((u - seam_u - from + half).rem_euclid(period) - half);
+    let (u, v) = uv_at(0.0)?;
+    path.push((past(path.last().map_or(0.0, |p| p.0), u), v));
+    let mut left = 0.0;
+    for k in 1..=HOLE_SAMPLES {
+        let f = f64::from(k) / f64::from(HOLE_SAMPLES);
+        let (u, v) = uv_at(f)?;
+        let mut pending = vec![(f, u, v, 0)];
+        while let Some(&(right, ur, vr, depth)) = pending.last() {
+            let &(dl, vl) = path.last()?;
+            let mid = f64::midpoint(left, right);
+            let (um, vm) = uv_at(mid)?;
+            let dm = past(dl, um);
+            let dr = past(dm, ur);
+            let chord = if (dr - dl).abs() > f64::EPSILON {
+                (vr - vl).madd((dm - dl) / (dr - dl), vl)
+            } else {
+                vm
+            };
+            if depth < DEPTH && (vm - chord).abs() > within {
+                pending.push((mid, um, vm, depth + 1));
+            } else {
+                pending.pop();
+                path.push((past(dl, ur), vr));
+                left = right;
+            }
+        }
+    }
+    Some(())
+}
+
+/// The `v` where a path winding a lateral once, as `(u` past the seam
+/// unwrapped along it`, v)` samples, passes `u` past the seam `d`; `None`
+/// where it passes there more than once or not at all.
+fn winding_path_v_at(path: &[(f64, f64)], d: f64, period: f64) -> Option<f64> {
+    let mut found: Option<f64> = None;
+    for turn in [-2.0, -1.0, 0.0, 1.0, 2.0] {
+        let target = period.madd(turn, d);
+        for w in path.windows(2) {
+            let ((d0, v0), (d1, v1)) = (w[0], w[1]);
+            let (lo, hi) = if d0 < d1 { (d0, d1) } else { (d1, d0) };
+            if (hi - lo).abs() < f64::EPSILON || target < lo || target >= hi {
+                continue;
+            }
+            let v = (v1 - v0).madd((target - d0) / (d1 - d0), v0);
+            match found {
+                Some(prev) if (prev - v).abs() > 1e-9 => return None,
+                _ => found = Some(v),
+            }
+        }
+    }
+    found
+}
+
+/// A point inside the closed `(u, v)` polygon `outer` and outside each of
+/// `holes`: the middle of the widest span they leave, read by parity, on the
+/// line through the mean `v` of `outer`.
+fn point_inside_region_uv(outer: &[Point2], holes: &[&[Point2]]) -> Option<Point2> {
+    #[allow(clippy::cast_precision_loss)]
+    let v = outer.iter().map(|p| p.y()).sum::<f64>() / outer.len() as f64;
+    let mut cuts: Vec<f64> = Vec::new();
+    for poly in std::iter::once(outer).chain(holes.iter().copied()) {
+        for k in 0..poly.len() {
+            let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+            if (a.y() <= v) != (b.y() <= v) {
+                cuts.push((b.x() - a.x()).madd((v - a.y()) / (b.y() - a.y()), a.x()));
+            }
+        }
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.chunks_exact(2)
+        .max_by(|a, b| (a[1] - a[0]).total_cmp(&(b[1] - b[0])))
+        .map(|span| Point2::new(f64::midpoint(span[0], span[1]), v))
 }
 
 /// Split a u-periodic cylinder/cone lateral (two closed rims, or a pointed
@@ -6927,9 +7310,9 @@ fn split_face_2d_impl(
                         if (s3 - e3).length() < tol.linear {
                             continue;
                         }
-                        // The piece's own span: a rim split where a line
-                        // crosses through its centre is two half turns,
-                        // which the shorter-arc reading cannot tell apart.
+                        // A piece of a split rim can run more than a half
+                        // turn: it traces its own span, not the shorter arc
+                        // between its ends.
                         let pcurve = super::pcurve_compute::compute_boundary_pcurve_on_surface(
                             e.curve(),
                             vs.point(),
@@ -8641,7 +9024,10 @@ fn split_face_2d_impl(
     // one continuous span.
     let mut one_turn: Option<(f64, f64)> = None;
     if u_periodic
-        && matches!(surface, FaceSurface::Cone(_) | FaceSurface::Cylinder(_))
+        && matches!(
+            surface,
+            FaceSurface::Cone(_) | FaceSurface::Cylinder(_) | FaceSurface::Torus(_)
+        )
         && all_edges.len() > n_boundary_edges
         && let (Some(u_period), _) = super::pcurve_compute::surface_periods(&surface)
     {
@@ -8756,7 +9142,13 @@ fn split_face_2d_impl(
                 }
             }
             if max_gap > 0.05 {
-                let lo = gap_start + max_gap;
+                // A band round the axis over more than half the tube has only
+                // its two rims' tube angles for ends, and the wider gap
+                // between them runs across the face: its outline says where
+                // the face starts.
+                let lo =
+                    super::super::pave_filler::phase_ff::face_tube_window(topo, face_id, &surface)
+                        .map_or(gap_start + max_gap, |(start, _)| start);
                 for e in &mut all_edges {
                     let remap = |uv: Point2| -> Point2 {
                         let mut d = (uv.y() - lo).rem_euclid(v_period);
@@ -10146,8 +10538,29 @@ fn split_face_2d_impl(
             // band's piece between two sections running rim to rim, the lens
             // between a cylinder's rim and an oblique plane's ellipse traced
             // on its strip) bounds a region of the face too; only a loop of
-            // sections alone is a hole.
+            // sections alone is a hole. A torus band's seam is a meridian
+            // arc, not a line, so its pieces read this way as well; but a
+            // section that retraces a stretch of the band's rim (two half
+            // rings meeting along it) closes a sliver with the rim, or runs
+            // out and back in the loop round the whole band, and neither
+            // bounds a piece of the face.
+            let torus_piece = matches!(surface, FaceSurface::Torus(_)) && {
+                let runs_both_ways = wire_loop.iter().any(|a| {
+                    a.source_edge_idx.is_some()
+                        && wire_loop.iter().any(|b| {
+                            b.source_edge_idx == a.source_edge_idx && b.forward != a.forward
+                        })
+                });
+                let pts = sample_wire_loop_uv_periodic(&wire_loop, u_per_opt, v_per_opt);
+                let perimeter: f64 = pts
+                    .iter()
+                    .zip(pts.iter().cycle().skip(1))
+                    .map(|(a, b)| (*b - *a).length())
+                    .sum();
+                !runs_both_ways && signed_area_2d(&pts).abs() > perimeter * tol.linear
+            };
             let on_boundary = (matches!(surface, FaceSurface::Cone(_) | FaceSurface::Cylinder(_))
+                || torus_piece
                 || strip)
                 && wire_loop.iter().any(|e| e.source_edge_idx.is_none())
                 && wire_loop.iter().any(|e| e.source_edge_idx.is_some());
@@ -10308,6 +10721,26 @@ fn split_face_2d_impl(
             }
         };
         let outer_uv: Vec<Vec<Point2>> = outers.iter().map(|(w, _)| sample_loop(w)).collect();
+        // An outer of lines and conic arcs read as it is: its polygon cuts
+        // each arc's corners off, by half a unit on a rim that is one circle
+        // of radius seven, and a loop that runs nearer the rim than that
+        // reads as outside it.
+        let outer_exact: Vec<Option<Vec<brepkit_math::region2d::Boundary2>>> = outers
+            .iter()
+            .map(|(w, _)| {
+                is_plane
+                    .then(|| containment::exact_hole(w, frame))
+                    .flatten()
+            })
+            .collect();
+        let within_exact = |pts: &[Point2]| {
+            outer_exact.iter().flatten().any(|pieces| {
+                pts.iter().all(|&p| {
+                    brepkit_math::region2d::point_in_region(pieces, p, tol.linear * 10.0)
+                        != Some(false)
+                })
+            })
+        };
         let mut promoted: Vec<Vec<OrientedPCurveEdge>> = Vec::new();
         holes.retain(|hole| {
             let hole_pts = sample_loop(hole);
@@ -10316,7 +10749,8 @@ fn split_face_2d_impl(
             }
             let nested = outer_uv
                 .iter()
-                .any(|o| loop_containment(&hole_pts, o) != LoopContainment::Outside);
+                .any(|o| loop_containment(&hole_pts, o) != LoopContainment::Outside)
+                || within_exact(&hole_pts);
             if nested {
                 true
             } else {
@@ -10423,7 +10857,20 @@ fn split_face_2d_impl(
                         && super::classify_2d::distance_to_polygon_boundary(ip, hp) > hole_margin
                         && !surrounds(hp)
                 });
-                if let Some(hole_poly) = matched_hole {
+                // A region that holds a hole is not inside one: the point
+                // read off its outline alone can lie in the hole it holds (a
+                // ring's outer rim, whose middle is the middle of its hole).
+                let holds_a_hole = matched_hole.is_some()
+                    && containment::exact_hole(&outer_wire, frame).is_some_and(|outline| {
+                        original_inner_wires.iter().flatten().any(|e| {
+                            brepkit_math::region2d::point_in_region(
+                                &outline,
+                                frame.project(e.start_3d),
+                                hole_margin,
+                            ) == Some(true)
+                        })
+                    });
+                if let Some(hole_poly) = matched_hole.filter(|_| !holds_a_hole) {
                     if trace_split {
                         log::debug!(
                             "STRACE-DROP face={face_id:?} in-hole island (ip=({:.4},{:.4}))",
@@ -10773,6 +11220,37 @@ pub fn face_has_curved_lens_holes(topo: &Topology, face_id: FaceId) -> bool {
     })
 }
 
+/// A point on a whole cylinder/cone wall that lies clear of its lens holes:
+/// the search of [`cylinder_cone_remainder_interior`], for a wall that no
+/// section cut. The generic sample of an uncut face does not look at holes.
+pub fn whole_lens_wall_interior(
+    topo: &Topology,
+    face_id: FaceId,
+    clearance: f64,
+) -> Option<Point3> {
+    let face = topo.face(face_id).ok()?;
+    let surface = face.surface().clone();
+    let edges_of = |wire| {
+        let pts = collect_wire_points(topo, wire);
+        boundary_edges_to_pcurve(topo, wire, &surface, &pts, None)
+    };
+    let outer_wire = edges_of(face.outer_wire());
+    let inner_wires: Vec<_> = face.inner_wires().iter().map(|&w| edges_of(w)).collect();
+    if outer_wire.is_empty() || inner_wires.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let whole = SplitSubFace {
+        surface,
+        outer_wire,
+        inner_wires,
+        reversed: face.is_reversed(),
+        parent: face_id,
+        rank: Rank::A,
+        precomputed_interior: None,
+    };
+    cylinder_cone_remainder_interior(&whole, clearance)
+}
+
 /// Get a point guaranteed inside a sub-face's outer wire (in UV space),
 /// not inside any inner wire (hole), then evaluate it to 3D via the surface.
 /// `None` for a plane piece bounded by lines and conic arcs when no point
@@ -10974,7 +11452,10 @@ pub fn interior_point_3d(
                             .fold(f64::INFINITY, f64::min);
                         far = far.min(near);
                     } else if hole_2d.len() >= 3 {
-                        islands.push(unwrapped_u(&hole_2d));
+                        // A hole runs with the piece on its left: turned
+                        // round, it has its own region there.
+                        let own: Vec<Point2> = hole_2d.iter().rev().copied().collect();
+                        islands.push(unwrapped_u(&own));
                     }
                 }
                 // A hole that does not wind the axis covers only part of any
@@ -11157,14 +11638,66 @@ fn sphere_loop_uv(sub_face: &SplitSubFace) -> Option<Vec<Point2>> {
     closes.then_some(pts)
 }
 
-/// A loop's `(u, v)` samples with `u` carried continuously along it.
+/// A sphere loop's `(u, v)` samples with `u` carried continuously along it.
+/// The loop's region is on its left.
+///
+/// A point at a pole has no `u` of its own. The loop arrives there on one
+/// meridian and leaves on another, and the nearest way round between the two
+/// is not the loop's way: for meridians a half turn apart, rounding alone
+/// picks it. The region lies below the north pole and above the south one,
+/// so with the region on its left the loop passes the north pole toward `-u`
+/// and the south pole toward `+u`. Each run of pole points becomes the two
+/// corners of that passage, and a loop that starts at a pole comes back
+/// starting at its first point off the poles.
 fn unwrapped_u(pts: &[Point2]) -> Vec<Point2> {
-    use std::f64::consts::{PI, TAU};
-    let mut u = pts[0].x();
-    let mut out = vec![pts[0]];
-    for w in pts.windows(2) {
-        u += (w[1].x() - w[0].x() + PI).rem_euclid(TAU) - PI;
-        out.push(Point2::new(u, w[1].y()));
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+    // A point projected from a pole reads a latitude short of the pole by
+    // the square root of its rounding, about 1.5e-8. A point farther off
+    // has a longitude of its own: a small loop beside the pole keeps the
+    // nearest way.
+    let at_pole = |p: &Point2| p.y().abs() >= FRAC_PI_2 - 1e-7;
+    let nearest = |from: f64, to: f64| (to - from + PI).rem_euclid(TAU) - PI;
+    // A loop with no point off the poles has no meridian to pass a pole
+    // from: it keeps the nearest way, as a loop with no point at a pole does.
+    let first = pts.iter().position(|p| !at_pole(p));
+    let (Some(first), true) = (first, pts.iter().any(at_pole)) else {
+        let mut u = pts[0].x();
+        let mut out = vec![pts[0]];
+        for w in pts.windows(2) {
+            u += nearest(w[0].x(), w[1].x());
+            out.push(Point2::new(u, w[1].y()));
+        }
+        return out;
+    };
+    // The way past a pole from the meridian `from` to the meridian `to`.
+    let past_pole = |from: f64, to: f64, north: bool| {
+        let turn = if north { from - to } else { to - from }.rem_euclid(TAU);
+        let turn = if turn > TAU - 1e-9 { 0.0 } else { turn };
+        if north { -turn } else { turn }
+    };
+    let count = pts.len();
+    let mut u = pts[first].x();
+    let mut last_raw = u;
+    let mut out = vec![pts[first]];
+    let mut pole: Option<f64> = None;
+    for k in 1..=count {
+        let p = pts[(first + k) % count];
+        if at_pole(&p) {
+            pole = Some(p.y());
+            continue;
+        }
+        if let Some(v) = pole.take() {
+            out.push(Point2::new(u, v));
+            u += past_pole(last_raw, p.x(), v > 0.0);
+            out.push(Point2::new(u, v));
+        } else {
+            u += nearest(last_raw, p.x());
+        }
+        last_raw = p.x();
+        // The last step comes back to the first point, which is there.
+        if k < count {
+            out.push(Point2::new(u, p.y()));
+        }
     }
     out
 }
@@ -11755,6 +12288,28 @@ mod tests {
         brepkit_math::curves2d::Curve2D::Line(
             Line2D::new(Point2::new(0.0, 0.0), Vec2::new(1.0, 0.0)).unwrap(),
         )
+    }
+
+    /// Half of the ellipse `v = 2 + cos(u)` on a unit cylinder: read between
+    /// the samples, the path stays within its bound of the curve. Even steps
+    /// alone miss it by 1.2e-3 a sixty-fourth of a turn along.
+    #[test]
+    fn a_separator_path_reads_its_curve_between_samples() {
+        use std::f64::consts::{PI, TAU};
+        let uv_at = |f: f64| Some((PI * f, 2.0 + (PI * f).cos()));
+        let within = 5e-6;
+        let mut path = Vec::new();
+        push_uv_path(&mut path, 0.0, TAU, within, &uv_at).unwrap();
+        for k in 1..64 {
+            let u = PI * f64::from(k) / 64.0;
+            let v = winding_path_v_at(&path, u, TAU).unwrap();
+            assert!((v - (2.0 + u.cos())).abs() < 2.0 * within, "at {u}: {v}");
+        }
+        let mut coarse = Vec::new();
+        push_uv_path(&mut coarse, 0.0, TAU, f64::MAX, &uv_at).unwrap();
+        let u = PI / 64.0;
+        let v = winding_path_v_at(&coarse, u, TAU).unwrap();
+        assert!((v - (2.0 + u.cos())).abs() > 1e-3);
     }
 
     /// A closed spline among the sections is the general splitter's: its quarters
@@ -13058,5 +13613,94 @@ mod tests {
         let p = interior_point_3d(&thin, Some(&frame), 1e-11).unwrap();
         assert!(inside(p, 1e-3, 1.5e-7), "{p:?}");
         assert!(interior_point_3d(&thin, Some(&frame), containment::SEED_CLEARANCE).is_none());
+    }
+
+    /// A loop through the north pole between two meridians a half turn
+    /// apart, with its region on its left: up the meridian `u = pi`, down
+    /// the meridian `u = 0`, and back along a latitude through `u = pi/2`.
+    /// The pole's own `u`, and the last bit of the seam meridian's `u`, are
+    /// noise, and neither moves the region.
+    #[test]
+    fn a_loop_through_a_pole_is_read_round_its_own_half() {
+        use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
+        let low = 0.34;
+        for pole_u in [0.0, 1.2, 5.0341, -2.0] {
+            for seam in [0.0, 1e-15, TAU - 1e-15, TAU] {
+                let mut pts = vec![
+                    Point2::new(PI, low),
+                    Point2::new(PI, 1.0),
+                    Point2::new(pole_u, FRAC_PI_2),
+                    Point2::new(seam, 1.0),
+                    Point2::new(seam, low),
+                    Point2::new(0.0, low),
+                    Point2::new(FRAC_PI_2, low),
+                ];
+                for start in 0..pts.len() {
+                    let poly = unwrapped_u(&pts);
+                    let holds = |u: f64, v: f64| {
+                        (-2..=2).any(|k| {
+                            let at = Point2::new(TAU * f64::from(k) + u, v);
+                            super::super::classify_2d::point_in_polygon_2d(at, &poly)
+                        })
+                    };
+                    let label = format!("pole_u={pole_u} seam={seam} start={start}");
+                    assert!(holds(FRAC_PI_2, 1.0), "{label}: its own half");
+                    assert!(holds(FRAC_PI_4, 1.5), "{label}: near the pole");
+                    assert!(!holds(3.0 * FRAC_PI_2, 1.0), "{label}: the other half");
+                    assert!(!holds(FRAC_PI_2, 0.2), "{label}: below the latitude");
+                    pts.rotate_left(1);
+                }
+            }
+        }
+    }
+
+    /// The same loop about the south pole runs the other way round, and a
+    /// loop off the poles keeps the nearest way.
+    #[test]
+    fn a_loop_through_the_south_pole_and_one_off_the_poles() {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        let south = [
+            Point2::new(0.0, -0.34),
+            Point2::new(0.0, -1.0),
+            Point2::new(4.0, -FRAC_PI_2),
+            Point2::new(PI, -1.0),
+            Point2::new(PI, -0.34),
+            Point2::new(FRAC_PI_2, -0.34),
+        ];
+        let poly = unwrapped_u(&south);
+        let holds = |u: f64, v: f64| {
+            (-2..=2).any(|k| {
+                let at = Point2::new(TAU * f64::from(k) + u, v);
+                super::super::classify_2d::point_in_polygon_2d(at, &poly)
+            })
+        };
+        assert!(holds(FRAC_PI_2, -1.0));
+        assert!(!holds(3.0 * FRAC_PI_2, -1.0));
+
+        let across_the_seam = [
+            Point2::new(6.0, 0.1),
+            Point2::new(0.2, 0.1),
+            Point2::new(0.2, 0.5),
+            Point2::new(6.0, 0.5),
+        ];
+        // The same loop within the pole's margin has no point off the pole.
+        let lift = |by: f64| -> Vec<Point2> {
+            across_the_seam
+                .iter()
+                .map(|p| Point2::new(p.x(), if p.y() < 0.3 { by } else { by + 6e-7 }))
+                .collect()
+        };
+        for loop_uv in [
+            across_the_seam.to_vec(),
+            lift(FRAC_PI_2 - 8e-7),
+            lift(FRAC_PI_2 - 6.5e-7),
+            lift(FRAC_PI_2 - 6.2e-7),
+        ] {
+            let us: Vec<f64> = unwrapped_u(&loop_uv).iter().map(|p| p.x()).collect();
+            assert_eq!(us.len(), 4);
+            for (got, want) in us.iter().zip([6.0, 0.2 + TAU, 0.2 + TAU, 6.0]) {
+                assert!((got - want).abs() < 1e-12, "{us:?}");
+            }
+        }
     }
 }

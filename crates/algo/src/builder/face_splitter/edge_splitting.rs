@@ -391,6 +391,16 @@ pub(super) fn find_splits_on_circle(
     ) && (edge.start_3d - edge.end_3d).length() < tol)
         .then(|| circle.project(edge.start_3d));
     let u_span = edge.end_uv.x() - edge.start_uv.x();
+    let reversed_on_nurbs =
+        matches!(surface, FaceSurface::Nurbs(_)) && !edge.forward && closed_anchor.is_none();
+    let reversed_span = reversed_on_nurbs
+        .then(|| {
+            reversed_arc_is_complement(circle, edge, surface, (t0, span)).then(|| {
+                edge.curve_3d
+                    .domain_with_endpoints(edge.end_3d, edge.start_3d)
+            })
+        })
+        .flatten();
     let mut splits = Vec::new();
     for &sp in split_pts_3d {
         crate::perf::bump_face_split_probe();
@@ -439,6 +449,8 @@ pub(super) fn find_splits_on_circle(
                 continue;
             }
             1.0 - normalize_angle_in_span(angle, p0, pspan)
+        } else if let Some((p0, p1)) = reversed_span {
+            1.0 - normalize_angle_in_span(angle, p0, p1 - p0)
         } else {
             normalize_angle_in_span(angle, t0, span)
         };
@@ -450,6 +462,38 @@ pub(super) fn find_splits_on_circle(
     splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     splits.dedup_by(|a, b| (a.0 - b.0).abs() < tol);
     splits
+}
+
+/// Whether an open arc walked against its curve on a B-spline face covers
+/// the circle's span from its walk's end to its start, not the span from
+/// its start to its end that the reading on such a face takes by default.
+///
+/// That reading is the complement of the arc wherever the stored edge runs
+/// counter-clockwise: a crease between two rounds' bands, a quarter turn
+/// walked back on the second band, read as the other three quarters, and a
+/// section ending on it never split it. The arc lies on the face, so the
+/// reading whose middle stands off the surface, where the other's lies on
+/// it, is the complement.
+fn reversed_arc_is_complement(
+    circle: &brepkit_math::curves::Circle3D,
+    edge: &OrientedPCurveEdge,
+    surface: &FaceSurface,
+    (t0, span): (f64, f64),
+) -> bool {
+    let (p0, p1) = edge
+        .curve_3d
+        .domain_with_endpoints(edge.end_3d, edge.start_3d);
+    let off = |angle: f64| {
+        let p = circle.evaluate(angle);
+        surface
+            .project_point(p)
+            .and_then(|(u, v)| surface.evaluate(u, v))
+            .map_or(f64::INFINITY, |q| (q - p).length())
+    };
+    let (start_to_end, end_to_start) = (off(span.madd(0.5, t0)), off((p1 - p0).madd(0.5, p0)));
+    end_to_start.is_finite()
+        && start_to_end > 1e-3 * circle.radius()
+        && start_to_end > 10.0 * end_to_start
 }
 
 /// True when a circle boundary edge is an open iso-v rim on a cylinder/cone —

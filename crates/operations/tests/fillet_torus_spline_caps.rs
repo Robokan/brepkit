@@ -250,8 +250,14 @@ fn round_and_check(r: f64, drop: f64, bow: f64) {
 
     let lost = before - solid_volume(&topo, result.solid, 1e-4).unwrap();
     let want = removed(r);
+    // A top edge dropped off its plane leaves the top face and the wall
+    // disagreeing by up to `drop` along the spline; the trim moves each
+    // piece's end to its vertex, off the curve, and so moves part of that
+    // disagreement, at most a strip `drop` deep and `r` wide along the
+    // spline's chord.
+    let chord = 2.0 * R * ALPHA_DEG.to_radians().sin();
     assert!(
-        (lost - want).abs() <= 1e-4 * want.max(1.0),
+        (lost - want).abs() <= 1e-4 * want.max(1.0) + drop * chord * r,
         "{case}: lost {lost}, the round's sweep {want}"
     );
 }

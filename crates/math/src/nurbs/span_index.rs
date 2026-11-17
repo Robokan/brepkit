@@ -1,11 +1,19 @@
-//! A NURBS surface's knot spans indexed by their control boxes, for exact
-//! line hits on surfaces too finely spanned for a sampling grid.
+//! A B-spline surface's knot spans indexed by their control boxes.
 //!
 //! Over one knot span a B-spline surface with positive weights lies within
 //! the convex hull of the control points that shape it, so the box of those
-//! points bounds the span. A line meets the surface only in spans whose box
-//! it meets, and each such span is solved on its own, so a fitted patch with
-//! hundreds of spans is read as finely as its knots, however small a fixed
+//! points bounds the span. A fitted surface can have thousands of spans;
+//! the index keeps their boxes in a bounding volume hierarchy, made once
+//! per surface, so a search near a point reads only the spans near it.
+//!
+//! Each span can also be split into sub-patches by de Casteljau, whose own
+//! nets hug the surface far closer than the span's: over a span turning
+//! through a wide angle the span's box holds points of the surface far from
+//! the span.
+//!
+//! A line meets the surface only in spans whose box it meets, and each such
+//! span is solved on its own, so a fitted patch with hundreds of spans is
+//! read as finely as its knots for exact line hits, however small a fixed
 //! grid over its whole domain would leave each span.
 
 use crate::aabb::Aabb3;
@@ -21,30 +29,11 @@ type Interval = (f64, f64);
 /// the last row and column of the control points that shape it.
 #[derive(Debug, Clone, Copy)]
 struct Span {
-    u: (f64, f64),
-    v: (f64, f64),
+    u: Interval,
+    v: Interval,
     last_row: usize,
     last_col: usize,
 }
-
-/// A surface's knot spans with a BVH over their control boxes.
-#[derive(Debug, Clone)]
-pub struct SpanIndex {
-    spans: Vec<Span>,
-    /// Each span's padded control box, by span index.
-    boxes: Vec<Aabb3>,
-    /// Each span's padded control box in a frame of its own, by span index.
-    frames: Vec<SpanFrame>,
-    bvh: Bvh,
-    /// The largest control box diagonal, the scale of the surface's pieces.
-    scale: f64,
-    /// Each span's sub-patch boxes, by span index, each made the first time
-    /// a search reads it.
-    sub_boxes: std::sync::OnceLock<Box<[std::sync::OnceLock<SubBoxes>]>>,
-}
-
-/// One span's sub-patch boxes.
-type SubBoxes = [Aabb3; SUB_BOXES];
 
 /// Each span is split in halves this many times along `u` and `v` for its
 /// sub-patch boxes.
@@ -53,74 +42,31 @@ const SUB_DEPTH: usize = 2;
 /// Sub-patch boxes a span: `4^SUB_DEPTH`.
 const SUB_BOXES: usize = 1 << (2 * SUB_DEPTH);
 
-/// A box about a span's control points in axes along its own net: across a
-/// fitted surface turned to the world axes the span's world box is fat, and
-/// many spans' boxes hold a point on the surface, while these hold it only
-/// near the span.
-#[derive(Debug, Clone, Copy)]
-struct SpanFrame {
-    origin: Point3,
-    axes: [Vec3; 3],
-    lo: [f64; 3],
-    hi: [f64; 3],
-}
+/// One span's sub-patch boxes.
+type SubBoxes = [Aabb3; SUB_BOXES];
 
-impl SpanFrame {
-    /// The box about `points` in axes along the net's `u` and `v` rows (from
-    /// its corners) and their normal, each side padded by `pad`; the world
-    /// axes where the net's corners give no frame.
-    fn of(points: &[Point3], corners: [Point3; 4], pad: f64) -> Self {
-        let [c00, c10, c01, c11] = corners;
-        let along_u = (c10 - c00) + (c11 - c01);
-        let along_v = (c01 - c00) + (c11 - c10);
-        let world = [
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
-        ];
-        let axes = along_u
-            .normalize()
-            .ok()
-            .and_then(|e1| {
-                let e2 = (along_v - e1 * e1.dot(along_v)).normalize().ok()?;
-                Some([e1, e2, e1.cross(e2)])
-            })
-            .unwrap_or(world);
-        let origin = c00;
-        let mut lo = [f64::INFINITY; 3];
-        let mut hi = [f64::NEG_INFINITY; 3];
-        for &q in points {
-            let d = q - origin;
-            for k in 0..3 {
-                let c = axes[k].dot(d);
-                lo[k] = lo[k].min(c);
-                hi[k] = hi[k].max(c);
-            }
-        }
-        for k in 0..3 {
-            lo[k] -= pad;
-            hi[k] += pad;
-        }
-        Self {
-            origin,
-            axes,
-            lo,
-            hi,
-        }
-    }
-
-    /// A lower bound on the distance from `p` to the span: its distance to
-    /// the box.
-    fn distance_to(&self, p: Point3) -> f64 {
-        let d = p - self.origin;
-        let mut sum = 0.0_f64;
-        for k in 0..3 {
-            let c = self.axes[k].dot(d);
-            let gap = (self.lo[k] - c).max(c - self.hi[k]).max(0.0);
-            sum = gap.madd(gap, sum);
-        }
-        sum.sqrt()
-    }
+/// A surface's knot spans with a BVH over their control boxes.
+#[derive(Debug, Clone)]
+pub struct SpanIndex {
+    /// The spans, along `u` and then, within each, along `v`.
+    spans: Vec<Span>,
+    /// Each span's control box, by span index, exactly the box of its
+    /// control points.
+    boxes: Vec<Aabb3>,
+    /// The boxes padded for rounding, in a BVH.
+    bvh: Bvh,
+    /// The padding of each box for rounding: a share of the largest
+    /// control box diagonal, the scale of the surface's pieces, and a
+    /// share of the largest coordinate, which rounding moves points by.
+    pad: f64,
+    /// The largest control box diagonal, the scale of the surface's pieces.
+    scale: f64,
+    /// Each span's sub-patch boxes, by span index, each made the first time
+    /// a search reads it.
+    sub_boxes: std::sync::OnceLock<Box<[std::sync::OnceLock<SubBoxes>]>>,
+    /// Each span's Bezier net, by span index, each made the first time it
+    /// is read.
+    nets: std::sync::OnceLock<Box<[std::sync::OnceLock<Vec<Hpoint>>]>>,
 }
 
 /// A point where a line meets the surface.
@@ -147,12 +93,31 @@ pub(crate) fn knot_spans(knots: &[f64], degree: usize, n: usize) -> Vec<(f64, f6
 }
 
 impl SpanIndex {
-    /// Index `surface`'s knot spans. `None` when a weight is not positive,
-    /// where the control boxes need not bound the surface.
+    /// Index `surface`'s knot spans. `None` when a weight is not positive
+    /// (or not a number), where the control boxes need not bound the
+    /// surface, or is too small for its products to keep their digits, or
+    /// a weighted coordinate overflows.
     #[must_use]
     pub fn new(surface: &NurbsSurface) -> Option<Self> {
+        if surface
+            .weights()
+            .iter()
+            .flatten()
+            .any(|&w| w <= 0.0 || !w.is_normal())
+        {
+            return None;
+        }
         let cps = surface.control_points();
-        if surface.weights().iter().flatten().any(|&w| w <= 0.0) {
+        // A weighted coordinate that overflows leaves the nets without
+        // their points.
+        let weighted = cps.iter().zip(surface.weights()).all(|(row, ws)| {
+            row.iter().zip(ws).all(|(p, &w)| {
+                [p.x() * w, p.y() * w, p.z() * w]
+                    .iter()
+                    .all(|c| c.is_finite())
+            })
+        });
+        if !weighted {
             return None;
         }
         let rows = cps.len();
@@ -163,16 +128,15 @@ impl SpanIndex {
         let mut spans = Vec::with_capacity(spans_u.len() * spans_v.len());
         let mut boxes = Vec::with_capacity(spans.capacity());
         let mut scale = 0.0_f64;
-        let net = |last_row: usize, last_col: usize| {
-            cps[last_row - pu..=last_row]
-                .iter()
-                .flat_map(move |row| row[last_col - pv..=last_col].iter().copied())
-        };
         for &(u0, u1, last_row) in &spans_u {
             for &(v0, v1, last_col) in &spans_v {
-                let aabb = Aabb3::from_points(net(last_row, last_col));
+                let aabb = Aabb3::from_points(
+                    cps[last_row - pu..=last_row]
+                        .iter()
+                        .flat_map(|row| row[last_col - pv..=last_col].iter().copied()),
+                );
                 scale = scale.max((aabb.max - aabb.min).length());
-                boxes.push((spans.len(), aabb));
+                boxes.push(aabb);
                 spans.push(Span {
                     u: (u0, u1),
                     v: (v0, v1),
@@ -181,37 +145,121 @@ impl SpanIndex {
                 });
             }
         }
-        // Pad each box for rounding, so a line through a box's face is not
-        // lost to its slab test.
-        let pad = 1e-9 * scale.max(1.0);
-        let boxes: Vec<(usize, Aabb3)> = boxes
-            .into_iter()
+        // Pad each box for rounding, so the BVH holds every point a box
+        // comes within a distance of.
+        let largest = cps
+            .iter()
+            .flatten()
+            .flat_map(|p| [p.x(), p.y(), p.z()])
+            .fold(0.0_f64, |m, c| m.max(c.abs()));
+        let pad = 1e-9 * scale.max(1.0) + 1e-12 * largest;
+        let padded: Vec<(usize, Aabb3)> = boxes
+            .iter()
+            .enumerate()
             .map(|(i, b)| (i, b.expanded(pad)))
             .collect();
-        let mut frames = Vec::with_capacity(spans.len());
-        let mut points = Vec::with_capacity((pu + 1) * (pv + 1));
-        for &(_, _, last_row) in &spans_u {
-            for &(_, _, last_col) in &spans_v {
-                points.clear();
-                points.extend(net(last_row, last_col));
-                let (r0, c0) = (last_row - pu, last_col - pv);
-                let corners = [
-                    cps[r0][c0],
-                    cps[last_row][c0],
-                    cps[r0][last_col],
-                    cps[last_row][last_col],
-                ];
-                frames.push(SpanFrame::of(&points, corners, pad));
-            }
-        }
         Some(Self {
             spans,
-            bvh: Bvh::build(&boxes),
-            boxes: boxes.into_iter().map(|(_, b)| b).collect(),
-            frames,
+            boxes,
+            bvh: Bvh::build(&padded),
+            pad,
             scale,
             sub_boxes: std::sync::OnceLock::new(),
+            nets: std::sync::OnceLock::new(),
         })
+    }
+
+    /// How many spans the index holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Whether the index holds no span.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Span `i`'s parameter rectangle, `((u0, u1), (v0, v1))`.
+    #[must_use]
+    pub fn span(&self, i: usize) -> Option<(Interval, Interval)> {
+        self.spans.get(i).map(|s| (s.u, s.v))
+    }
+
+    /// The spans whose control boxes come nearer `point` than `bound`, as
+    /// `(span, distance to its box)`, nearest first and, among equally
+    /// near, in span order: what reading every span's box and sorting them
+    /// by their distance gives, from only the spans near the point.
+    #[must_use]
+    pub fn spans_within(&self, point: Point3, bound: f64) -> Vec<(usize, f64)> {
+        let mut near: Vec<usize> = if bound.is_finite() {
+            let reach = crate::vec::Vec3::new(bound, bound, bound);
+            self.bvh.query_overlap(&Aabb3 {
+                min: point - reach,
+                max: point + reach,
+            })
+        } else {
+            (0..self.spans.len()).collect()
+        };
+        near.sort_unstable();
+        let mut found: Vec<(usize, f64)> = near
+            .into_iter()
+            .map(|i| (i, self.boxes[i].distance_squared_to_point(point).sqrt()))
+            .filter(|&(_, d)| d < bound)
+            .collect();
+        found.sort_by(|a, b| a.1.total_cmp(&b.1));
+        found
+    }
+
+    /// Whether every point of `b` lies farther than `reach` from `surface`:
+    /// none of the sub-patch boxes of the spans whose boxes come within
+    /// `reach` of `b` does.
+    #[must_use]
+    pub fn box_clears(&self, surface: &NurbsSurface, b: &Aabb3, reach: f64) -> bool {
+        self.bvh
+            .query_overlap(&b.expanded(reach))
+            .into_iter()
+            .all(|i| {
+                self.sub_boxes_of(surface, i)
+                    .is_some_and(|boxes| boxes.iter().all(|sub| box_gap(sub, b) > reach))
+            })
+    }
+
+    /// Span `i`'s Bezier net (see [`span_net`]), made the first time it is
+    /// read, with its parameter rectangle.
+    pub(crate) fn bezier_net(
+        &self,
+        surface: &NurbsSurface,
+        i: usize,
+    ) -> Option<(&[Hpoint], Interval, Interval)> {
+        let span = *self.spans.get(i)?;
+        let net = self
+            .nets
+            .get_or_init(|| {
+                (0..self.spans.len())
+                    .map(|_| std::sync::OnceLock::new())
+                    .collect()
+            })
+            .get(i)?
+            .get_or_init(|| span_net(surface, span));
+        Some((net, span.u, span.v))
+    }
+
+    /// Span `i`'s sub-patch boxes, made the first time they are read.
+    fn sub_boxes_of(&self, surface: &NurbsSurface, i: usize) -> Option<&SubBoxes> {
+        let pad = self.pad;
+        let (net, _, _) = self.bezier_net(surface, i)?;
+        Some(
+            self.sub_boxes
+                .get_or_init(|| {
+                    (0..self.spans.len())
+                        .map(|_| std::sync::OnceLock::new())
+                        .collect()
+                })
+                .get(i)?
+                .get_or_init(|| sub_patch_boxes(surface, net, pad)),
+        )
     }
 
     /// The parameter rectangles `(u, v)` of the spans whose control boxes
@@ -324,165 +372,6 @@ impl SpanIndex {
         Some(in_span(best))
     }
 
-    /// The point of `surface` closest to `p` nearer than `bound`, as `(u, v,
-    /// distance)`: only spans whose boxes come nearer than the best point
-    /// so far are searched, nearest box first. `None` when no span comes
-    /// nearer than `bound`.
-    ///
-    /// A span whose box in its own frame lies no nearer than the best point
-    /// so far is passed over: its own closest point, kept within the span,
-    /// lies at least that far, so it could not replace the best, and the
-    /// answer is the one searching it would give.
-    #[must_use]
-    pub fn closest_point_within(
-        &self,
-        surface: &NurbsSurface,
-        p: Point3,
-        bound: f64,
-    ) -> Option<(f64, f64, f64)> {
-        let reach = Vec3::new(bound, bound, bound);
-        let around = Aabb3 {
-            min: p - reach,
-            max: p + reach,
-        };
-        let mut near: Vec<(f64, usize)> = self
-            .bvh
-            .query_overlap(&around)
-            .into_iter()
-            .map(|i| (self.boxes[i].distance_squared_to_point(p).sqrt(), i))
-            .filter(|&(d, _)| d < bound)
-            .collect();
-        near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut best: Option<(f64, f64, f64)> = None;
-        for (box_gap, i) in near {
-            let best_gap = best.map_or(bound, |b| b.2);
-            if box_gap >= best_gap {
-                break;
-            }
-            if self.frames[i].distance_to(p) >= best_gap {
-                continue;
-            }
-            if std::env::var_os("NOSUB").is_none() && self.sub_gap(surface, i, p) >= best_gap {
-                continue;
-            }
-            let span = self.spans[i];
-            let found = closest_from(
-                surface,
-                p,
-                (
-                    f64::midpoint(span.u.0, span.u.1),
-                    f64::midpoint(span.v.0, span.v.1),
-                ),
-                span.u,
-                span.v,
-            );
-            if found.2 < best.map_or(bound, |b| b.2) {
-                best = Some(found);
-            }
-        }
-        best
-    }
-
-    /// A lower bound on the distance from `p` to span `i`: its distance to
-    /// the nearest of the span's sub-patch boxes, 0 where they are not made.
-    ///
-    /// Over a span that turns through a wide angle (a wing skin round its
-    /// nose) the span's control net, and so its boxes, hold points of the
-    /// surface far from the span, and a point near the surface lies in the
-    /// boxes of many spans it is far from. Each quarter of the span, split
-    /// twice each way by de Casteljau, lies in the hull of its own net,
-    /// which hugs the surface far closer.
-    fn sub_gap(&self, surface: &NurbsSurface, i: usize, p: Point3) -> f64 {
-        self.sub_boxes_of(surface, i).map_or(0.0, |boxes| {
-            boxes
-                .iter()
-                .map(|b| b.distance_squared_to_point(p))
-                .fold(f64::INFINITY, f64::min)
-                .sqrt()
-        })
-    }
-
-    /// Span `i`'s sub-patch boxes, made the first time they are read.
-    fn sub_boxes_of(&self, surface: &NurbsSurface, i: usize) -> Option<&SubBoxes> {
-        let span = *self.spans.get(i)?;
-        let pad = 1e-9 * self.scale.max(1.0);
-        Some(
-            self.sub_boxes
-                .get_or_init(|| {
-                    (0..self.spans.len())
-                        .map(|_| std::sync::OnceLock::new())
-                        .collect()
-                })
-                .get(i)?
-                .get_or_init(|| sub_patch_boxes(surface, span, pad)),
-        )
-    }
-
-    /// Whether every point of `b` lies farther than `reach` from `surface`:
-    /// none of the sub-patch boxes of the spans whose boxes come within
-    /// `reach` of `b` does.
-    #[must_use]
-    pub fn box_clears(&self, surface: &NurbsSurface, b: &Aabb3, reach: f64) -> bool {
-        self.bvh
-            .query_overlap(&b.expanded(reach))
-            .into_iter()
-            .all(|i| {
-                self.sub_boxes_of(surface, i)
-                    .is_some_and(|boxes| boxes.iter().all(|sub| box_gap(sub, b) > reach))
-            })
-    }
-
-    /// Where `p` lies on `surface`, if it lies on it: of the spans whose
-    /// boxes hold `p`, the few whose middles lie nearest it are searched by
-    /// Gauss-Newton, kept within the span, until one comes within
-    /// `tolerance` of `p`; else the nearest found. `None` when no span's box
-    /// holds `p` (it lies off the surface).
-    #[must_use]
-    pub fn locate_on(
-        &self,
-        surface: &NurbsSurface,
-        p: Point3,
-        tolerance: f64,
-    ) -> Option<(f64, f64, f64)> {
-        const TRIED: usize = 4;
-        let at = Aabb3 { min: p, max: p };
-        let mut holding: Vec<(f64, usize)> = self
-            .bvh
-            .query_overlap(&at)
-            .into_iter()
-            .map(|i| {
-                let span = self.spans[i];
-                let mid = surface.evaluate(
-                    f64::midpoint(span.u.0, span.u.1),
-                    f64::midpoint(span.v.0, span.v.1),
-                );
-                ((mid - p).length(), i)
-            })
-            .collect();
-        holding.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut best: Option<(f64, f64, f64)> = None;
-        for &(_, i) in holding.iter().take(TRIED) {
-            let span = self.spans[i];
-            let found = closest_from(
-                surface,
-                p,
-                (
-                    f64::midpoint(span.u.0, span.u.1),
-                    f64::midpoint(span.v.0, span.v.1),
-                ),
-                span.u,
-                span.v,
-            );
-            if best.is_none_or(|b| found.2 < b.2) {
-                best = Some(found);
-            }
-            if found.2 <= tolerance {
-                break;
-            }
-        }
-        best
-    }
-
     /// The point of `surface` closest to `p` found by Gauss-Newton from
     /// `guess` over the whole domain, as `(u, v, distance)`: the nearest
     /// point to a point beside one already placed (the next sample along a
@@ -560,10 +449,10 @@ fn box_gap(a: &Aabb3, b: &Aabb3) -> f64 {
 /// A homogeneous control point: `(w x, w y, w z, w)`.
 type Hpoint = [f64; 4];
 
-/// `span`'s sub-patch boxes, each padded by `pad`: the span's Bezier net,
-/// read off its control points by blossoming, split in halves along `u` and
-/// `v` [`SUB_DEPTH`] times, each piece's box that of its net's points.
-fn sub_patch_boxes(surface: &NurbsSurface, span: Span, pad: f64) -> SubBoxes {
+/// `span`'s Bezier net, read off its control points by blossoming: rows
+/// along `u` of homogeneous points, point `(i, j)` at `i * (degree_v + 1) +
+/// j`.
+fn span_net(surface: &NurbsSurface, span: Span) -> Vec<Hpoint> {
     let (pu, pv) = (surface.degree_u(), surface.degree_v());
     let (nu, nv) = (pu + 1, pv + 1);
     let cps = surface.control_points();
@@ -591,7 +480,16 @@ fn sub_patch_boxes(surface: &NurbsSurface, span: Span, pad: f64) -> SubBoxes {
         let bez = span_bezier(&row, surface.knots_v(), span.last_col, span.v);
         net[r * nv..(r + 1) * nv].copy_from_slice(&bez);
     }
-    let mut pieces = vec![net];
+    net
+}
+
+/// A span's sub-patch boxes, each padded by `pad`: its Bezier net `net`,
+/// split in halves along `u` and `v` [`SUB_DEPTH`] times, each piece's box
+/// that of its net's points. Each piece lies in the hull of its net, its
+/// weights being positive.
+fn sub_patch_boxes(surface: &NurbsSurface, net: &[Hpoint], pad: f64) -> SubBoxes {
+    let (nu, nv) = (surface.degree_u() + 1, surface.degree_v() + 1);
+    let mut pieces = vec![net.to_vec()];
     for _ in 0..SUB_DEPTH {
         pieces = pieces
             .into_iter()
@@ -661,7 +559,7 @@ fn halve(net: &[Hpoint], nu: usize, nv: usize, along_u: bool) -> (Vec<Hpoint>, V
         for r in 1..len {
             for k in 0..len - r {
                 for c in 0..4 {
-                    tmp[k][c] = 0.5 * (tmp[k][c] + tmp[k + 1][c]);
+                    tmp[k][c] = f64::midpoint(tmp[k][c], tmp[k + 1][c]);
                 }
             }
             lo[at(line, r)] = tmp[0];
@@ -713,15 +611,34 @@ mod tests {
 
     use super::*;
 
-    /// A bicubic patch over [0, 3]^2 bulging up in its middle, split into
-    /// three knot spans each way.
+    /// A U-shaped wall: a rational cubic profile of two spans, each turning
+    /// through about a right angle, run straight along `y` over [0, 1].
+    fn u_wall() -> NurbsSurface {
+        let profile = [
+            (0.0, 4.0),
+            (0.0, -1.0),
+            (2.0, -1.5),
+            (4.0, -1.0),
+            (4.0, 4.0),
+        ];
+        let weights = [1.0, 0.7, 1.3, 0.7, 1.0];
+        let cps = profile
+            .iter()
+            .map(|&(x, z)| vec![Point3::new(x, 0.0, z), Point3::new(x, 1.0, z)])
+            .collect();
+        let ws = weights.iter().map(|&w| vec![w, w]).collect();
+        let knots_u = vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        NurbsSurface::new(3, 1, knots_u, vec![0.0, 0.0, 1.0, 1.0], cps, ws).unwrap()
+    }
+
+    /// A bicubic patch with nine spans whose middle bulges up.
     fn bump() -> NurbsSurface {
         let n = 6;
         let cps: Vec<Vec<Point3>> = (0..n)
             .map(|i| {
                 (0..n)
                     .map(|j| {
-                        let (x, y) = (i as f64 * 0.6, j as f64 * 0.6);
+                        let (x, y) = (f64::from(i) * 0.6, f64::from(j) * 0.6);
                         let z = if (1..n - 1).contains(&i) && (1..n - 1).contains(&j) {
                             1.0
                         } else {
@@ -733,7 +650,201 @@ mod tests {
             })
             .collect();
         let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0];
-        NurbsSurface::new(3, 3, knots.clone(), knots, cps, vec![vec![1.0; n]; n]).unwrap()
+        NurbsSurface::new(3, 3, knots.clone(), knots, cps, vec![vec![1.0; 6]; 6]).unwrap()
+    }
+
+    /// The least distance from `p` to span `i` of `index`, sampled.
+    fn sampled_gap(s: &NurbsSurface, index: &SpanIndex, i: usize, p: Point3) -> f64 {
+        let span = index.spans[i];
+        let n = 64;
+        let mut best = f64::INFINITY;
+        for a in 0..=n {
+            for b in 0..=n {
+                let u = span.u.0 + (span.u.1 - span.u.0) * f64::from(a) / f64::from(n);
+                let v = span.v.0 + (span.v.1 - span.v.0) * f64::from(b) / f64::from(n);
+                best = best.min((s.evaluate(u, v) - p).length());
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn sub_patch_boxes_hold_their_span() {
+        // Weights of 1e308 leave the surface as it is, and its homogeneous
+        // points stay finite; the sum of two of them does not, so the
+        // halvings must not form it.
+        let heavy = NurbsSurface::new(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.5, 0.0]
+                .iter()
+                .enumerate()
+                .map(|(i, &z)| {
+                    let x = 0.05 * i as f64 + 0.9;
+                    vec![Point3::new(x, 0.0, z), Point3::new(x, 1.0, z)]
+                })
+                .collect(),
+            vec![vec![1e308; 2]; 3],
+        )
+        .unwrap();
+        for s in [u_wall(), heavy] {
+            sub_patch_boxes_hold_the_span_of(&s);
+        }
+    }
+
+    /// A small surface far from the origin: rounding there is about a ten
+    /// thousandth of a unit, far more than a share of the surface's size.
+    #[test]
+    fn sub_patch_boxes_hold_a_span_far_from_the_origin() {
+        let s = u_wall();
+        let far = NurbsSurface::new(
+            s.degree_u(),
+            s.degree_v(),
+            s.knots_u().to_vec(),
+            s.knots_v().to_vec(),
+            s.control_points()
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|p| Point3::new(p.x() + 1e12, p.y() + 1e12, p.z() + 1e12))
+                        .collect()
+                })
+                .collect(),
+            s.weights().to_vec(),
+        )
+        .unwrap();
+        sub_patch_boxes_hold_the_span_of(&far);
+        let index = SpanIndex::new(&far).unwrap();
+        let p = far.evaluate(0.25, 0.0);
+        let b = Aabb3 { min: p, max: p };
+        assert!(!index.box_clears(&far, &b, 8e-7));
+    }
+
+    /// Weights below the least normal float, and weights whose products
+    /// with the coordinates overflow, leave a span's net without its
+    /// points, so no index is made.
+    #[test]
+    fn weights_out_of_range_get_no_index() {
+        let cps = (0..3)
+            .map(|i| {
+                (0..2)
+                    .map(|j| {
+                        Point3::new(f64::from(i), f64::from(j), if i == 1 { 1.0 } else { 0.0 })
+                    })
+                    .collect()
+            })
+            .collect();
+        let s = NurbsSurface::new(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            cps,
+            vec![vec![1e-323; 2]; 3],
+        )
+        .unwrap();
+        assert!(SpanIndex::new(&s).is_none());
+        // Weights of `1e308` on coordinates of 2 overflow.
+        let heavy = NurbsSurface::new(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                vec![Point3::new(2.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(0.0, 0.0, 1.0), Point3::new(0.0, 1.0, 1.0)],
+            ],
+            vec![vec![1e308; 2]; 2],
+        )
+        .unwrap();
+        assert!(SpanIndex::new(&heavy).is_none());
+    }
+
+    fn sub_patch_boxes_hold_the_span_of(s: &NurbsSurface) {
+        let s = s.clone();
+        let index = SpanIndex::new(&s).unwrap();
+        for i in 0..index.len() {
+            let boxes = index.sub_boxes_of(&s, i).unwrap();
+            let span = index.spans[i];
+            for a in 0..=32 {
+                for b in 0..=8 {
+                    let u = span.u.0 + (span.u.1 - span.u.0) * f64::from(a) / 32.0;
+                    let v = span.v.0 + (span.v.1 - span.v.0) * f64::from(b) / 8.0;
+                    let p = s.evaluate(u, v);
+                    assert!(
+                        boxes.iter().any(|bx| bx.contains_point(p)),
+                        "span {i} at ({u}, {v}): {p:?} in no sub-box"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sub_patch_boxes_part_a_span_from_points_its_net_holds() {
+        let s = u_wall();
+        let index = SpanIndex::new(&s).unwrap();
+        // Inside the U, within the first span's control box, about a unit
+        // from the span itself.
+        let p = Point3::new(1.0, 0.5, 1.0);
+        assert!(index.boxes[0].distance_squared_to_point(p) <= 0.0);
+        let gap = sampled_gap(&s, &index, 0, p);
+        let nearest_sub = index
+            .sub_boxes_of(&s, 0)
+            .unwrap()
+            .iter()
+            .map(|b| b.distance_squared_to_point(p).sqrt())
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            nearest_sub > 0.2 * gap && nearest_sub <= gap,
+            "{nearest_sub} for {gap}"
+        );
+    }
+
+    #[test]
+    fn spans_within_matches_reading_every_span() {
+        let s = bump();
+        let index = SpanIndex::new(&s).unwrap();
+        assert_eq!(index.len(), 9);
+        for &(x, y, z) in &[
+            (0.4, 0.4, 2.0),
+            (1.5, 1.5, 0.2),
+            (5.0, -1.0, 0.0),
+            (1.5, 0.1, -0.3),
+        ] {
+            let p = Point3::new(x, y, z);
+            for bound in [0.05, 0.5, 1.0, 3.0, f64::INFINITY] {
+                let mut every: Vec<(usize, f64)> = (0..index.len())
+                    .map(|i| (i, index.boxes[i].distance_squared_to_point(p).sqrt()))
+                    .filter(|&(_, d)| d < bound)
+                    .collect();
+                every.sort_by(|a, b| a.1.total_cmp(&b.1));
+                assert_eq!(index.spans_within(p, bound), every, "{p:?} within {bound}");
+            }
+        }
+    }
+
+    #[test]
+    fn box_clears_only_a_box_off_the_surface() {
+        let s = bump();
+        let index = SpanIndex::new(&s).unwrap();
+        let cube = |c: Point3, h: f64| Aabb3 {
+            min: Point3::new(c.x() - h, c.y() - h, c.z() - h),
+            max: Point3::new(c.x() + h, c.y() + h, c.z() + h),
+        };
+        // Above the bump's top, clear; around a point on it, not.
+        let top = s.evaluate(1.5, 1.5);
+        assert!(index.box_clears(&s, &cube(Point3::new(1.5, 1.5, top.z() + 1.0), 0.1), 0.05));
+        assert!(!index.box_clears(&s, &cube(top, 0.01), 0.05));
+        // A box within reach of a point of the surface is never clear,
+        // wherever the point lies.
+        for (u, v) in [(0.2, 0.2), (1.0, 2.0), (2.9, 0.4), (1.5, 1.5)] {
+            let q = s.evaluate(u, v);
+            let near = Point3::new(q.x(), q.y(), q.z() + 0.2);
+            assert!(!index.box_clears(&s, &cube(near, 0.05), 0.16), "({u}, {v})");
+        }
     }
 
     #[test]
@@ -776,98 +887,12 @@ mod tests {
     }
 
     #[test]
-    fn closest_point_finds_a_point_on_the_patch() {
+    fn closest_point_near_finds_a_point_on_the_patch() {
         let s = bump();
-        let index = SpanIndex::new(&s).unwrap();
         for &(u, v) in &[(0.3, 2.7), (1.5, 1.5), (2.0, 0.0), (1.0, 1.0)] {
             let q = s.evaluate(u, v);
-            let (pu, pv, d) = index.closest_point(&s, q).unwrap();
-            assert!(d < 1e-9, "({u}, {v}) projected {d} off");
-            assert!((s.evaluate(pu, pv) - q).length() < 1e-9);
             let (_, _, dn) = SpanIndex::closest_point_near(&s, q, (u + 0.05, v - 0.05));
             assert!(dn < 1e-9, "({u}, {v}) projected {dn} off from nearby");
-        }
-    }
-
-    /// A U-shaped wall: a rational cubic profile of two spans, each turning
-    /// through about a right angle, run straight along `y` over [0, 1].
-    fn u_wall() -> NurbsSurface {
-        let profile = [
-            (0.0, 4.0),
-            (0.0, -1.0),
-            (2.0, -1.5),
-            (4.0, -1.0),
-            (4.0, 4.0),
-        ];
-        let weights = [1.0, 0.7, 1.3, 0.7, 1.0];
-        let cps = profile
-            .iter()
-            .map(|&(x, z)| vec![Point3::new(x, 0.0, z), Point3::new(x, 1.0, z)])
-            .collect();
-        let ws = weights.iter().map(|&w| vec![w, w]).collect();
-        let knots_u = vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0, 2.0];
-        NurbsSurface::new(3, 1, knots_u, vec![0.0, 0.0, 1.0, 1.0], cps, ws).unwrap()
-    }
-
-    /// The least distance from `p` to span `i` of `index`, sampled.
-    fn sampled_gap(s: &NurbsSurface, index: &SpanIndex, i: usize, p: Point3) -> f64 {
-        let span = index.spans[i];
-        let n = 64;
-        let mut best = f64::INFINITY;
-        for a in 0..=n {
-            for b in 0..=n {
-                let u = span.u.0 + (span.u.1 - span.u.0) * f64::from(a) / f64::from(n);
-                let v = span.v.0 + (span.v.1 - span.v.0) * f64::from(b) / f64::from(n);
-                best = best.min((s.evaluate(u, v) - p).length());
-            }
-        }
-        best
-    }
-
-    #[test]
-    fn sub_patch_boxes_bound_each_span() {
-        let s = u_wall();
-        let index = SpanIndex::new(&s).unwrap();
-        for i in 0..index.spans.len() {
-            for x in -2..=6 {
-                for z in -3..=5 {
-                    for y in [-0.5, 0.5, 1.5] {
-                        let p = Point3::new(f64::from(x), y, f64::from(z));
-                        let bound = index.sub_gap(&s, i, p);
-                        let gap = sampled_gap(&s, &index, i, p);
-                        assert!(bound <= gap + 1e-12, "span {i} at {p:?}: {bound} > {gap}");
-                    }
-                }
-            }
-        }
-        assert!((0..index.spans.len()).all(|i| index.sub_boxes_of(&s, i).is_some()));
-    }
-
-    #[test]
-    fn sub_patch_boxes_part_a_span_from_points_its_net_holds() {
-        let s = u_wall();
-        let index = SpanIndex::new(&s).unwrap();
-        // Inside the U, within the first span's control net, about a unit
-        // from the span itself.
-        let p = Point3::new(1.0, 0.5, 1.0);
-        assert!(index.frames[0].distance_to(p) <= 0.0);
-        let gap = sampled_gap(&s, &index, 0, p);
-        let bound = index.sub_gap(&s, 0, p);
-        assert!(bound > 0.2 * gap && bound <= gap, "{bound} for {gap}");
-    }
-
-    #[test]
-    fn closest_point_within_is_the_nearest_span_point() {
-        let s = u_wall();
-        let index = SpanIndex::new(&s).unwrap();
-        for &(x, z) in &[(1.0, 1.0), (2.0, -1.0), (0.5, 3.0), (3.0, 0.0), (2.0, 2.0)] {
-            let p = Point3::new(x, 0.5, z);
-            let (u, v, d) = index.closest_point_within(&s, p, 10.0).unwrap();
-            assert!((s.evaluate(u, v) - p).length() <= d + 1e-12);
-            let sampled = (0..index.spans.len())
-                .map(|i| sampled_gap(&s, &index, i, p))
-                .fold(f64::INFINITY, f64::min);
-            assert!(d <= sampled + 1e-9, "({x}, {z}): {d} against {sampled}");
         }
     }
 

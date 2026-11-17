@@ -36,6 +36,9 @@ pub enum CheckId {
     FaceNoSurface,
     /// Face orientation inconsistent with wire winding.
     FaceOrientationConsistency,
+    /// An inner wire crosses another wire of its face, lies outside the
+    /// outer wire, or lies inside another inner wire.
+    FaceWiresIntersect,
     /// Shell contains no faces.
     ShellEmpty,
     /// Shell faces not all connected via shared edges.
@@ -48,6 +51,9 @@ pub enum CheckId {
     SolidEulerCharacteristic,
     /// Same face ID appears in multiple shells.
     SolidDuplicateFaces,
+    /// Two plane faces of the solid lie on one plane and cover the same
+    /// area.
+    SolidFacesOverlap,
 }
 
 /// Issue severity.

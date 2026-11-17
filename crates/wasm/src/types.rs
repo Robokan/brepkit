@@ -16,6 +16,16 @@ pub struct GroupedMeshResult {
     pub face_offsets: Vec<u32>,
 }
 
+/// Typed result for the `import*Parts` mesh imports.
+#[derive(Debug, serde::Serialize, Tsify)]
+pub struct MeshImportResult {
+    /// A solid handle for each closed body, cavities included.
+    pub solids: Vec<u32>,
+    /// A shell handle for each body that does not bound a solid: a body that
+    /// does not close, and an inward closed body that crosses another body.
+    pub shells: Vec<u32>,
+}
+
 /// Typed result for `tessellateSolidUV`.
 #[derive(serde::Serialize, Tsify)]
 pub struct UvMeshResult {

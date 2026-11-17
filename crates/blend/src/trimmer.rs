@@ -58,6 +58,68 @@ pub struct TrimResult {
 }
 
 /// Default vertex tolerance used when creating intersection vertices.
+/// The faces and wires that can use an edge of the solid under a blend: those
+/// of the solid, and each one made after the scope was taken. A split looks
+/// for the users of its edge only here, so its cost does not depend on the
+/// other shapes that the topology holds.
+#[derive(Debug, Clone, Default)]
+pub struct SplitScope {
+    faces: Vec<FaceId>,
+    wires: Vec<WireId>,
+    first_new_face: usize,
+    first_new_wire: usize,
+}
+
+impl SplitScope {
+    /// Every face and wire of the topology.
+    #[cfg(test)]
+    pub(crate) fn whole() -> Self {
+        Self::default()
+    }
+
+    /// The faces and wires of `solid`, and each one made from now on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlendError`] if a topology lookup fails.
+    pub fn of_solid(
+        topo: &Topology,
+        solid: brepkit_topology::solid::SolidId,
+    ) -> Result<Self, BlendError> {
+        let mut faces = brepkit_topology::explorer::solid_faces(topo, solid)?;
+        faces.sort_unstable_by_key(|face| face.index());
+        faces.dedup();
+        let mut wires = Vec::new();
+        for &face in &faces {
+            let face = topo.face(face)?;
+            wires.push(face.outer_wire());
+            wires.extend_from_slice(face.inner_wires());
+        }
+        wires.sort_unstable_by_key(|wire| wire.index());
+        wires.dedup();
+        Ok(Self {
+            faces,
+            wires,
+            first_new_face: topo.num_faces(),
+            first_new_wire: topo.num_wires(),
+        })
+    }
+
+    /// The wires in scope, in id order.
+    fn wires(&self, topo: &Topology) -> Vec<WireId> {
+        let made = (self.first_new_wire..topo.num_wires())
+            .filter_map(|index| topo.wire_id_from_index(index));
+        self.wires.iter().copied().chain(made).collect()
+    }
+
+    /// The faces in scope, in id order.
+    fn faces(&self, topo: &Topology) -> Vec<FaceId> {
+        let made = (self.first_new_face..topo.num_faces())
+            .filter_map(|index| topo.face_id_from_index(index));
+        self.faces.iter().copied().chain(made).collect()
+    }
+}
+
 const VERTEX_TOL: f64 = 1e-7;
 
 /// Distance within which two contact ends on one face are one vertex, the
@@ -127,6 +189,7 @@ struct BoundaryHit {
 #[allow(clippy::too_many_lines)]
 pub fn trim_face(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     contact_3d: &[Point3],
     contact_uv: &[(f64, f64)],
@@ -353,8 +416,8 @@ pub fn trim_face(
     // when it lands on an existing boundary vertex (a previous stripe's
     // propagated split) — reuses that vertex outright: splitting at t=0/1
     // would mint a duplicate vertex and a zero-length sub-edge.
-    let ends_a = resolve_hit_ends(topo, edge_data[hit_a.edge_idx].0, hit_a)?;
-    let ends_b = resolve_hit_ends(topo, edge_data[hit_b.edge_idx].0, hit_b)?;
+    let ends_a = resolve_hit_ends(topo, scope, edge_data[hit_a.edge_idx].0, hit_a)?;
+    let ends_b = resolve_hit_ends(topo, scope, edge_data[hit_b.edge_idx].0, hit_b)?;
     let (va_id, vb_id) = (ends_a.vertex, ends_b.vertex);
     let (sub_a1, sub_a2) = (ends_a.pre, ends_a.post);
     let (sub_b1, sub_b2) = (ends_b.pre, ends_b.post);
@@ -463,16 +526,17 @@ pub fn trim_face(
 /// leaves the face before its end, or a hole lies in the strip cut off.
 pub fn trim_face_to_corners(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     contact_3d: &[Point3],
     contact_uv: &[(f64, f64)],
     keep: TrimKeep,
     corners: &[VertexId],
 ) -> Result<TrimResult, BlendError> {
-    if let Some(result) = trim_to_inside_corners(topo, face_id, contact_3d, corners)? {
+    if let Some(result) = trim_to_inside_corners(topo, scope, face_id, contact_3d, corners)? {
         return Ok(result);
     }
-    trim_face(topo, face_id, contact_3d, contact_uv, keep)
+    trim_face(topo, scope, face_id, contact_3d, contact_uv, keep)
 }
 
 /// The inside-corner trim of [`trim_face_to_corners`], or `None` where no
@@ -480,6 +544,7 @@ pub fn trim_face_to_corners(
 #[allow(clippy::too_many_lines)]
 fn trim_to_inside_corners(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     contact_3d: &[Point3],
     corners: &[VertexId],
@@ -661,8 +726,8 @@ fn trim_to_inside_corners(
         return Err(fail());
     };
 
-    let ends_a = resolve_hit_ends(topo, edge_data[hit_a.edge_idx].0, hit_a)?;
-    let ends_b = resolve_hit_ends(topo, edge_data[hit_b.edge_idx].0, hit_b)?;
+    let ends_a = resolve_hit_ends(topo, scope, edge_data[hit_a.edge_idx].0, hit_a)?;
+    let ends_b = resolve_hit_ends(topo, scope, edge_data[hit_b.edge_idx].0, hit_b)?;
     let mut chain1: Vec<OrientedEdge> = Vec::new();
     let mut chain2: Vec<OrientedEdge> = Vec::new();
     chain1.extend(ends_a.post);
@@ -863,6 +928,7 @@ struct HitEnds {
 
 fn resolve_hit_ends(
     topo: &mut Topology,
+    scope: &SplitScope,
     oe: OrientedEdge,
     hit: &BoundaryHit,
 ) -> Result<HitEnds, BlendError> {
@@ -889,7 +955,7 @@ fn resolve_hit_ends(
         });
     }
     let v = topo.add_vertex(Vertex::new(hit.point_3d, VERTEX_TOL));
-    let (s1, s2) = split_edge_at(topo, &oe, v)?;
+    let (s1, s2) = split_edge_at(topo, scope, &oe, v)?;
     Ok(HitEnds {
         vertex: v,
         pre: Some(s1),
@@ -906,6 +972,7 @@ fn resolve_hit_ends(
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn split_edge_at(
     topo: &mut Topology,
+    scope: &SplitScope,
     oe: &OrientedEdge,
     split_vertex: VertexId,
 ) -> Result<(OrientedEdge, OrientedEdge), BlendError> {
@@ -919,7 +986,7 @@ pub(crate) fn split_edge_at(
     let e1_id = topo.add_edge(Edge::new(s_v, split_vertex, curve.clone()));
     let e2_id = topo.add_edge(Edge::new(split_vertex, e_v, curve));
 
-    propagate_split(topo, oe.edge(), true, e1_id, e2_id)?;
+    propagate_split(topo, scope, oe.edge(), true, e1_id, e2_id)?;
 
     if oe.is_forward() {
         Ok((
@@ -942,6 +1009,7 @@ pub(crate) fn split_edge_at(
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn split_edge_at_with_curves(
     topo: &mut Topology,
+    scope: &SplitScope,
     oe: &OrientedEdge,
     split_vertex: VertexId,
     left: brepkit_math::nurbs::curve::NurbsCurve,
@@ -951,7 +1019,7 @@ pub(crate) fn split_edge_at_with_curves(
     let (s_v, e_v) = (edge.start(), edge.end());
     let e1_id = topo.add_edge(Edge::new(s_v, split_vertex, EdgeCurve::NurbsCurve(left)));
     let e2_id = topo.add_edge(Edge::new(split_vertex, e_v, EdgeCurve::NurbsCurve(right)));
-    propagate_split(topo, oe.edge(), true, e1_id, e2_id)?;
+    propagate_split(topo, scope, oe.edge(), true, e1_id, e2_id)?;
     if oe.is_forward() {
         Ok((
             OrientedEdge::new(e1_id, true),
@@ -979,13 +1047,15 @@ pub(crate) fn split_edge_at_with_curves(
 /// `e2` then `e1`, both reversed.
 fn propagate_split(
     topo: &mut Topology,
+    scope: &SplitScope,
     old_edge: EdgeId,
     split_forward: bool,
     e1: EdgeId,
     e2: EdgeId,
 ) -> Result<(), BlendError> {
     let mut updates: Vec<(WireId, Vec<OrientedEdge>, bool)> = Vec::new();
-    for (wid, wire) in topo.wires().iter() {
+    for wid in scope.wires(topo) {
+        let wire = topo.wire(wid)?;
         if !wire.edges().iter().any(|oe| oe.edge() == old_edge) {
             continue;
         }
@@ -1013,14 +1083,26 @@ fn propagate_split(
     // The sub-edges deliberately get none: downstream consumers regenerate
     // lazily (boolean assembly) or fall back to direct surface projection
     // (tessellation), matching every other edge the blend engine creates.
-    let stale_faces: Vec<FaceId> = topo
+    // A face out of scope keeps the edge whole, and so keeps its pcurve.
+    let on_edge: Vec<FaceId> = topo
         .pcurves()
         .pcurves_for_edge(old_edge)
         .into_iter()
         .map(|(fid, _)| fid)
         .collect();
-    for fid in stale_faces {
-        topo.pcurves_mut().remove(old_edge, fid);
+    for fid in on_edge {
+        let face = topo.face(fid)?;
+        let mut still_used = false;
+        for wire in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            still_used |= topo
+                .wire(wire)?
+                .edges()
+                .iter()
+                .any(|oe| oe.edge() == old_edge);
+        }
+        if !still_used {
+            topo.pcurves_mut().remove(old_edge, fid);
+        }
     }
     Ok(())
 }
@@ -1160,6 +1242,7 @@ fn line_segment_intersect_2d(
 #[allow(clippy::too_many_lines)]
 pub fn trim_face_general(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     contact_3d: &[Point3],
     keep: TrimKeep,
@@ -1206,7 +1289,7 @@ pub fn trim_face_general(
             })
             .collect();
 
-        return trim_face(topo, face_id, contact_3d, &contact_uv, keep);
+        return trim_face(topo, scope, face_id, contact_3d, &contact_uv, keep);
     }
 
     // Non-planar path: project to UV space. NURBS projection has a total
@@ -1342,8 +1425,8 @@ pub fn trim_face_general(
         }
     }
 
-    let ends_a = resolve_hit_ends(topo, oe_a, hit_a)?;
-    let ends_b = resolve_hit_ends(topo, oe_b, hit_b)?;
+    let ends_a = resolve_hit_ends(topo, scope, oe_a, hit_a)?;
+    let ends_b = resolve_hit_ends(topo, scope, oe_b, hit_b)?;
     let (va, vb) = (ends_a.vertex, ends_b.vertex);
 
     let contact_eid = topo.add_edge(Edge::new(va, vb, EdgeCurve::Line));
@@ -1609,6 +1692,72 @@ fn edge_curve_for_span(
     ))
 }
 
+/// The parameter within `step` of `around`, and within `span`, where
+/// `reading` is least. It is refined until the bracket stops shrinking: a
+/// parameter error on a line grows with the line's length, and a contact's
+/// end must meet the edge within 1e-6 however long the edge is.
+fn refined_minimum(
+    reading: impl Fn(f64) -> f64,
+    around: f64,
+    step: f64,
+    (low, high): (f64, f64),
+) -> f64 {
+    let mut lo = (around - step.abs()).clamp(low, high);
+    let mut hi = (around + step.abs()).clamp(low, high);
+    for _ in 0..200 {
+        if hi - lo <= f64::EPSILON * lo.abs().max(hi.abs()).max(1.0) {
+            break;
+        }
+        let m1 = lo + (hi - lo) / 3.0;
+        let m2 = hi - (hi - lo) / 3.0;
+        if reading(m1) < reading(m2) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// A spline edge spanning `t0` to `t1` of `curve`, split at `t`: the piece
+/// before the split and the piece after it, each running the edge's way,
+/// moved to meet at `point` (a contact's end off the edge, within a file's
+/// tolerance of it). `None` where a piece cannot be cut.
+fn spline_pieces_meeting_at(
+    curve: &EdgeCurve,
+    (t0, t, t1): (f64, f64, f64),
+    point: Point3,
+) -> Option<(
+    brepkit_math::nurbs::curve::NurbsCurve,
+    brepkit_math::nurbs::curve::NurbsCurve,
+)> {
+    let (EdgeCurve::NurbsCurve(before), EdgeCurve::NurbsCurve(after)) = (
+        edge_curve_for_span(curve, t0, t).ok()?,
+        edge_curve_for_span(curve, t, t1).ok()?,
+    ) else {
+        return None;
+    };
+    // Each piece is clamped where it was cut, so it passes through its end
+    // control point there.
+    let moved = |piece: &brepkit_math::nurbs::curve::NurbsCurve, at_end: bool| {
+        let mut control_points = piece.control_points().to_vec();
+        let index = if at_end {
+            control_points.len().checked_sub(1)?
+        } else {
+            0
+        };
+        *control_points.get_mut(index)? = point;
+        brepkit_math::nurbs::curve::NurbsCurve::new(
+            piece.degree(),
+            piece.knots().to_vec(),
+            control_points,
+            piece.weights().to_vec(),
+        )
+        .ok()
+    };
+    Some((moved(&before, true)?, moved(&after, false)?))
+}
+
 fn mapped_surface_uv(
     surface: &FaceSurface,
     point: Point3,
@@ -1633,7 +1782,9 @@ fn mapped_surface_uv(
             point.y(),
             point.z(),
         )) - d;
-        if residual.abs() > 1e-5 {
+        // A plane holds a point within 1e-5, and within as much more as the
+        // caller's allowance grants past its base (a long contact's sag).
+        if residual.abs() > 1e-5 + (allowance - MAPPED_UV_TOL).max(0.0) {
             return Err(BlendError::TrimmingFailure { face: face_id });
         }
         return Ok((u.dot(offset), v.dot(offset)));
@@ -1650,21 +1801,32 @@ fn mapped_surface_uv(
     Ok(projected)
 }
 
-/// How far a point mapped onto a curved face may stand off its surface. A
-/// contact ends on the face's boundary, and a face read from a file can
-/// have its edges stand off its surface by more than the 1e-4 a point
-/// otherwise may (a B-spline skin's edges 3e-3 off it): the allowance
-/// grows by the farthest the boundary stands off, read at its vertices and
-/// at points along each edge.
+/// How far a point inside a contact, mapped onto a curved face, may stand
+/// off its surface (more along a long contact: [`CONTACT_SAG_PER_LENGTH`]).
+const MAPPED_UV_TOL: f64 = 1e-4;
+
+/// Number of spans a contact's curve is read in, between its ends, for how
+/// far it stands off the face it trims.
+const CONTACT_SAMPLES: u32 = 16;
+
+/// How much farther than [`MAPPED_UV_TOL`] a point inside a contact may
+/// stand off its face, per unit of the contact's length.
+const CONTACT_SAG_PER_LENGTH: f64 = 1e-4;
+
+/// How far a contact's end or a vertex on the boundary, mapped onto a curved
+/// face, may stand off its surface. A contact ends on the face's boundary,
+/// and a face read from a file can have its edges stand off its surface by
+/// more than [`MAPPED_UV_TOL`] (a B-spline skin's edges 3e-3 off it): the
+/// allowance grows by the farthest the boundary stands off, read at its
+/// vertices and at points along each edge.
 fn mapped_uv_allowance(
     topo: &Topology,
     face_id: FaceId,
     surface: &FaceSurface,
 ) -> Result<f64, BlendError> {
-    const BASE: f64 = 1e-4;
     const SAMPLES: u32 = 8;
     if surface.is_planar() {
-        return Ok(BASE);
+        return Ok(MAPPED_UV_TOL);
     }
     let face = topo.face(face_id)?;
     let mut farthest: f64 = 0.0;
@@ -1688,7 +1850,7 @@ fn mapped_uv_allowance(
             }
         }
     }
-    Ok(BASE + farthest)
+    Ok(MAPPED_UV_TOL + farthest)
 }
 
 fn mapped_vertex_for_point(
@@ -2252,6 +2414,7 @@ impl BoundarySplitPolicy<'_> {
 
 fn rebuild_mapped_parametric_face(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     restrictions: &[ParametricRestriction],
     split_policy: BoundarySplitPolicy<'_>,
@@ -2361,17 +2524,49 @@ fn rebuild_mapped_parametric_face(
     let mut closed_vertices = std::collections::HashSet::new();
     let mut contact_edges = Vec::with_capacity(restrictions.len());
     for restriction in restrictions {
-        if restriction.contact_3d.len() < 2
-            || restriction
-                .contact_3d
-                .iter()
-                .copied()
-                .any(|point| mapped_surface_uv(&surface, point, face_id, allowance).is_err())
-        {
+        let last = restriction.contact_3d.len().saturating_sub(1);
+        if last == 0 {
             return Err(BlendError::TrimmingFailure { face: face_id });
         }
         let start = restriction.contact_3d[0];
-        let end = restriction.contact_3d[restriction.contact_3d.len() - 1];
+        let end = restriction.contact_3d[last];
+        // A round's builder gives a contact by its two ends and its curve, so
+        // the points between them are read along the curve too.
+        let along_curve: Vec<Point3> = restriction
+            .curve
+            .iter()
+            .flat_map(|curve| {
+                let (t0, t1) = curve.domain_with_endpoints(start, end);
+                (1..CONTACT_SAMPLES).map(move |k| {
+                    let t = (t1 - t0).madd(f64::from(k) / f64::from(CONTACT_SAMPLES), t0);
+                    curve.evaluate_with_endpoints(t, start, end)
+                })
+            })
+            .collect();
+        // A walked contact is fitted through its sections, and between them
+        // it stands off the face by the fit's sag, which grows with the
+        // contact's length (1e-3 off along a 260 mm rim, 8.7e-2 along a
+        // 2276 mm one: 3.8e-5 of the length at most). A contact that has
+        // left its face stands off it by about the round's radius.
+        let length: f64 = std::iter::once(start)
+            .chain(along_curve.iter().copied())
+            .chain(std::iter::once(end))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).length())
+            .sum();
+        let interior = CONTACT_SAG_PER_LENGTH.madd(length, MAPPED_UV_TOL);
+        if [start, end]
+            .into_iter()
+            .any(|point| mapped_surface_uv(&surface, point, face_id, allowance).is_err())
+            || restriction.contact_3d[1..last]
+                .iter()
+                .copied()
+                .chain(along_curve)
+                .any(|point| mapped_surface_uv(&surface, point, face_id, interior).is_err())
+        {
+            return Err(BlendError::TrimmingFailure { face: face_id });
+        }
         let pcurve_closed = restriction.pcurve.as_ref().is_some_and(|pcurve| {
             let a = pcurve.evaluate(pcurve.t_start());
             let b = pcurve.evaluate(pcurve.t_end());
@@ -2466,6 +2661,14 @@ fn rebuild_mapped_parametric_face(
         let single_contact = restrictions.len() == 1;
         for &vertex_id in &new_vertices.clone() {
             let point = topo.vertex(vertex_id)?.point();
+            // Whether an open contact's end lies beside an edge the policy
+            // splits, within the allowance of a point inside it, and whether
+            // it split an edge: beside one and unsplit, the edge stays whole
+            // and the wire runs on along it past the end and back. A closed
+            // contact does not end on the boundary: its vertex is only where
+            // the loop starts.
+            let open_end = !closed_vertices.contains(&vertex_id);
+            let (mut beside, mut split) = (false, false);
             'edges: for &wire_id in &wire_ids {
                 let wire = topo.wire(wire_id)?;
                 for &oriented in wire.edges() {
@@ -2535,79 +2738,116 @@ fn rebuild_mapped_parametric_face(
                     // line, an angle for arcs) and rejected on-carrier points
                     // once the samples were further apart than 1.0 model unit,
                     // which silently skipped terminal splits on large solids.
-                    if best_d > max_step_len {
+                    // A contact's end may stand off the edge as far as the
+                    // allowance below, more than a short edge's step.
+                    if best_d > max_step_len + allowance {
                         continue;
                     }
                     let step = (d1 - d0) / 64.0;
-                    let (low, high) = (d0.min(d1), d0.max(d1));
-                    let mut lo = (best_t - step.abs()).clamp(low, high);
-                    let mut hi = (best_t + step.abs()).clamp(low, high);
-                    // Refined until the bracket stops shrinking: a parameter
-                    // error on a line grows with the line's length, and a
-                    // contact's end must meet the edge within 1e-6 however
-                    // long the edge is.
-                    for _ in 0..200 {
-                        if hi - lo <= f64::EPSILON * lo.abs().max(hi.abs()).max(1.0) {
-                            break;
-                        }
-                        let m1 = lo + (hi - lo) / 3.0;
-                        let m2 = hi - (hi - lo) / 3.0;
-                        if dist_at(m1) < dist_at(m2) {
-                            hi = m2;
-                        } else {
-                            lo = m1;
-                        }
-                    }
-                    let tt = 0.5 * (lo + hi);
-                    // A file's edge may stand off its face by its digits
-                    // (8e-5 off a plane on a 500 mm part, a fitted section
-                    // 3e-5 off a cylinder): a contact on the face ends on it
-                    // where it meets the edge's trace on the face, the edge
-                    // itself within a file's tolerance.
-                    let on_face = |q: Point3| match &surface {
-                        FaceSurface::Plane { normal, d } => {
-                            q - *normal
-                                * ((normal.dot(brepkit_math::vec::Vec3::new(q.x(), q.y(), q.z()))
-                                    - d)
-                                    / normal.length_squared())
-                        }
-                        other => other
-                            .project_point(q)
-                            .and_then(|(u, v)| other.evaluate(u, v))
-                            .unwrap_or(q),
+                    let span = (d0.min(d1), d0.max(d1));
+                    let inside = |tt: f64| {
+                        let f = (tt - d0) / (d1 - d0);
+                        f > 1e-9 && f < 1.0 - 1e-9
                     };
-                    let on_edge = curve.evaluate_with_endpoints(tt, sp, tp);
-                    let gap = dist_at(tt);
-                    if gap > 1e-6 && (gap > allowance || (on_face(on_edge) - point).length() > 1e-6)
-                    {
+                    let tt = refined_minimum(dist_at, best_t, step, span);
+                    let tt = if dist_at(tt) <= 1e-6 {
+                        tt
+                    } else if dist_at(tt) > allowance {
                         continue;
-                    }
-                    let f = (tt - d0) / (d1 - d0);
-                    if f <= 1e-9 || f >= 1.0 - 1e-9 {
-                        continue;
-                    }
-                    // A vertex off a B-spline's curve reads no parameter of
-                    // its own there, so a piece that kept the whole curve
-                    // would span all of it: the curve is cut at the split.
-                    let (e1, e2) = match curve {
-                        EdgeCurve::NurbsCurve(nurbs) if gap > 1e-6 => {
-                            let (left, right) =
-                                brepkit_math::nurbs::knot_ops::curve_split(nurbs, tt)?;
-                            let (first, second) = if d0 <= d1 {
-                                (left, right)
-                            } else {
-                                (right, left)
-                            };
-                            split_edge_at_with_curves(topo, &oriented, vertex_id, first, second)?
+                    } else {
+                        // A file's edge may stand off its face by its digits
+                        // (8e-5 off a plane on a 500 mm part, a fitted
+                        // section 3e-5 off a cylinder): a contact on the face
+                        // ends on it where it meets the edge's trace on the
+                        // face, the edge itself within a file's tolerance.
+                        // Where the standoff varies along the edge, the
+                        // edge's point nearest the end lies off that place,
+                        // so the trace is searched itself.
+                        let on_face = |q: Point3| match &surface {
+                            FaceSurface::Plane { normal, d } => {
+                                q - *normal
+                                    * ((normal.dot(brepkit_math::vec::Vec3::new(
+                                        q.x(),
+                                        q.y(),
+                                        q.z(),
+                                    )) - d)
+                                        / normal.length_squared())
+                            }
+                            other => other
+                                .project_point(q)
+                                .and_then(|(u, v)| other.evaluate(u, v))
+                                .unwrap_or(q),
+                        };
+                        // The end itself may stand off the face within the
+                        // band a contact's points may: its foot is read.
+                        let foot = on_face(point);
+                        let miss_at = |tt: f64| {
+                            (on_face(curve.evaluate_with_endpoints(tt, sp, tp)) - foot).length()
+                        };
+                        let (mut best_t, mut best_miss) = (d0, miss_at(d0));
+                        for i in 1..=64 {
+                            let tt = (d1 - d0).madd(f64::from(i) / 64.0, d0);
+                            let miss = miss_at(tt);
+                            if miss < best_miss {
+                                (best_t, best_miss) = (tt, miss);
+                            }
                         }
-                        _ => split_edge_at(topo, &oriented, vertex_id)?,
+                        let tt = refined_minimum(miss_at, best_t, step, span);
+                        beside |= open_end && inside(tt);
+                        if miss_at(tt) > 1e-6 {
+                            continue;
+                        }
+                        tt
+                    };
+                    if !inside(tt) {
+                        continue;
+                    }
+                    // On the edge's trace and inside it, but farther off the
+                    // edge than the face's allowance: an open contact's end
+                    // can neither split it there nor leave it whole.
+                    let gap = dist_at(tt);
+                    if gap > allowance {
+                        if open_end {
+                            return Err(BlendError::TrimmingFailure { face: face_id });
+                        }
+                        continue;
+                    }
+                    // Off its curve, the vertex no longer picks out each
+                    // piece's span of a shared spline, so each piece takes
+                    // its own. A piece of a circle or an ellipse cannot end
+                    // at a vertex off it, and the edge left whole would be
+                    // walked out to its far end and back.
+                    let pieces = match curve {
+                        EdgeCurve::Line => None,
+                        EdgeCurve::NurbsCurve(_) | EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_)
+                            if gap <= 1e-6 =>
+                        {
+                            None
+                        }
+                        EdgeCurve::NurbsCurve(_) => Some(
+                            spline_pieces_meeting_at(curve, (d0, tt, d1), point)
+                                .ok_or(BlendError::TrimmingFailure { face: face_id })?,
+                        ),
+                        EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => {
+                            return Err(BlendError::TrimmingFailure { face: face_id });
+                        }
+                    };
+                    let (e1, e2) = match pieces {
+                        Some((before, after)) => split_edge_at_with_curves(
+                            topo, scope, &oriented, vertex_id, before, after,
+                        )?,
+                        None => split_edge_at(topo, scope, &oriented, vertex_id)?,
                     };
                     if let Some(owner) = restriction_for_edge.get(&oriented.edge()).copied() {
                         restriction_for_edge.insert(e1.edge(), owner);
                         restriction_for_edge.insert(e2.edge(), owner);
                     }
+                    split = true;
                     break 'edges;
                 }
+            }
+            if beside && !split {
+                return Err(BlendError::TrimmingFailure { face: face_id });
             }
         }
     }
@@ -3654,6 +3894,7 @@ fn check_holes_clear_in_space(
 
 fn trim_parametric_face_batch_in_place(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     restrictions: &[ParametricRestriction],
     split_policy: BoundarySplitPolicy<'_>,
@@ -3662,11 +3903,11 @@ fn trim_parametric_face_batch_in_place(
         return Err(BlendError::TrimmingFailure { face: face_id });
     }
     check_holes_clear_of_closed_contacts(topo, face_id, restrictions)?;
-    let fast = rebuild_mapped_parametric_face(topo, face_id, restrictions, split_policy)?;
+    let fast = rebuild_mapped_parametric_face(topo, scope, face_id, restrictions, split_policy)?;
     if let Some(result) = fast {
         return Ok(result);
     }
-    let source_face_ids: Vec<FaceId> = topo.faces().iter().map(|(id, _)| id).collect();
+    let source_face_ids = scope.faces(topo);
     let face = topo.face(face_id)?.clone();
     let surface = face.surface().clone();
     let reversed = face.is_reversed();
@@ -4560,19 +4801,19 @@ fn trim_parametric_face_batch_in_place(
 }
 /// Rebuild a planar or curved support face from all restrictions at once.
 ///
-/// The arrangement only adds entities (the trimmed face, its edges and
-/// vertices, neighbours' replacement faces and wires) and pcurves keyed to
-/// the faces it adds, so a projection or intersection failure part way
-/// leaves the source topology's own entities as they were. It used to run
-/// on a copy of the whole topology, which a kernel holding many bodies (the
-/// faceted results of earlier mesh booleans) made the cost of every trim.
+/// The work runs in a transaction that is kept only after the complete
+/// arrangement succeeds. This keeps explicit projection/intersection
+/// failures non-destructive to the source topology.
 pub fn trim_parametric_face_batch(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     restrictions: &[ParametricRestriction],
     split_policy: BoundarySplitPolicy<'_>,
 ) -> Result<BatchTrimResult, BlendError> {
-    trim_parametric_face_batch_in_place(topo, face_id, restrictions, split_policy)
+    topo.transaction(|topo| {
+        trim_parametric_face_batch_in_place(topo, scope, face_id, restrictions, split_policy)
+    })
 }
 
 /// Backwards-compatible planar entry point. The implementation is the same
@@ -4580,13 +4821,14 @@ pub fn trim_parametric_face_batch(
 /// surfaces so existing BK4 callers retain their contract.
 pub fn trim_planar_face_batch(
     topo: &mut Topology,
+    scope: &SplitScope,
     face_id: FaceId,
     restrictions: &[PlanarRestriction],
 ) -> Result<BatchTrimResult, BlendError> {
     if !topo.face(face_id)?.surface().is_planar() {
         return Err(BlendError::TrimmingFailure { face: face_id });
     }
-    trim_parametric_face_batch(topo, face_id, restrictions, BoundarySplitPolicy::All)
+    trim_parametric_face_batch(topo, scope, face_id, restrictions, BoundarySplitPolicy::All)
 }
 
 // ===========================================================================
@@ -4715,6 +4957,7 @@ mod tests {
         let contact_uv = vec![(0.5, 0.0), (0.5, 1.0)];
         let result = trim_face(
             &mut topo,
+            &SplitScope::whole(),
             face_id,
             &contact_3d,
             &contact_uv,
@@ -4737,6 +4980,7 @@ mod tests {
 
         let result = trim_face(
             &mut topo,
+            &SplitScope::whole(),
             face_id,
             &contact_3d,
             &contact_uv,
@@ -4823,6 +5067,7 @@ mod tests {
             let contact_uv = vec![(0.95, -3.0), (0.95, 3.0)];
             let result = trim_face(
                 &mut topo,
+                &SplitScope::whole(),
                 face_id,
                 &contact_3d,
                 &contact_uv,
@@ -4895,6 +5140,7 @@ mod tests {
         let contact_uv = vec![(0.5, 0.0), (0.5, 1.0)];
         let result = trim_face(
             &mut topo,
+            &SplitScope::whole(),
             face_id,
             &contact_3d,
             &contact_uv,
@@ -4990,6 +5236,7 @@ mod tests {
         let contact_uv = vec![(0.5, -1.0), (0.5, 1.0)];
         let result = trim_face(
             &mut topo,
+            &SplitScope::whole(),
             face_id,
             &contact_3d,
             &contact_uv,
@@ -5030,6 +5277,7 @@ mod tests {
         let contact_uv = vec![(0.5, 0.0), (0.5, 1.0)];
         trim_face(
             &mut topo,
+            &SplitScope::whole(),
             face_id,
             &contact_3d,
             &contact_uv,
@@ -5044,6 +5292,55 @@ mod tests {
     }
 
     #[test]
+    fn a_face_out_of_scope_keeps_its_edge_and_its_pcurve() {
+        use brepkit_math::curves2d::{Curve2D, Line2D};
+        use brepkit_math::vec::{Point2, Vec2};
+        use brepkit_topology::pcurve::PCurve;
+
+        let mut topo = Topology::new();
+        let (face_id, verts, edges) = make_square_face(&mut topo);
+        let neighbor = attach_neighbor_below(&mut topo, verts[0], verts[1], edges[0]);
+        let line = Line2D::new(Point2::new(0.0, 0.0), Vec2::new(1.0, 0.0)).unwrap();
+        topo.pcurves_mut().set(
+            edges[0],
+            neighbor,
+            PCurve::new(Curve2D::Line(line), 0.0, 1.0),
+        );
+        let scope = SplitScope {
+            faces: vec![face_id],
+            wires: vec![topo.face(face_id).unwrap().outer_wire()],
+            first_new_face: topo.num_faces(),
+            first_new_wire: topo.num_wires(),
+        };
+
+        let contact_3d = vec![Point3::new(0.5, 0.0, 0.0), Point3::new(0.5, 1.0, 0.0)];
+        let contact_uv = vec![(0.5, 0.0), (0.5, 1.0)];
+        trim_face(
+            &mut topo,
+            &scope,
+            face_id,
+            &contact_3d,
+            &contact_uv,
+            TrimKeep::Side(TrimSide::Left),
+        )
+        .expect("trim should succeed");
+
+        let wire = topo.face(neighbor).unwrap().outer_wire();
+        assert!(
+            topo.wire(wire)
+                .unwrap()
+                .edges()
+                .iter()
+                .any(|oe| oe.edge() == edges[0]),
+            "a face out of scope keeps the whole edge"
+        );
+        assert!(
+            topo.pcurves().contains(edges[0], neighbor),
+            "and the pcurve of that edge"
+        );
+    }
+
+    #[test]
     fn trim_preserves_surface() {
         let mut topo = Topology::new();
         let (face_id, _verts, _edges) = make_square_face(&mut topo);
@@ -5053,6 +5350,7 @@ mod tests {
 
         let result = trim_face(
             &mut topo,
+            &SplitScope::whole(),
             face_id,
             &contact_3d,
             &contact_uv,
@@ -5113,6 +5411,7 @@ mod tests {
 
         let result = trim_face(
             &mut topo,
+            &SplitScope::whole(),
             face_id,
             &contact_3d,
             &contact_uv,
@@ -5151,7 +5450,9 @@ mod tests {
             TrimKeep::Side(TrimSide::Left),
         );
         right.curve = Some(EdgeCurve::Line);
-        let result = trim_planar_face_batch(&mut topo, face_id, &[left, right]).unwrap();
+        let result =
+            trim_planar_face_batch(&mut topo, &SplitScope::whole(), face_id, &[left, right])
+                .unwrap();
         assert_ne!(result.trimmed_face, face_id);
         let wire_edges = |wire: &Wire| {
             wire.edges()
@@ -5200,7 +5501,7 @@ mod tests {
         );
         assert!(
             matches!(
-                trim_parametric_face_batch(&mut topo, face, &[restriction], BoundarySplitPolicy::All),
+                trim_parametric_face_batch(&mut topo, &SplitScope::whole(), face, &[restriction], BoundarySplitPolicy::All),
                 Err(BlendError::TrimmingFailure { face: failed }) if failed == face
             ),
             "off-surface projection must be an explicit failure"
@@ -5280,9 +5581,14 @@ mod tests {
             TrimKeep::Side(TrimSide::Right),
         );
         restriction.curve = Some(EdgeCurve::Line);
-        let result =
-            trim_parametric_face_batch(&mut topo, face, &[restriction], BoundarySplitPolicy::All)
-                .unwrap();
+        let result = trim_parametric_face_batch(
+            &mut topo,
+            &SplitScope::whole(),
+            face,
+            &[restriction],
+            BoundarySplitPolicy::All,
+        )
+        .unwrap();
         assert_ne!(result.trimmed_face, face);
         assert_eq!(result.contact_edges.len(), 1);
         assert!(
@@ -5352,6 +5658,7 @@ mod tests {
         );
         let result = trim_parametric_face_batch(
             &mut topo,
+            &SplitScope::whole(),
             face,
             &[ParametricRestriction::new(
                 vec![point(0.8, 1.0), point(0.8, 2.0)],
@@ -5396,6 +5703,7 @@ mod tests {
         );
         let result = trim_parametric_face_batch(
             &mut topo,
+            &SplitScope::whole(),
             face,
             &[ParametricRestriction::new(
                 vec![Point3::new(0.5, 0.0, 0.0), Point3::new(0.5, 1.0, 0.0)],
@@ -5473,8 +5781,13 @@ mod tests {
             .unwrap(),
         );
         restriction.pcurve = Some(brepkit_topology::pcurve::PCurve::new(pcurve, 0.0, 1.0));
-        let result =
-            trim_parametric_face_batch(&mut topo, face, &[restriction], BoundarySplitPolicy::All);
+        let result = trim_parametric_face_batch(
+            &mut topo,
+            &SplitScope::whole(),
+            face,
+            &[restriction],
+            BoundarySplitPolicy::All,
+        );
         assert!(
             result.is_ok(),
             "periodic torus patch must rebuild: {result:?}"
@@ -5682,6 +5995,7 @@ mod tests {
         );
         let result = trim_parametric_face_batch(
             &mut topo,
+            &SplitScope::whole(),
             replacement,
             &[restriction],
             BoundarySplitPolicy::All,
@@ -5723,7 +6037,9 @@ mod tests {
             TrimKeep::Side(TrimSide::Right),
         );
 
-        let result = trim_planar_face_batch(&mut topo, face_id, &[restriction]).unwrap();
+        let result =
+            trim_planar_face_batch(&mut topo, &SplitScope::whole(), face_id, &[restriction])
+                .unwrap();
 
         assert_eq!(
             edge_signature(topo.wire(source_wire).unwrap()),
@@ -5786,7 +6102,9 @@ mod tests {
             vec![Point3::new(0.5, 0.0, 0.0), Point3::new(0.5, 1.0, 0.0)],
             TrimKeep::Side(TrimSide::Right),
         );
-        let result = trim_planar_face_batch(&mut topo, face_id, &[restriction]).unwrap();
+        let result =
+            trim_planar_face_batch(&mut topo, &SplitScope::whole(), face_id, &[restriction])
+                .unwrap();
         let wire = topo
             .wire(topo.face(result.trimmed_face).unwrap().outer_wire())
             .unwrap();
@@ -5826,7 +6144,9 @@ mod tests {
             vec![Point3::new(0.0, 0.5, 0.0), Point3::new(1.5, 0.5, 0.0)],
             TrimKeep::Side(TrimSide::Right),
         );
-        let result = trim_planar_face_batch(&mut topo, face_id, &[restriction]).unwrap();
+        let result =
+            trim_planar_face_batch(&mut topo, &SplitScope::whole(), face_id, &[restriction])
+                .unwrap();
         let split_vertex = result
             .new_vertices
             .iter()
@@ -5859,6 +6179,594 @@ mod tests {
         }
         assert!(found, "batch result must retain a split circle sub-edge");
     }
+
+    /// A quarter of a cylinder's wall whose rims, at z = 0 and z = 1 and
+    /// made by `rim` from their center, start and end, have radius `radius`
+    /// and stand `off` inside its surface, cut on its surface from rim to
+    /// rim halfway round: the contact replaces the wall's far side, and its
+    /// ends stand `off` off the rims.
+    fn trim_a_wall_off_its_rims(
+        radius: f64,
+        off: f64,
+        rim: impl Fn(Point3, Point3, Point3) -> EdgeCurve,
+    ) -> (Topology, FaceId, Result<BatchTrimResult, BlendError>) {
+        use brepkit_math::surfaces::CylindricalSurface;
+        use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+
+        let mut topo = Topology::new();
+        let (origin, axis) = (Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        let wall = CylindricalSurface::new(origin, axis, radius + off).unwrap();
+        let rims = CylindricalSurface::new(origin, axis, radius).unwrap();
+        let at = |u: f64, z: f64| rims.evaluate(u, z);
+        let center = |z: f64| Point3::new(0.0, 0.0, z);
+        let face = add_parametric_quad(
+            &mut topo,
+            FaceSurface::Cylinder(wall.clone()),
+            [
+                at(0.0, 0.0),
+                at(FRAC_PI_2, 0.0),
+                at(FRAC_PI_2, 1.0),
+                at(0.0, 1.0),
+            ],
+            [
+                rim(center(0.0), at(0.0, 0.0), at(FRAC_PI_2, 0.0)),
+                EdgeCurve::Line,
+                rim(center(1.0), at(0.0, 1.0), at(FRAC_PI_2, 1.0)),
+                EdgeCurve::Line,
+            ],
+        );
+        let far_side = topo
+            .wire(topo.face(face).unwrap().outer_wire())
+            .unwrap()
+            .edges()[1]
+            .edge();
+        let restriction = ParametricRestriction {
+            contact_3d: vec![wall.evaluate(FRAC_PI_4, 0.0), wall.evaluate(FRAC_PI_4, 1.0)],
+            keep: TrimKeep::AwayFrom(at(FRAC_PI_2, 0.5)),
+            curve: Some(EdgeCurve::Line),
+            pcurve: None,
+            source_edges: vec![far_side],
+        };
+        let result = trim_parametric_face_batch(
+            &mut topo,
+            &SplitScope::whole(),
+            face,
+            &[restriction],
+            BoundarySplitPolicy::All,
+        );
+        (topo, face, result)
+    }
+
+    /// The unit square in z = 0 as a flat B-spline.
+    fn flat_unit_skin() -> FaceSurface {
+        FaceSurface::Nurbs(
+            brepkit_math::nurbs::surface::NurbsSurface::new(
+                1,
+                1,
+                vec![0.0, 0.0, 1.0, 1.0],
+                vec![0.0, 0.0, 1.0, 1.0],
+                vec![
+                    vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                    vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+                ],
+                vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A flat B-spline face over the unit square in z = 0 with a square hole
+    /// whose edges stand `lift` above it, trimmed along x = 0.3, cut off its
+    /// x = 0 side, by a contact whose middle stands `bulge` off the face.
+    /// With `two_points`, the contact is given as a round's builder gives
+    /// it, by its two ends and its curve; otherwise by three points, its
+    /// middle among them.
+    fn trim_beside_a_lifted_hole(
+        lift: f64,
+        bulge: f64,
+        two_points: bool,
+    ) -> Result<BatchTrimResult, BlendError> {
+        let mut topo = Topology::new();
+        let mut wire = |corners: [(f64, f64, f64); 4]| {
+            let vertices = corners
+                .map(|(x, y, z)| topo.add_vertex(Vertex::new(Point3::new(x, y, z), VERTEX_TOL)));
+            let edges: Vec<OrientedEdge> = (0..4)
+                .map(|k| {
+                    let edge = Edge::new(vertices[k], vertices[(k + 1) % 4], EdgeCurve::Line);
+                    OrientedEdge::new(topo.add_edge(edge), true)
+                })
+                .collect();
+            (
+                topo.add_wire(Wire::new(edges.clone(), true).unwrap()),
+                edges,
+            )
+        };
+        let (outer, outer_edges) = wire([
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]);
+        let (hole, _) = wire([
+            (0.6, 0.4, lift),
+            (0.6, 0.6, lift),
+            (0.8, 0.6, lift),
+            (0.8, 0.4, lift),
+        ]);
+        let face = topo.add_face(Face::new(outer, vec![hole], flat_unit_skin()));
+        let (start, end) = (Point3::new(0.3, 0.0, 0.0), Point3::new(0.3, 1.0, 0.0));
+        let (contact_3d, curve) = if two_points {
+            let arch = brepkit_math::nurbs::curve::NurbsCurve::new(
+                2,
+                vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                vec![start, Point3::new(0.3, 0.5, 2.0 * bulge), end],
+                vec![1.0; 3],
+            )
+            .unwrap();
+            (vec![start, end], Some(EdgeCurve::NurbsCurve(arch)))
+        } else {
+            (vec![start, Point3::new(0.3, 0.5, bulge), end], None)
+        };
+        let restriction = ParametricRestriction {
+            contact_3d,
+            keep: TrimKeep::AwayFrom(Point3::new(0.0, 0.5, 0.0)),
+            curve,
+            pcurve: None,
+            source_edges: vec![outer_edges[3].edge()],
+        };
+        trim_parametric_face_batch(
+            &mut topo,
+            &SplitScope::whole(),
+            face,
+            &[restriction],
+            BoundarySplitPolicy::All,
+        )
+    }
+
+    /// A flat B-spline face over the unit square in z = 0 with a round hole
+    /// of radius 0.1 in its middle, trimmed round the hole by a closed
+    /// contact of radius `radius` about the middle given as a round's
+    /// builder gives it: both its points at its start, on the face at
+    /// `angle` round the middle, and its circle, turned by `tilt` about its
+    /// tangent there.
+    fn trim_round_a_hole(
+        radius: f64,
+        angle: f64,
+        tilt: f64,
+    ) -> Result<BatchTrimResult, BlendError> {
+        use brepkit_math::curves::Circle3D;
+
+        let mut topo = Topology::new();
+        let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+            .map(|(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), VERTEX_TOL)));
+        let outer: Vec<OrientedEdge> = (0..4)
+            .map(|k| {
+                let edge = Edge::new(corners[k], corners[(k + 1) % 4], EdgeCurve::Line);
+                OrientedEdge::new(topo.add_edge(edge), true)
+            })
+            .collect();
+        let outer = topo.add_wire(Wire::new(outer, true).unwrap());
+        let middle = Point3::new(0.5, 0.5, 0.0);
+        let rim = Circle3D::new(middle, Vec3::new(0.0, 0.0, -1.0), 0.1).unwrap();
+        let rim_vertex = topo.add_vertex(Vertex::new(rim.evaluate(0.0), VERTEX_TOL));
+        let rim_edge = topo.add_edge(Edge::new(rim_vertex, rim_vertex, EdgeCurve::Circle(rim)));
+        let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim_edge, true)], true).unwrap());
+        let face = topo.add_face(Face::new(outer, vec![hole], flat_unit_skin()));
+        let out = {
+            let (sin, cos) = angle.sin_cos();
+            Vec3::new(cos, sin, 0.0)
+        };
+        let start = middle + out * radius;
+        let (sin, cos) = tilt.sin_cos();
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let center = start + (up * sin - out * cos) * radius;
+        let normal = up * cos + out * sin;
+        let contact = Circle3D::new_with_ref(center, normal, radius, start - center).unwrap();
+        let pcurve =
+            brepkit_math::curves2d::Circle2D::new(brepkit_math::vec::Point2::new(0.5, 0.5), radius)
+                .unwrap();
+        let restriction = ParametricRestriction {
+            contact_3d: vec![start, start],
+            keep: TrimKeep::AwayFrom(middle),
+            curve: Some(EdgeCurve::Circle(contact)),
+            pcurve: Some(brepkit_topology::pcurve::PCurve::new(
+                brepkit_math::curves2d::Curve2D::Circle(pcurve),
+                angle,
+                angle + std::f64::consts::TAU,
+            )),
+            source_edges: vec![rim_edge],
+        };
+        trim_parametric_face_batch(
+            &mut topo,
+            &SplitScope::whole(),
+            face,
+            &[restriction],
+            BoundarySplitPolicy::All,
+        )
+    }
+
+    /// A hole whose edges stand well off a curved face lets a contact end
+    /// or a boundary vertex stand as far off it, but not the points along a
+    /// contact elsewhere on the face: one 1e-3 off it refuses the trim, as
+    /// it does on a face whose edges lie on it.
+    #[test]
+    fn an_edge_off_the_face_does_not_let_a_contact_off_it() {
+        for lift in [0.0, 0.05] {
+            for two_points in [false, true] {
+                let label = format!("hole {lift} off, two points {two_points}");
+                assert!(
+                    trim_beside_a_lifted_hole(lift, 0.0, two_points).is_ok(),
+                    "{label}: a contact on the face trims it"
+                );
+                assert!(
+                    matches!(
+                        trim_beside_a_lifted_hole(lift, 1e-3, two_points),
+                        Err(BlendError::TrimmingFailure { .. })
+                    ),
+                    "{label}: a contact 1e-3 off the face must refuse the trim"
+                );
+            }
+        }
+    }
+
+    /// A flat B-spline face over a `side` square in z = 0, trimmed along
+    /// x = 0.3 `side` by a contact given as a round's builder gives it, its
+    /// middle standing `bulge` off the face.
+    fn trim_a_long_face(side: f64, bulge: f64) -> Result<BatchTrimResult, BlendError> {
+        let mut topo = Topology::new();
+        let skin = FaceSurface::Nurbs(
+            brepkit_math::nurbs::surface::NurbsSurface::new(
+                1,
+                1,
+                vec![0.0, 0.0, 1.0, 1.0],
+                vec![0.0, 0.0, 1.0, 1.0],
+                vec![
+                    vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, side, 0.0)],
+                    vec![Point3::new(side, 0.0, 0.0), Point3::new(side, side, 0.0)],
+                ],
+                vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            )
+            .unwrap(),
+        );
+        let corners = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)]
+            .map(|(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), VERTEX_TOL)));
+        let edges: Vec<OrientedEdge> = (0..4)
+            .map(|k| {
+                let edge = Edge::new(corners[k], corners[(k + 1) % 4], EdgeCurve::Line);
+                OrientedEdge::new(topo.add_edge(edge), true)
+            })
+            .collect();
+        let outer = topo.add_wire(Wire::new(edges.clone(), true).unwrap());
+        let face = topo.add_face(Face::new(outer, vec![], skin));
+        let (start, end) = (
+            Point3::new(0.3 * side, 0.0, 0.0),
+            Point3::new(0.3 * side, side, 0.0),
+        );
+        let arch = brepkit_math::nurbs::curve::NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![start, Point3::new(0.3 * side, 0.5 * side, 2.0 * bulge), end],
+            vec![1.0; 3],
+        )
+        .unwrap();
+        let restriction = ParametricRestriction {
+            contact_3d: vec![start, end],
+            keep: TrimKeep::AwayFrom(Point3::new(0.0, 0.5 * side, 0.0)),
+            curve: Some(EdgeCurve::NurbsCurve(arch)),
+            pcurve: None,
+            source_edges: vec![edges[3].edge()],
+        };
+        trim_parametric_face_batch(
+            &mut topo,
+            &SplitScope::whole(),
+            face,
+            &[restriction],
+            BoundarySplitPolicy::All,
+        )
+    }
+
+    /// A walked contact stands off its face between its sections by the
+    /// fit's sag, which grows with its length: along a 1000 mm face, one
+    /// 2e-2 off (2e-5 of its length) trims, as a 2e-5 sag does along a
+    /// unit face, while one 0.5 off refuses the trim.
+    #[test]
+    fn a_long_contact_may_sag_off_its_face_by_its_length_s_share() {
+        assert!(
+            trim_a_long_face(1000.0, 2e-2).is_ok(),
+            "the fit's sag trims"
+        );
+        assert!(trim_a_long_face(1.0, 2e-5).is_ok(), "the same share trims");
+        assert!(
+            matches!(
+                trim_a_long_face(1000.0, 0.5),
+                Err(BlendError::TrimmingFailure { .. })
+            ),
+            "a contact 0.5 off the face must refuse the trim"
+        );
+        assert!(
+            matches!(
+                trim_a_long_face(1.0, 1e-3),
+                Err(BlendError::TrimmingFailure { .. })
+            ),
+            "a contact 1e-3 off a unit face must refuse the trim"
+        );
+    }
+
+    /// A closed contact is read along its curve as an open one is: tilted
+    /// so that its far side stands 4e-3 off the face, it refuses the trim.
+    #[test]
+    fn a_closed_contact_off_the_face_refuses_the_trim() {
+        assert!(
+            trim_round_a_hole(0.2, 0.0, 0.0).is_ok(),
+            "a closed contact on the face trims it"
+        );
+        assert!(
+            matches!(
+                trim_round_a_hole(0.2, 0.0, 0.01),
+                Err(BlendError::TrimmingFailure { .. })
+            ),
+            "a closed contact 4e-3 off the face must refuse the trim"
+        );
+    }
+
+    /// A closed contact does not end on the face's boundary: one 5e-5 inside
+    /// the face's sides trims it wherever it starts, by a side or not.
+    #[test]
+    fn a_closed_contact_near_the_boundary_trims_wherever_it_starts() {
+        for angle in [0.0, std::f64::consts::FRAC_PI_4] {
+            assert!(
+                trim_round_a_hole(0.49995, angle, 0.0).is_ok(),
+                "a closed contact starting at {angle} round the middle must trim"
+            );
+        }
+    }
+
+    /// Each edge of the trimmed face's outer wire: its curve, how far the
+    /// ends of the span it reads fall from its vertices, and that span's
+    /// length along 64 chords.
+    fn outer_pieces(topo: &Topology, result: &BatchTrimResult) -> Vec<(EdgeCurve, f64, f64)> {
+        let wire = topo
+            .wire(topo.face(result.trimmed_face).unwrap().outer_wire())
+            .unwrap();
+        wire.edges()
+            .iter()
+            .map(|oriented| {
+                let edge = topo.edge(oriented.edge()).unwrap();
+                let a = topo.vertex(edge.start()).unwrap().point();
+                let b = topo.vertex(edge.end()).unwrap().point();
+                let curve = edge.curve();
+                let (t0, t1) = curve.domain_with_endpoints(a, b);
+                let at = |k: u32| {
+                    curve.evaluate_with_endpoints((t1 - t0).madd(f64::from(k) / 64.0, t0), a, b)
+                };
+                let miss = (at(0) - a).length().max((at(64) - b).length());
+                let length = (0..64).map(|k| (at(k + 1) - at(k)).length()).sum();
+                (curve.clone(), miss, length)
+            })
+            .collect()
+    }
+
+    /// Rims of radius 1 and 0.1, on their wall and off it. Off it, the
+    /// contact's end stands farther off the short rim than the rim's 64
+    /// samples stand apart (0.003 against 0.0025).
+    const WALL_RIMS: [(f64, f64); 4] = [(1.0, 0.0), (1.0, 1e-3), (0.1, 0.0), (0.1, 3e-3)];
+
+    /// A spline rim split where a contact ends off it keeps, in each piece,
+    /// its own share of the rim, from the rim's vertex to the contact's end.
+    #[test]
+    fn a_spline_rim_off_its_wall_splits_into_its_own_pieces() {
+        let quarter = |center: Point3, from: Point3, to: Point3| {
+            EdgeCurve::NurbsCurve(
+                brepkit_math::nurbs::curve::NurbsCurve::new(
+                    2,
+                    vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                    vec![from, from + (to - center), to],
+                    vec![1.0, std::f64::consts::FRAC_1_SQRT_2, 1.0],
+                )
+                .unwrap(),
+            )
+        };
+        for (radius, off) in WALL_RIMS {
+            let label = format!("radius {radius}, off {off}");
+            let (topo, _, result) = trim_a_wall_off_its_rims(radius, off, quarter);
+            let pieces = outer_pieces(&topo, &result.unwrap());
+            assert_eq!(pieces.len(), 4, "{label}: the contact, a side and two rims");
+            for (curve, miss, length) in pieces {
+                assert!(
+                    miss <= 1e-9,
+                    "{label}: a piece's ends miss its vertices by {miss}"
+                );
+                // 64 chords of an eighth of a turn fall 5e-6 of the radius
+                // short of it.
+                if matches!(curve, EdgeCurve::NurbsCurve(_)) {
+                    assert!(
+                        (length - radius * std::f64::consts::FRAC_PI_4).abs() <= off + 1e-5,
+                        "{label}: a rim's piece reads {length} long"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A circle cannot be cut to end at a contact's end off it, so a wall
+    /// whose circular rims stand off it refuses the trim, as it would walk
+    /// each rim out to its far end and back.
+    #[test]
+    fn a_circular_rim_off_its_wall_refuses_the_trim() {
+        let circle = |center: Point3, from: Point3, _: Point3| {
+            EdgeCurve::Circle(
+                brepkit_math::curves::Circle3D::new(
+                    center,
+                    Vec3::new(0.0, 0.0, 1.0),
+                    (from - center).length(),
+                )
+                .unwrap(),
+            )
+        };
+        for (radius, off) in WALL_RIMS {
+            let label = format!("radius {radius}, off {off}");
+            let (topo, face, result) = trim_a_wall_off_its_rims(radius, off, circle);
+            if off > 0.0 {
+                assert!(
+                    matches!(result, Err(BlendError::TrimmingFailure { face: failed }) if failed == face),
+                    "{label}: a circular rim off the wall must refuse the trim"
+                );
+            } else {
+                let pieces = outer_pieces(&topo, &result.unwrap());
+                assert_eq!(pieces.len(), 4, "{label}");
+                assert!(
+                    pieces.iter().all(|(_, miss, _)| *miss <= 1e-9),
+                    "{label}: a piece's ends miss its vertices"
+                );
+            }
+        }
+    }
+
+    /// How a sloped edge is stored.
+    #[derive(Clone, Copy, Debug)]
+    enum Slope {
+        Line,
+        Spline,
+        Arc,
+    }
+
+    /// A square of side 0.01 on a flat B-spline in z = 0 whose edges along x
+    /// rise from 0.001 above it at x = 0 to 0.003 at x = 0.01, stored as
+    /// `slope` says (an arc bulges 2.6e-4 above the chord), cut on the face
+    /// along x = 0.005, its x = 0 side cut off. Each contact end is the
+    /// trace on the face of its edge's middle, 0.002 or more below it; the
+    /// edge's point nearest the end lies at 0.46 of the edge, whose trace
+    /// misses the end by 3.8e-4. The contact's first end is moved `inset`
+    /// into the face, and the contact `lift` above it.
+    fn trim_off_sloped_edges(
+        slope: Slope,
+        inset: f64,
+        lift: f64,
+    ) -> (Topology, FaceId, Result<BatchTrimResult, BlendError>) {
+        let mut topo = Topology::new();
+        let corners = [
+            Point3::new(0.0, 0.0, 0.001),
+            Point3::new(0.01, 0.0, 0.003),
+            Point3::new(0.01, 0.01, 0.003),
+            Point3::new(0.0, 0.01, 0.001),
+        ];
+        let vertices = corners.map(|p| topo.add_vertex(Vertex::new(p, VERTEX_TOL)));
+        let sloped = |a: Point3, b: Point3| match slope {
+            Slope::Line => EdgeCurve::Line,
+            Slope::Spline => EdgeCurve::NurbsCurve(
+                brepkit_math::nurbs::curve::NurbsCurve::new(
+                    1,
+                    vec![0.0, 0.0, 1.0, 1.0],
+                    vec![a, b],
+                    vec![1.0, 1.0],
+                )
+                .unwrap(),
+            ),
+            Slope::Arc => {
+                let radius = 0.05;
+                let middle = a + (b - a) * 0.5;
+                let up = Vec3::new(a.z() - b.z(), 0.0, b.x() - a.x())
+                    .normalize()
+                    .unwrap();
+                let up = if up.z() < 0.0 { -up } else { up };
+                let half = (b - a).length() * 0.5;
+                let center = middle - up * radius.madd(radius, -(half * half)).sqrt();
+                [Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, -1.0, 0.0)]
+                    .into_iter()
+                    .map(|normal| {
+                        EdgeCurve::Circle(
+                            brepkit_math::curves::Circle3D::new(center, normal, radius).unwrap(),
+                        )
+                    })
+                    .find(|arc| {
+                        let (t0, t1) = arc.domain_with_endpoints(a, b);
+                        (t1 - t0).abs() < std::f64::consts::PI
+                    })
+                    .unwrap()
+            }
+        };
+        let curves = [
+            sloped(corners[0], corners[1]),
+            EdgeCurve::Line,
+            sloped(corners[2], corners[3]),
+            EdgeCurve::Line,
+        ];
+        let edges: Vec<OrientedEdge> = (0..4)
+            .map(|k| {
+                let edge = Edge::new(vertices[k], vertices[(k + 1) % 4], curves[k].clone());
+                OrientedEdge::new(topo.add_edge(edge), true)
+            })
+            .collect();
+        let side = edges[3].edge();
+        let wire = topo.add_wire(Wire::new(edges, true).unwrap());
+        let face = topo.add_face(Face::new(wire, Vec::new(), flat_unit_skin()));
+        let restriction = ParametricRestriction {
+            contact_3d: vec![
+                Point3::new(0.005, inset, lift),
+                Point3::new(0.005, 0.01, lift),
+            ],
+            keep: TrimKeep::AwayFrom(Point3::new(0.0, 0.005, 0.0)),
+            curve: Some(EdgeCurve::Line),
+            pcurve: None,
+            source_edges: vec![side],
+        };
+        let result = trim_parametric_face_batch(
+            &mut topo,
+            &SplitScope::whole(),
+            face,
+            &[restriction],
+            BoundarySplitPolicy::All,
+        );
+        (topo, face, result)
+    }
+
+    /// A contact ends where its foot on the face meets the trace of an edge
+    /// on the face, not at the edge's point nearest it: where the edge's
+    /// standoff varies, the two differ. A line or a spline is split there
+    /// into pieces that meet the contact's ends; an arc cannot end there and
+    /// refuses the trim. A contact 5e-5 above the face, within the 1e-4 it
+    /// may stand off it, ends alike.
+    #[test]
+    fn a_contact_ending_under_a_sloped_edge_splits_it_where_it_ends() {
+        for lift in [0.0, 5e-5] {
+            for slope in [Slope::Line, Slope::Spline] {
+                let label = format!("{slope:?}, contact {lift} above the face");
+                let (topo, _, result) = trim_off_sloped_edges(slope, 0.0, lift);
+                let pieces = outer_pieces(&topo, &result.unwrap());
+                assert_eq!(
+                    pieces.len(),
+                    4,
+                    "{label}: the contact, a side and two pieces of the sloped edges"
+                );
+                for (_, miss, _) in pieces {
+                    assert!(
+                        miss <= 1e-9,
+                        "{label}: a piece's ends miss its vertices by {miss}"
+                    );
+                }
+            }
+            let (_, face, result) = trim_off_sloped_edges(Slope::Arc, 0.0, lift);
+            assert!(
+                matches!(result, Err(BlendError::TrimmingFailure { face: failed }) if failed == face),
+                "contact {lift} above the face: an arc a contact ends off must refuse the trim"
+            );
+        }
+    }
+
+    /// A contact's end within the allowance of a point inside an edge, but
+    /// 2e-5 off its trace on the face, does not meet the edge: left whole,
+    /// the edge would run on past the end and back, so the trim refuses.
+    #[test]
+    fn a_contact_ending_beside_an_edge_it_does_not_meet_refuses_the_trim() {
+        for slope in [Slope::Line, Slope::Spline, Slope::Arc] {
+            let (_, face, result) = trim_off_sloped_edges(slope, 2e-5, 0.0);
+            assert!(
+                matches!(result, Err(BlendError::TrimmingFailure { face: failed }) if failed == face),
+                "{slope:?}: a contact ending beside an edge must refuse the trim"
+            );
+        }
+    }
+
     #[test]
     fn segment_intersect_2d_parallel() {
         // Parallel segments — no intersection.

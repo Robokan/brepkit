@@ -231,10 +231,18 @@ fn pave_co_endpoint_curves(
                 let Some(&[pb_id]) = arena.edge_pave_blocks.get(&edge_id).map(Vec::as_slice) else {
                     continue;
                 };
-                let unsplit = arena
-                    .pave_blocks
-                    .get(pb_id)
-                    .is_some_and(|pb| pb.extra_paves.is_empty());
+                // A pave at one of the block's own ends (a crossing with
+                // another edge there) splits nothing: the copy is whole, and
+                // left so it would not split as its twin does.
+                let unsplit = arena.pave_blocks.get(pb_id).is_some_and(|pb| {
+                    let ends = [
+                        arena.resolve_vertex(pb.start.vertex),
+                        arena.resolve_vertex(pb.end.vertex),
+                    ];
+                    pb.extra_paves
+                        .iter()
+                        .all(|pave| ends.contains(&arena.resolve_vertex(pave.vertex)))
+                });
                 if !(curved && unsplit) {
                     continue;
                 }

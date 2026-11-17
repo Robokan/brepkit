@@ -13,6 +13,10 @@ use crate::edge::EdgeCurve;
 use crate::face::FaceId;
 use crate::wire::{OrientedEdge, WireId};
 
+/// How far a NURBS edge's control points may stray from the segment between
+/// its ends for it to be read as that segment.
+const STRAIGHT_TOL: f64 = 1e-9;
+
 /// The plane through `origin` spanned by the orthonormal `x` and `y`.
 #[derive(Clone, Copy)]
 struct Plane2 {
@@ -22,6 +26,17 @@ struct Plane2 {
 }
 
 impl Plane2 {
+    /// [`Self::exact_piece`], with a NURBS curve that lies on the segment
+    /// between its ends, within [`STRAIGHT_TOL`], read as that segment.
+    fn boundary_piece(self, curve: &EdgeCurve, a: Point3, b: Point3) -> Option<Boundary2> {
+        if matches!(curve, EdgeCurve::NurbsCurve(_))
+            && curve.is_straight_between(a, b, STRAIGHT_TOL)
+        {
+            return Some(Boundary2::Segment(self.point(a), self.point(b)));
+        }
+        self.exact_piece(curve, a, b)
+    }
+
     fn point(self, p: Point3) -> Point2 {
         let d = p - self.origin;
         Point2::new(d.dot(self.x), d.dot(self.y))
@@ -68,8 +83,9 @@ impl Plane2 {
 /// A planar face's boundary flattened into its plane, holes included.
 ///
 /// The plane runs through `origin`, spanned by the orthonormal `x` and `y`.
-/// A line becomes a segment, a circle or ellipse arc the arc it is. `None`
-/// when an edge is a NURBS curve.
+/// A line, or a NURBS curve lying on the segment between its ends, becomes
+/// that segment, and a circle or ellipse arc the arc it is. `None` when an
+/// edge is any other NURBS curve.
 ///
 /// # Errors
 ///
@@ -87,11 +103,18 @@ pub fn face_boundary_2d(
         .chain(face.inner_wires().iter().copied())
         .map(|w| topo.wire(w))
         .collect::<Result<_, _>>()?;
-    // A NURBS edge declines before any curve is projected: finding its
-    // span costs point projections the caller's fallback repeats.
+    // A curved NURBS edge declines before any curve is projected: finding
+    // its span costs point projections the caller's fallback repeats.
     for wire in &wires {
         for oe in wire.edges() {
-            if matches!(topo.edge(oe.edge())?.curve(), EdgeCurve::NurbsCurve(_)) {
+            let edge = topo.edge(oe.edge())?;
+            if matches!(edge.curve(), EdgeCurve::NurbsCurve(_))
+                && !edge.curve().is_straight_between(
+                    topo.vertex(edge.start())?.point(),
+                    topo.vertex(edge.end())?.point(),
+                    STRAIGHT_TOL,
+                )
+            {
                 return Ok(None);
             }
         }
@@ -104,15 +127,18 @@ pub fn face_boundary_2d(
                 topo.vertex(edge.start())?.point(),
                 topo.vertex(edge.end())?.point(),
             );
-            pieces.extend(plane.exact_piece(edge.curve(), a, b));
+            pieces.extend(plane.boundary_piece(edge.curve(), a, b));
         }
     }
     Ok(Some(pieces))
 }
 
 /// One wire flattened into the plane through `origin` spanned by the
-/// orthonormal `x` and `y`, each line a segment and each circle or ellipse
-/// arc the arc it is. `None` when an edge is a NURBS curve.
+/// orthonormal `x` and `y`.
+///
+/// Each line, or NURBS curve lying on the segment between its ends, becomes
+/// that segment, and each circle or ellipse arc the arc it is. `None` when an
+/// edge is any other NURBS curve.
 ///
 /// # Errors
 ///
@@ -132,7 +158,7 @@ pub fn wire_boundary_2d(
             topo.vertex(edge.start())?.point(),
             topo.vertex(edge.end())?.point(),
         );
-        let Some(piece) = plane.exact_piece(edge.curve(), a, b) else {
+        let Some(piece) = plane.boundary_piece(edge.curve(), a, b) else {
             return Ok(None);
         };
         pieces.push(piece);
@@ -475,8 +501,16 @@ impl PlanarRegion {
     /// boundary there.
     #[must_use]
     pub fn contains_clear(&self, p: Point2, margin: f64) -> bool {
+        self.side(p, margin) == Some(true)
+    }
+
+    /// Whether `p` lies inside the region, read as
+    /// [`contains_clear`](Self::contains_clear) reads it. `None` when `p`
+    /// lies within `margin` of the boundary, or the query does not settle.
+    #[must_use]
+    pub fn side(&self, p: Point2, margin: f64) -> Option<bool> {
         if distance_to_boundary(&self.exact, p) <= margin {
-            return false;
+            return None;
         }
         let mut pieces = Vec::with_capacity(self.exact.len() + self.beziers.len());
         pieces.extend_from_slice(&self.exact);
@@ -495,10 +529,10 @@ impl PlanarRegion {
             };
             match piece.read(p, margin) {
                 Reading::Chord => pieces.push(Boundary2::Segment(piece.start, piece.end)),
-                Reading::Touches => return false,
+                Reading::Touches => return None,
                 Reading::Unsettled => {
                     if halvings == MAX_HALVINGS {
-                        return false;
+                        return None;
                     }
                     halvings += 1;
                     let (first, second) = piece.halves();
@@ -507,7 +541,7 @@ impl PlanarRegion {
                 }
             }
         }
-        point_in_region(&pieces, p, margin.min(self.tol)) == Some(true)
+        point_in_region(&pieces, p, margin.min(self.tol))
     }
 }
 
@@ -532,10 +566,41 @@ pub fn face_region_2d(
     tol: f64,
 ) -> Result<Option<PlanarRegion>, TopologyError> {
     let face = topo.face(face)?;
+    let wires: Vec<WireId> = std::iter::once(face.outer_wire())
+        .chain(face.inner_wires().iter().copied())
+        .collect();
+    wires_region_2d(topo, &wires, origin, x, y, tol)
+}
+
+/// The region one wire encloses in the plane through `origin` spanned by the
+/// orthonormal `x` and `y`, read as [`face_region_2d`] reads a face's.
+///
+/// # Errors
+///
+/// Returns [`TopologyError`] if an entity lookup fails.
+pub fn wire_region_2d(
+    topo: &Topology,
+    wire: WireId,
+    origin: Point3,
+    x: Vec3,
+    y: Vec3,
+    tol: f64,
+) -> Result<Option<PlanarRegion>, TopologyError> {
+    wires_region_2d(topo, &[wire], origin, x, y, tol)
+}
+
+fn wires_region_2d(
+    topo: &Topology,
+    wires: &[WireId],
+    origin: Point3,
+    x: Vec3,
+    y: Vec3,
+    tol: f64,
+) -> Result<Option<PlanarRegion>, TopologyError> {
     let plane = Plane2 { origin, x, y };
     let mut exact = Vec::new();
     let mut beziers = Vec::new();
-    for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+    for &wid in wires {
         for oe in topo.wire(wid)?.edges() {
             let edge = topo.edge(oe.edge())?;
             let (a, b) = (
@@ -847,17 +912,34 @@ mod tests {
         assert_eq!(wire_area_2d(&topo, w, x, y).unwrap(), None);
     }
 
-    /// A NURBS edge declines the flattening.
+    /// A curved NURBS edge declines the flattening.
     #[test]
-    fn a_nurbs_edge_declines() {
+    fn a_curved_nurbs_edge_declines() {
         let mut topo = Topology::new();
-        let face = half_disc(&mut topo, true);
+        let face = nurbs_half_disc(&mut topo, false, std::f64::consts::FRAC_1_SQRT_2);
         let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
         assert!(
             face_boundary_2d(&topo, face, Point3::new(0.0, 0.0, 0.0), x, y)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A NURBS edge lying on the segment between its ends flattens to that
+    /// segment.
+    #[test]
+    fn a_straight_nurbs_edge_flattens_to_its_segment() {
+        let mut topo = Topology::new();
+        let face = half_disc(&mut topo, true);
+        let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        let pieces = face_boundary_2d(&topo, face, Point3::new(0.0, 0.0, 0.0), x, y)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert!(matches!(pieces[1], Boundary2::Segment(..)));
+        let inside = |px: f64, py: f64| point_in_region(&pieces, Point2::new(px, py), 1e-9);
+        assert_eq!(inside(0.0, 0.5), Some(true));
+        assert_eq!(inside(0.0, -0.01), Some(false));
     }
 
     /// The region of a face in `z = 0`, read in the plane's own axes.

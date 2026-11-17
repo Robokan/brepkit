@@ -4,6 +4,7 @@
 //! duplicated vertex-lookup and pave-insertion logic.
 
 use brepkit_math::aabb::Aabb3;
+use brepkit_math::madd::Madd;
 use brepkit_math::nurbs::surface::NurbsSurface;
 use brepkit_math::tolerance::Tolerance;
 use brepkit_math::vec::Point3;
@@ -352,13 +353,97 @@ pub(super) fn add_pave_to_edge(arena: &mut GfaArena, topo: &Topology, edge_id: E
     if let Some(pb_ids) = arena.edge_pave_blocks.get(&edge_id) {
         let pb_ids_copy: Vec<_> = pb_ids.clone();
         for pb_id in pb_ids_copy {
-            if arena
-                .pave_blocks
-                .get(pb_id)
-                .is_some_and(|pb| pb.spans_interior(pave.parameter))
-            {
+            if block_spans_interior(topo, arena, pb_id, pave.parameter) {
                 arena.add_extra_pave(topo, pb_id, pave);
             }
         }
     }
+}
+
+/// The foot of `p` on an edge's curve between the parameters `range`, as
+/// its parameter and its distance from `p`.
+///
+/// `ends` are the edge's vertex positions. `samples` are places on that part
+/// of the curve, in order, each with its parameter: the nearest chord
+/// between them gives the start.
+pub(super) fn foot_on_curve(
+    p: Point3,
+    curve: &EdgeCurve,
+    ends: (Point3, Point3),
+    range: (f64, f64),
+    samples: &[(f64, Point3)],
+) -> (f64, f64) {
+    let at = |t: f64| curve.evaluate_with_endpoints(t, ends.0, ends.1);
+    let (lo, hi) = (range.0.min(range.1), range.0.max(range.1));
+    let mut nearest = (f64::INFINITY, lo);
+    for chord in samples.windows(2) {
+        let dir = chord[1].1 - chord[0].1;
+        let len2 = dir.dot(dir);
+        let s = if len2 > 0.0 {
+            ((p - chord[0].1).dot(dir) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let gap2 = (chord[0].1 + dir * s - p).length_squared();
+        if gap2 < nearest.0 {
+            nearest = (gap2, s.madd(chord[1].0 - chord[0].0, chord[0].0));
+        }
+    }
+    let mut t = nearest.1.clamp(lo, hi);
+    let h = (hi - lo) * 1e-7;
+    if h > 0.0 {
+        for _ in 0..20 {
+            let (below, above) = ((t - h).max(lo), (t + h).min(hi));
+            let speed = (at(above) - at(below)) * (1.0 / (above - below));
+            let speed2 = speed.dot(speed);
+            if speed2 <= 0.0 {
+                break;
+            }
+            let next = (t + (p - at(t)).dot(speed) / speed2).clamp(lo, hi);
+            let moved = (next - t).abs();
+            t = next;
+            if moved <= 1e-11 * (hi - lo) {
+                break;
+            }
+        }
+    }
+    (t, (at(t) - p).length())
+}
+
+/// The angular parameter of a closed circle or ellipse edge's seam vertex.
+pub(super) fn closed_seam_parameter(topo: &Topology, edge_id: EdgeId) -> Option<f64> {
+    let edge = topo.edge(edge_id).ok()?;
+    let sp = topo.vertex(edge.start()).ok()?.point();
+    match edge.curve() {
+        EdgeCurve::Circle(c) => Some(c.project(sp)),
+        EdgeCurve::Ellipse(e) => Some(e.project(sp)),
+        EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => None,
+    }
+}
+
+/// Whether `t` lies strictly inside a pave block.
+///
+/// The whole block of a closed circle or ellipse spans the curve's own
+/// period from its angular origin, but the block's two ends are the edge's
+/// one vertex, which sits wherever the seam is. The origin is then a point
+/// inside the block and the seam's parameter is not, so the test runs from
+/// the seam.
+pub(super) fn block_spans_interior(
+    topo: &Topology,
+    arena: &GfaArena,
+    pb_id: crate::ds::PaveBlockId,
+    t: f64,
+) -> bool {
+    use std::f64::consts::TAU;
+    let Some(pb) = arena.pave_blocks.get(pb_id) else {
+        return false;
+    };
+    let (a, b) = pb.parameter_range();
+    let whole_turn = ((b - a).abs() - TAU).abs() < 1e-9
+        && arena.resolve_vertex(pb.start.vertex) == arena.resolve_vertex(pb.end.vertex);
+    if whole_turn && let Some(seam) = closed_seam_parameter(topo, pb.original_edge) {
+        let from_seam = (t - seam).rem_euclid(TAU);
+        return from_seam > 1e-10 && from_seam < TAU - 1e-10;
+    }
+    pb.spans_interior(t)
 }
