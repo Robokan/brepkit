@@ -3663,10 +3663,23 @@ fn split_arc_edges_at_collinear_vertices(
                     amax.z().max(q.z()),
                 );
             }
+            // Every point of the curve lies in one of its pieces' boxes: a
+            // vertex farther than `snap` from all of them is farther from the
+            // curve, and the search below would leave it out. On a long
+            // section through a dense part most candidates are such, each
+            // 80 evaluations of the curve.
+            let pieces = crate::pave_filler::phase_ef::curve_piece_boxes(&curve, sp, ep, t0, t1);
             let mut cuts: Vec<(f64, VertexId)> = Vec::new();
             for ci in grid.box_candidates(amin, amax, snap * 2.0) {
                 let (vid, p) = verts[ci];
                 if (p - sp).length() < snap || (p - ep).length() < snap {
+                    continue;
+                }
+                if pieces.as_ref().is_some_and(|boxes| {
+                    boxes
+                        .iter()
+                        .all(|b| b.distance_squared_to_point(p) > snap * snap)
+                }) {
                     continue;
                 }
                 let mut best_k = 0;

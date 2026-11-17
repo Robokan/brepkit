@@ -89,6 +89,46 @@ fn main() {
                 brepkit_io::step::write_step(&copy, &ids).unwrap_or_else(|e| format!("error {e}"));
             std::fs::write(Path::new(&dir_out).join(format!("{key}.step")), text).unwrap();
         }
+        // VOL=1: the inputs' and the result's volumes and the result's validity.
+        if std::env::var_os("VOL").is_some() {
+            let mut copy = topo.clone();
+            let ids = if a.len() == 1 && b.len() == 1 {
+                boolean_with_options(&mut copy, op, a[0], b[0], opts)
+                    .map(|r| vec![r])
+                    .unwrap_or_default()
+            } else {
+                multi(&mut copy, op, &a, &b, opts)
+            };
+            let vol = |t: &Topology, ids: &[brepkit_topology::solid::SolidId]| -> f64 {
+                ids.iter()
+                    .map(|&s| {
+                        brepkit_operations::measure::solid_volume(
+                            t,
+                            s,
+                            std::env::var("VOLDEF")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(1e-3),
+                        )
+                        .unwrap_or(f64::NAN)
+                    })
+                    .sum()
+            };
+            let valid = ids.iter().all(|&s| {
+                brepkit_operations::validate::validate_solid(&copy, s).is_ok_and(|r| r.is_valid())
+            });
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!(
+                    "{} a {:.4} b {:.4} result {:.4} ({} solids, valid {valid})",
+                    dir.display(),
+                    vol(&topo, &a),
+                    vol(&topo, &b),
+                    vol(&copy, &ids),
+                    ids.len()
+                );
+            }
+        }
         runs.sort_by(f64::total_cmp);
         let median = runs[runs.len() / 2];
         let key = dir.file_name().unwrap().to_string_lossy().into_owned();

@@ -212,6 +212,30 @@ impl SpanIndex {
         found
     }
 
+    /// Whether every point of `surface` lies at least `reach` from `point`:
+    /// no span whose control box comes nearer has a sub-patch box nearer.
+    #[must_use]
+    pub fn clear_of(&self, surface: &NurbsSurface, point: Point3, reach: f64) -> bool {
+        self.spans_within(point, reach)
+            .into_iter()
+            .all(|(i, _)| self.sub_gap(surface, i, point) >= reach)
+    }
+
+    /// Whether no span's control box of this index comes within `margin` of
+    /// one of `other`'s, read against its boxes padded for rounding: then no
+    /// part of either surface's Bezier decomposition does, each part's net
+    /// lying in its span's control box.
+    #[must_use]
+    pub fn boxes_apart(&self, other: &Self, margin: f64) -> bool {
+        let mut near = Vec::new();
+        self.boxes.iter().all(|b| {
+            other
+                .bvh
+                .query_overlap_into(&b.expanded(margin + self.pad), &mut near);
+            near.is_empty()
+        })
+    }
+
     /// Whether every point of `b` lies farther than `reach` from `surface`:
     /// none of the sub-patch boxes of the spans whose boxes come within
     /// `reach` of `b` does.
@@ -224,6 +248,19 @@ impl SpanIndex {
                 self.sub_boxes_of(surface, i)
                     .is_some_and(|boxes| boxes.iter().all(|sub| box_gap(sub, b) > reach))
             })
+    }
+
+    /// A lower bound on the distance from `point` to span `i`: its distance
+    /// to the nearest of the span's sub-patch boxes, which hug the span far
+    /// closer than its control box; 0 where they cannot be made.
+    pub(crate) fn sub_gap(&self, surface: &NurbsSurface, i: usize, point: Point3) -> f64 {
+        self.sub_boxes_of(surface, i).map_or(0.0, |boxes| {
+            boxes
+                .iter()
+                .map(|b| b.distance_squared_to_point(point))
+                .fold(f64::INFINITY, f64::min)
+                .sqrt()
+        })
     }
 
     /// Span `i`'s Bezier net (see [`span_net`]), made the first time it is
@@ -902,5 +939,61 @@ mod tests {
         let index = SpanIndex::new(&s).unwrap();
         let hits = index.line_hits(&s, Point3::new(5.0, 5.0, -5.0), Vec3::new(0.0, 0.0, 1.0));
         assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    /// A surface is clear of a point only where every point of it lies at
+    /// least that far, and is never clear of a point on it.
+    #[test]
+    fn clear_of_only_a_point_the_surface_keeps_away_from() {
+        let s = u_wall();
+        let index = SpanIndex::new(&s).unwrap();
+        for x in -2..=6 {
+            for z in -3..=5 {
+                let p = Point3::new(f64::from(x), 0.5, f64::from(z));
+                let nearest = (0..index.len())
+                    .map(|i| sampled_gap(&s, &index, i, p))
+                    .fold(f64::INFINITY, f64::min);
+                for reach in [0.1, 0.5, 1.0, 2.0] {
+                    if index.clear_of(&s, p, reach) {
+                        assert!(nearest >= reach - 1e-12, "{p:?} at {reach}: {nearest}");
+                    }
+                }
+            }
+        }
+        let on = s.evaluate(0.7, 0.3);
+        assert!(!index.clear_of(&s, on, 1e-9));
+        assert!(index.clear_of(&s, Point3::new(2.0, 0.5, 30.0), 10.0));
+    }
+
+    /// Two surfaces' spans are apart only where the surfaces are.
+    #[test]
+    fn boxes_apart_only_for_surfaces_apart() {
+        let s = bump();
+        let index = SpanIndex::new(&s).unwrap();
+        let moved = |dz: f64| {
+            let cps: Vec<Vec<Point3>> = s
+                .control_points()
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|p| Point3::new(p.x(), p.y(), p.z() + dz))
+                        .collect()
+                })
+                .collect();
+            NurbsSurface::new(
+                3,
+                3,
+                s.knots_u().to_vec(),
+                s.knots_v().to_vec(),
+                cps,
+                s.weights().to_vec(),
+            )
+            .unwrap()
+        };
+        let far = moved(5.0);
+        assert!(index.boxes_apart(SpanIndex::new(&far).as_ref().unwrap(), 1.0));
+        assert!(!index.boxes_apart(SpanIndex::new(&far).as_ref().unwrap(), 4.5));
+        let near = moved(0.5);
+        assert!(!index.boxes_apart(SpanIndex::new(&near).as_ref().unwrap(), 0.0));
     }
 }
