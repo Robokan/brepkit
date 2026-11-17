@@ -1319,34 +1319,42 @@ fn loop_area_in_frame(wire: &[OrientedPCurveEdge], frame: &PlaneFrame) -> f64 {
 /// wire winding the same way (the arrangement traces each region
 /// counter-clockwise, whichever way the face itself winds), no region's
 /// interior inside another's, and their areas summing to the boundary's.
-/// Only outlines of lines and conics are measured exactly, so any NURBS piece
-/// passes unmeasured: an arrangement over a NURBS outline can leave out a
-/// region the boolean discards anyway (a lip's ring coincident with the rim
-/// it is fused onto), and sampled areas cannot tell that from a lost one.
+/// Only outlines of lines and conics are measured exactly, so with any NURBS
+/// piece nothing more is checked: an arrangement over a NURBS outline can
+/// leave out a region the boolean discards anyway (a lip's ring coincident
+/// with the rim it is fused onto), and sampled areas cannot tell that from a
+/// lost one. Where the walker's own loops are broken (`walker_broken`), the
+/// arrangement over a NURBS outline must at least wind one way: two thin
+/// regions traced opposite ways (a crescent between a rim arc and a section
+/// arc whose chords cross) leave the face to the rescues after it. Over sound
+/// walker loops a region read the other way round does not refuse it (a
+/// face split further than the walker split it, its pieces whole).
 fn subfaces_cover_boundary(
     subs: &[SplitSubFace],
     boundary: &[OrientedPCurveEdge],
     frame: &PlaneFrame,
+    walker_broken: bool,
 ) -> bool {
     let nurbs = |w: &[OrientedPCurveEdge]| {
         w.iter()
             .any(|e| matches!(e.curve_3d, EdgeCurve::NurbsCurve(_)))
     };
+    let outers: Vec<f64> = subs
+        .iter()
+        .map(|s| loop_area_in_frame(&s.outer_wire, frame))
+        .collect();
+    let mixed = outers.iter().any(|&a| a > 0.0) && outers.iter().any(|&a| a < 0.0);
     if nurbs(boundary)
         || subs
             .iter()
             .any(|s| nurbs(&s.outer_wire) || s.inner_wires.iter().any(|h| nurbs(h)))
     {
-        return true;
+        return !(walker_broken && mixed);
     }
-    let enclosed = loop_area_in_frame(boundary, frame).abs();
-    let outers: Vec<f64> = subs
-        .iter()
-        .map(|s| loop_area_in_frame(&s.outer_wire, frame))
-        .collect();
-    if outers.iter().any(|&a| a > 0.0) && outers.iter().any(|&a| a < 0.0) {
+    if mixed {
         return false;
     }
+    let enclosed = loop_area_in_frame(boundary, frame).abs();
     let regions: Vec<(Vec<Point2>, Vec<Vec<Point2>>)> = subs
         .iter()
         .map(|s| {
@@ -10032,12 +10040,12 @@ fn split_face_2d_impl(
         // the rim (a keyhole cap inside a disc) leaves the ring around it no
         // cell, and a rim arc whose chord crosses sections (a knuckle's rim
         // past a pin's cap) has its region traced the wrong way round.
+        let walker_broken = wire_loops_self_cross(&loops, tol.linear)
+            || greedy_outer_loops_nested(&loops, cw_loops)
+            || wire_loops_have_degenerate_area(&loops, tol.linear);
         if let Some(result) = arr
-            && (result.len() > loops.len()
-                || wire_loops_self_cross(&loops, tol.linear)
-                || greedy_outer_loops_nested(&loops, cw_loops)
-                || wire_loops_have_degenerate_area(&loops, tol.linear))
-            && subfaces_cover_boundary(&result, boundary, frame)
+            && (result.len() > loops.len() || walker_broken)
+            && subfaces_cover_boundary(&result, boundary, frame, walker_broken)
         {
             if let Some(reg) = split_registry {
                 for (pb_id, pts) in trial_breaks {
@@ -13552,6 +13560,87 @@ mod tests {
             }
         }
         assert!(point_in(5.0, 1e-8, 0).0.is_none());
+    }
+
+    /// Two regions of a square split down its middle, one traced backwards,
+    /// do not tile it, though a straight B-spline runs along the split: the
+    /// winding is read on NURBS outlines too where the walker's own loops are
+    /// broken (a crescent between a rim arc and a section arc whose chords
+    /// cross came back from the arrangement wound against its neighbour, and
+    /// the result's faces disagreed along it).
+    #[test]
+    fn regions_wound_both_ways_do_not_cover_a_nurbs_outline() {
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let frame = PlaneFrame::from_normal_and_point(z, Point3::new(0.0, 0.0, 0.0));
+        let mut topo = Topology::new();
+        let face_id = make_unit_square_face(&mut topo);
+        let p = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        let edge = |from: Point3, to: Point3, nurbs: bool| OrientedPCurveEdge {
+            curve_3d: if nurbs {
+                EdgeCurve::NurbsCurve(
+                    brepkit_math::nurbs::curve::NurbsCurve::new(
+                        1,
+                        vec![0.0, 0.0, 1.0, 1.0],
+                        vec![from, to],
+                        vec![1.0; 2],
+                    )
+                    .unwrap(),
+                )
+            } else {
+                EdgeCurve::Line
+            },
+            pcurve: dummy_pcurve(),
+            start_uv: frame.project(from),
+            end_uv: frame.project(to),
+            start_3d: from,
+            end_3d: to,
+            forward: true,
+            source_edge_idx: None,
+            pave_block_id: None,
+        };
+        let piece = |corners: &[Point3]| SplitSubFace {
+            surface: FaceSurface::Plane { normal: z, d: 0.0 },
+            outer_wire: (0..corners.len())
+                .map(|k| {
+                    let (from, to) = (corners[k], corners[(k + 1) % corners.len()]);
+                    edge(
+                        from,
+                        to,
+                        (from.x() - 1.0).abs() < 1e-12 && (to.x() - 1.0).abs() < 1e-12,
+                    )
+                })
+                .collect(),
+            inner_wires: vec![],
+            reversed: false,
+            parent: face_id,
+            rank: Rank::A,
+            precomputed_interior: None,
+        };
+        let boundary = piece(&[p(0.0, 0.0), p(2.0, 0.0), p(2.0, 1.0), p(0.0, 1.0)]).outer_wire;
+        let left = piece(&[p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)]);
+        let right = piece(&[p(1.0, 0.0), p(2.0, 0.0), p(2.0, 1.0), p(1.0, 1.0)]);
+        let right_backwards = piece(&[p(1.0, 0.0), p(1.0, 1.0), p(2.0, 1.0), p(2.0, 0.0)]);
+        assert!(subfaces_cover_boundary(
+            &[left.clone(), right],
+            &boundary,
+            &frame,
+            true
+        ));
+        // Taken over broken walker loops, regions wound both ways refuse;
+        // over sound ones (the arrangement only splitting further) they do
+        // not.
+        assert!(!subfaces_cover_boundary(
+            &[left.clone(), right_backwards.clone()],
+            &boundary,
+            &frame,
+            true
+        ));
+        assert!(subfaces_cover_boundary(
+            &[left, right_backwards],
+            &boundary,
+            &frame,
+            false
+        ));
     }
 
     /// Rectangles 1 by 1e-6 and 100 by 1e-5 get a point inside them at the

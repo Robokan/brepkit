@@ -4011,6 +4011,16 @@ pub fn separate_arcs_sharing_ends(
         if paths.len() < 2 {
             continue;
         }
+        // Pieces of one face's own loop between the same two points (a
+        // B-spline rim cut short of a turn and the long way round) are no
+        // two curves the merge could weld; their partner elsewhere may be
+        // the rim whole, which the pieces split here would no longer rejoin.
+        let mut owners = group.iter().filter_map(|e| edge_faces.get(e)).flatten();
+        if let Some(first) = owners.next()
+            && owners.all(|f| f == first)
+        {
+            continue;
+        }
         let mut chords: Vec<(Point3, Vec3)> = Vec::new();
         for path in &paths {
             if let Some(&line) = path.iter().find(|&&e| is_line(topo, e)) {
@@ -5522,6 +5532,61 @@ mod tests {
             brepkit_topology::edge::EdgeCurve::Line,
             bulge
         ));
+    }
+
+    /// One face bounded by a B-spline rim cut in two near each other, the
+    /// short piece and the long way round between the same two points: both
+    /// are the face's own, so neither is split (their partner on the face
+    /// beyond can be the rim whole, which split pieces no longer rejoin: a
+    /// cut through such a rim came back with four free edges).
+    #[test]
+    fn a_face_s_own_rim_pieces_are_not_separated() {
+        use brepkit_topology::edge::{Edge, EdgeCurve};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::Wire;
+
+        let arc = |from: f64, to: f64| {
+            let pts: Vec<Point3> = (0..=24)
+                .map(|i| {
+                    let t = (to - from).madd(f64::from(i) / 24.0, from);
+                    Point3::new(t.cos(), t.sin(), 0.0)
+                })
+                .collect();
+            EdgeCurve::NurbsCurve(brepkit_math::nurbs::fitting::interpolate(&pts, 3).unwrap())
+        };
+        let mut topo = Topology::new();
+        let (t0, t1) = (0.0_f64, 0.3_f64);
+        let a = topo.add_vertex(Vertex::new(Point3::new(t0.cos(), t0.sin(), 0.0), 1e-7));
+        let b = topo.add_vertex(Vertex::new(Point3::new(t1.cos(), t1.sin(), 0.0), 1e-7));
+        let short = topo.add_edge(Edge::new(a, b, arc(t0, t1)));
+        let long = topo.add_edge(Edge::new(b, a, arc(t1, std::f64::consts::TAU)));
+        let wire = topo.add_wire(
+            Wire::new(
+                vec![
+                    OrientedEdge::new(short, true),
+                    OrientedEdge::new(long, true),
+                ],
+                true,
+            )
+            .unwrap(),
+        );
+        let disc = topo.add_face(Face::new(
+            wire,
+            vec![],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        let mut face_ids = vec![disc];
+        separate_arcs_sharing_ends(&mut topo, &mut face_ids).unwrap();
+        let edges: Vec<EdgeId> = face_edge_uses(&topo, face_ids[0])
+            .unwrap()
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(edges, vec![short, long]);
     }
 
     /// Two faces each bounded by a chord and a spline that crosses it at its
