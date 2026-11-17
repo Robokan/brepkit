@@ -2250,8 +2250,26 @@ fn nurbs_geom(
         });
         let warm = tried.filter(|q| q.distance <= 64.0 * f64::EPSILON * size.max(1.0));
         let found = warm.or_else(|| {
+            // The search proves its foot nearest to a millionth of the
+            // face's size, and Newton takes it the rest of the way: proved
+            // to 1e-12, a boundary standing off its surface (a file's edges,
+            // 3e-5 off a fitted skin) had every point's foot halved down to
+            // that, most of a boolean's time.
+            let near = 1e-6 * size.max(1.0);
             let searched =
-                brepkit_math::nurbs::projection::project_point_to_surface(surface, p, 1e-12).ok();
+                brepkit_math::nurbs::projection::project_point_to_surface(surface, p, near)
+                    .ok()
+                    .map(|s| {
+                        brepkit_math::nurbs::projection::project_point_to_surface_from(
+                            surface,
+                            p,
+                            (s.u, s.v),
+                            1e-12,
+                        )
+                        .ok()
+                        .filter(|r| r.distance <= s.distance)
+                        .unwrap_or(s)
+                    });
             match (searched, tried) {
                 (Some(s), Some(t)) if t.distance < s.distance => Some(t),
                 (s, t) => s.or(t),
