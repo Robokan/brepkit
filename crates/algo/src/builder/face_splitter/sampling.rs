@@ -235,10 +235,36 @@ pub(super) fn sample_wire_loop_uv_periodic(
                     // fit's band, both ways land within it).
                     let (from, to) = if edge.forward { (t0, tn) } else { (tn, t0) };
                     let (stored, turned) = (shifts(from, to), shifts(to, from));
+                    // Where neither way lands within the band (a fit on a
+                    // B-spline face, whose parameters can run to hundreds),
+                    // the way whose ends land clearly nearer is still the one
+                    // the wire runs: a plane facing against a circle's axis
+                    // has its rim arcs both ways, and a section's reversed
+                    // copy can reach a wire with its pcurve in the wire's
+                    // order.
+                    let misfit = |t_first: f64, t_last: f64| {
+                        let off = |dx: f64, dy: f64| {
+                            let reduce = |x: f64, period: Option<f64>| {
+                                period.map_or(x, |p| x - (x / p).round() * p)
+                            };
+                            reduce(dx, u_period).hypot(reduce(dy, v_period))
+                        };
+                        let (first, last) = (nurbs.evaluate(t_first), nurbs.evaluate(t_last));
+                        off(edge.start_uv.x() - first.x(), edge.start_uv.y() - first.y())
+                            + off(edge.end_uv.x() - last.x(), edge.end_uv.y() - last.y())
+                    };
                     let reads_turned = match (stored.2, turned.2) {
                         (Some(a), Some(b)) => b < a,
                         (None, Some(_)) => true,
-                        _ => false,
+                        (Some(_), None) => false,
+                        (None, None) => {
+                            let (flagged, other) = (misfit(from, to), misfit(to, from));
+                            (edge.end_uv.x() - edge.start_uv.x())
+                                .hypot(edge.end_uv.y() - edge.start_uv.y())
+                                > 1e-9
+                                && flagged > 1e-6
+                                && other < 0.25 * flagged
+                        }
                     };
                     let (from, to, (du, dv, _)) = if reads_turned {
                         (to, from, turned)
