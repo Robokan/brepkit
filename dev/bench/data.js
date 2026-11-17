@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794861493661,
+  "lastUpdate": 1794878523020,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5399,6 +5399,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 21599394,
             "range": "± 162277",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "3630d0d182ed75030970085198d36707e6c0d3aa",
+          "message": "Merge remote-tracking branch 'origin/main'",
+          "timestamp": "2026-11-16T16:40:14-08:00",
+          "tree_id": "a7263491d70cc6fb267a1f775ab09521e7592203",
+          "url": "https://github.com/Robokan/brepkit/commit/3630d0d182ed75030970085198d36707e6c0d3aa"
+        },
+        "date": 1794878522308,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1182051,
+            "range": "± 4813",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1251248,
+            "range": "± 18632",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13313,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 778970,
+            "range": "± 13168",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 27319107,
+            "range": "± 182760",
             "unit": "ns/iter"
           }
         ]
