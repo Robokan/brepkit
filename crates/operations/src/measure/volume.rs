@@ -3083,8 +3083,9 @@ pub fn volume_from_direct_face_tessellation(
     } else {
         solid_centre(topo, solid)
     };
-    let mut total: f64 = 0.0;
-    for fid in brepkit_topology::explorer::solid_faces(topo, solid)? {
+    // Each face's term is worked out on its own (on rayon's pool off wasm)
+    // and the terms are summed in the faces' order, as one loop would.
+    let face_term = |fid: FaceId| -> Result<f64, crate::OperationsError> {
         let face = topo.face(fid)?;
 
         // Use exact analytical volume for analytic surface faces. The
@@ -3102,8 +3103,7 @@ pub fn volume_from_direct_face_tessellation(
             if vol_trace_enabled() {
                 log::debug!("VOL_TRACE holed developable face {fid:?} -> {flux}");
             }
-            total += flux * 6.0;
-            continue;
+            return Ok(flux * 6.0);
         }
         match face.surface() {
             FaceSurface::Cylinder(_) => {
@@ -3111,12 +3111,10 @@ pub fn volume_from_direct_face_tessellation(
                 if vol_trace_enabled() {
                     log::debug!("VOL_TRACE direct cyl face {:?} -> {}", fid, v / 6.0);
                 }
-                total += v;
-                continue;
+                return Ok(v);
             }
             FaceSurface::Cone(_) => {
-                total += analytic_cone_signed_volume(topo, fid, about)? * 6.0;
-                continue;
+                return Ok(analytic_cone_signed_volume(topo, fid, about)? * 6.0);
             }
             FaceSurface::Sphere(_) => {
                 let flux = match sphere_patch_flux(topo, fid, about)? {
@@ -3125,18 +3123,15 @@ pub fn volume_from_direct_face_tessellation(
                 };
                 // Neither closed form fits: the face's own mesh below.
                 if let Some(flux) = flux {
-                    total += flux * 6.0;
-                    continue;
+                    return Ok(flux * 6.0);
                 }
             }
             FaceSurface::Torus(_) => {
-                total += analytic_torus_signed_volume(topo, fid, about)? * 6.0;
-                continue;
+                return Ok(analytic_torus_signed_volume(topo, fid, about)? * 6.0);
             }
             FaceSurface::Plane { .. } => {
                 if let Some(flux) = planar_face_flux(topo, fid, about)? {
-                    total += flux * 6.0;
-                    continue;
+                    return Ok(flux * 6.0);
                 }
             }
             FaceSurface::Nurbs(_) => {}
@@ -3158,11 +3153,29 @@ pub fn volume_from_direct_face_tessellation(
                 tri_count
             );
         }
-        total += face_total;
+        Ok(face_total)
+    };
+    let faces = brepkit_topology::explorer::solid_faces(topo, solid)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let terms: Vec<Result<f64, crate::OperationsError>> = {
+        use rayon::prelude::*;
+        faces.par_iter().map(|&fid| face_term(fid)).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let terms: Vec<Result<f64, crate::OperationsError>> =
+        faces.iter().map(|&fid| face_term(fid)).collect();
+    let mut total: f64 = 0.0;
+    for term in terms {
+        total += term?;
     }
 
     Ok((total / 6.0).abs())
 }
+
+/// A big face's mesh is integrated in chunks of this many triangle
+/// indices (1024 triangles) on rayon's pool.
+#[cfg(not(target_arch = "wasm32"))]
+const TRIANGLE_CHUNK: usize = 3 * 1024;
 
 /// Twice the flux `∫ (P − about)·N dA` of a face over its mesh, the
 /// signed-tetrahedra sum's unit, and the matching first moment: the sum of
@@ -3229,20 +3242,36 @@ fn surface_flux_over_mesh(
             (d.length() <= tol).then_some(d)
         })
         .collect();
-    let mut total = zero;
-    for tri in idx.chunks_exact(3) {
+    // Each triangle's term, worked out on its own: in chunks on rayon's
+    // pool (each with its own evaluator) for a big mesh, and summed in the
+    // triangles' order, as one loop would.
+    let term = |ev: &mut brepkit_math::nurbs::evaluator::SurfaceEvaluator<'_>, tri: &[u32]| {
         let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         let flat = flat_flux(i0, i1, i2);
         let (Some(d0), Some(d1), Some(d2)) = (offsets[i0], offsets[i1], offsets[i2]) else {
-            total = add(total, flat);
-            continue;
+            return flat;
         };
         let corners = [(i0, d0), (i1, d1), (i2, d2)];
-        let on_surface =
-            triangle_flux_on_surface(&mut ev, &wrap, uvs, pos, corners, deflection, about);
-        total = add(total, on_surface.unwrap_or(flat));
+        triangle_flux_on_surface(ev, &wrap, uvs, pos, corners, deflection, about).unwrap_or(flat)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    if idx.len() > TRIANGLE_CHUNK {
+        use rayon::prelude::*;
+        let terms: Vec<Vec<(f64, Vec3)>> = idx
+            .par_chunks(TRIANGLE_CHUNK)
+            .map(|chunk| {
+                let mut ev = s.evaluator();
+                chunk
+                    .chunks_exact(3)
+                    .map(|tri| term(&mut ev, tri))
+                    .collect()
+            })
+            .collect();
+        return terms.into_iter().flatten().fold(zero, add);
     }
-    total
+    idx.chunks_exact(3)
+        .map(|tri| term(&mut ev, tri))
+        .fold(zero, add)
 }
 
 /// Twice the flux and six times the moment's flux (as
