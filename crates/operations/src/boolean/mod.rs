@@ -3799,6 +3799,8 @@ fn planar_face_centroid(topo: &Topology, fid: FaceId) -> Option<Point3> {
 struct ComponentMesh {
     deflection: f64,
     triangles: Vec<[Point3; 3]>,
+    /// The triangles indexed along the ray [`Self::holds`] casts.
+    rays: Option<RayIndex>,
     faces: Vec<std::ops::Range<usize>>,
     min: Point3,
     max: Point3,
@@ -3835,9 +3837,11 @@ impl ComponentMesh {
                 brepkit_math::aabb::Aabb3::from_points(triangles.iter().flatten().copied());
             (bounds.min, bounds.max)
         };
+        let rays = RayIndex::new(&triangles);
         Some(Self {
             deflection,
             triangles,
+            rays,
             faces,
             min,
             max,
@@ -3853,7 +3857,10 @@ impl ComponentMesh {
         within(p.x(), self.min.x(), self.max.x())
             && within(p.y(), self.min.y(), self.max.y())
             && within(p.z(), self.min.z(), self.max.z())
-            && triangles_hold(&self.triangles, p)
+            && self.rays.as_ref().map_or_else(
+                || triangles_hold(&self.triangles, p),
+                |ix| ix.holds(&self.triangles, p),
+            )
     }
 }
 
@@ -3887,7 +3894,8 @@ fn pieces_only_touch(topo: &Topology, pieces: &[Vec<FaceId>]) -> bool {
                 .enumerate()
                 .all(|(j, mesh)| i == j || mesh.as_ref().is_some_and(|m| !m.holds(p)))
         };
-        interior_point_in(topo, piece, &own.triangles, own.bounds).is_some_and(outside_others)
+        interior_point_in(topo, piece, &own.triangles, own.bounds, own.rays.as_ref())
+            .is_some_and(outside_others)
             && face_witnesses(own, clear).is_some_and(|ws| {
                 ws.into_iter().all(|w| {
                     outside_others(w.inside)
@@ -3958,10 +3966,18 @@ fn face_witnesses(mesh: &ComponentMesh, clear: f64) -> Option<Vec<FaceWitness>> 
     Some(out)
 }
 
+/// The direction [`triangles_hold`] casts its ray in: a sqrt-prime
+/// direction cannot lie in a face plane or run along an edge.
+fn hold_ray() -> Option<Vec3> {
+    Vec3::new(2.0_f64.sqrt(), 3.0_f64.sqrt(), 5.0_f64.sqrt())
+        .normalize()
+        .ok()
+}
+
 /// Whether a closed set of triangles holds `p`, by the parity of a ray's
 /// crossings in a direction that cannot lie in a face or run along an edge.
 fn triangles_hold(triangles: &[[Point3; 3]], p: Point3) -> bool {
-    let Ok(dir) = Vec3::new(2.0_f64.sqrt(), 3.0_f64.sqrt(), 5.0_f64.sqrt()).normalize() else {
+    let Some(dir) = hold_ray() else {
         return false;
     };
     triangles
@@ -3973,6 +3989,124 @@ fn triangles_hold(triangles: &[[Point3; 3]], p: Point3) -> bool {
         .count()
         % 2
         == 1
+}
+
+/// Triangles indexed for [`triangles_hold`]'s ray: each by its box seen along
+/// the ray, in a grid of cells across it. A triangle the ray meets holds the
+/// point where it does, which lies on the ray, so seen along it, at the
+/// ray's start: only the triangles whose boxes reach the cell holding that
+/// are read, and the parity is the same.
+struct RayIndex {
+    across: [Vec3; 2],
+    /// The grid's corner, its cells' size and how many there are each way.
+    origin: [f64; 2],
+    cell: [f64; 2],
+    cells: [usize; 2],
+    /// The triangles whose boxes reach each cell, row by row.
+    grid: Vec<Vec<u32>>,
+    /// Padding for rounding, a share of the triangles' largest coordinate.
+    pad: f64,
+}
+
+impl RayIndex {
+    fn new(triangles: &[[Point3; 3]]) -> Option<Self> {
+        let dir = hold_ray()?;
+        let first = dir.cross(Vec3::new(0.0, 0.0, 1.0)).normalize().ok()?;
+        let across = [first, dir.cross(first)];
+        let largest = triangles
+            .iter()
+            .flatten()
+            .flat_map(|p| [p.x(), p.y(), p.z()])
+            .fold(0.0_f64, |m, c| m.max(c.abs()));
+        let pad = 1e-9 * largest.max(1.0);
+        let flat = |p: Point3| {
+            let v = Vec3::new(p.x(), p.y(), p.z());
+            [v.dot(across[0]), v.dot(across[1])]
+        };
+        let boxes: Vec<[f64; 4]> = triangles
+            .iter()
+            .map(|t| {
+                let q = t.map(flat);
+                let lo = |k: usize| q[0][k].min(q[1][k]).min(q[2][k]) - pad;
+                let hi = |k: usize| q[0][k].max(q[1][k]).max(q[2][k]) + pad;
+                [lo(0), lo(1), hi(0), hi(1)]
+            })
+            .collect();
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for b in &boxes {
+            for k in 0..2 {
+                lo[k] = lo[k].min(b[k]);
+                hi[k] = hi[k].max(b[k + 2]);
+            }
+        }
+        if !(lo[0].is_finite() && lo[1].is_finite() && hi[0].is_finite() && hi[1].is_finite()) {
+            return None;
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let side = ((boxes.len() as f64 / 2.0).sqrt().ceil() as usize).clamp(1, 512);
+        let cells = [side, side];
+        #[allow(clippy::cast_precision_loss)]
+        let cell = [
+            ((hi[0] - lo[0]) / side as f64).max(f64::MIN_POSITIVE),
+            ((hi[1] - lo[1]) / side as f64).max(f64::MIN_POSITIVE),
+        ];
+        let mut index = Self {
+            across,
+            origin: lo,
+            cell,
+            cells,
+            grid: vec![Vec::new(); side * side],
+            pad,
+        };
+        for (i, b) in boxes.iter().enumerate() {
+            let (x0, y0) = (index.slot(b[0], 0), index.slot(b[1], 1));
+            let (x1, y1) = (index.slot(b[2], 0), index.slot(b[3], 1));
+            #[allow(clippy::cast_possible_truncation)]
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    index.grid[y * side + x].push(i as u32);
+                }
+            }
+        }
+        Some(index)
+    }
+
+    /// The cell holding coordinate `c` along way `k`, clamped to the grid.
+    fn slot(&self, c: f64, k: usize) -> usize {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let s = ((c - self.origin[k]) / self.cell[k]).floor().max(0.0) as usize;
+        s.min(self.cells[k] - 1)
+    }
+
+    /// [`triangles_hold`] on `triangles`, the set this index was made from.
+    fn holds(&self, triangles: &[[Point3; 3]], p: Point3) -> bool {
+        let Some(dir) = hold_ray() else {
+            return false;
+        };
+        let v = Vec3::new(p.x(), p.y(), p.z());
+        let at = [v.dot(self.across[0]), v.dot(self.across[1])];
+        let outside = (0..2).any(|k| {
+            at[k] < self.origin[k] - self.pad
+                || at[k] > self.origin[k] + self.cell[k] * self.cells[k] as f64 + self.pad
+        });
+        if outside {
+            return false;
+        }
+        self.grid[self.slot(at[1], 1) * self.cells[0] + self.slot(at[0], 0)]
+            .iter()
+            .filter(|&&i| {
+                let [a, b, c] = triangles[i as usize];
+                brepkit_math::ray_triangle::watertight_ray_triangle_intersect(p, dir, a, b, c)
+                    .is_some_and(|hit| hit.t > 1e-9)
+            })
+            .count()
+            % 2
+            == 1
+    }
 }
 
 /// A point inside a face component: its box centre when the component holds
@@ -3998,7 +4132,7 @@ fn component_interior_point(topo: &Topology, comp: &[FaceId]) -> Option<Point3> 
             ]);
         }
     }
-    interior_point_in(topo, comp, &triangles, bounds)
+    interior_point_in(topo, comp, &triangles, bounds, None)
 }
 
 /// How finely a face component is meshed to read which points it holds: a
@@ -4009,11 +4143,13 @@ fn component_deflection(min: Point3, max: Point3) -> f64 {
 
 /// [`component_interior_point`] on the component's mesh already made at
 /// [`component_deflection`] of its box `bounds`.
+/// `rays` is that mesh's [`RayIndex`] where the caller has one.
 fn interior_point_in(
     topo: &Topology,
     comp: &[FaceId],
     triangles: &[[Point3; 3]],
     (min, max): (Point3, Point3),
+    rays: Option<&RayIndex>,
 ) -> Option<Point3> {
     let centre = Point3::new(
         (min.x() + max.x()) * 0.5,
@@ -4022,7 +4158,16 @@ fn interior_point_in(
     );
     let extent = (max - min).length();
     // A sqrt-prime direction cannot lie in a face plane or run along an edge.
-    let holds = |p: Point3| triangles_hold(triangles, p);
+    // The component's own index where the caller has one.
+    let built;
+    let index = if let Some(index) = rays {
+        Some(index)
+    } else {
+        built = RayIndex::new(triangles);
+        built.as_ref()
+    };
+    let holds =
+        |p: Point3| index.map_or_else(|| triangles_hold(triangles, p), |ix| ix.holds(triangles, p));
     if holds(centre) {
         return Some(centre);
     }
