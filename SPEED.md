@@ -163,6 +163,19 @@ instead of recomputed) are the safe kind.
   the flamegraph recipe (`[profile.profiling]` in `Cargo.toml` keeps
   symbols), the criterion benches in `crates/operations/benches/` and the
   perf bugs this code has had before.
+- **The speed agent's own tools:** `buzzcad-corpus/tools/speed/` (its
+  `README.md` says what each does). `export_slow.py` exports the booleans
+  that lose most time to Open CASCADE in a replay as `corpus_bench` case
+  folders, and `export_keys.py` named cases; `ab.sh` and `ident.sh` time two
+  builds on the same case sets and compare their results byte for byte (a
+  speedup must change no result); `prof.sh` samples a run's stacks with gdb
+  (no `perf` on these machines) and `rank.py` ranks brepkit's frames;
+  `recheck.sh` replays a list of cases one at a time at 300 s. The case sets
+  they time, `~/sparkpack/speed-corpus/losers-*` and `bench`, are private
+  parts exported from the corpus and live outside the repositories: on a
+  new machine, export them again. Give each worktree its own
+  `CARGO_TARGET_DIR`: cargo reads a worktree's build as fresh in another
+  tree sharing the folder, and the tests then run a mix of both.
 - **One machine.** Compare times only between runs on the same machine
   with nothing else heavy running. On Linux, BuzzCAD's bridge is built for
   x86-64-v3 (`source/brepkit_py/.cargo/config.toml`): brepkit's `mul_add`
