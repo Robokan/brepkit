@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794878523020,
+  "lastUpdate": 1794878944529,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5453,6 +5453,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 27319107,
             "range": "± 182760",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Robokan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "c919c69ea9f73a7bb0206fa7603fa6899ff80e53",
+          "message": "Merge remote-tracking branch 'origin/main'",
+          "timestamp": "2026-11-16T17:24:22-08:00",
+          "tree_id": "5321428d050ee263f0cbaaa1857360208f49d3e5",
+          "url": "https://github.com/Robokan/brepkit/commit/c919c69ea9f73a7bb0206fa7603fa6899ff80e53"
+        },
+        "date": 1794878944011,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 942287,
+            "range": "± 6769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 998432,
+            "range": "± 1441",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11549,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 611053,
+            "range": "± 58832",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 21007529,
+            "range": "± 228874",
             "unit": "ns/iter"
           }
         ]
