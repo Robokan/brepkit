@@ -715,11 +715,53 @@ fn main() {
             if std::env::var("FACES").is_ok() {
                 for f in solid_faces(&topo, r.solid).unwrap() {
                     let area = brepkit_operations::measure::face_area(&topo, f, 1e-3);
+                    // The outer wire's signed area in the surface's (u, v),
+                    // unwrapped step by step, from points along its edges.
+                    let face = topo.face(f).unwrap();
+                    let surface = face.surface();
+                    let mut uv: Vec<(f64, f64)> = Vec::new();
+                    for oe in topo.wire(face.outer_wire()).unwrap().edges() {
+                        let e = topo.edge(oe.edge()).unwrap();
+                        let (a, b) = (
+                            topo.vertex(e.start()).unwrap().point(),
+                            topo.vertex(e.end()).unwrap().point(),
+                        );
+                        let (t0, t1) = e.curve().domain_with_endpoints(a, b);
+                        for k in 0..16 {
+                            let f = f64::from(k) / 16.0;
+                            let f = if oe.is_forward() { f } else { 1.0 - f };
+                            let p = e.curve().evaluate_with_endpoints(t0 + (t1 - t0) * f, a, b);
+                            if let Some(q) = surface.project_point(p) {
+                                uv.push(q);
+                            }
+                        }
+                    }
+                    let tau = std::f64::consts::TAU;
+                    let mut flat = Vec::with_capacity(uv.len());
+                    for &(u, v) in &uv {
+                        let (u, v) = match flat.last() {
+                            Some(&(pu, pv)) => {
+                                let near = |x: f64, p: f64| x - tau * ((x - p) / tau).round();
+                                (near(u, pu), near(v, pv))
+                            }
+                            None => (u, v),
+                        };
+                        flat.push((u, v));
+                    }
+                    let signed: f64 = (0..flat.len())
+                        .map(|i| {
+                            let (a, b) = (flat[i], flat[(i + 1) % flat.len()]);
+                            a.0 * b.1 - b.0 * a.1
+                        })
+                        .sum::<f64>()
+                        / 2.0;
                     println!(
-                        "   face {} {}: area {:?}",
+                        "   face {} {}: area {:?} reversed {} uv winding {:.4}",
                         f.index(),
-                        topo.face(f).unwrap().surface().type_tag(),
-                        area.map(|a| (a * 1000.0).round() / 1000.0)
+                        surface.type_tag(),
+                        area.map(|a| (a * 1000.0).round() / 1000.0),
+                        face.is_reversed(),
+                        signed
                     );
                 }
                 return;
