@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795030961309,
+  "lastUpdate": 1795036384176,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5993,6 +5993,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 21463372,
             "range": "± 548665",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "30cc0128fc78af5de81236c0ef10dd8b1b57834f",
+          "message": "fix(blend): cut out the crossing of a round's contact past a tight tip\n\nA round a little wider than the bend at its outline's tip cannot roll\nround the tip: its contact on the plane runs back past it, loops and\ncrosses itself. It was refused (\"turns back on itself\").\n\nThe crossing is cut out. The two sections through the crossing point,\npinned by a Newton solve on the walker, bound the cut: both are arcs of\none ball, centred where the ball's path crosses itself. Between them the\ncontact on the plane stands still at the crossing point, the contact on\nthe wall runs on as walked, and each section is the arc from the point\nto the wall contact, tangent to the wall there. The band is three\ninterpolated pieces joined C0. The run-on check reads each piece apart,\nand the residual check skips tangency where a contact stands still.\n\nThe repro tool gains FACES (each face's area) and FLIPFACE takes a list.\n\nTest `fillet_round_past_a_tip.rs`: a B-spline nose bending 22.5,\nrounded at r 21 to 26, the removed volume against its rate below the\nbend; refused without the change.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-18T13:09:03-08:00",
+          "tree_id": "7413cd1ac0669a4148a7699854e647569aeadfb3",
+          "url": "https://github.com/Robokan/brepkit/commit/30cc0128fc78af5de81236c0ef10dd8b1b57834f"
+        },
+        "date": 1795036383223,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1175060,
+            "range": "± 2972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1244693,
+            "range": "± 3723",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13653,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 768938,
+            "range": "± 2326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 27039955,
+            "range": "± 406682",
             "unit": "ns/iter"
           }
         ]
