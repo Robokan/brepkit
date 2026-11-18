@@ -53,3 +53,4 @@ tarpaulin-report.html
 ISSUES-*.md
 ROADMAP.md
 .claude/scheduled_tasks.lock
+/target-*/
