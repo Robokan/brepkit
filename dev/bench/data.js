@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795040619507,
+  "lastUpdate": 1795043752608,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -6155,6 +6155,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 18850587,
             "range": "± 21436",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "a6572fa8d75d6fdd95ad3ae3711b80efe0176765",
+          "message": "docs(buzzcad): the spindle torus read-back and the held 4.11.32 merge; corpus_fillet FACES checks orientation\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-18T15:11:40-08:00",
+          "tree_id": "b2ce7d628864b54fee837a1d5115a80033bb076e",
+          "url": "https://github.com/Robokan/brepkit/commit/a6572fa8d75d6fdd95ad3ae3711b80efe0176765"
+        },
+        "date": 1795043752094,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1174638,
+            "range": "± 18352",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1256787,
+            "range": "± 39240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12470,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 786556,
+            "range": "± 8669",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 25232575,
+            "range": "± 69101",
             "unit": "ns/iter"
           }
         ]
