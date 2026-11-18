@@ -4990,6 +4990,17 @@ fn edge_distance(
     point: Point3,
     onto: Option<&FaceSurface>,
 ) -> Result<f64, BlendError> {
+    edge_nearest(topo, edge_id, point, onto).map(|(distance, _)| distance)
+}
+
+/// `point`'s distance from an edge, or from its trace on `onto`, as
+/// [`edge_distance`], with the point of the edge (or its trace) nearest it.
+fn edge_nearest(
+    topo: &Topology,
+    edge_id: EdgeId,
+    point: Point3,
+    onto: Option<&FaceSurface>,
+) -> Result<(f64, Point3), BlendError> {
     const SAMPLES: usize = 64;
     let edge = topo.edge(edge_id)?;
     let (a, b) = (
@@ -5012,12 +5023,13 @@ fn edge_distance(
                 .unwrap_or(on),
             None => on,
         };
-        (on - point).length()
+        ((on - point).length(), on)
     };
+    let dist = |t: f64| at(t).0;
     #[allow(clippy::cast_precision_loss)]
     let param = |k: usize| t0 + (t1 - t0) * (k as f64) / (SAMPLES as f64);
     let nearest = (0..=SAMPLES)
-        .min_by(|&i, &j| at(param(i)).total_cmp(&at(param(j))))
+        .min_by(|&i, &j| dist(param(i)).total_cmp(&dist(param(j))))
         .unwrap_or(0);
     // Golden-section refinement between the nearest sample's neighbours.
     let (mut lo, mut hi) = (
@@ -5027,7 +5039,7 @@ fn edge_distance(
     let ratio = 0.5 * (5.0_f64.sqrt() - 1.0);
     for _ in 0..80 {
         let (x1, x2) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
-        if at(x1) <= at(x2) {
+        if dist(x1) <= dist(x2) {
             hi = x2;
         } else {
             lo = x1;
@@ -5918,6 +5930,10 @@ struct WalkedEnd {
     /// on (the walls meeting the cap in concave edges), whose outward side
     /// is the round's own.
     past: f64,
+    /// Where the round swallowed a narrow side face: which contact (0 or 1)
+    /// is pivoted on the face's far edge, and that edge's corner on the cap,
+    /// where that contact ends.
+    pivot: Option<(usize, Point3)>,
 }
 
 impl WalkedEnd {
@@ -5944,9 +5960,38 @@ fn walked_end(
     let [cap] = fan.as_slice() else {
         return Ok(None);
     };
-    let corner_edges = cap_corner_edges(topo, *cap, junction.vertex)?;
+    let mut corner_edges = cap_corner_edges(topo, *cap, junction.vertex)?;
     if corner_edges.len() != 2 {
         return Ok(None);
+    }
+    let mut pivot = None;
+    // A round that swallowed a narrow side face (`swallow_narrow_face`)
+    // rests its pivoted contact on the face beyond, so that contact ends on
+    // the cap's edges at the swallowed face's far corner: the other end of
+    // the cap edge the swallowed face shares with the cap.
+    for side in [contour.side1, contour.side2] {
+        if side == stripe.face1 || side == stripe.face2 {
+            continue;
+        }
+        let Some(&shared) = corner_edges
+            .iter()
+            .find(|&&edge| topo.faces_of_edge(edge).contains(&side))
+        else {
+            continue;
+        };
+        let edge = topo.edge(shared)?;
+        let far = if edge.start() == junction.vertex {
+            edge.end()
+        } else {
+            edge.start()
+        };
+        for extra in cap_corner_edges(topo, *cap, far)? {
+            if !corner_edges.contains(&extra) {
+                corner_edges.push(extra);
+            }
+        }
+        let pivoted = usize::from(stripe.face1 == contour.side1 || stripe.face1 == contour.side2);
+        pivot = Some((pivoted, topo.vertex(far)?.point()));
     }
     let run_on = outward_plane(topo, *cap)?.map_or(RunOnCap::Face(*cap), |(normal, d)| {
         RunOnCap::Plane(normal, d)
@@ -5982,6 +6027,7 @@ fn walked_end(
         section: section.clone(),
         tol,
         past: -towards_round.signum(),
+        pivot,
     }))
 }
 
@@ -6168,15 +6214,63 @@ fn walked_run_back(
         end,
         ref section,
         tol,
+        pivot,
         ..
     } = walked;
+    // A contact on a side face ends on the cap's corner edge with that face.
+    // A round that swallowed a narrow face has its sections pivoted and its
+    // contact on the wall refitted through them: it ends on its corner edge
+    // within as far as the edge stands off the face (a B-spline skin's edge
+    // stands off it), and that fit. Any other round's walked contact ends on
+    // it within the walk's own tolerance; one missing it by more is left to
+    // the runout.
+    let sides = [contour.side1, contour.side2]
+        .map(|side| topo.face(side).map(|f| f.surface().clone()))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut slack: f64 = 0.0;
+    for &edge_id in corner_edges {
+        let edge = topo.edge(edge_id)?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let off = sides
+            .iter()
+            .map(|surface| edge_off_surface(edge.curve(), a, b, surface))
+            .fold(f64::INFINITY, f64::min);
+        if off.is_finite() {
+            slack = slack.max(off);
+        }
+    }
+    let corner_tol = if pivot.is_some() {
+        tol.max(1e-5 + slack)
+    } else {
+        tol
+    };
     let mut contacts = Vec::with_capacity(2);
     let mut cut = false;
-    for (contact, at) in [
+    for (index, (contact, at)) in [
         (&stripe.contact1, section.p1),
         (&stripe.contact2, section.p2),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (near, far, at_end) = contact_ends(contact, at);
+        // The contact pivoted on a swallowed face's far edge runs along that
+        // edge, so it ends where the edge does, at its corner on the cap.
+        if let Some((_, corner)) = pivot.filter(|&(pivoted, _)| pivoted == index) {
+            let Some(piece) =
+                pivoted_contact_to_corner(contact, near, far, at_end, corner, section.radius)?
+            else {
+                log::debug!("walked_run_back: pivoted contact misses its corner");
+                return Ok(None);
+            };
+            cut |= (contact.evaluate(near) - corner).length() > tol;
+            contacts.push((piece, corner));
+            continue;
+        }
         let Some(beyond) = offset(contact.evaluate(near)) else {
             return Ok(None);
         };
@@ -6217,20 +6311,26 @@ fn walked_run_back(
             f64::midpoint(outside, inside)
         };
         let reached = contact.evaluate(crossing);
-        let mut on_corner = false;
+        // The contact ends on the corner edge it reaches: within the
+        // tolerance it may miss the edge by, it is ended on the edge itself,
+        // where the trim splits the edge.
+        let mut corner = None;
         for &edge in corner_edges {
-            on_corner |= point_on_edge(topo, edge, reached, tol)?;
+            let (distance, on) = edge_nearest(topo, edge, reached, None)?;
+            if distance <= corner_tol && corner.is_none_or(|(best, _)| distance < best) {
+                corner = Some((distance, on));
+            }
         }
-        if !on_corner {
+        let Some((_, on)) = corner else {
             return Ok(None);
-        }
+        };
         let piece = if at_near {
             contact.clone()
         } else {
             let (left, right) = brepkit_math::nurbs::knot_ops::curve_split(contact, crossing)?;
             if at_end { left } else { right }
         };
-        contacts.push((piece, reached));
+        contacts.push((pin_contact_end(&piece, at_end, on)?, on));
     }
     if !cut {
         return Ok(None);
@@ -6247,6 +6347,56 @@ fn walked_run_back(
         centre: section.center,
         cap: run_on,
     }))
+}
+
+/// A contact pivoted on a swallowed face's far edge, cut where it passes the
+/// edge's `corner` on the cap and ended exactly there: `near` is its end at
+/// the cap and `far` its other end (`at_end` when `near` is the curve's own
+/// end). `None` where it passes farther from the corner than its fit could
+/// stray (a thousandth of the round's radius).
+fn pivoted_contact_to_corner(
+    contact: &brepkit_math::nurbs::curve::NurbsCurve,
+    near: f64,
+    far: f64,
+    at_end: bool,
+    corner: Point3,
+    radius: f64,
+) -> Result<Option<brepkit_math::nurbs::curve::NurbsCurve>, BlendError> {
+    let reach = 1e-3 * radius.abs().max(1e-9);
+    // The corner may lie past the contact's end (the contact carried on
+    // stopped short of it by its fit) or inside it.
+    let found = brepkit_math::nurbs::projection::project_point_to_curve(contact, corner, 1e-12)?;
+    if found.distance > reach {
+        return Ok(None);
+    }
+    let (low, high) = (near.min(far), near.max(far));
+    let inside =
+        found.parameter > low + 1e-9 * (high - low) && found.parameter < high - 1e-9 * (high - low);
+    let piece = if inside {
+        let (left, right) = brepkit_math::nurbs::knot_ops::curve_split(contact, found.parameter)?;
+        if at_end { left } else { right }
+    } else {
+        contact.clone()
+    };
+    Ok(Some(pin_contact_end(&piece, at_end, corner)?))
+}
+
+/// `contact` with its end at the cap (its last end with `at_end`, else its
+/// first) moved on to `point`, the end being a control point of the curve.
+fn pin_contact_end(
+    contact: &brepkit_math::nurbs::curve::NurbsCurve,
+    at_end: bool,
+    point: Point3,
+) -> Result<brepkit_math::nurbs::curve::NurbsCurve, BlendError> {
+    let mut points = contact.control_points().to_vec();
+    let slot = if at_end { points.len() - 1 } else { 0 };
+    points[slot] = point;
+    Ok(brepkit_math::nurbs::curve::NurbsCurve::new(
+        contact.degree(),
+        contact.knots().to_vec(),
+        points,
+        contact.weights().to_vec(),
+    )?)
 }
 
 /// The curve where a walked band meets its cap between the contact ends `a`
@@ -7815,7 +7965,10 @@ fn check_stripe_residuals(topo: &Topology, stripe: &Stripe) -> Result<(), BlendE
     let ps2 = surface_ref_or_adapter(&surface2, &mut adapter2);
     // A side whose face the spine does not run along is a face beyond a
     // narrow face the round swallowed: the ball pivots on its rim there
-    // (`pivot_on_far_loop`), and is not tangent to it.
+    // (`pivot_on_far_loop`), and is not tangent to it. Its contact is the
+    // rim itself, carried straight on past the rim's ends where the round
+    // runs on to a tilted cap: off the face's surface there, until the cap
+    // cuts it back to the rim's end (`walked_run_back`).
     let along = |face_id: FaceId| -> Result<bool, BlendError> {
         let Some(&edge) = stripe.spine_edges().first() else {
             return Ok(true);
@@ -7832,12 +7985,32 @@ fn check_stripe_residuals(topo: &Topology, stripe: &Stripe) -> Result<(), BlendE
     let mut max_contact: f64 = 0.0;
     let mut max_radius: f64 = 0.0;
     let mut max_tangent: f64 = 0.0;
-    for section in &stripe.sections {
+    // With the ball pivoted on a swallowed face's rim, a round ending on a
+    // tilted cap can end with its wall contact past the cap, beyond the edge
+    // of the wall's spline surface, where it cannot be read: the cap cuts
+    // the contact back inside it (`walked_run_back`).
+    let pivoted = !(tangent1 && tangent2);
+    let past_spline = |surface: &FaceSurface, (u, v): (f64, f64)| -> bool {
+        let FaceSurface::Nurbs(spline) = surface else {
+            return false;
+        };
+        let on = |x: f64, (low, high): (f64, f64)| {
+            let slack = 1e-12 * (high - low).abs().max(1.0);
+            (x - low).abs() <= slack || (x - high).abs() <= slack
+        };
+        on(u, spline.domain_u()) || on(v, spline.domain_v())
+    };
+    let last = stripe.sections.len().saturating_sub(1);
+    for (index, section) in stripe.sections.iter().enumerate() {
         let uv1 = ps1.project_point(section.p1);
         let uv2 = ps2.project_point(section.p2);
-        max_contact = max_contact
-            .max((ps1.evaluate(uv1.0, uv1.1) - section.p1).length())
-            .max((ps2.evaluate(uv2.0, uv2.1) - section.p2).length());
+        let at_end = pivoted && (index == 0 || index == last);
+        if tangent1 && !(at_end && past_spline(&surface1, uv1)) {
+            max_contact = max_contact.max((ps1.evaluate(uv1.0, uv1.1) - section.p1).length());
+        }
+        if tangent2 && !(at_end && past_spline(&surface2, uv2)) {
+            max_contact = max_contact.max((ps2.evaluate(uv2.0, uv2.1) - section.p2).length());
+        }
         max_radius = max_radius
             .max(((section.center - section.p1).length() - section.radius).abs())
             .max(((section.center - section.p2).length() - section.radius).abs());
@@ -8147,7 +8320,7 @@ fn compute_stripe_for_spine(
     let config = WalkerConfig::default();
 
     let closed = spine.is_closed();
-    let (walk_result, beyond) = if let RadiusLaw::Constant(r) = law {
+    let (walk_result, mut beyond) = if let RadiusLaw::Constant(r) = law {
         let blend = ConstRadBlend { radius: *r };
         let walker = Walker::new(&blend, ps1, ps2, &spine, topo, config);
         let start = walker.find_start(0.0)?;
@@ -8189,8 +8362,15 @@ fn compute_stripe_for_spine(
         // pivot keeps both contacts on their faces.
         let mut pivoted = None;
         for found in candidates {
-            let Some(sections) =
-                pivot_on_far_loop(topo, &found, ps1, ps2, law, &walk_result.sections)?
+            let Some(sections) = pivot_on_far_loop(
+                topo,
+                &found,
+                ps1,
+                ps2,
+                law,
+                &walk_result.sections,
+                walk_result.sections.len(),
+            )?
             else {
                 continue;
             };
@@ -8199,16 +8379,37 @@ fn compute_stripe_for_spine(
             } else {
                 (face1, found.beyond)
             };
-            if check_contacts_on_faces(topo, on1, on2, &sections).is_ok() {
+            // An open round's end sections may pivot past the far run's
+            // ends, on to its extension, where an end face leans across
+            // them: the end face cuts them back (`walked_run_back`). The
+            // sections between must keep both contacts on their faces.
+            let inner = if spine.is_closed() || sections.len() < 3 {
+                &sections[..]
+            } else {
+                &sections[1..sections.len() - 1]
+            };
+            if check_contacts_on_faces(topo, on1, on2, inner).is_ok() {
                 pivoted = Some((found, sections));
                 break;
             }
         }
-        let Some((found, sections)) = pivoted else {
-            return Err(error);
-        };
-        walk_result.sections = sections;
-        Some(found)
+        // An open round none of whose candidates pivots is left as walked,
+        // as one with no candidate is.
+        match pivoted {
+            Some((found, sections)) => {
+                walk_result.sections = sections;
+                // The sections the ball rolls through past the spine's ends,
+                // which carry the round on to a tilted cap, pivot on the far
+                // run too.
+                for past in &mut beyond {
+                    *past = pivot_on_far_loop(topo, &found, ps1, ps2, law, past, 0)?
+                        .unwrap_or_default();
+                }
+                Some(found)
+            }
+            None if spine.is_closed() => return Err(error),
+            None => None,
+        }
     } else {
         None
     };
@@ -8312,7 +8513,7 @@ fn swallow_narrow_face(
             })
             .collect::<Result<_, _>>()?;
         let rim_loop = |edges: &[EdgeId]| edges.iter().all(|e| spine_edges.contains(e));
-        let far: Vec<EdgeId> = if face.surface().is_planar() && !spine.is_closed() {
+        let far: Vec<EdgeId> = if !spine.is_closed() {
             // An open round of a narrow band's edge (a ledge between two
             // coaxial walls, cut through by a plane the round ends on): the
             // band's one loop runs along the rim, out along an end edge in
@@ -8458,10 +8659,11 @@ fn swallow_narrow_face(
     Ok(found)
 }
 
-/// The far run of a narrow plane band an open round's spine runs along:
-/// `wire` (the band's one loop) is the spine's edges, one edge at each of
-/// the spine's ends lying in that end's section plane, and the rest, its
-/// far rim. `None` when the loop is not that.
+/// The far run of a narrow band an open round's spine runs along: `wire`
+/// (the band's one loop) is the spine's edges, one straight edge out from
+/// each of the spine's ends (in that end's section plane, or leaning across
+/// it where the end face is tilted to the round), and the rest, its far
+/// rim. `None` when the loop is not that.
 fn open_band_far_run(
     topo: &Topology,
     spine: &Spine,
@@ -8472,15 +8674,9 @@ fn open_band_far_run(
         return Ok(None);
     }
     let length = spine.length();
-    let ends = [
-        (spine.evaluate(topo, 0.0)?, spine.tangent(topo, 0.0)?),
-        (spine.evaluate(topo, length)?, spine.tangent(topo, length)?),
-    ];
+    let ends = [spine.evaluate(topo, 0.0)?, spine.evaluate(topo, length)?];
     let size = length.max(1e-9);
-    let at_end = |p: Point3| {
-        ends.iter()
-            .position(|(q, _)| (p - *q).length() < 1e-6 * size)
-    };
+    let at_end = |p: Point3| ends.iter().position(|q| (p - *q).length() < 1e-6 * size);
     let mut far = Vec::new();
     let mut end_edges = [false; 2];
     for &edge_id in wire {
@@ -8492,26 +8688,19 @@ fn open_band_far_run(
             topo.vertex(edge.start())?.point(),
             topo.vertex(edge.end())?.point(),
         );
-        let (end, other) = match (at_end(a), at_end(b)) {
-            (Some(end), None) => (end, b),
-            (None, Some(end)) => (end, a),
+        let end = match (at_end(a), at_end(b)) {
+            (Some(end), None) | (None, Some(end)) => end,
             (None, None) => {
                 far.push(edge_id);
                 continue;
             }
             (Some(_), Some(_)) => return Ok(None),
         };
-        // The end edge is straight and lies in the end's section plane, so
-        // the band's end section closes the end face where it was.
-        let (point, tangent) = ends[end];
-        let run = other - point;
-        let Ok(tangent) = tangent.normalize() else {
-            return Ok(None);
-        };
-        if !matches!(edge.curve(), EdgeCurve::Line)
-            || end_edges[end]
-            || run.dot(tangent).abs() > 1e-6 * run.length().max(1e-9)
-        {
+        // The end edge is straight: in the end's section plane the band's
+        // end section closes the end face where it was; leaning across it
+        // (an end face tilted to the round), the end face cuts the band
+        // back (`walked_run_back`).
+        if !matches!(edge.curve(), EdgeCurve::Line) || end_edges[end] {
             return Ok(None);
         }
         end_edges[end] = true;
@@ -8531,6 +8720,7 @@ fn pivot_on_far_loop(
     ps2: &dyn brepkit_math::traits::ParametricSurface,
     law: &RadiusLaw,
     sections: &[crate::section::CircSection],
+    required: usize,
 ) -> Result<Option<Vec<crate::section::CircSection>>, BlendError> {
     const SAMPLES: usize = 128;
     let RadiusLaw::Constant(radius) = law else {
@@ -8564,9 +8754,61 @@ fn pivot_on_far_loop(
     let beyond_surface = topo.face(found.beyond)?.surface().clone();
     let mut beyond_adapter = None;
     let beyond_surface = surface_ref_or_adapter(&beyond_surface, &mut beyond_adapter);
-    let at = |&(edge_id, _, _): &(EdgeId, f64, f64), t: f64| at(edge_id, t);
-    let pieces: Vec<((EdgeId, f64, f64), f64, f64)> =
-        rim.iter().map(|&piece| (piece, piece.1, piece.2)).collect();
+    // An open round's far run ends on the end faces, which may lean across
+    // the round's end sections: the last section's plane can pass beyond
+    // the run's end. The run is carried on straight past each free end, a
+    // few radii along its tangent there, so every section finds its pivot;
+    // the band is cut back to the end face afterwards.
+    let mut ends: std::collections::HashMap<VertexId, usize> = std::collections::HashMap::new();
+    for &edge_id in &found.far {
+        let edge = topo.edge(edge_id)?;
+        *ends.entry(edge.start()).or_default() += 1;
+        *ends.entry(edge.end()).or_default() += 1;
+    }
+    let mut extend: Vec<(EdgeId, f64, f64)> = Vec::new();
+    {
+        for &edge_id in &found.far {
+            let edge = topo.edge(edge_id)?;
+            let (a, b) = (
+                topo.vertex(edge.start())?.point(),
+                topo.vertex(edge.end())?.point(),
+            );
+            let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+            let span = (t1 - t0).abs().max(1e-12);
+            let length = (b - a).length().max(1e-12);
+            // Eight radii on, in the curve's parameter.
+            let reach = 8.0 * radius * span / length;
+            if ends.get(&edge.start()) == Some(&1) {
+                extend.push((edge_id, t0 - reach.copysign(t1 - t0), t0));
+            }
+            if ends.get(&edge.end()) == Some(&1) {
+                extend.push((edge_id, t1, t1 + reach.copysign(t1 - t0)));
+            }
+        }
+    }
+    let at = |&(edge_id, _, _): &(EdgeId, f64, f64), t: f64| -> Result<Point3, BlendError> {
+        let edge = topo.edge(edge_id)?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+        let (lo, hi) = (t0.min(t1), t0.max(t1));
+        if t >= lo && t <= hi {
+            return at(edge_id, t);
+        }
+        // Past an end: straight on along the curve's tangent there.
+        let end = if t < lo { lo } else { hi };
+        let step = 1e-6 * (hi - lo).max(1e-12);
+        let inner = if t < lo { end + step } else { end - step };
+        let (p, q) = (at(edge_id, end)?, at(edge_id, inner)?);
+        Ok(p + (p - q) * ((t - end).abs() / step))
+    };
+    let pieces: Vec<((EdgeId, f64, f64), f64, f64)> = rim
+        .iter()
+        .chain(extend.iter())
+        .map(|&piece| (piece, piece.1, piece.2))
+        .collect();
     pivot_sections(
         &pieces,
         &at,
@@ -8576,7 +8818,7 @@ fn pivot_on_far_loop(
         radius,
         sections,
         false,
-        sections.len(),
+        required,
     )
 }
 
