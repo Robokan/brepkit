@@ -755,8 +755,66 @@ fn main() {
                         })
                         .sum::<f64>()
                         / 2.0;
+                    // A point just off the face along its oriented normal:
+                    // outside the solid where the face faces out.
+                    let off = brepkit_operations::tessellate::tessellate(&topo, f, 0.05)
+                        .ok()
+                        .and_then(|m| {
+                            let i = m.indices.get(..3)?.to_vec();
+                            let c = Point3::new(
+                                (m.positions[i[0] as usize].x()
+                                    + m.positions[i[1] as usize].x()
+                                    + m.positions[i[2] as usize].x())
+                                    / 3.0,
+                                (m.positions[i[0] as usize].y()
+                                    + m.positions[i[1] as usize].y()
+                                    + m.positions[i[2] as usize].y())
+                                    / 3.0,
+                                (m.positions[i[0] as usize].z()
+                                    + m.positions[i[1] as usize].z()
+                                    + m.positions[i[2] as usize].z())
+                                    / 3.0,
+                            );
+                            let (u, v) = surface.project_point(c)?;
+                            let n = surface.normal(u, v);
+                            let n = if face.is_reversed() { -n } else { n };
+                            let p = surface.evaluate(u, v)? + n * 1e-3;
+                            brepkit_operations::classify::classify_point(
+                                &topo, r.solid, p, 0.01, 1e-7,
+                            )
+                            .ok()
+                        });
+                    if std::env::var("FACES").is_ok_and(|v| v == "loops") {
+                        for oe in topo.wire(face.outer_wire()).unwrap().edges() {
+                            let e = topo.edge(oe.edge()).unwrap();
+                            let (a, b) = (
+                                topo.vertex(e.start()).unwrap().point(),
+                                topo.vertex(e.end()).unwrap().point(),
+                            );
+                            let (t0, t1) = e.curve().domain_with_endpoints(a, b);
+                            let mid =
+                                e.curve()
+                                    .evaluate_with_endpoints(f64::midpoint(t0, t1), a, b);
+                            let (a, b) = if oe.is_forward() { (a, b) } else { (b, a) };
+                            println!(
+                                "      edge {} {} {} ({:.3},{:.3},{:.3}) -> ({:.3},{:.3},{:.3}) via ({:.3},{:.3},{:.3})",
+                                oe.edge().index(),
+                                e.curve().type_tag(),
+                                if oe.is_forward() { "fwd" } else { "rev" },
+                                a.x(),
+                                a.y(),
+                                a.z(),
+                                b.x(),
+                                b.y(),
+                                b.z(),
+                                mid.x(),
+                                mid.y(),
+                                mid.z()
+                            );
+                        }
+                    }
                     println!(
-                        "   face {} {}: area {:?} reversed {} uv winding {:.4}",
+                        "   face {} {}: area {:?} reversed {} uv winding {:.4} off-normal {off:?}",
                         f.index(),
                         surface.type_tag(),
                         area.map(|a| (a * 1000.0).round() / 1000.0),
