@@ -8016,12 +8016,23 @@ fn check_stripe_residuals(topo: &Topology, stripe: &Stripe) -> Result<(), BlendE
             .max(((section.center - section.p2).length() - section.radius).abs());
         let radial1 = (section.p1 - section.center).normalize();
         let radial2 = (section.p2 - section.center).normalize();
+        // A contact standing still between two sections is a cut crossing's
+        // point (`cut_contact_crossing`): the arcs there pass through it
+        // without touching the face tangentially.
+        let still = |side: fn(&crate::section::CircSection) -> Point3| {
+            [index.checked_sub(1), Some(index + 1)]
+                .into_iter()
+                .flatten()
+                .filter_map(|k| stripe.sections.get(k))
+                .any(|other| (side(other) - side(section)).length() <= 1e-12)
+        };
+        let (still1, still2) = (still(|s| s.p1), still(|s| s.p2));
         if let (Ok(radial1), Ok(radial2)) = (radial1, radial2) {
-            if tangent1 {
+            if tangent1 && !still1 {
                 max_tangent =
                     max_tangent.max((1.0 - ps1.normal(uv1.0, uv1.1).dot(radial1).abs()).abs());
             }
-            if tangent2 {
+            if tangent2 && !still2 {
                 max_tangent =
                     max_tangent.max((1.0 - ps2.normal(uv2.0, uv2.1).dot(radial2).abs()).abs());
             }
@@ -8320,11 +8331,28 @@ fn compute_stripe_for_spine(
     let config = WalkerConfig::default();
 
     let closed = spine.is_closed();
+    let plane_normal = |surf: &FaceSurface| match surf {
+        FaceSurface::Plane { normal, .. } => Some(*normal),
+        _ => None,
+    };
+    let planes = [plane_normal(&oriented_surf1), plane_normal(&oriented_surf2)];
+    // Where a round's contact on a plane turns back on itself past a tip a
+    // little tighter than the round, the crossing it makes is cut out, and
+    // the band is built in three pieces about the cut.
+    let mut crossing_cut: Option<[usize; 2]> = None;
     let (walk_result, mut beyond) = if let RadiusLaw::Constant(r) = law {
         let blend = ConstRadBlend { radius: *r };
         let walker = Walker::new(&blend, ps1, ps2, &spine, topo, config);
         let start = walker.find_start(0.0)?;
-        let result = walker.walk(start, 0.0, spine.length())?;
+        let mut result = walker.walk(start, 0.0, spine.length())?;
+        if !closed
+            && check_contacts_run_on(&result.sections).is_err()
+            && let Some(cut) =
+                cut_contact_crossing(&walker, spine.length(), &result.sections, planes)
+        {
+            result.sections = cut.sections;
+            crossing_cut = Some(cut.bounds);
+        }
         let beyond = walk_beyond(&walker, start, &result, closed);
         (result, beyond)
     } else {
@@ -8434,15 +8462,49 @@ fn compute_stripe_for_spine(
         (Some(found), Some(ps), Some(surface)) if found.side == 1 => (ps, face_u_period(surface)),
         _ => (ps2, face_u_period(&oriented_surf2)),
     };
-    check_contacts_run_on(&walk_result.sections)?;
+    // A cut contact turns at its crossing point, where the band's pieces
+    // meet: each piece runs on by itself.
+    match crossing_cut.filter(|_| swallowed.is_none()) {
+        Some([first, last]) => {
+            let all = &walk_result.sections;
+            for piece in [&all[..=first], &all[first..=last], &all[last..]] {
+                check_contacts_run_on(piece)?;
+            }
+        }
+        None => check_contacts_run_on(&walk_result.sections)?,
+    }
     if closed {
         close_sections(&mut walk_result.sections);
     }
     // The band passes through its walked sections, so its boundary rows pass
     // through the walked contacts. Where the interpolation is refused, the
     // band takes the sections as its control points.
-    let blend_surface = interpolate_blend_surface(&walk_result.sections)
-        .or_else(|_| approximate_blend_surface(&walk_result.sections))?;
+    // A round with its contact's crossing cut out is three bands end to end:
+    // up to the cut, across it, and on from it, joined at the cut's bounds.
+    let blend_surface = match crossing_cut.filter(|_| swallowed.is_none()) {
+        Some([first, last]) => {
+            let all = &walk_result.sections;
+            let pieces = [&all[..=first], &all[first..=last], &all[last..]];
+            let mut bands = Vec::with_capacity(3);
+            let mut lengths = Vec::with_capacity(3);
+            for piece in pieces {
+                bands.push(interpolate_blend_surface(piece)?);
+                lengths.push(
+                    piece
+                        .windows(2)
+                        .map(|w| {
+                            (w[1].p1 - w[0].p1)
+                                .length()
+                                .max((w[1].p2 - w[0].p2).length())
+                        })
+                        .sum::<f64>(),
+                );
+            }
+            join_bands(&bands, &lengths)?
+        }
+        None => interpolate_blend_surface(&walk_result.sections)
+            .or_else(|_| approximate_blend_surface(&walk_result.sections))?,
+    };
     // The band's sides are its own boundary rows: between two sections, a
     // polyline through the contacts leaves the band.
     let contact1 = band_side(&blend_surface, 0)?;
@@ -9024,6 +9086,255 @@ fn check_contacts_run_on(sections: &[crate::section::CircSection]) -> Result<(),
 /// Contact steps shorter than this are read as standing still, not as a
 /// direction (a ball pinned where a face's contact barely moves).
 const CONTACT_STEP_FLOOR: f64 = 1e-9;
+
+/// A walked round's sections with the crossing of its contact on a plane
+/// face cut out, and the places of the two sections that bound the cut.
+struct CrossingCut {
+    sections: Vec<crate::section::CircSection>,
+    /// The section where the contact reaches its crossing, and the one
+    /// where it leaves it.
+    bounds: [usize; 2],
+}
+
+/// Cut out the stretch where a round's contact on a plane face crosses
+/// itself: an outline's tip whose bend is a little tighter than the round,
+/// where the ball cannot roll round the tip.
+///
+/// Past the bend the contact on the plane runs back, forms a small loop and
+/// crosses where it was before. The sections through that crossing bound
+/// the cut: both are arcs of one ball, its centre where the ball's path
+/// crosses itself, from the crossing point down to the wall. Between them
+/// the contact on the plane stands still at the crossing point and the
+/// contact on the wall runs on as walked; each section there is the arc
+/// from the crossing point to the wall contact, tangent to the wall there.
+/// At the two bounds those arcs are the ball's own.
+///
+/// `None` unless one side's contact crosses itself once, that side is a
+/// plane, and every cut section solves.
+fn cut_contact_crossing<F: crate::blend_func::BlendFunction>(
+    walker: &Walker<'_, F>,
+    spine_length: f64,
+    sections: &[crate::section::CircSection],
+    planes: [Option<Vec3>; 2],
+) -> Option<CrossingCut> {
+    use crate::blend_func::BlendParams;
+    use crate::section::CircSection;
+
+    const CUT_STEPS: usize = 8;
+    let contact = |sec: &CircSection, side: usize| if side == 0 { sec.p1 } else { sec.p2 };
+    let params = |sec: &CircSection| BlendParams {
+        u1: sec.uv1.0,
+        v1: sec.uv1.1,
+        u2: sec.uv2.0,
+        v2: sec.uv2.1,
+    };
+    for (side, normal) in planes.iter().enumerate() {
+        let Some(normal) = *normal else {
+            continue;
+        };
+        let e1 = normal.cross(Vec3::new(1.0, 0.0, 0.0));
+        let e1 = if e1.length() < 0.1 {
+            normal.cross(Vec3::new(0.0, 1.0, 0.0))
+        } else {
+            e1
+        };
+        let Ok(e1) = e1.normalize() else {
+            continue;
+        };
+        let e2 = normal.cross(e1);
+        let flat = |p: Point3| {
+            (
+                Vec3::new(p.x(), p.y(), p.z()).dot(e1),
+                Vec3::new(p.x(), p.y(), p.z()).dot(e2),
+            )
+        };
+        let pts: Vec<(f64, f64)> = sections.iter().map(|s| flat(contact(s, side))).collect();
+        // The first two segments of the contact that cross, not neighbours.
+        let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)| {
+            let r = (b.0 - a.0, b.1 - a.1);
+            let s = (d.0 - c.0, d.1 - c.1);
+            let den = r.0 * s.1 - r.1 * s.0;
+            if den.abs() < 1e-300 {
+                return None;
+            }
+            let q = (c.0 - a.0, c.1 - a.1);
+            let ta = (q.0 * s.1 - q.1 * s.0) / den;
+            let tb = (q.0 * r.1 - q.1 * r.0) / den;
+            ((0.0..=1.0).contains(&ta) && (0.0..=1.0).contains(&tb)).then_some((ta, tb))
+        };
+        let mut found = None;
+        'outer: for i in 0..pts.len().saturating_sub(1) {
+            for j in i + 2..pts.len().saturating_sub(1) {
+                if let Some(at) = cross(pts[i], pts[i + 1], pts[j], pts[j + 1]) {
+                    found = Some((i, j, at));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((i, j, (fa, fb))) = found else {
+            continue;
+        };
+        // Pin the two sections whose contacts on the plane meet.
+        let length = spine_length;
+        let s_of =
+            |k: usize, f: f64| (sections[k].t + (sections[k + 1].t - sections[k].t) * f) * length;
+        let (mut sa, mut sb) = (s_of(i, fa), s_of(j, fb));
+        let (mut ga, mut gb) = (params(&sections[i]), params(&sections[j]));
+        let mut solved = None;
+        let h = 1e-7 * length.max(1e-9);
+        for _ in 0..30 {
+            let (pa, a) = walker.solve_section(sa, Some(ga))?;
+            let (pb, b) = walker.solve_section(sb, Some(gb))?;
+            ga = pa;
+            gb = pb;
+            let (ca, cb) = (flat(contact(&a, side)), flat(contact(&b, side)));
+            let f = (ca.0 - cb.0, ca.1 - cb.1);
+            // The walker solves each section to its own tolerance, which
+            // bounds how closely two of them meet.
+            if f.0.hypot(f.1) <= 1e-7 * sections[i].radius.max(1e-6) {
+                solved = Some((a, b));
+                break;
+            }
+            let (_, a2) = walker.solve_section(sa + h, Some(pa))?;
+            let (_, b2) = walker.solve_section(sb + h, Some(pb))?;
+            let (da, db) = (flat(contact(&a2, side)), flat(contact(&b2, side)));
+            let ja = ((da.0 - ca.0) / h, (da.1 - ca.1) / h);
+            let jb = ((cb.0 - db.0) / h, (cb.1 - db.1) / h);
+            let det = ja.0 * jb.1 - jb.0 * ja.1;
+            if det.abs() < 1e-300 {
+                return None;
+            }
+            let dsa = (-f.0 * jb.1 + jb.0 * f.1) / det;
+            let dsb = (-ja.0 * f.1 + ja.1 * f.0) / det;
+            sa += dsa;
+            sb += dsb;
+            if !(sa.is_finite() && sb.is_finite()) || sa <= 0.0 || sb >= length || sa >= sb {
+                return None;
+            }
+        }
+        let (mut a, mut b) = solved?;
+        let crossing = {
+            let (p, q) = (contact(&a, side), contact(&b, side));
+            Point3::new(
+                f64::midpoint(p.x(), q.x()),
+                f64::midpoint(p.y(), q.y()),
+                f64::midpoint(p.z(), q.z()),
+            )
+        };
+        for sec in [&mut a, &mut b] {
+            if side == 0 {
+                sec.p1 = crossing;
+            } else {
+                sec.p2 = crossing;
+            }
+        }
+        // Between the bounds: from the crossing point to the walked wall
+        // contact, tangent to the wall there.
+        let mut cut = Vec::with_capacity(CUT_STEPS + 1);
+        let mut guess = ga;
+        for k in 1..CUT_STEPS {
+            #[allow(clippy::cast_precision_loss)]
+            let s = sa + (sb - sa) * (k as f64 / CUT_STEPS as f64);
+            let (p, sec) = walker.solve_section(s, Some(guess))?;
+            guess = p;
+            let wall = contact(&sec, 1 - side);
+            let inward = (sec.center - wall).normalize().ok()?;
+            let chord = crossing - wall;
+            let along = chord.dot(inward);
+            if along <= 1e-9 * sec.radius {
+                return None;
+            }
+            let radius = chord.dot(chord) / (2.0 * along);
+            if !(radius.is_finite() && radius < 4.0 * sec.radius) {
+                return None;
+            }
+            let mut mid = sec.clone();
+            mid.center = wall + inward * radius;
+            mid.radius = radius;
+            if side == 0 {
+                mid.p1 = crossing;
+                mid.uv1 = a.uv1;
+            } else {
+                mid.p2 = crossing;
+                mid.uv2 = a.uv2;
+            }
+            cut.push(mid);
+        }
+        let mut out: Vec<CircSection> = sections[..=i].to_vec();
+        let first = out.len();
+        out.push(a);
+        out.extend(cut);
+        let last = out.len();
+        out.push(b);
+        out.extend_from_slice(&sections[j + 1..]);
+        // Each piece must hold enough sections for a cubic of its own.
+        if first < 3 || out.len() - last < 4 {
+            return None;
+        }
+        return Some(CrossingCut {
+            sections: out,
+            bounds: [first, last],
+        });
+    }
+    None
+}
+
+/// Join bands built piece by piece along a round end to end, each piece's
+/// last section the next one's first: a band only C0 at the joins, each
+/// piece taking a share of the parameter range as long as its `lengths`.
+fn join_bands(
+    pieces: &[brepkit_math::nurbs::surface::NurbsSurface],
+    lengths: &[f64],
+) -> Result<brepkit_math::nurbs::surface::NurbsSurface, BlendError> {
+    let fail = || BlendError::Math(brepkit_math::MathError::EmptyInput);
+    let first = pieces.first().ok_or_else(fail)?;
+    let degree = first.degree_v();
+    let rows = first.control_points().len();
+    let total: f64 = lengths.iter().sum();
+    if pieces.len() != lengths.len() || total.is_nan() || total <= 0.0 {
+        return Err(fail());
+    }
+    let mut knots = vec![0.0; degree + 1];
+    let mut points: Vec<Vec<Point3>> = vec![Vec::new(); rows];
+    let mut weights: Vec<Vec<f64>> = vec![Vec::new(); rows];
+    let mut start = 0.0;
+    for (k, (piece, &length)) in pieces.iter().zip(lengths).enumerate() {
+        if piece.degree_v() != degree
+            || piece.control_points().len() != rows
+            || piece.knots_u() != first.knots_u()
+        {
+            return Err(fail());
+        }
+        let share = length / total;
+        let pk = piece.knots_v();
+        for &knot in &pk[degree + 1..pk.len() - degree - 1] {
+            knots.push(start + share * knot);
+        }
+        start += share;
+        let end = if k + 1 == pieces.len() { 1.0 } else { start };
+        knots.extend(std::iter::repeat_n(
+            end,
+            if k + 1 == pieces.len() {
+                degree + 1
+            } else {
+                degree
+            },
+        ));
+        let skip = usize::from(k > 0);
+        for row in 0..rows {
+            points[row].extend_from_slice(&piece.control_points()[row][skip..]);
+            weights[row].extend_from_slice(&piece.weights()[row][skip..]);
+        }
+    }
+    Ok(brepkit_math::nurbs::surface::NurbsSurface::new(
+        first.degree_u(),
+        degree,
+        first.knots_u().to_vec(),
+        knots,
+        points,
+        weights,
+    )?)
+}
 
 /// Whether every contact a band leaves on a plane face lies inside that
 /// face, read against its exact outline in its plane (a box holds a tilted

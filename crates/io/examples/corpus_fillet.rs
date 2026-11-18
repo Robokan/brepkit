@@ -599,11 +599,11 @@ fn main() {
             for (eid, why) in &r.failed {
                 println!("  failed edge {}: {why}", eid.index());
             }
-            // FLIPFACE=i turns face i of the result over (a debugging aid).
+            // FLIPFACE=i,j turns faces i, j of the result over (a debugging aid).
             if let Ok(i) = std::env::var("FLIPFACE") {
-                let i: usize = i.parse().unwrap();
+                let i: Vec<usize> = i.split(',').map(|i| i.trim().parse().unwrap()).collect();
                 for f in solid_faces(&topo, r.solid).unwrap() {
-                    if f.index() == i {
+                    if i.contains(&f.index()) {
                         let face = topo.face_mut(f).unwrap();
                         face.set_reversed(!face.is_reversed());
                     }
@@ -708,6 +708,20 @@ fn main() {
                     t.elapsed().as_secs_f64(),
                     census(&topo, r.solid)
                 );
+                return;
+            }
+            // FACES=1 prints each face's type and area, the input's faces
+            // first.
+            if std::env::var("FACES").is_ok() {
+                for f in solid_faces(&topo, r.solid).unwrap() {
+                    let area = brepkit_operations::measure::face_area(&topo, f, 1e-3);
+                    println!(
+                        "   face {} {}: area {:?}",
+                        f.index(),
+                        topo.face(f).unwrap().surface().type_tag(),
+                        area.map(|a| (a * 1000.0).round() / 1000.0)
+                    );
+                }
                 return;
             }
             if let Ok(d) = std::env::var("TESSF") {
