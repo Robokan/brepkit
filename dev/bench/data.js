@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794931968890,
+  "lastUpdate": 1795022353523,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -5885,6 +5885,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 26345143,
             "range": "± 242814",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b66960dd37b767053709e913dfe2c514de14d8e0",
+          "message": "fix(blend): swallow a curved narrow face between tilted end faces\n\nAn open round wider than the narrow face beside it pivots on the face's\nfar edge, and the face goes. That was taken only where the far edge's\nends lay in the round's end sections, so a fan blade's tip (a strip\nrounded past its width, its ends leaning) failed.\n\n- The far edge is carried straight on past its free ends, so the end\n  sections still find their pivot; only the inner sections are held to\n  lie on the faces.\n- The band is carried past its ends and cut back to the end faces. The\n  pivoted contact ends exactly on the far edge's corner (it stopped\n  1e-5 off, leaving sliver edges the incidence audit refused), and the\n  other contacts are snapped onto the cap's corner edges.\n- The residual check reads the contact only on tangent sides, and skips\n  pivoted end sections clamped to a B-spline's domain.\n- An open round whose narrow face cannot be swallowed keeps its walked\n  contacts, as before.\n\nTest `fillet_swallow_with_tilted_ends.rs`: a leaning strip rounded at\nr 0.8 to 2, the removed sweep integrated. Below r 1.25 the solid is\nexact but the end face's mesh doubles a triangle over its shallow\nnotch, so the mesh is checked from 1.25.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-18T09:14:33-08:00",
+          "tree_id": "e266559f831481db8780c73bb7927d11dde285f4",
+          "url": "https://github.com/Robokan/brepkit/commit/b66960dd37b767053709e913dfe2c514de14d8e0"
+        },
+        "date": 1795022352705,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1212089,
+            "range": "± 8229",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1284360,
+            "range": "± 70358",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 14273,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 789016,
+            "range": "± 3542",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 27575060,
+            "range": "± 247524",
             "unit": "ns/iter"
           }
         ]
