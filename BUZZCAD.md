@@ -250,9 +250,11 @@ Run these commands from `../BuzzCAD`. It uses its own Python: `.venv/bin/python`
 - **Don't kill the user's BuzzCAD.** `build.sh` installs the bridge as a
   new file, which is safe while BuzzCAD runs. BuzzCAD picks up a new bridge
   when it restarts.
-- **Don't commit or push** in this repo or in BuzzCAD until the user asks.
-  When they do, end commit messages with the attribution line they give
-  you.
+- **Work autonomously.** Commit, push and send each fix upstream as part
+  of the cycle above, without waiting to be asked: every verified fix is
+  committed and pushed to main, then sent upstream as its own PR (or with
+  similar fixes in one PR) straight away, so fixes never pile up on the
+  fork. End commit messages with the attribution line you are given.
 - **License.** brepkit is AGPL-3.0, and so is the bridge.
 - **Engine naming.** Three engines come up here: Open CASCADE (what
   BuzzCAD records with), brepkit (what we fix), and a third engine whose
