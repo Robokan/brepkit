@@ -713,7 +713,13 @@ fn main() {
             // FACES=1 prints each face's type and area, the input's faces
             // first.
             if std::env::var("FACES").is_ok() {
-                for f in solid_faces(&topo, r.solid).unwrap() {
+                // FACESIN=1 reads the input's faces instead.
+                let of = if std::env::var("FACESIN").is_ok() {
+                    sid
+                } else {
+                    r.solid
+                };
+                for f in solid_faces(&topo, of).unwrap() {
                     let area = brepkit_operations::measure::face_area(&topo, f, 1e-3);
                     // The outer wire's signed area in the surface's (u, v),
                     // unwrapped step by step, from points along its edges.
@@ -784,6 +790,9 @@ fn main() {
                             )
                             .ok()
                         });
+                    if std::env::var("FACES").is_ok_and(|v| v == "surfaces") {
+                        println!("      {:?}", face.surface());
+                    }
                     if std::env::var("FACES").is_ok_and(|v| v == "loops") {
                         for oe in topo.wire(face.outer_wire()).unwrap().edges() {
                             let e = topo.edge(oe.edge()).unwrap();
@@ -796,6 +805,12 @@ fn main() {
                                 e.curve()
                                     .evaluate_with_endpoints(f64::midpoint(t0, t1), a, b);
                             let (a, b) = if oe.is_forward() { (a, b) } else { (b, a) };
+                            let uv = |p: Point3| {
+                                surface.project_point(p).map(|(u, v)| {
+                                    ((u * 1000.0).round() / 1000.0, (v * 1000.0).round() / 1000.0)
+                                })
+                            };
+                            println!("        uv {:?} -> {:?} via {:?}", uv(a), uv(b), uv(mid));
                             println!(
                                 "      edge {} {} {} ({:.3},{:.3},{:.3}) -> ({:.3},{:.3},{:.3}) via ({:.3},{:.3},{:.3})",
                                 oe.edge().index(),
