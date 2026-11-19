@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795043752608,
+  "lastUpdate": 1795051101637,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -6209,6 +6209,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 25232575,
             "range": "± 69101",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "a9e43f8d21ba11cd539265f1dece9844630f3b2a",
+          "message": "fix(topology): with no seed, face normals follow the readings' convention\n\n`normalize_face_normals` reads each face's boundary winding about its\neffective normal and turns the faces that disagree with the solid's\nconvention. With no seed to read that convention from (a round that\nrebuilt every face of its input, both outlines of a plate rounded), the\nrebuilt faces voted on it. Where more bands were built backwards than\ninput faces were trimmed right, the vote went backwards and every face\nwas turned to match: each loop then ran clockwise about a normal facing\nout. brepkit's own measures take a loop's region either way, but a STEP\nreader on a closed surface takes such a loop as a hole: a spindle torus\nband read back as the whole torus less the face.\n\nThe readings are all taken in one convention, a boundary running\ncounterclockwise about its face's effective normal, so with no seed\nthat convention holds and the faces built backwards are the ones turned.\n\nTest `fillet_rounded_both_outlines_wound_out.rs`: a plate read from STEP\nrounded round both outlines; its caps' loops run counterclockwise about\ntheir normals (clockwise without the change). The orientation unit tests\nnow expect turned faces turned back however many there are.\n\n`corpus_fillet` FACES=1 prints each face's orientation, loop winding and\nan off-normal classification; FACES=loops, FACES=surfaces, FACESIN.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-18T17:15:06-08:00",
+          "tree_id": "49f9fe8ed2b4fdf8b785c451243e3b7cba386d1f",
+          "url": "https://github.com/Robokan/brepkit/commit/a9e43f8d21ba11cd539265f1dece9844630f3b2a"
+        },
+        "date": 1795051100908,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 944942,
+            "range": "± 22702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1000552,
+            "range": "± 5246",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11221,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 615955,
+            "range": "± 4782",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 20968871,
+            "range": "± 27924",
             "unit": "ns/iter"
           }
         ]
