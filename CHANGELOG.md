@@ -1,5 +1,65 @@
 # Changelog
 
+## [4.11.32](https://github.com/andymai/brepkit/compare/v4.11.31...v4.11.32) (2026-11-17)
+
+
+### Bug Fixes
+
+* **algo:** fuse a strut into a bore under its window exactly ([#2626](https://github.com/andymai/brepkit/issues/2626)) ([fd67303](https://github.com/andymai/brepkit/commit/fd67303b0795550a63e28d2b970ea692226b0988))
+* **algo:** fuse a yoke onto a stepped flange exactly ([#2623](https://github.com/andymai/brepkit/issues/2623)) ([74d304e](https://github.com/andymai/brepkit/commit/74d304e4f8bf0d8da7893a51c5e25a0178d0288a))
+
+## [4.11.31](https://github.com/andymai/brepkit/compare/v4.11.30...v4.11.31) (2026-11-17)
+
+
+### Bug Fixes
+
+* **algo:** end a box wall's torus loop at the torus face's rims ([#2584](https://github.com/andymai/brepkit/issues/2584)) ([c46825f](https://github.com/andymai/brepkit/commit/c46825f3c9e8a0893f57dfcc609a4b021da319a5))
+* **algo:** fuse a funnel's torus lip and a cup's lug exactly ([#2601](https://github.com/andymai/brepkit/issues/2601)) ([b8c67be](https://github.com/andymai/brepkit/commit/b8c67be755a59fb9c0c54643677f4f6d32a1e8ed))
+* **algo:** fuse struts across a cylinder's seam and struts that start at one point exactly ([#2597](https://github.com/andymai/brepkit/issues/2597)) ([382bf3e](https://github.com/andymai/brepkit/commit/382bf3e4ea05ae72b140a33ce3baa041e5eb9121))
+* **algo:** fuse two rods at one ball and a second ball across a flat ring exactly ([#2583](https://github.com/andymai/brepkit/issues/2583)) ([b3188d0](https://github.com/andymai/brepkit/commit/b3188d0d86b5da8219747b71df127c7aa24baa01))
+* **algo:** keep the cylinder classifier off a solid with a cone ([#2614](https://github.com/andymai/brepkit/issues/2614)) ([eeb097a](https://github.com/andymai/brepkit/commit/eeb097a3c14d41b5031fd68e992224ee00864a17))
+* **blend:** build two rounds of different radii that cross at a corner ([#2611](https://github.com/andymai/brepkit/issues/2611)) ([3a1535d](https://github.com/andymai/brepkit/commit/3a1535d5359b52bc6c466b7b8cbf81cf696bc042))
+* **blend:** build two rounds that cross past a short edge ([#2590](https://github.com/andymai/brepkit/issues/2590)) ([bf4209b](https://github.com/andymai/brepkit/commit/bf4209b96eb99cbcd17d3c938efaff3f32b1a455))
+* **check:** bound a B-spline drawing's stretch over each chord ([#2606](https://github.com/andymai/brepkit/issues/2606)) ([6b6fe1d](https://github.com/andymai/brepkit/commit/6b6fe1d8bfeb05e2e5436ea9fd6b9fe05a231e51))
+* **io:** pair each surface with itself where two cross at an edge ([#2602](https://github.com/andymai/brepkit/issues/2602)) ([9506f9d](https://github.com/andymai/brepkit/commit/9506f9d2b47ba7e393eaeb4648eac8592318eafe)), closes [#2576](https://github.com/andymai/brepkit/issues/2576)
+* **math,algo:** keep a solid that notches a cone's base rim exact at every angle ([#2586](https://github.com/andymai/brepkit/issues/2586)) ([c552087](https://github.com/andymai/brepkit/commit/c552087388016fa61776a67a8d0caeede66dcf8a))
+
+
+### Performance
+
+* **measure:** integrate a solid's faces on all cores ([#2612](https://github.com/andymai/brepkit/issues/2612)) ([cbbceaf](https://github.com/andymai/brepkit/commit/cbbceaf0f571cd8be230d5ab5735b4a0bcc18e20))
+* **tessellate:** mesh fillet corners and stripes as structured patches ([#2625](https://github.com/andymai/brepkit/issues/2625)) ([54db542](https://github.com/andymai/brepkit/commit/54db542fafd0e678f95d253b8f37855c4f020f8c)), closes [#2515](https://github.com/andymai/brepkit/issues/2515)
+
+## [4.11.30](https://github.com/andymai/brepkit/compare/v4.11.29...v4.11.30) (2026-11-17)
+
+
+### Bug Fixes
+
+* **algo:** separate paths that weld together, and the two sides of a thin lens ([#2579](https://github.com/andymai/brepkit/issues/2579)) ([b25bef8](https://github.com/andymai/brepkit/commit/b25bef89f74a89a095ca0ef7485d5ebf114a91f7)), closes [#2550](https://github.com/andymai/brepkit/issues/2550) [#2554](https://github.com/andymai/brepkit/issues/2554)
+* **io:** pair the triangles round a shared edge again after a turn ([#2580](https://github.com/andymai/brepkit/issues/2580)) ([d6ae204](https://github.com/andymai/brepkit/commit/d6ae204d4638a07037b3da4dda91122111474870)), closes [#2510](https://github.com/andymai/brepkit/issues/2510)
+* **operations:** blend a chain that turns a corner or hooks back, instead of refusing it ([#2591](https://github.com/andymai/brepkit/issues/2591)) ([bb04eb2](https://github.com/andymai/brepkit/commit/bb04eb20ebbbe445c0ca06a6190838dd51ed091f))
+* **operations:** chamfer round edges with two distances and end chains on slanted planes ([#2571](https://github.com/andymai/brepkit/issues/2571)) ([08d5be5](https://github.com/andymai/brepkit/commit/08d5be5b672ed71f587d99c135fc7aed07a37bc3))
+* **tessellate:** keep a shell's free rim out of the boundary weld ([#2569](https://github.com/andymai/brepkit/issues/2569)) ([3c8d110](https://github.com/andymai/brepkit/commit/3c8d1104a2b9fd95f3e8d4d4bca4d978e30bf56a)), closes [#2548](https://github.com/andymai/brepkit/issues/2548)
+
+## [4.11.29](https://github.com/andymai/brepkit/compare/v4.11.28...v4.11.29) (2026-11-17)
+
+
+### Bug Fixes
+
+* **algo,operations:** keep a spherical cap's seam to its pole ([#2561](https://github.com/andymai/brepkit/issues/2561)) ([c9f7aed](https://github.com/andymai/brepkit/commit/c9f7aed150eb6e3a409874fc2bd26fc249b034bc))
+* **algo:** cut a rod's torus groove exactly across its seam and its middle ([#2575](https://github.com/andymai/brepkit/issues/2575)) ([4311993](https://github.com/andymai/brepkit/commit/4311993890f36b95d9075d99a4a9a0250305ec28))
+* **algo:** keep a conic leaf that crosses a plane out of the plane's face ([#2572](https://github.com/andymai/brepkit/issues/2572)) ([03c48a5](https://github.com/andymai/brepkit/commit/03c48a540574cfe583cde2ba7475b4a8374ef624))
+* **algo:** read a plane face's outer wire on its arcs for EF crossings ([#2566](https://github.com/andymai/brepkit/issues/2566)) ([38db3e9](https://github.com/andymai/brepkit/commit/38db3e918c2af1e2895c56d78356a4b6db7af71e))
+* **heal:** join straight edges a fuse leaves in pieces across the whole solid ([#2562](https://github.com/andymai/brepkit/issues/2562)) ([1fc2bdd](https://github.com/andymai/brepkit/commit/1fc2bdd04d75d384bebdac26c6c0372329d3d92e))
+* **heal:** leave a slit's pieces alone when joining split edges ([#2567](https://github.com/andymai/brepkit/issues/2567)) ([f6c1c56](https://github.com/andymai/brepkit/commit/f6c1c56be5ae0e63c4fc8b99da23b4d8fa5f97e5))
+* **math:** refuse a control point at infinity after a knot insertion ([#2564](https://github.com/andymai/brepkit/issues/2564)) ([ad7e21b](https://github.com/andymai/brepkit/commit/ad7e21b44f4e44c2a1001d4fa63c6e781eec7f68))
+* **tessellate:** keep the CDT grid off a face's constrained edges ([#2582](https://github.com/andymai/brepkit/issues/2582)) ([cd1cfa0](https://github.com/andymai/brepkit/commit/cd1cfa015a50c8d8493edb318fc4bf324347a631))
+
+
+### Performance
+
+* **tessellate:** mesh a filleted box in half the time ([#2581](https://github.com/andymai/brepkit/issues/2581)) ([84770d9](https://github.com/andymai/brepkit/commit/84770d94bd74b8f255fa83ba9da87dff85e7f0a0))
+
 ## [4.11.28](https://github.com/andymai/brepkit/compare/v4.11.27...v4.11.28) (2026-11-16)
 
 

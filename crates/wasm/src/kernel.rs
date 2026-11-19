@@ -1215,17 +1215,18 @@ mod batch_tests {
     }
 
     /// A v2 chamfer of an edge the blend engine leaves out (a cylinder's
-    /// rim) is an error, not the input solid handed back as the result.
+    /// seam, with its wall on both sides) is an error, not the input solid
+    /// handed back as the result.
     #[test]
     fn batch_chamfer_v2_reports_an_edge_it_could_not_blend() {
         use crate::handles::{edge_id_to_u32, solid_id_to_u32};
         let mut kernel = BrepKernel::new();
         let cylinder =
             brepkit_operations::primitives::make_cylinder(kernel.topo_mut(), 2.0, 5.0).unwrap();
-        let rim = brepkit_topology::explorer::solid_edges(kernel.topo(), cylinder)
+        let seam = brepkit_topology::explorer::solid_edges(kernel.topo(), cylinder)
             .unwrap()
             .into_iter()
-            .find(|&e| matches!(kernel.topo().edge(e).unwrap().curve(), EdgeCurve::Circle(_)))
+            .find(|&e| matches!(kernel.topo().edge(e).unwrap().curve(), EdgeCurve::Line))
             .unwrap();
         let block =
             brepkit_operations::primitives::make_box(kernel.topo_mut(), 2.0, 2.0, 2.0).unwrap();
@@ -1236,7 +1237,7 @@ mod batch_tests {
                 {{"op": "chamferV2", "args": {{"solid": {}, "edges": [{}], "d1": 0.5, "d2": 0.5}}}}
             ]"#,
             solid_id_to_u32(cylinder),
-            edge_id_to_u32(rim),
+            edge_id_to_u32(seam),
             solid_id_to_u32(block),
             edge_id_to_u32(side),
         ));
