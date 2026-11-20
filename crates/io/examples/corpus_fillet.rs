@@ -285,6 +285,10 @@ fn main() {
         );
     }
     // INPUT=1 lists the input's faces, each loop's edges and their curves.
+    // OUTIN=path writes the input through brepkit's STEP writer.
+    if let Ok(out) = std::env::var("OUTIN") {
+        std::fs::write(&out, brepkit_io::step::write_step(&topo, &[sid]).unwrap()).unwrap();
+    }
     if std::env::var("INPUT").is_ok() {
         for f in solid_faces(&topo, sid).unwrap() {
             let face = topo.face(f).unwrap();
@@ -1037,6 +1041,72 @@ fn main() {
                 .unwrap_or_else(|e| format!("{e}"));
             if std::env::var("THIRD").is_ok() || std::env::var("TABLE").is_ok() {
                 face_table(&topo, r.solid, "ours", 0.05);
+            }
+            // LOOPX lists plane faces whose wires cross themselves (a
+            // contact run past an edge of its face, the loop closed over
+            // the crossing).
+            if std::env::var("LOOPX").is_ok() {
+                for face_id in solid_faces(&topo, r.solid).unwrap() {
+                    let face = topo.face(face_id).unwrap();
+                    let brepkit_topology::face::FaceSurface::Plane { normal, .. } = face.surface()
+                    else {
+                        continue;
+                    };
+                    let normal = *normal;
+                    let x = if normal.x().abs() < 0.9 {
+                        brepkit_math::vec::Vec3::new(1.0, 0.0, 0.0)
+                    } else {
+                        brepkit_math::vec::Vec3::new(0.0, 1.0, 0.0)
+                    };
+                    let u = normal.cross(x).normalize().unwrap();
+                    let v = normal.cross(u);
+                    for wire_id in
+                        std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied())
+                    {
+                        let mut poly: Vec<(f64, f64)> = Vec::new();
+                        for oe in topo.wire(wire_id).unwrap().edges() {
+                            let edge = topo.edge(oe.edge()).unwrap();
+                            let a = topo.vertex(edge.start()).unwrap().point();
+                            let b = topo.vertex(edge.end()).unwrap().point();
+                            let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+                            for k in 0..32 {
+                                let f = f64::from(k) / 32.0;
+                                let f = if oe.is_forward() { f } else { 1.0 - f };
+                                let p =
+                                    edge.curve()
+                                        .evaluate_with_endpoints(t0 + (t1 - t0) * f, a, b);
+                                let p = brepkit_math::vec::Vec3::new(p.x(), p.y(), p.z());
+                                poly.push((p.dot(u), p.dot(v)));
+                            }
+                        }
+                        let n = poly.len();
+                        let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+                            (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+                        };
+                        let mut hits = 0;
+                        for i in 0..n {
+                            for j in i + 2..n {
+                                if i == 0 && j == n - 1 {
+                                    continue;
+                                }
+                                let (a, b, c, d) =
+                                    (poly[i], poly[(i + 1) % n], poly[j], poly[(j + 1) % n]);
+                                let (d1, d2) = (cross(a, b, c), cross(a, b, d));
+                                let (d3, d4) = (cross(c, d, a), cross(c, d, b));
+                                if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+                                    hits += 1;
+                                }
+                            }
+                        }
+                        if hits > 0 {
+                            println!(
+                                "loop crosses itself: face {} wire {} ({hits} crossings)",
+                                face_id.index(),
+                                wire_id.index()
+                            );
+                        }
+                    }
+                }
             }
             // FOLDS lists edges two plane faces meet at facing opposite
             // ways (the solid folding back on itself there).
