@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795136122916,
+  "lastUpdate": 1795139039008,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -6425,6 +6425,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 26303606,
             "range": "± 100464",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "8c55984235513512e54ce89bbdc4420f6e549c50",
+          "message": "docs(buzzcad): the ledge run-up sent upstream as #2641\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-19T17:40:03-08:00",
+          "tree_id": "9e69a95f944fe770642c48a695a423f3d69cc27e",
+          "url": "https://github.com/Robokan/brepkit/commit/8c55984235513512e54ce89bbdc4420f6e549c50"
+        },
+        "date": 1795139038475,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1170418,
+            "range": "± 3237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1235694,
+            "range": "± 1655",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13365,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 766906,
+            "range": "± 2497",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 26613328,
+            "range": "± 91196",
             "unit": "ns/iter"
           }
         ]
