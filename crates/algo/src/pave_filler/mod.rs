@@ -756,11 +756,13 @@ fn split_sections_at_rim_vertices(
         // A whole circle splits only into arcs under half a turn, at least
         // three of them: an open arc's pcurve runs the short way round, and
         // two arcs between the same two vertices would weld into one edge.
+        // An arc a hair under half a turn (cut at two vertices opposite each
+        // other) reads either way round too.
         if whole
             && (paves.len() < 4
                 || paves
                     .windows(2)
-                    .any(|w| w[1].parameter - w[0].parameter >= std::f64::consts::PI))
+                    .any(|w| w[1].parameter - w[0].parameter >= std::f64::consts::PI - 1e-9))
         {
             continue;
         }

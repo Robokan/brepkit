@@ -673,6 +673,15 @@ pub fn fill_images_faces<S: BuildHasher, S2: BuildHasher>(
                 }
             };
 
+            // A piece with no clear interior whose wires run out and back
+            // along the same curves (two coincident rims split alike, the
+            // section linked to one and the other kept beside it) bounds no
+            // area: it is no face of the result, and its edges' twins are
+            // joined when the result's duplicate edges merge.
+            if interior_unclear && folded_sliver(topo, resolved_face_id, tol.linear) {
+                log::debug!("fill_images_faces: dropped folded sliver {resolved_face_id:?}");
+                continue;
+            }
             sub_faces.push(SubFace {
                 face_id: resolved_face_id,
                 source_face: face_id,
@@ -8368,4 +8377,61 @@ fn distance_to_runs(p: Point3, runs: &[Vec<Point3>]) -> f64 {
     runs.iter()
         .flat_map(|run| run.windows(2).map(|w| to_segment(w[0], w[1])))
         .fold(f64::INFINITY, f64::min)
+}
+
+/// Whether every edge of the face's wires has another edge of them with the
+/// same two ends (either way) and the same middle, within `tol`: wires that
+/// run out and back along the same curves, bounding no area.
+fn folded_sliver(topo: &Topology, face_id: FaceId, tol: f64) -> bool {
+    let Ok(face) = topo.face(face_id) else {
+        return false;
+    };
+    let mut edges: Vec<(
+        brepkit_math::vec::Point3,
+        brepkit_math::vec::Point3,
+        brepkit_math::vec::Point3,
+    )> = Vec::new();
+    for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+        let Ok(wire) = topo.wire(wid) else {
+            return false;
+        };
+        for oe in wire.edges() {
+            let Ok(edge) = topo.edge(oe.edge()) else {
+                return false;
+            };
+            let (Ok(a), Ok(b)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+                return false;
+            };
+            let (a, b) = (a.point(), b.point());
+            let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+            let mid = edge
+                .curve()
+                .evaluate_with_endpoints(f64::midpoint(t0, t1), a, b);
+            edges.push((a, b, mid));
+        }
+    }
+    if edges.len() < 2 || !edges.len().is_multiple_of(2) {
+        return false;
+    }
+    let close =
+        |p: brepkit_math::vec::Point3, q: brepkit_math::vec::Point3| (p - q).length() <= tol;
+    let mut used = vec![false; edges.len()];
+    for i in 0..edges.len() {
+        if used[i] {
+            continue;
+        }
+        let (a, b, m) = edges[i];
+        let Some(j) = (0..edges.len()).find(|&j| {
+            j != i
+                && !used[j]
+                && close(edges[j].2, m)
+                && ((close(edges[j].0, a) && close(edges[j].1, b))
+                    || (close(edges[j].0, b) && close(edges[j].1, a)))
+        }) else {
+            return false;
+        };
+        used[i] = true;
+        used[j] = true;
+    }
+    true
 }
