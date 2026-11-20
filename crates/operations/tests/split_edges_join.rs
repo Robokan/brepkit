@@ -17,7 +17,7 @@ use brepkit_topology::Topology;
 use brepkit_topology::explorer::{solid_edges, solid_faces, solid_vertices};
 use brepkit_topology::solid::SolidId;
 
-/// A fuse as BuzzCAD runs it: coplanar fragments unified afterwards.
+/// A fuse with the default options: coplanar fragments unified afterwards.
 fn fuse(topo: &mut Topology, a: SolidId, b: SolidId) -> SolidId {
     boolean_with_options(topo, BooleanOp::Fuse, a, b, BooleanOptions::default()).unwrap()
 }

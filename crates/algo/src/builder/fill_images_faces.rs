@@ -1448,8 +1448,8 @@ struct SeamAnchor {
 /// circle at the seam's u parameter; for each closed NURBS curve that winds
 /// such a surface's period once, the point where it crosses the seam and the
 /// curve re-parameterized to start there; for a window of a closed NURBS
-/// loop, the window cut at the seam crossings inside it. Keyed by the curve's
-/// arena index.
+/// loop or an open NURBS section, the curve cut at the seam crossings inside
+/// it. Keyed by the curve's arena index.
 fn compute_seam_anchors(topo: &Topology, arena: &GfaArena) -> BTreeMap<usize, SeamAnchor> {
     use std::f64::consts::TAU;
 
@@ -1459,7 +1459,8 @@ fn compute_seam_anchors(topo: &Topology, arena: &GfaArena) -> BTreeMap<usize, Se
             let faces = [curve_ds.face_a, curve_ds.face_b];
             let (d0, d1) = nurbs.domain();
             let (w0, w1) = curve_ds.t_range;
-            if w1 - w0 < (d1 - d0) * (1.0 - 1e-9) {
+            let open = (nurbs.evaluate(d0) - nurbs.evaluate(d1)).length() > SEAM_ON_CIRCLE_TOL;
+            if open || w1 - w0 < (d1 - d0) * (1.0 - 1e-9) {
                 if let Some(seam) = cut_window_at_seams(topo, arena, idx, nurbs) {
                     anchors.insert(idx, seam);
                 }
@@ -1822,11 +1823,71 @@ fn seam_crossings_of_contractible_loop(
     crossings
 }
 
+/// The parameters inside `window` where an open NURBS section crosses
+/// `face`'s seam meridian. Each face the section bounds is cut there, so a
+/// wall whose seam the section crosses and the face across it share the
+/// vertex at the crossing. Empty for a face with no seam.
+fn seam_crossings_of_open_curve(
+    topo: &Topology,
+    face: &Face,
+    nurbs: &brepkit_math::nurbs::curve::NurbsCurve,
+    (w0, w1): (f64, f64),
+) -> Vec<f64> {
+    use std::f64::consts::{PI, TAU};
+    const SAMPLES: u32 = 64;
+    let surface = face.surface();
+    if !matches!(surface, FaceSurface::Cylinder(_) | FaceSurface::Cone(_)) {
+        return Vec::new();
+    }
+    let Some(seam_u) = face_seam_u(topo, face) else {
+        return Vec::new();
+    };
+    let wrap = |d: f64| (d + PI).rem_euclid(TAU) - PI;
+    let delta = |t: f64| {
+        surface
+            .project_point(nurbs.evaluate(t))
+            .map(|(u, _)| wrap(u - seam_u))
+    };
+    let param = |k: u32| w0 + (w1 - w0) * f64::from(k) / f64::from(SAMPLES);
+    let Some(samples) = (0..=SAMPLES)
+        .map(|k| delta(param(k)))
+        .collect::<Option<Vec<f64>>>()
+    else {
+        return Vec::new();
+    };
+    let mut crossings = Vec::new();
+    for k in 1..=SAMPLES {
+        let (prev, d) = (samples[k as usize - 1], samples[k as usize]);
+        // A crossing exactly at an inner sample belongs to the step that
+        // reaches it, when the curve goes on to the other side.
+        let crosses = if d == 0.0 && k < SAMPLES {
+            prev * samples[k as usize + 1] < 0.0
+        } else {
+            prev * d < 0.0
+        };
+        if !crosses || (prev - d).abs() >= PI {
+            continue;
+        }
+        let (mut lo, mut hi) = (param(k - 1), param(k));
+        for _ in 0..60 {
+            let tm = 0.5 * (lo + hi);
+            match delta(tm) {
+                Some(dm) if (dm > 0.0) == (prev > 0.0) => lo = tm,
+                Some(_) => hi = tm,
+                None => break,
+            }
+        }
+        crossings.push(0.5 * (lo + hi));
+    }
+    crossings
+}
+
 /// A section that is a window of a closed loop (the loop crosses a boundary
 /// of one of its faces, a ball's equator, and each face keeps its own arc) is
 /// an open curve: it is cut at the seam crossings inside the window only, so
-/// no face receives the arcs of the loop that lie on another. `None` when the
-/// window crosses no seam and has no twin, or a split fails.
+/// no face receives the arcs of the loop that lie on another. An open
+/// section is cut at its own crossings alike. `None` when the window crosses
+/// no seam and has no twin, or a split fails.
 fn cut_window_at_seams(
     topo: &Topology,
     arena: &GfaArena,
@@ -1839,10 +1900,17 @@ fn cut_window_at_seams(
     let (Some(from), Some(to)) = curve_endpoints(topo, arena, curve_ds) else {
         return None;
     };
+    let closed = (nurbs.evaluate(d0) - nurbs.evaluate(d1)).length() <= SEAM_ON_CIRCLE_TOL;
     let mut cuts: Vec<f64> = [curve_ds.face_a, curve_ds.face_b]
         .iter()
         .filter_map(|&fid| topo.face(fid).ok())
-        .flat_map(|face| seam_crossings_of_contractible_loop(topo, face, nurbs))
+        .flat_map(|face| {
+            if closed {
+                seam_crossings_of_contractible_loop(topo, face, nurbs)
+            } else {
+                seam_crossings_of_open_curve(topo, face, nurbs, (w0, w1))
+            }
+        })
         .filter(|&t| {
             let p = nurbs.evaluate(t);
             t > w0
@@ -1854,7 +1922,10 @@ fn cut_window_at_seams(
     // The loop's other window ends where this one does, and the edge merge
     // would weld two uncut windows into one edge: a vertex midway keeps them
     // apart.
-    if cuts.is_empty() && shares_both_ends_with_another_section(topo, arena, idx, from, to) {
+    if cuts.is_empty()
+        && closed
+        && shares_both_ends_with_another_section(topo, arena, idx, from, to)
+    {
         cuts.push(0.5 * (w0 + w1));
     }
     if cuts.is_empty() {
@@ -2787,10 +2858,21 @@ fn build_section_edges(
                         // Project the start 3D point to UV.
                         let start_uv = face.surface().project_point(start);
                         if let Some((su, sv)) = start_uv {
-                            // Sample the curve at t=0.25 to determine winding direction.
+                            // Sample the curve a quarter turn on from its start to
+                            // determine winding direction. A closed circle's domain
+                            // starts at its own angle origin, which need not be the
+                            // start: a quarter of the way on from there can be the
+                            // start's antipode, which reads either way round.
                             let (t0, t1) = curve_3d.domain_with_endpoints(start, end);
-                            let mid_3d =
-                                curve_3d.evaluate_with_endpoints(t0 + (t1 - t0) * 0.25, start, end);
+                            let t_start = match &curve_3d {
+                                EdgeCurve::Circle(c) => c.project(start),
+                                _ => t0,
+                            };
+                            let mid_3d = curve_3d.evaluate_with_endpoints(
+                                (t1 - t0).madd(0.25, t_start),
+                                start,
+                                end,
+                            );
                             let mid_uv = face.surface().project_point(mid_3d);
                             if let Some((mu, _mv)) = mid_uv {
                                 // Determine winding: does the curve go in +u or -u
@@ -4461,6 +4543,10 @@ impl BoundaryArc {
     }
 }
 
+/// A place on a hole's loop: an edge's index and a fraction along it, in
+/// steps of 1e-9.
+type LoopPlace = (usize, i64);
+
 /// Clip a 3D line segment to a face's boundary polygon.
 ///
 /// Collects the outer wire vertices as line segments, then finds where
@@ -4472,7 +4558,7 @@ impl BoundaryArc {
 /// lies on the edge only where its middle is on the curve too, unless
 /// `chords_are_edges`: a coplanar partner's section stands for a curved
 /// edge of this face by its chord.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn clip_line_to_face_boundary(
     topo: &Topology,
     face_id: FaceId,
@@ -4702,7 +4788,16 @@ fn clip_line_to_face_boundary(
     let holed_plane_partial = crossings.len() < 2
         && !face.inner_wires().is_empty()
         && matches!(face.surface(), FaceSurface::Plane { .. });
-    if crossings.len() < 2 && !single_crossing_ok && !holed_plane_partial {
+    // A ruling of a cylinder or cone that starts inside the face, where
+    // another section crosses it, and runs to the rim crosses the boundary
+    // once (a block's side meeting a disc's wall from the circle where a
+    // coaxial cone stands on it). The face's own loops read its windows.
+    let lateral_partial = crossings.len() < 2
+        && matches!(
+            face.surface(),
+            FaceSurface::Cylinder(_) | FaceSurface::Cone(_)
+        );
+    if crossings.len() < 2 && !single_crossing_ok && !holed_plane_partial && !lateral_partial {
         return None;
     }
 
@@ -4920,6 +5015,241 @@ fn clip_line_to_face_boundary(
                 inside.then_some((w[0], w[1]))
             })
             .collect()
+    } else if lateral_partial {
+        let loops = face_loops
+            .get(topo, face_id)
+            .filter(|l| l.outer.len() >= 3)?;
+        // Where the ruling crosses a hole's edges, read on the edges' own
+        // curves: the sampled loops place a crossing on a curved edge's
+        // chords, off the edge the run must end on. The crossings also say
+        // which runs lie in a hole: the ruling's line, run on past the hole
+        // both ways, crosses each hole's loop an odd number of times after a
+        // point inside it. The sampled outer loop still reads the rest.
+        let normal = face
+            .surface()
+            .project_point(line_start + line_dir * 0.5)
+            .map(|(u, v)| face.surface().normal(u, v))
+            .and_then(|n| n.normalize().ok());
+        let mut hole_hits: Vec<Vec<f64>> = Vec::new();
+        for &hole in face.inner_wires() {
+            let wire = topo.wire(hole).ok()?;
+            let mut reach = line_len;
+            for oe in wire.edges() {
+                let edge = topo.edge(oe.edge()).ok()?;
+                let (a, b) = (
+                    topo.vertex(edge.start()).ok()?.point(),
+                    topo.vertex(edge.end()).ok()?.point(),
+                );
+                let (d0, d1) = edge.curve().domain_with_endpoints(a, b);
+                for k in 0..=8 {
+                    let t = (d1 - d0).madd(f64::from(k) / 8.0, d0);
+                    let p = edge.curve().evaluate_with_endpoints(t, a, b);
+                    reach = reach.max(2.0 * (p - line_start).length());
+                }
+            }
+            // Past every point sampled on the hole by twice its distance: an
+            // edge bulges past its samples by less than that.
+            let far = line_dir * (reach / line_len);
+            let mut hits: Vec<(usize, Point3)> = Vec::new();
+            for (k, oe) in wire.edges().iter().enumerate() {
+                let edge = topo.edge(oe.edge()).ok()?;
+                if matches!(edge.curve(), EdgeCurve::Line) {
+                    // A straight edge on a cylinder or cone is a ruling too,
+                    // which another ruling meets only at a cone's apex.
+                    continue;
+                }
+                let (sp, ep) = (
+                    topo.vertex(oe.oriented_start(edge)).ok()?.point(),
+                    topo.vertex(oe.oriented_end(edge)).ok()?.point(),
+                );
+                let found = arc_segment_crossings(
+                    edge.curve(),
+                    sp,
+                    ep,
+                    oe.oriented_start(edge) == oe.oriented_end(edge),
+                    oe.is_forward(),
+                    line_start - far,
+                    line_end + far,
+                    tol,
+                    normal,
+                );
+                for (p, _) in found {
+                    if (p - line_start).cross(line_dir).length() <= 1e-3 * line_len {
+                        hits.push((k, p));
+                    }
+                }
+            }
+            // A hit is a crossing only where the hole's loop passes from one
+            // side of the ruling to the other. Each side is read where the
+            // loop first stands clear of the ruling by more than the
+            // tolerance, walking back and on from the hit: a loop that turns
+            // back at a tip, or leaves along the ruling and bends away, only
+            // touches it. Hits between the same two clear points are one
+            // passage.
+            let side = |p: Point3| {
+                normal.map_or(0.0, |n| (p - line_start).cross(line_dir).dot(n) / line_len)
+            };
+            let loop_edges: Vec<_> = wire.edges().to_vec();
+            let count = loop_edges.len();
+            let mut spans: Vec<(Point3, Point3, f64, f64)> = Vec::with_capacity(count);
+            for oe in &loop_edges {
+                let edge = topo.edge(oe.edge()).ok()?;
+                let (a, b) = (
+                    topo.vertex(edge.start()).ok()?.point(),
+                    topo.vertex(edge.end()).ok()?.point(),
+                );
+                let (d0, d1) = edge.curve().domain_with_endpoints(a, b);
+                spans.push((a, b, d0, d1));
+            }
+            // The point at fraction `f` of edge `k`, along the loop.
+            let point_at = |k: usize, f: f64| -> Option<Point3> {
+                let oe = &loop_edges[k];
+                let edge = topo.edge(oe.edge()).ok()?;
+                let (a, b, d0, d1) = spans[k];
+                let f = if oe.is_forward() { f } else { 1.0 - f };
+                Some(
+                    edge.curve()
+                        .evaluate_with_endpoints((d1 - d0).madd(f, d0), a, b),
+                )
+            };
+            // Where along the loop the first point clear of the ruling lies,
+            // from fraction `f` of edge `k`, walking on (`ahead`) or back,
+            // and its side. `None` when the whole loop lies on the ruling.
+            let clear_of = |k: usize, f: f64, ahead: bool| -> Option<(usize, i64, f64)> {
+                let (mut k, mut f) = (k, f);
+                for _ in 0..=count {
+                    let mut step = 1e-9;
+                    loop {
+                        let g = if ahead {
+                            (f + step).min(1.0)
+                        } else {
+                            (f - step).max(0.0)
+                        };
+                        let s = side(point_at(k, g)?);
+                        if s.abs() > tol {
+                            #[allow(clippy::cast_possible_truncation)]
+                            return Some((k, (g * 1e9).round() as i64, s.signum()));
+                        }
+                        if (ahead && g >= 1.0) || (!ahead && g <= 0.0) {
+                            break;
+                        }
+                        step *= 2.0;
+                    }
+                    if ahead {
+                        (k, f) = ((k + 1) % count, 0.0);
+                    } else {
+                        (k, f) = ((k + count - 1) % count, 1.0);
+                    }
+                }
+                None
+            };
+            // Each hit's place on its edge: the loop's vertices on the ruling,
+            // and the arc hits off them.
+            let fraction_on = |k: usize, p: Point3| -> Option<f64> {
+                let mut best = (0.0, f64::INFINITY);
+                for i in 0..=64 {
+                    let f = f64::from(i) / 64.0;
+                    let d = (point_at(k, f)? - p).length();
+                    if d < best.1 {
+                        best = (f, d);
+                    }
+                }
+                let (mut lo, mut hi) = (
+                    (best.0 - 1.0 / 64.0).max(0.0),
+                    (best.0 + 1.0 / 64.0).min(1.0),
+                );
+                for _ in 0..60 {
+                    let (m1, m2) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+                    if (point_at(k, m1)? - p).length() < (point_at(k, m2)? - p).length() {
+                        hi = m2;
+                    } else {
+                        lo = m1;
+                    }
+                }
+                Some(f64::midpoint(lo, hi))
+            };
+            let mut places: Vec<(usize, f64, Point3)> = Vec::new();
+            for k in 0..count {
+                let at = point_at(k, 0.0)?;
+                if side(at).abs() <= tol
+                    && (at - line_start).cross(line_dir).length() <= 1e-3 * line_len
+                {
+                    places.push((k, 0.0, at));
+                }
+            }
+            for &(k, p) in &hits {
+                if places.iter().any(|&(_, _, q)| (q - p).length() <= tol) {
+                    continue;
+                }
+                places.push((k, fraction_on(k, p)?, p));
+            }
+            // A passage: where the loop is clear of the ruling before and
+            // after it, whether it crosses, and a hit in it.
+            let mut passages: Vec<(LoopPlace, LoopPlace, bool, Point3)> = Vec::new();
+            for (k, f, p) in places {
+                let (Some(before), Some(after)) = (clear_of(k, f, false), clear_of(k, f, true))
+                else {
+                    // The hole lies along the ruling: the hit stands.
+                    passages.push(((k, 0), (k, 0), true, p));
+                    continue;
+                };
+                let key = ((before.0, before.1), (after.0, after.1));
+                if passages.iter().any(|q| (q.0, q.1) == key) {
+                    continue;
+                }
+                passages.push((key.0, key.1, before.2 * after.2 < 0.0, p));
+            }
+            let mut hits: Vec<f64> = passages
+                .into_iter()
+                .filter(|q| q.2)
+                .map(|q| (q.3 - line_start).dot(line_dir) / (line_len * line_len))
+                .collect();
+            hits.sort_by(f64::total_cmp);
+            hits.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+            hole_hits.push(hits);
+        }
+        let hole_crossings = hole_hits
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|t| (0.0..=1.0).contains(t));
+        let mut borders: Vec<f64> = crossings
+            .iter()
+            .chain(crossings_ext.iter())
+            .copied()
+            .chain(hole_crossings)
+            .map(|t| t.clamp(0.0, 1.0))
+            .chain([0.0, 1.0])
+            .collect();
+        borders.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        borders.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let eps = crate::builder::classify_2d::boundary_eps(&loops.outer);
+        let in_hole = |t: f64| {
+            hole_hits
+                .iter()
+                .any(|hits| hits.iter().filter(|&&h| h > t).count() % 2 == 1)
+        };
+        let in_face = |t: f64| {
+            !in_hole(t)
+                && loops.to_uv(line_start + line_dir * t).is_some_and(|q| {
+                    crate::builder::classify_2d::point_in_polygon_2d(q, &loops.outer)
+                        || crate::builder::classify_2d::distance_to_polygon_boundary(
+                            q,
+                            &loops.outer,
+                        ) <= eps
+                })
+        };
+        let mut windows: Vec<(f64, f64)> = Vec::new();
+        for w in borders.windows(2) {
+            if !in_face(f64::midpoint(w[0], w[1])) {
+                continue;
+            }
+            match windows.last_mut() {
+                Some(last) if (last.1 - w[0]).abs() < 1e-9 => last.1 = w[1],
+                _ => windows.push((w[0], w[1])),
+            }
+        }
+        windows
     } else if matches!(
         face.surface(),
         FaceSurface::Cylinder(_) | FaceSurface::Cone(_)
@@ -6091,6 +6421,518 @@ mod clip_tests {
                 .flatten()
                 .all(|&(a, b)| a.z().max(b.z()) <= 2.0 + 1e-9 || a.z().min(b.z()) >= 4.0 - 1e-9),
             "{out:?}"
+        );
+    }
+
+    /// A ruling that starts inside a cylinder's whole band and runs out
+    /// through its top rim crosses the boundary once, and on its way crosses
+    /// a window cut through the band: it keeps the two runs beside the
+    /// window.
+    #[test]
+    fn a_ruling_from_inside_the_band_skips_a_window() {
+        use brepkit_math::surfaces::CylindricalSurface;
+        let mut topo = Topology::new();
+        let r = 3.75;
+        let z_axis = Vec3::new(0.0, 0.0, 1.0);
+        let at = |u: f64, z: f64| Point3::new(r * u.cos(), r * u.sin(), z);
+        let (w0, w1) = (0.6, 1.0);
+        let corners = [
+            at(0.0, 0.0),
+            at(0.0, 10.0),
+            at(w0, 5.0),
+            at(w1, 5.0),
+            at(w1, 7.0),
+            at(w0, 7.0),
+        ];
+        let v = corners.map(|c| topo.add_vertex(Vertex::new(c, 1e-7)));
+        let arc = |topo: &mut Topology, a: usize, b: usize, z: f64| {
+            let circle = Circle3D::new(Point3::new(0.0, 0.0, z), z_axis, r).unwrap();
+            topo.add_edge(Edge::new(v[a], v[b], EdgeCurve::Circle(circle)))
+        };
+        let line = |topo: &mut Topology, a: usize, b: usize| {
+            topo.add_edge(Edge::new(v[a], v[b], EdgeCurve::Line))
+        };
+        let seam = line(&mut topo, 0, 1);
+        let outer = [
+            (arc(&mut topo, 0, 0, 0.0), true),
+            (seam, true),
+            (arc(&mut topo, 1, 1, 10.0), false),
+            (seam, false),
+        ];
+        let window = [
+            (line(&mut topo, 2, 5), true),
+            (arc(&mut topo, 5, 4, 7.0), true),
+            (line(&mut topo, 3, 4), false),
+            (arc(&mut topo, 2, 3, 5.0), false),
+        ];
+        let wire = |topo: &mut Topology, edges: &[(brepkit_topology::edge::EdgeId, bool)]| {
+            let w = Wire::new(
+                edges
+                    .iter()
+                    .map(|&(e, fwd)| OrientedEdge::new(e, fwd))
+                    .collect(),
+                true,
+            )
+            .unwrap();
+            topo.add_wire(w)
+        };
+        let (wid, hole) = (wire(&mut topo, &outer), wire(&mut topo, &window));
+        let cyl = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), z_axis, r).unwrap();
+        let face = topo.add_face(Face::new(wid, vec![hole], FaceSurface::Cylinder(cyl)));
+        let u = 0.8;
+        let out = clip_line_to_face_boundary(
+            &topo,
+            face,
+            at(u, 3.0),
+            at(u, 12.0),
+            1e-7,
+            &FaceLoopsCache::default(),
+            None,
+            false,
+        )
+        .expect("the ruling runs in the face beside the window");
+        let mut runs: Vec<(f64, f64)> = out
+            .iter()
+            .map(|&(a, b)| (a.z().min(b.z()), a.z().max(b.z())))
+            .collect();
+        runs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(runs.len(), 2, "{out:?}");
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(runs[0].0, 3.0) && near(runs[0].1, 5.0), "{out:?}");
+        assert!(near(runs[1].0, 7.0) && near(runs[1].1, 10.0), "{out:?}");
+    }
+
+    /// [`a_ruling_from_inside_the_band_skips_a_window`] with the window's top
+    /// cut by the plane z = 7 + x, an ellipse on the band: the ruling's run
+    /// past the window starts on the ellipse itself.
+    #[test]
+    fn a_ruling_from_inside_the_band_meets_a_windows_curved_top_on_it() {
+        use brepkit_math::curves::Ellipse3D;
+        use brepkit_math::surfaces::CylindricalSurface;
+        let mut topo = Topology::new();
+        let r = 3.75;
+        let z_axis = Vec3::new(0.0, 0.0, 1.0);
+        let at = |u: f64, z: f64| Point3::new(r * u.cos(), r * u.sin(), z);
+        let top_of = |u: f64| 7.0 + r * u.cos();
+        let (w0, w1) = (0.6, 1.0);
+        let corners = [
+            at(0.0, 0.0),
+            at(0.0, 14.0),
+            at(w0, 5.0),
+            at(w1, 5.0),
+            at(w1, top_of(w1)),
+            at(w0, top_of(w0)),
+        ];
+        let v = corners.map(|c| topo.add_vertex(Vertex::new(c, 1e-7)));
+        let arc = |topo: &mut Topology, a: usize, b: usize, z: f64| {
+            let circle = Circle3D::new(Point3::new(0.0, 0.0, z), z_axis, r).unwrap();
+            topo.add_edge(Edge::new(v[a], v[b], EdgeCurve::Circle(circle)))
+        };
+        let line = |topo: &mut Topology, a: usize, b: usize| {
+            topo.add_edge(Edge::new(v[a], v[b], EdgeCurve::Line))
+        };
+        let seam = line(&mut topo, 0, 1);
+        let outer = [
+            (arc(&mut topo, 0, 0, 0.0), true),
+            (seam, true),
+            (arc(&mut topo, 1, 1, 14.0), false),
+            (seam, false),
+        ];
+        let top = Ellipse3D::new_with_ref(
+            Point3::new(0.0, 0.0, 7.0),
+            Vec3::new(-1.0, 0.0, 1.0),
+            r * std::f64::consts::SQRT_2,
+            r,
+            Vec3::new(1.0, 0.0, 1.0),
+        )
+        .unwrap();
+        let top = topo.add_edge(Edge::new(v[5], v[4], EdgeCurve::Ellipse(top)));
+        let window = [
+            (line(&mut topo, 2, 5), true),
+            (top, true),
+            (line(&mut topo, 3, 4), false),
+            (arc(&mut topo, 2, 3, 5.0), false),
+        ];
+        let wire = |topo: &mut Topology, edges: &[(brepkit_topology::edge::EdgeId, bool)]| {
+            let w = Wire::new(
+                edges
+                    .iter()
+                    .map(|&(e, fwd)| OrientedEdge::new(e, fwd))
+                    .collect(),
+                true,
+            )
+            .unwrap();
+            topo.add_wire(w)
+        };
+        let (wid, hole) = (wire(&mut topo, &outer), wire(&mut topo, &window));
+        let cyl = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), z_axis, r).unwrap();
+        let face = topo.add_face(Face::new(wid, vec![hole], FaceSurface::Cylinder(cyl)));
+        let u = 0.8125;
+        let out = clip_line_to_face_boundary(
+            &topo,
+            face,
+            at(u, 3.0),
+            at(u, 16.0),
+            1e-7,
+            &FaceLoopsCache::default(),
+            None,
+            false,
+        )
+        .expect("the ruling runs in the face beside the window");
+        let mut runs: Vec<(f64, f64)> = out
+            .iter()
+            .map(|&(a, b)| (a.z().min(b.z()), a.z().max(b.z())))
+            .collect();
+        runs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(runs.len(), 2, "{out:?}");
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-7;
+        assert!(near(runs[0].0, 3.0) && near(runs[0].1, 5.0), "{out:?}");
+        assert!(
+            near(runs[1].0, top_of(u)) && near(runs[1].1, 14.0),
+            "{out:?}: the top is at {}",
+            top_of(u)
+        );
+    }
+
+    /// [`a_ruling_from_inside_the_band_meets_a_windows_curved_top_on_it`] with
+    /// a short ruling that starts 0.0001 below the window's elliptic top,
+    /// inside the window: it keeps only its run above the top.
+    #[test]
+    fn a_short_ruling_from_just_inside_a_curved_window_starts_on_its_top() {
+        use brepkit_math::curves::Ellipse3D;
+        use brepkit_math::surfaces::CylindricalSurface;
+        let mut topo = Topology::new();
+        let r = 3.75;
+        let z_axis = Vec3::new(0.0, 0.0, 1.0);
+        let at = |u: f64, z: f64| Point3::new(r * u.cos(), r * u.sin(), z);
+        let top_of = |u: f64| 7.0 + r * u.cos();
+        let (w0, w1) = (0.6, 1.0);
+        let corners = [
+            at(0.0, 0.0),
+            at(0.0, 14.0),
+            at(w0, 5.0),
+            at(w1, 5.0),
+            at(w1, top_of(w1)),
+            at(w0, top_of(w0)),
+        ];
+        let v = corners.map(|c| topo.add_vertex(Vertex::new(c, 1e-7)));
+        let arc = |topo: &mut Topology, a: usize, b: usize, z: f64| {
+            let circle = Circle3D::new(Point3::new(0.0, 0.0, z), z_axis, r).unwrap();
+            topo.add_edge(Edge::new(v[a], v[b], EdgeCurve::Circle(circle)))
+        };
+        let line = |topo: &mut Topology, a: usize, b: usize| {
+            topo.add_edge(Edge::new(v[a], v[b], EdgeCurve::Line))
+        };
+        let seam = line(&mut topo, 0, 1);
+        let outer = [
+            (arc(&mut topo, 0, 0, 0.0), true),
+            (seam, true),
+            (arc(&mut topo, 1, 1, 14.0), false),
+            (seam, false),
+        ];
+        let top = Ellipse3D::new_with_ref(
+            Point3::new(0.0, 0.0, 7.0),
+            Vec3::new(-1.0, 0.0, 1.0),
+            r * std::f64::consts::SQRT_2,
+            r,
+            Vec3::new(1.0, 0.0, 1.0),
+        )
+        .unwrap();
+        let top = topo.add_edge(Edge::new(v[5], v[4], EdgeCurve::Ellipse(top)));
+        let window = [
+            (line(&mut topo, 2, 5), true),
+            (top, true),
+            (line(&mut topo, 3, 4), false),
+            (arc(&mut topo, 2, 3, 5.0), false),
+        ];
+        let wire = |topo: &mut Topology, edges: &[(brepkit_topology::edge::EdgeId, bool)]| {
+            let w = Wire::new(
+                edges
+                    .iter()
+                    .map(|&(e, fwd)| OrientedEdge::new(e, fwd))
+                    .collect(),
+                true,
+            )
+            .unwrap();
+            topo.add_wire(w)
+        };
+        let (wid, hole) = (wire(&mut topo, &outer), wire(&mut topo, &window));
+        let cyl = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), z_axis, r).unwrap();
+        let face = topo.add_face(Face::new(wid, vec![hole], FaceSurface::Cylinder(cyl)));
+        let u = 0.8125;
+        let out = clip_line_to_face_boundary(
+            &topo,
+            face,
+            at(u, top_of(u) - 0.0001),
+            at(u, top_of(u) + 0.1),
+            1e-7,
+            &FaceLoopsCache::default(),
+            None,
+            false,
+        )
+        .expect("the ruling runs in the face past the window's top");
+        assert_eq!(out.len(), 1, "{out:?}");
+        let (a, b) = out[0];
+        let (lo, hi) = (a.z().min(b.z()), a.z().max(b.z()));
+        assert!(
+            (lo - top_of(u)).abs() < 1e-7 && (hi - (top_of(u) + 0.1)).abs() < 1e-9,
+            "{out:?}: the top is at {}",
+            top_of(u)
+        );
+    }
+
+    /// A whole cylinder band of radius `r`, its seam at u = pi, with one hole
+    /// of the edges `hole` (from, to, curve or a line, whether the wire runs
+    /// it from to to), between the points `corners`, and the runs in z of the
+    /// ruling at `u` from z = 3 to 16.
+    fn band_runs_past_a_hole(
+        r: f64,
+        corners: &[Point3],
+        hole: &[(usize, usize, Option<EdgeCurve>, bool)],
+        u: f64,
+    ) -> Vec<(f64, f64)> {
+        use brepkit_math::surfaces::CylindricalSurface;
+        let mut topo = Topology::new();
+        let z_axis = Vec3::new(0.0, 0.0, 1.0);
+        let at = |u: f64, z: f64| Point3::new(r * u.cos(), r * u.sin(), z);
+        let mut points = vec![
+            at(std::f64::consts::PI, 0.0),
+            at(std::f64::consts::PI, 14.0),
+        ];
+        points.extend_from_slice(corners);
+        let v: Vec<_> = points
+            .iter()
+            .map(|&c| topo.add_vertex(Vertex::new(c, 1e-7)))
+            .collect();
+        let rim = |topo: &mut Topology, a: usize, z: f64| {
+            let circle = Circle3D::new(Point3::new(0.0, 0.0, z), z_axis, r).unwrap();
+            topo.add_edge(Edge::new(v[a], v[a], EdgeCurve::Circle(circle)))
+        };
+        let seam = topo.add_edge(Edge::new(v[0], v[1], EdgeCurve::Line));
+        let outer = vec![
+            OrientedEdge::new(rim(&mut topo, 0, 0.0), true),
+            OrientedEdge::new(seam, true),
+            OrientedEdge::new(rim(&mut topo, 1, 14.0), false),
+            OrientedEdge::new(seam, false),
+        ];
+        let inner: Vec<OrientedEdge> = hole
+            .iter()
+            .map(|(a, b, curve, forward)| {
+                let curve = curve.clone().unwrap_or(EdgeCurve::Line);
+                OrientedEdge::new(
+                    topo.add_edge(Edge::new(v[a + 2], v[b + 2], curve)),
+                    *forward,
+                )
+            })
+            .collect();
+        let wid = topo.add_wire(Wire::new(outer, true).unwrap());
+        let hid = topo.add_wire(Wire::new(inner, true).unwrap());
+        let cyl = CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), z_axis, r).unwrap();
+        let face = topo.add_face(Face::new(wid, vec![hid], FaceSurface::Cylinder(cyl)));
+        let out = clip_line_to_face_boundary(
+            &topo,
+            face,
+            at(u, 3.0),
+            at(u, 16.0),
+            1e-7,
+            &FaceLoopsCache::default(),
+            None,
+            false,
+        )
+        .unwrap_or_default();
+        let mut runs: Vec<(f64, f64)> = out
+            .iter()
+            .map(|&(a, b)| (a.z().min(b.z()), a.z().max(b.z())))
+            .collect();
+        runs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        runs
+    }
+
+    /// A lens on the band between z = 7 + x and z = 7 - x, x >= 0, turns
+    /// back at (0, r, 7): a ruling through that tip only touches the hole,
+    /// and runs on whole from z = 3 to the band's top rim.
+    #[test]
+    fn a_ruling_through_a_holes_tip_only_touches_it() {
+        use brepkit_math::curves::Ellipse3D;
+        let r = 3.75;
+        let ellipse = |slope: f64| {
+            Ellipse3D::new_with_ref(
+                Point3::new(0.0, 0.0, 7.0),
+                Vec3::new(-slope, 0.0, 1.0),
+                r * std::f64::consts::SQRT_2,
+                r,
+                Vec3::new(1.0, 0.0, slope),
+            )
+            .map(EdgeCurve::Ellipse)
+            .unwrap()
+        };
+        let corners = [Point3::new(0.0, -r, 7.0), Point3::new(0.0, r, 7.0)];
+        let runs = band_runs_past_a_hole(
+            r,
+            &corners,
+            &[
+                (0, 1, Some(ellipse(1.0)), true),
+                (0, 1, Some(ellipse(-1.0)), false),
+            ],
+            std::f64::consts::FRAC_PI_2,
+        );
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            (runs[0].0 - 3.0).abs() < 1e-9 && (runs[0].1 - 14.0).abs() < 1e-7,
+            "{runs:?}"
+        );
+    }
+
+    /// A window whose bottom and top each break at a vertex on the ruling:
+    /// the ruling passes through both vertices into and out of the window,
+    /// and keeps its runs below and above it.
+    #[test]
+    fn a_ruling_through_a_windows_vertices_crosses_it() {
+        let r = 3.75;
+        let at = |u: f64, z: f64| Point3::new(r * u.cos(), r * u.sin(), z);
+        let (w0, wm, w1) = (0.6, 0.8, 1.0);
+        let corners = [
+            at(w0, 5.0),
+            at(wm, 5.0),
+            at(w1, 5.0),
+            at(w1, 7.0),
+            at(wm, 7.0),
+            at(w0, 7.0),
+        ];
+        let arc = |z: f64| {
+            Circle3D::new(Point3::new(0.0, 0.0, z), Vec3::new(0.0, 0.0, 1.0), r)
+                .map(EdgeCurve::Circle)
+                .unwrap()
+        };
+        let runs = band_runs_past_a_hole(
+            r,
+            &corners,
+            &[
+                (0, 1, Some(arc(5.0)), true),
+                (1, 2, Some(arc(5.0)), true),
+                (2, 3, None, true),
+                (4, 3, Some(arc(7.0)), false),
+                (5, 4, Some(arc(7.0)), false),
+                (5, 0, None, true),
+            ],
+            wm,
+        );
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-7;
+        assert!(near(runs[0].0, 3.0) && near(runs[0].1, 5.0), "{runs:?}");
+        assert!(near(runs[1].0, 7.0) && near(runs[1].1, 14.0), "{runs:?}");
+    }
+
+    /// A lens between two cubic splines on a band of radius `r`, from a tip
+    /// on the ruling at u = pi/2, z = 7 to a tip at u = pi/2 - 0.25: both
+    /// splines leave the first tip along the ruling (their second control
+    /// points lie straight above and below it) and bend away to the same
+    /// side, so the ruling only touches the hole there.
+    fn runs_past_a_tangent_lens(r: f64) -> Vec<(f64, f64)> {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        let at = |u: f64, z: f64| Point3::new(r * u.cos(), r * u.sin(), z);
+        let half = std::f64::consts::FRAC_PI_2;
+        let (tip, far) = (at(half, 7.0), at(half - 0.25, 7.0));
+        let side = |up: f64| {
+            let poles = vec![
+                tip,
+                Point3::new(tip.x(), tip.y(), 7.0 + 0.6 * up),
+                {
+                    let q = at(half - 0.2, 7.0 + 0.6 * up);
+                    Point3::new(q.x(), q.y(), q.z())
+                },
+                far,
+            ];
+            EdgeCurve::NurbsCurve(
+                NurbsCurve::new(
+                    3,
+                    vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+                    poles,
+                    vec![1.0; 4],
+                )
+                .unwrap(),
+            )
+        };
+        band_runs_past_a_hole(
+            r,
+            &[tip, far],
+            &[
+                (0, 1, Some(side(1.0)), true),
+                (0, 1, Some(side(-1.0)), false),
+            ],
+            half,
+        )
+    }
+
+    /// [`a_ruling_through_a_holes_tip_only_touches_it`] on a band of radius
+    /// 0.001: the hole's sides move off the ruling by less than the
+    /// tolerance over a fixed short step, and still leave to one side.
+    #[test]
+    fn a_ruling_through_a_tiny_lenss_tip_only_touches_it() {
+        use brepkit_math::curves::Ellipse3D;
+        let r = 0.001;
+        let ellipse = |slope: f64| {
+            Ellipse3D::new_with_ref(
+                Point3::new(0.0, 0.0, 7.0),
+                Vec3::new(-slope, 0.0, 1.0),
+                r * std::f64::consts::SQRT_2,
+                r,
+                Vec3::new(1.0, 0.0, slope),
+            )
+            .map(EdgeCurve::Ellipse)
+            .unwrap()
+        };
+        let corners = [Point3::new(0.0, -r, 7.0), Point3::new(0.0, r, 7.0)];
+        let runs = band_runs_past_a_hole(
+            r,
+            &corners,
+            &[
+                (0, 1, Some(ellipse(1.0)), true),
+                (0, 1, Some(ellipse(-1.0)), false),
+            ],
+            std::f64::consts::FRAC_PI_2,
+        );
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            (runs[0].0 - 3.0).abs() < 1e-9 && (runs[0].1 - 14.0).abs() < 1e-7,
+            "{runs:?}"
+        );
+    }
+
+    /// A lens whose sides leave its tip along the ruling, on a band of radius
+    /// 10: they move off the ruling only to second order, and the ruling
+    /// still only touches the hole.
+    #[test]
+    fn a_ruling_along_a_lenss_tangent_tip_only_touches_it() {
+        let runs = runs_past_a_tangent_lens(10.0);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            (runs[0].0 - 3.0).abs() < 1e-9 && (runs[0].1 - 14.0).abs() < 1e-7,
+            "{runs:?}"
+        );
+    }
+
+    /// An oval hole on a band of radius 10, its widest point on the ruling:
+    /// the ruling touches the hole's edge there without crossing it, and
+    /// runs on whole.
+    #[test]
+    fn a_ruling_tangent_to_a_holes_edge_only_touches_it() {
+        use brepkit_math::nurbs::fitting::interpolate;
+        let r = 10.0;
+        let at = |u: f64, z: f64| Point3::new(r * u.cos(), r * u.sin(), z);
+        let (centre, reach) = (std::f64::consts::FRAC_PI_2 - 0.1, 0.1);
+        let pts: Vec<Point3> = (0..=48)
+            .map(|k| {
+                let a = std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * f64::from(k) / 48.0;
+                at(centre + reach * a.cos(), 7.0 + 2.0 * a.sin())
+            })
+            .collect();
+        let oval = EdgeCurve::NurbsCurve(interpolate(&pts, 3).unwrap());
+        let runs = band_runs_past_a_hole(r, &[pts[0]], &[(0, 0, Some(oval), true)], centre + reach);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            (runs[0].0 - 3.0).abs() < 1e-9 && (runs[0].1 - 14.0).abs() < 1e-7,
+            "{runs:?}"
         );
     }
 
