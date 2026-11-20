@@ -1064,6 +1064,7 @@ fn main() {
                         std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied())
                     {
                         let mut poly: Vec<(f64, f64)> = Vec::new();
+                        let mut owner: Vec<(usize, brepkit_math::vec::Point3)> = Vec::new();
                         for oe in topo.wire(wire_id).unwrap().edges() {
                             let edge = topo.edge(oe.edge()).unwrap();
                             let a = topo.vertex(edge.start()).unwrap().point();
@@ -1075,6 +1076,7 @@ fn main() {
                                 let p =
                                     edge.curve()
                                         .evaluate_with_endpoints(t0 + (t1 - t0) * f, a, b);
+                                owner.push((oe.edge().index(), p));
                                 let p = brepkit_math::vec::Vec3::new(p.x(), p.y(), p.z());
                                 poly.push((p.dot(u), p.dot(v)));
                             }
@@ -1095,6 +1097,10 @@ fn main() {
                                 let (d3, d4) = (cross(c, d, a), cross(c, d, b));
                                 if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
                                     hits += 1;
+                                    println!(
+                                        "  crossing: edge {} near {:?} with edge {} near {:?}",
+                                        owner[i].0, owner[i].1, owner[j].0, owner[j].1
+                                    );
                                 }
                             }
                         }
