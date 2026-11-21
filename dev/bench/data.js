@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795167272609,
+  "lastUpdate": 1795220476009,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -6587,6 +6587,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 16796599,
             "range": "± 216896",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "f0b5d8a6f9994406ff777e3d8384d4a6e7b9b9ea",
+          "message": "docs(buzzcad): the backlog sent upstream as #2642-#2645\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-20T16:17:23-08:00",
+          "tree_id": "7f2a97f5628c381b57e9f7a9bb6f0b5e620fb227",
+          "url": "https://github.com/Robokan/brepkit/commit/f0b5d8a6f9994406ff777e3d8384d4a6e7b9b9ea"
+        },
+        "date": 1795220474965,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1178103,
+            "range": "± 3905",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1240006,
+            "range": "± 1597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13436,
+            "range": "± 57",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 779930,
+            "range": "± 1490",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 26508391,
+            "range": "± 35180",
             "unit": "ns/iter"
           }
         ]
