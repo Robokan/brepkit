@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795220476009,
+  "lastUpdate": 1795284617694,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -6641,6 +6641,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 26508391,
             "range": "± 35180",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "156c37fd402bc2eb840b64f6181f81342583fcc7",
+          "message": "fix(blend): run a round's own end wall up first, and run a short band on\n\nA concave round at a ledge whose end wall runs on under the ledge ran\nthe walls up past that end wall and left the ledge's loop crossing\nitself. The end wall is now the first wall run up, its runout edge\ndropped from the wire. A NURBS band ending short of the wall it must\nreach is run on past its end section (its last span extrapolated)\nbefore the run-up is planned.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-21T10:07:08-08:00",
+          "tree_id": "9933ca4eb8c6c99f14504d02343b3f086f54ff7f",
+          "url": "https://github.com/Robokan/brepkit/commit/156c37fd402bc2eb840b64f6181f81342583fcc7"
+        },
+        "date": 1795284615961,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 698486,
+            "range": "± 13644",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 761602,
+            "range": "± 2901",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8604,
+            "range": "± 125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 454596,
+            "range": "± 10111",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 15759283,
+            "range": "± 257789",
             "unit": "ns/iter"
           }
         ]
