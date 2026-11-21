@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795289197192,
+  "lastUpdate": 1795297147254,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -6803,6 +6803,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 22340656,
             "range": "± 519771",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "6180acb91d483483ed24e7accfedaf595d6e00ff",
+          "message": "fix(blend): a walked end on a curved cap allows the cap's stand-off too\n\nA walked round cut back to a curved cap ends each contact on the cap's\ncorner edge with its face, within as far as that edge stands off the\nface. The contact is cut on the cap's surface, so a file's skin edge\nstanding off the cap as well moves the cut by both: the allowance now\nadds the edge's stand-off from the cap. A wing's top rounded to its tip\nhad its wall contact cut 1.24e-3 from the skins' shared edge, 1.08e-3\noff the side and 1.03e-3 off the cap; the end was left to a runout\npatch whose line crossed the top's outline.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-21T13:35:14-08:00",
+          "tree_id": "1d8cefb2f6adfa1cc3aa9814555d831bcd659b3f",
+          "url": "https://github.com/Robokan/brepkit/commit/6180acb91d483483ed24e7accfedaf595d6e00ff"
+        },
+        "date": 1795297146941,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1179740,
+            "range": "± 4749",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1242721,
+            "range": "± 3519",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13595,
+            "range": "± 108",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 792564,
+            "range": "± 6654",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 26547384,
+            "range": "± 758525",
             "unit": "ns/iter"
           }
         ]
