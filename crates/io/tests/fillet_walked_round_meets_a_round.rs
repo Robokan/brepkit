@@ -160,7 +160,7 @@ fn self_crossings(topo: &Topology, solid: SolidId) -> usize {
 #[test]
 fn a_walked_round_runs_on_to_the_end_face_past_the_straight_round() {
     let mut topo = Topology::new();
-    let peg = load(&mut topo, "tuner_flat_corner_rounds.step");
+    let peg = load(&mut topo, "peg_flat_corner_rounds.step");
     let picks = [
         Point3::new(4.5, 30.0, 0.0),
         Point3::new(4.5, 25.001_192_399_121_788, -10.711_280_128_285_926),
