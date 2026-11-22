@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795299902850,
+  "lastUpdate": 1795307883151,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -6911,6 +6911,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 25916406,
             "range": "± 309638",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "bfc45a16ee38e4cb3b6fff3b72c533fab64d1f45",
+          "message": "fix(blend): split off a ledge's corner a runout line cuts across\n\nA round closed by a runout patch has the patch's line on the ledge run\nfrom the contact's end to the ledge's corner. Where the ledge's outline\nfirst steps a little the round's way along a short edge and then\ncrosses that line, the ledge's loop ran out past the crossing and back,\ncrossing itself. The line is now cut at the crossing: the ledge keeps\nit to there and its outline on from there, the corner cut off becomes\na face of its own on the ledge's surface, and the patch takes the line\nin two pieces.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-21T16:34:40-08:00",
+          "tree_id": "dbe189cd2431083e7f651d03c910c1b5ddb2bf35",
+          "url": "https://github.com/Robokan/brepkit/commit/bfc45a16ee38e4cb3b6fff3b72c533fab64d1f45"
+        },
+        "date": 1795307882427,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 994675,
+            "range": "± 11376",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1035733,
+            "range": "± 10775",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11818,
+            "range": "± 190",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 633322,
+            "range": "± 6600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 21991048,
+            "range": "± 245218",
             "unit": "ns/iter"
           }
         ]
