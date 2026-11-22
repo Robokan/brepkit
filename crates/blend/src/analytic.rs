@@ -402,32 +402,6 @@ fn section_basis(n1: Vec3, n2: Vec3, spine_tangent: Vec3) -> (Vec3, Vec3) {
     (bisector, cross_dir)
 }
 
-/// The in-plane direction from the spine INTO `face`'s material: the left
-/// side of the face's own traversal of the spine edge (`effective normal x
-/// traversal tangent` under the CCW-outer-wire convention). Returns `None`
-/// when the spine's first edge is not in the face's wires.
-fn material_contact_direction(
-    topo: &Topology,
-    face: FaceId,
-    spine: &Spine,
-    normal: Vec3,
-    tangent: Vec3,
-) -> Option<Vec3> {
-    let spine_edge = *spine.edges().first()?;
-    let f = topo.face(face).ok()?;
-    let n_eff = if f.is_reversed() { -normal } else { normal };
-    for wid in std::iter::once(f.outer_wire()).chain(f.inner_wires().iter().copied()) {
-        let w = topo.wire(wid).ok()?;
-        for oe in w.edges() {
-            if oe.edge() == spine_edge {
-                let t = if oe.is_forward() { tangent } else { -tangent };
-                return n_eff.cross(t).normalize().ok();
-            }
-        }
-    }
-    None
-}
-
 /// Compute the direction from edge toward contact point on a plane.
 ///
 /// This is the component of the bisector projected onto the plane surface,
@@ -649,14 +623,20 @@ fn plane_plane_chamfer(
     // INTO each face's material only on a CONVEX edge — on a concave edge it
     // flips onto the faces' extensions, placing the contacts on the external
     // tangent branch (a 0.02 chamfer on a reflex notch grew the solid by
-    // 6.7%). The exact, convexity-independent direction is the wire-traversal
-    // left side (`effective_normal x traversal_tangent` for a CCW-wound
-    // face); the bisector projection remains the fallback when the spine
-    // edge is not found in a face's wires.
-    let contact_dir1 = material_contact_direction(topo, face1, spine, n1, tangent)
-        .unwrap_or_else(|| compute_contact_direction(n1, bisector));
-    let contact_dir2 = material_contact_direction(topo, face2, spine, n2, tangent)
-        .unwrap_or_else(|| compute_contact_direction(n2, bisector));
+    // 6.7%). The exact, convexity-independent direction is the left of the
+    // face's wire along the edge about the plane's own normal, which a
+    // reversed face's wire winds about too (a pocket's wall); the bisector
+    // projection remains the fallback when the spine edge is not found in a
+    // face's wires.
+    let into = |face: FaceId, normal: Vec3| -> Result<Vec3, BlendError> {
+        let side = match spine.edges().first() {
+            Some(&edge) => crate::builder_utils::into_face_from_edge(topo, face, edge)?,
+            None => None,
+        };
+        Ok(side.unwrap_or_else(|| compute_contact_direction(normal, bisector)))
+    };
+    let contact_dir1 = into(face1, n1)?;
+    let contact_dir2 = into(face2, n2)?;
 
     let c1_start = p_start + contact_dir1 * d1;
     let c1_end = p_end + contact_dir1 * d1;
@@ -1195,7 +1175,10 @@ fn plane_cylinder_ruling_fillet(
     face_plane: FaceId,
     face_cyl: FaceId,
 ) -> Result<Option<StripeResult>, BlendError> {
-    const PARALLEL_TOL: f64 = 1e-7;
+    // A plane off parallel to the axis meets the wall in an ellipse, along
+    // which no cylinder band rolls: over a long wall a band laid along its
+    // chord stands off the wall. The walker takes it.
+    const PARALLEL_TOL: f64 = ANALYTIC_TOL_ANG;
     let axis = cyl.axis();
     if spine.is_closed() || spine.edges().len() != 1 || n_p_inward.dot(axis).abs() > PARALLEL_TOL {
         return Ok(None);
@@ -1217,13 +1200,10 @@ fn plane_cylinder_ruling_fillet(
     };
     // Where the plane face lies off the edge, and the wall's material side
     // there: a convex edge's plane face reaches into the wall's material.
-    let plane_raw_normal = if topo.face(face_plane)?.is_reversed() {
-        n_p_inward
-    } else {
-        -n_p_inward
-    };
-    let Some(into_plane) =
-        material_contact_direction(topo, face_plane, spine, plane_raw_normal, tangent)
+    // A face's wire winds about its surface's normal, reversed or not, so
+    // the face lies on the wire's left about that normal.
+    let edge = spine.edges()[0];
+    let Some(into_plane) = crate::builder_utils::into_face_from_edge(topo, face_plane, edge)?
     else {
         return Ok(None);
     };
@@ -1272,8 +1252,7 @@ fn plane_cylinder_ruling_fillet(
     if (plane_start - p_start).dot(into_plane) <= 0.0 {
         return Ok(None);
     }
-    let Some(into_wall) = material_contact_direction(topo, face_cyl, spine, outward, tangent)
-    else {
+    let Some(into_wall) = crate::builder_utils::into_face_from_edge(topo, face_cyl, edge)? else {
         return Ok(None);
     };
     if (wall_start - p_start).dot(into_wall) <= 0.0 {
@@ -5273,11 +5252,11 @@ pub fn cone_cone_coaxial_chamfer(
 /// a pair of straight lines. The chamfer surface is a **plane** that
 /// contains the two contact lines (each parallel to the cyl axes).
 ///
-/// Convex/concave configurations are unified via per-face
-/// `signed_offset_i = ±1`: the angular displacement on each cylinder
-/// from the spine flips toward or away from the OTHER cylinder. For
-/// convex-convex, both contacts move AWAY from the other cyl;
-/// concave-concave moves both TOWARD; mixed configurations swap one.
+/// Each contact turns off the spine into its face, the side the face's
+/// wire keeps along the edge. Where the edge is in no wire of a face, the
+/// per-face `signed_offset_i = ±1` below picks the side: both contacts
+/// move AWAY from the other cyl for outward faces, both TOWARD for
+/// reversed ones, and mixed configurations swap one.
 ///
 /// # Geometry
 ///
@@ -5423,8 +5402,22 @@ pub fn cylinder_cylinder_chamfer(
     let (Some(turn1), Some(turn2)) = (chord_turn(d1, r1), chord_turn(d2, r2)) else {
         return Ok(None);
     };
-    let dtheta1 = y_sign * s1 * turn1;
-    let dtheta2 = -y_sign * s2 * turn2;
+    // A face's reversal does not tell which way round its axis it runs off
+    // the ridge: the lens two cylinders share and their union both have
+    // outward faces, and run off the ridge opposite ways. The side the
+    // face's wire keeps does, where it runs along the edge; on cyl1 a turn
+    // `+θ` from the ridge runs along `ẑ × (x_spine, y_spine)`.
+    let side = |face: FaceId, tangent: Vec3| -> Result<Option<f64>, BlendError> {
+        let Some(&edge) = edges.first() else {
+            return Ok(None);
+        };
+        Ok(crate::builder_utils::into_face_from_edge(topo, face, edge)?
+            .map(|into| into.dot(tangent).signum()))
+    };
+    let ccw1 = a_cyl.cross(x_hat * x_spine + y_hat * y_spine);
+    let ccw2 = a_cyl.cross(x_hat * (x_spine - big_d) + y_hat * y_spine);
+    let dtheta1 = side(face1, ccw1)?.unwrap_or(y_sign * s1) * turn1;
+    let dtheta2 = side(face2, ccw2)?.unwrap_or(-y_sign * s2) * turn2;
     let (sin1, cos1) = dtheta1.sin_cos();
     let (sin2, cos2) = dtheta2.sin_cos();
 

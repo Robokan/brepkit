@@ -556,8 +556,34 @@ fn trim_to_inside_corners(
     }
     let surface = face.surface().clone();
     let reversed = face.is_reversed();
+    let outline = face.outer_wire();
     let holes = face.inner_wires().to_vec();
-    let oriented_edges: Vec<OrientedEdge> = topo.wire(face.outer_wire())?.edges().to_vec();
+    // The wire through the blended edge's corners: the outline, or a hole
+    // whose own edge is blended (a pocket's rim on the face round it).
+    let through_corner = |wid: WireId| -> Result<bool, BlendError> {
+        for oe in topo.wire(wid)?.edges() {
+            let e = topo.edge(oe.edge())?;
+            if corners.contains(&e.start()) || corners.contains(&e.end()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let mut wire_id = outline;
+    if !through_corner(outline)? {
+        for &hole in &holes {
+            if through_corner(hole)? {
+                wire_id = hole;
+                break;
+            }
+        }
+    }
+    let in_hole = wire_id != outline;
+    let others: Vec<WireId> = std::iter::once(outline)
+        .chain(holes.iter().copied())
+        .filter(|&w| w != wire_id)
+        .collect();
+    let oriented_edges: Vec<OrientedEdge> = topo.wire(wire_id)?.edges().to_vec();
     let n = oriented_edges.len();
     let mut edge_data: Vec<(OrientedEdge, Point3, Point3)> = Vec::with_capacity(n);
     let mut starts: Vec<VertexId> = Vec::with_capacity(n);
@@ -609,7 +635,10 @@ fn trim_to_inside_corners(
         let d_out = sub2(project(next.2), project(corner));
         let turn = cross2(d_in, d_out);
         let scale = d_in.0.hypot(d_in.1) * d_out.0.hypot(d_out.1);
-        if turn * winding.signum() >= -1e-9 * scale {
+        // The outline's inside corner turns against its winding. A hole's
+        // corner that turns with the hole's winding points into the face.
+        let toward = if in_hole { -1.0 } else { 1.0 };
+        if turn * winding.signum() * toward >= -1e-9 * scale {
             continue;
         }
         let j = usize::from((ends[1] - corner).length() < (ends[0] - corner).length());
@@ -677,8 +706,9 @@ fn trim_to_inside_corners(
         contact_ends[j] = hit.point_3d;
         hits.push(hit);
     }
-    // The stretch from each inside corner to its contact end crosses no
-    // boundary edge but the two at the corner.
+    // The stretch from each inside corner to its contact end meets no
+    // boundary edge but the two at the corner. An edge in line with it but
+    // apart from it (the other end's set-back on a hole) does not meet it.
     for j in 0..2 {
         let Some(k) = inside[j] else { continue };
         let (c, p) = (project(edge_data[k].1), project(contact_ends[j]));
@@ -686,15 +716,7 @@ fn trim_to_inside_corners(
             if idx == k || idx == (k + n - 1) % n {
                 continue;
             }
-            let (d1, d2) = (
-                cross2(sub2(b, a), sub2(c, a)),
-                cross2(sub2(b, a), sub2(p, a)),
-            );
-            let (d3, d4) = (
-                cross2(sub2(p, c), sub2(a, c)),
-                cross2(sub2(p, c), sub2(b, c)),
-            );
-            if d1 * d2 <= 0.0 && d3 * d4 <= 0.0 {
+            if flat_segment_distance(c, p, a, b) <= CONTACT_END_TOL {
                 return Err(fail());
             }
         }
@@ -786,8 +808,9 @@ fn trim_to_inside_corners(
         loop_edges.extend(close_b.map(|e| OrientedEdge::new(e, false)));
     }
 
-    // No hole may lie in the strip cut off: its outline is the dropped
-    // chain closed through the contact.
+    // No other wire may reach into the strip cut off: its outline is the
+    // dropped chain closed through the contact. A wire that does either
+    // crosses the new edges or lies wholly inside.
     let mut cut: Vec<(f64, f64)> = Vec::new();
     for oe in &dropped {
         let e = topo.edge(oe.edge())?;
@@ -796,7 +819,25 @@ fn trim_to_inside_corners(
     let (first, second) = if keep_chain1 { (ja, jb) } else { (jb, ja) };
     cut.push(project(contact_ends[first]));
     cut.push(project(contact_ends[second]));
-    for &hole in &holes {
+    let FaceSurface::Plane { normal, .. } = surface else {
+        return Err(fail());
+    };
+    let mut new_segments = vec![(contact_ends[0], contact_ends[1])];
+    for j in 0..2 {
+        if let Some(k) = inside[j] {
+            new_segments.push((edge_data[k].1, contact_ends[j]));
+        }
+    }
+    for &wid in &others {
+        for oe in topo.wire(wid)?.edges() {
+            for &(s, e) in &new_segments {
+                if edge_meets_segment(topo, oe.edge(), s, e, normal, &project)? {
+                    return Err(fail());
+                }
+            }
+        }
+    }
+    for &hole in &others {
         for oe in topo.wire(hole)?.edges() {
             let e = topo.edge(oe.edge())?;
             let (sp, ep) = (
@@ -818,7 +859,16 @@ fn trim_to_inside_corners(
 
     let trimmed_wire = Wire::new(loop_edges, true).map_err(|_| fail())?;
     let trimmed_wire_id = topo.add_wire(trimmed_wire);
-    let mut trimmed_face = Face::new(trimmed_wire_id, holes, surface);
+    let (outline, holes) = if in_hole {
+        let holes = holes
+            .iter()
+            .map(|&w| if w == wire_id { trimmed_wire_id } else { w })
+            .collect();
+        (outline, holes)
+    } else {
+        (trimmed_wire_id, holes)
+    };
+    let mut trimmed_face = Face::new(outline, holes, surface);
     if reversed {
         trimmed_face.set_reversed(true);
     }
@@ -896,6 +946,76 @@ fn edge_side_range(
 
 /// The range of `s0 + a cos t + b sin t` for `t` from `t0` to `t1`: its
 /// values at the ends and at the peak and trough angles inside the span.
+/// Whether a boundary edge of a plane face comes within `CONTACT_END_TOL`
+/// of the segment `s`..`e` in that plane. A line is measured exactly. A
+/// circle or an ellipse is split along its span until each piece's box in
+/// the segment's frame clears the segment, or is too small to tell. Any
+/// other curve is read by the box of its control points, so a near miss
+/// reads as a meeting.
+fn edge_meets_segment(
+    topo: &Topology,
+    edge_id: EdgeId,
+    s: Point3,
+    e: Point3,
+    normal: brepkit_math::vec::Vec3,
+    project: &dyn Fn(Point3) -> (f64, f64),
+) -> Result<bool, BlendError> {
+    let length = (e - s).length();
+    let along = (e - s) * (1.0 / length.max(f64::MIN_POSITIVE));
+    let across = normal.cross(along);
+    let overlaps = |(lo, hi): (f64, f64), (start, end): (f64, f64)| {
+        lo <= CONTACT_END_TOL
+            && hi >= -CONTACT_END_TOL
+            && start <= length + CONTACT_END_TOL
+            && end >= -CONTACT_END_TOL
+    };
+    let edge = topo.edge(edge_id)?;
+    let sp = topo.vertex(edge.start())?.point();
+    let ep = topo.vertex(edge.end())?.point();
+    let conic = match edge.curve() {
+        EdgeCurve::Line => {
+            let gap = flat_segment_distance(project(s), project(e), project(sp), project(ep));
+            return Ok(gap <= CONTACT_END_TOL);
+        }
+        EdgeCurve::Circle(c) => {
+            Some((c.center(), c.u_axis() * c.radius(), c.v_axis() * c.radius()))
+        }
+        EdgeCurve::Ellipse(el) => Some((
+            el.center(),
+            el.u_axis() * el.semi_major(),
+            el.v_axis() * el.semi_minor(),
+        )),
+        EdgeCurve::NurbsCurve(_) => None,
+    };
+    let Some((center, a_axis, b_axis)) = conic else {
+        return Ok(overlaps(
+            edge_side_range(topo, edge_id, s, across)?,
+            edge_side_range(topo, edge_id, s, along)?,
+        ));
+    };
+    let range = |dir: brepkit_math::vec::Vec3, span: (f64, f64)| {
+        sinusoid_range(
+            dir.dot(center - s),
+            (dir.dot(a_axis), dir.dot(b_axis)),
+            span,
+        )
+    };
+    let reach = a_axis.length().max(b_axis.length());
+    let mut pending = vec![edge.curve().domain_with_endpoints(sp, ep)];
+    while let Some((t0, t1)) = pending.pop() {
+        if !overlaps(range(across, (t0, t1)), range(along, (t0, t1))) {
+            continue;
+        }
+        if (t1 - t0).abs() * reach <= CONTACT_END_TOL || pending.len() > 4096 {
+            return Ok(true);
+        }
+        let mid = f64::midpoint(t0, t1);
+        pending.push((t0, mid));
+        pending.push((mid, t1));
+    }
+    Ok(false)
+}
+
 fn sinusoid_range(s0: f64, (a, b): (f64, f64), (t0, t1): (f64, f64)) -> (f64, f64) {
     use std::f64::consts::{PI, TAU};
     let (lo, hi) = if t1 >= t0 { (t0, t1) } else { (t1, t0) };
@@ -2335,6 +2455,29 @@ fn mapped_contact_forward(
     Ok(contact_tangent.dot(source_tangent) >= 0.0)
 }
 
+/// Whether an edge from `start` to `end` on `curve` is straight: a line, or a
+/// B-spline whose control points lie on the line through its ends (a round's
+/// contact on a plane, or a piece of one that still carries the whole
+/// contact's curve).
+pub fn is_straight(curve: &EdgeCurve, start: Point3, end: Point3) -> bool {
+    match curve {
+        EdgeCurve::Line => true,
+        EdgeCurve::NurbsCurve(spline) => {
+            let chord = end - start;
+            let Ok(along) = chord.normalize() else {
+                return false;
+            };
+            let tol = 1e-9 * chord.length().max(1.0);
+            spline.weights().iter().all(|w| w.is_finite() && *w > 0.0)
+                && spline.control_points().iter().all(|&p| {
+                    let off = p - start;
+                    (off - along * off.dot(along)).length() <= tol
+                })
+        }
+        EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => false,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 /// Which boundary edges a trim may split where a contact ends on them.
 #[derive(Clone, Copy)]
@@ -2700,7 +2843,7 @@ fn rebuild_mapped_parametric_face(
                     let tp = topo.vertex(t)?.point();
                     let curve = edge.curve();
                     let spoke = !single_contact
-                        && matches!(curve, EdgeCurve::Line)
+                        && is_straight(curve, sp, tp)
                         && split_policy.on_spoke((s, sp), (t, tp));
                     if !(own_seam || spoke || split_policy.allows(single_contact, s, t)) {
                         continue;
@@ -3225,7 +3368,20 @@ fn rebuild_mapped_parametric_face(
         .flat_map(|(index, pieces)| pieces.iter().map(move |piece| (index, piece)))
     {
         let whole = contact_pieces[restriction_index].len() == 1;
-        let closed_piece =
+        // A piece of a contact cut at the seam runs its own part of the
+        // contact's curve, on one side of the seam: its pcurve is fitted
+        // along that part.
+        let fitted_piece = if whole || surface.is_planar() {
+            None
+        } else {
+            let piece = topo.edge(contact_edge)?;
+            let ends = (
+                topo.vertex(piece.start())?.point(),
+                topo.vertex(piece.end())?.point(),
+            );
+            crate::builder_utils::pcurve_along(&surface, piece.curve(), ends, false)
+        };
+        let closed_piece = fitted_piece.or_else(|| {
             closed_seam_splits
                 .get(&restriction_index)
                 .and_then(|&(seam_vertex, _)| {
@@ -3233,7 +3389,8 @@ fn rebuild_mapped_parametric_face(
                     let point = topo.vertex(seam_vertex).ok()?.point();
                     let first = contact_pieces[restriction_index].first() == Some(&contact_edge);
                     closed_pcurve_piece(&surface, pcurve, point, first)
-                });
+                })
+        });
         let pcurve = if let Some(pcurve) = closed_piece {
             pcurve
         } else if let Some(pcurve) = restrictions[restriction_index]

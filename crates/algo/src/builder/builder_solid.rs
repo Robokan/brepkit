@@ -1371,7 +1371,18 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
                     continue;
                 };
                 let (sp, ep) = (sv.point(), ev.point());
-                let (d0, d1) = edge.curve().domain_with_endpoints(sp, ep);
+                let (mut d0, mut d1) = edge.curve().domain_with_endpoints(sp, ep);
+                // A closed circle's domain starts at its frame's parameter
+                // 0, not at its vertex: run the full turn from the vertex.
+                // Read from 0, a strut's rim stepped a quarter turn off the
+                // seam line it meets, the box below spanned a turn and a
+                // quarter, and the wall's flux came out negative.
+                if let EdgeCurve::Circle(c) = edge.curve()
+                    && (sp - ep).length() < 1e-9
+                {
+                    d0 = c.project(sp);
+                    d1 = d0 + std::f64::consts::TAU;
+                }
                 // Traversal order (is_forward-aware), each edge's end taken
                 // too: a loop running a whole turn then spans the whole
                 // period, not all of it but its last step.
@@ -1425,27 +1436,12 @@ fn shell_is_outward_oriented(topo: &Topology, faces: &[FaceId]) -> Option<bool> 
             // A sphere face whose loop winds the axis holds the pole on the
             // loop's left, which the box of its boundary never reaches (a
             // hemisphere's box is a sliver on its equator, and the face's
-            // flux would drop out of the vote): progress toward +u puts the
-            // north pole there. A sample at a pole has no longitude, and
-            // stepping through one could count a turn the loop never makes.
+            // flux would drop out of the vote).
             if matches!(surface, FaceSurface::Sphere(_)) {
-                let off_pole: Vec<f64> = uvs
-                    .iter()
-                    .filter(|&&(_, v)| v.abs() < std::f64::consts::FRAC_PI_2 - 1e-6)
-                    .map(|&(u, _)| u)
-                    .collect();
-                let progress: f64 = off_pole
-                    .iter()
-                    .zip(off_pole.iter().cycle().skip(1))
-                    .map(|(a, b)| {
-                        (b - a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
-                            - std::f64::consts::PI
-                    })
-                    .sum();
-                if progress > std::f64::consts::PI {
-                    v_hi = std::f64::consts::FRAC_PI_2;
-                } else if progress < -std::f64::consts::PI {
-                    v_lo = -std::f64::consts::FRAC_PI_2;
+                match pole_on_left(&uvs) {
+                    Some(v) if v > 0.0 => v_hi = v,
+                    Some(v) => v_lo = v,
+                    None => {}
                 }
             }
             // A whole ring's outer wire is its two seam placeholders, one
@@ -1961,6 +1957,62 @@ fn corner_fan_holds_holes(topo: &Topology, faces: &[FaceId]) -> bool {
     })
 }
 
+/// The latitude of the pole a sphere face's loop holds on its left, from
+/// the loop's samples in `(u, v)`: a loop winding the axis toward +u holds
+/// the north pole there. `None` when the loop does not wind the axis. A
+/// sample at a pole has no longitude, and stepping through one could count
+/// a turn the loop never makes, so those are passed over.
+fn pole_on_left(uvs: &[(f64, f64)]) -> Option<f64> {
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+    let off_pole: Vec<f64> = uvs
+        .iter()
+        .filter(|&&(_, v)| v.abs() < FRAC_PI_2 - 1e-6)
+        .map(|&(u, _)| u)
+        .collect();
+    let progress: f64 = off_pole
+        .iter()
+        .zip(off_pole.iter().cycle().skip(1))
+        .map(|(a, b)| (b - a + PI).rem_euclid(TAU) - PI)
+        .sum();
+    if progress > PI {
+        Some(FRAC_PI_2)
+    } else if progress < -PI {
+        Some(-FRAC_PI_2)
+    } else {
+        None
+    }
+}
+
+/// The outward normal of a sphere face whose outer loop winds the sphere's
+/// axis, read at the pole the loop holds. The loop's corners centre on the
+/// axis, at the sphere's centre for a hemisphere, where every point of the
+/// sphere is equally near and no normal can be read. Past a hemisphere they
+/// project to the pole the face does not hold.
+fn sphere_pole_normal(topo: &Topology, face: &Face) -> Option<Vec3> {
+    let surface = face.surface();
+    if !matches!(surface, FaceSurface::Sphere(_)) {
+        return None;
+    }
+    let wire = topo.wire(face.outer_wire()).ok()?;
+    let mut uvs = Vec::new();
+    for oe in wire.edges() {
+        let edge = topo.edge(oe.edge()).ok()?;
+        let sp = topo.vertex(edge.start()).ok()?.point();
+        let ep = topo.vertex(edge.end()).ok()?.point();
+        let (d0, d1) = edge.curve().domain_with_endpoints(sp, ep);
+        for k in 0..8 {
+            let f = f64::from(k) / 8.0;
+            let f = if oe.is_forward() { f } else { 1.0 - f };
+            let p = edge
+                .curve()
+                .evaluate_with_endpoints((d1 - d0).madd(f, d0), sp, ep);
+            uvs.extend(surface.project_point(p));
+        }
+    }
+    let n = surface.normal(0.0, pole_on_left(&uvs)?);
+    Some(if face.is_reversed() { -n } else { n })
+}
+
 /// Compute a signed volume estimate for a shell using the divergence theorem.
 ///
 /// Positive = outward-oriented normals (growth shell).
@@ -2011,7 +2063,9 @@ fn signed_volume_of_shell(topo: &Topology, faces: &[FaceId]) -> f64 {
             Point3::new(c.x() * inv, c.y() * inv, c.z() * inv)
         };
         let wound_normal = newell_normal(&verts);
-        let sign = match face_normal_at(topo, fid, centroid) {
+        let reading =
+            sphere_pole_normal(topo, face).or_else(|| face_normal_at(topo, fid, centroid));
+        let sign = match reading {
             // Flip when the wire winds opposite the outward normal so the
             // fan tets are consistent with the divergence-theorem convention.
             Some(outward) if wound_normal.dot(outward) < 0.0 => -1.0,
@@ -4578,11 +4632,21 @@ fn path_parting(topo: &Topology, a: EdgeId, b: EdgeId, tol: f64) -> Result<Optio
     }
     let (at_a, at_b) = (edge_path(topo, ea)?, edge_path(topo, eb)?);
     let (steps_a, steps_b) = (path_steps(topo, ea)?, path_steps(topo, eb)?);
-    let by_step = steps_a
-        .iter()
-        .chain(&steps_b)
-        .map(|&f| (at_a(f) - at_b(f)).length())
-        .fold(0.0, f64::max);
+    // Two edges may run between their ends either way: a face's copy of a
+    // section often runs against its partner's. Each step is a share of the
+    // first edge's run, so the second edge's own steps (its knots, where a
+    // bulge between samples shows) are reflected onto it when the edges run
+    // against each other.
+    let along = |back: bool| {
+        let flip = |f: f64| if back { 1.0 - f } else { f };
+        steps_a
+            .iter()
+            .copied()
+            .chain(steps_b.iter().map(|&f| flip(f)))
+            .map(|f| (at_a(f) - at_b(flip(f))).length())
+            .fold(0.0, f64::max)
+    };
+    let by_step = along(false).min(along(true));
     if by_step <= PATH_MIN_TOL {
         return Ok(Some(by_step));
     }
@@ -5937,6 +6001,32 @@ mod tests {
             brepkit_topology::edge::EdgeCurve::Line,
             bulge
         ));
+    }
+
+    /// A polyline run from the line's end back to its start, on the line
+    /// but for a bulge 1e-3 high at its own knot 0.3. Read backwards, no
+    /// step of the line lands on the bulge; the polyline's own knots do,
+    /// read on the polyline.
+    #[test]
+    fn a_path_run_backwards_is_read_at_its_own_steps() {
+        use brepkit_topology::edge::Edge;
+        use brepkit_topology::vertex::Vertex;
+        let along: [f64; 8] = [0.0, 0.2, 0.28, 0.3, 0.32, 0.4, 0.9, 1.0];
+        let points: Vec<(f64, f64)> = along
+            .iter()
+            .map(|&g| (1.0 - g, if (g - 0.3).abs() < 1e-12 { 1e-3 } else { 0.0 }))
+            .collect();
+        let mut knots = vec![0.0];
+        knots.extend(along);
+        knots.push(1.0);
+        let back = spline(1, &points, knots);
+        let mut topo = Topology::new();
+        let va = topo.add_vertex(Vertex::new(Point3::new(0.0, 0.0, 0.0), 1e-7));
+        let vb = topo.add_vertex(Vertex::new(Point3::new(1.0, 0.0, 0.0), 1e-7));
+        let line = topo.add_edge(Edge::new(va, vb, EdgeCurveOf::Line));
+        let bulge = topo.add_edge(Edge::new(vb, va, back));
+        assert_eq!(path_parting(&topo, line, bulge, 1e-5).unwrap(), None);
+        assert_eq!(path_parting(&topo, bulge, line, 1e-5).unwrap(), None);
     }
 
     /// One face bounded by a B-spline rim cut in two near each other, the

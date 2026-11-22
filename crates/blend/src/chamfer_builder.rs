@@ -7,9 +7,8 @@
 use brepkit_math::madd::Madd;
 use std::collections::{HashMap, HashSet};
 
-use brepkit_math::curves2d::{Curve2D, Line2D, NurbsCurve2D};
 use brepkit_math::traits::ParametricSurface;
-use brepkit_math::vec::{Point2, Point3, Vec3};
+use brepkit_math::vec::{Point3, Vec3};
 use brepkit_topology::Topology;
 use brepkit_topology::edge::{Edge, EdgeCurve, EdgeId};
 use brepkit_topology::face::{Face, FaceId, FaceSurface};
@@ -582,11 +581,16 @@ fn chamfer_face_of(
     }
     let info = crate::builder_utils::create_chamfer_face_with_contacts(topo, stripe, c1, c2)?;
     orient_chamfer_face(topo, info.face, stripe)?;
-    if let (
-        FaceSurface::Nurbs(_) | FaceSurface::Cone(_) | FaceSurface::Cylinder(_),
-        [Some(c1), Some(c2)],
-    ) = (&stripe.surface, [c1, c2])
-    {
+    // A plane band between curved faces (two cylinders' ridge) runs its
+    // contacts as its spine runs, which need not agree with its normal.
+    let on_curved = !topo.face(stripe.face1)?.surface().is_planar()
+        || !topo.face(stripe.face2)?.surface().is_planar();
+    let band_runs_its_own_way = match &stripe.surface {
+        FaceSurface::Nurbs(_) | FaceSurface::Cone(_) | FaceSurface::Cylinder(_) => true,
+        FaceSurface::Plane { .. } => on_curved,
+        FaceSurface::Sphere(_) | FaceSurface::Torus(_) => false,
+    };
+    if let (true, [Some(c1), Some(c2)]) = (band_runs_its_own_way, [c1, c2]) {
         run_against_supports(topo, info.face, [(supports[0], c1), (supports[1], c2)])?;
     }
     // The spine runs the chamfered edge forward, so the cross edge at its
@@ -897,7 +901,7 @@ fn seam_through(
     let surface = f.surface();
     let periods = [
         crate::fillet_builder::face_u_period(surface),
-        face_v_period(surface),
+        crate::builder_utils::face_v_period(surface),
     ];
     if periods.iter().all(Option::is_none) {
         return Ok(None);
@@ -985,7 +989,7 @@ fn rotated(
 /// keeping the side `keep` names. The contact's pcurve runs with the curve
 /// that the contact edge stores: on a plane, a NURBS contact's control
 /// points map into the plane's frame, and a circle or a contact on a curved
-/// face takes [`pcurve_along`].
+/// face takes [`crate::builder_utils::pcurve_along`].
 fn trim_along(
     topo: &mut Topology,
     scope: &trimmer::SplitScope,
@@ -1020,11 +1024,7 @@ fn trim_along(
             } else {
                 ends[1]
             };
-            let periods = [
-                crate::fillet_builder::face_u_period(&surface),
-                face_v_period(&surface),
-            ];
-            pcurve_along(support, periods, &curve, (start, end))
+            crate::builder_utils::pcurve_along(&surface, &curve, (start, end), false)
                 .ok_or(BlendError::TrimmingFailure { face })?
         }
     };
@@ -1039,157 +1039,6 @@ fn trim_along(
         &[restriction],
         trimmer::BoundarySplitPolicy::All,
     )
-}
-
-/// The period of `surface` in v: the torus's, and a NURBS surface's that
-/// closes round in v.
-fn face_v_period(surface: &FaceSurface) -> Option<f64> {
-    match surface {
-        FaceSurface::Torus(_) => Some(std::f64::consts::TAU),
-        FaceSurface::Nurbs(nurbs) if nurbs.is_periodic_v() => {
-            let (v0, v1) = nurbs.domain_v();
-            (v1 > v0).then_some(v1 - v0)
-        }
-        FaceSurface::Plane { .. }
-        | FaceSurface::Cylinder(_)
-        | FaceSurface::Cone(_)
-        | FaceSurface::Sphere(_)
-        | FaceSurface::Nurbs(_) => None,
-    }
-}
-
-/// The pcurve on `support` of `curve` run from `start` to `end`, over the
-/// curve's own parameters between them: one fraction of each span gives one
-/// point. The image of the curve in the surface's parameters is read along
-/// the curve, across the seams of `periods` (u, v). Where that image is a
-/// straight line run at an even rate (a circle round a cylinder's or a
-/// cone's axis), the pcurve is that line. Elsewhere a cubic interpolates the
-/// image at more and more points, until between them it lies within `FIT`
-/// times one more than the curve's size of the image, in pieces that meet at
-/// the curve's corners. `None` when no such cubic comes within it.
-fn pcurve_along(
-    support: &dyn ParametricSurface,
-    periods: [Option<f64>; 2],
-    curve: &EdgeCurve,
-    (start, end): (Point3, Point3),
-) -> Option<PCurve> {
-    const FIT: f64 = 1e-7;
-    const FIRST: u32 = 16;
-    const LAST: u32 = 4096;
-    let (t0, t1) = curve.domain_with_endpoints(start, end);
-    // The tolerance scales with the curve's size, not with where it lies.
-    let size = brepkit_math::aabb::Aabb3::try_from_points((0..=FIRST).map(|k| {
-        let f = f64::from(k) / f64::from(FIRST);
-        curve.evaluate_with_endpoints((t1 - t0).madd(f, t0), start, end)
-    }))
-    .map_or(0.0, |aabb| (aabb.max - aabb.min).length());
-    let fit = FIT * (1.0 + size);
-    let on = |uv: Point2| support.evaluate(uv.x(), uv.y());
-    let mut pieces: Vec<f64> = corners(curve)
-        .into_iter()
-        .map(|t| (t - t0) / (t1 - t0))
-        .filter(|f| *f > 1e-9 && *f < 1.0 - 1e-9)
-        .collect();
-    pieces.sort_by(f64::total_cmp);
-    pieces.insert(0, 0.0);
-    pieces.push(1.0);
-    let mut steps = FIRST;
-    while steps <= LAST {
-        let count = 2 * steps;
-        let step = |k: u32| f64::from(k) / f64::from(count);
-        let mut fractions = vec![0.0];
-        for piece in pieces.windows(2) {
-            fractions.extend((1..=count).map(|k| (piece[1] - piece[0]).madd(step(k), piece[0])));
-        }
-        let mut image: Vec<Point2> = Vec::with_capacity(fractions.len());
-        for &f in &fractions {
-            let point = curve.evaluate_with_endpoints((t1 - t0).madd(f, t0), start, end);
-            let (mut u, mut v) = support.project_point(point);
-            if let Some(last) = image.last() {
-                for (value, (period, reference)) in [
-                    (&mut u, (periods[0], last.x())),
-                    (&mut v, (periods[1], last.y())),
-                ] {
-                    if let Some(period) = period {
-                        *value -= period * ((*value - reference) / period).round();
-                    }
-                }
-            }
-            image.push(Point2::new(u, v));
-        }
-        let near = |at: Point2, k: usize| (on(at) - on(image[k])).length() <= fit;
-        let (first, chord) = (image[0], image[image.len() - 1] - image[0]);
-        if fractions
-            .iter()
-            .enumerate()
-            .all(|(k, &f)| near(first + chord * f, k))
-        {
-            let line = Line2D::new(first, chord).ok()?;
-            return Some(PCurve::new(Curve2D::Line(line), 0.0, chord.length()));
-        }
-        let params: Vec<f64> = (0..=steps)
-            .map(|k| f64::from(k) / f64::from(steps))
-            .collect();
-        let flat = |p: Point3| Point2::new(p.x(), p.y());
-        let mut knots = vec![0.0; 4];
-        let mut points: Vec<Point2> = Vec::new();
-        let mut within = true;
-        for (index, piece) in pieces.windows(2).enumerate() {
-            let base = index * count as usize;
-            let run = &image[base..=base + count as usize];
-            let nodes: Vec<Point3> = run
-                .iter()
-                .step_by(2)
-                .map(|uv| Point3::new(uv.x(), uv.y(), 0.0))
-                .collect();
-            let cubic = brepkit_math::nurbs::fitting::interpolate_at(&nodes, &params, 3).ok()?;
-            within &= (1..count)
-                .step_by(2)
-                .all(|k| near(flat(cubic.evaluate(step(k))), base + k as usize));
-            let inner = &cubic.knots()[4..cubic.knots().len() - 4];
-            knots.extend(
-                inner
-                    .iter()
-                    .map(|&k| (piece[1] - piece[0]).madd(k, piece[0])),
-            );
-            knots.extend(std::iter::repeat_n(piece[1], 3));
-            let skip = usize::from(index > 0);
-            points.extend(cubic.control_points()[skip..].iter().copied().map(flat));
-        }
-        if within {
-            knots.push(1.0);
-            let weights = vec![1.0; points.len()];
-            let pcurve = NurbsCurve2D::new(3, knots, points, weights).ok()?;
-            return Some(PCurve::new(Curve2D::Nurbs(pcurve), 0.0, 1.0));
-        }
-        steps *= 2;
-    }
-    None
-}
-
-/// The parameters of `curve` where it may turn a corner: the knots of a
-/// NURBS curve that reach its degree in number, inside its domain.
-fn corners(curve: &EdgeCurve) -> Vec<f64> {
-    let EdgeCurve::NurbsCurve(nurbs) = curve else {
-        return Vec::new();
-    };
-    let (d0, d1) = nurbs.domain();
-    let same = 1e-12 * (d1 - d0).abs();
-    let knots = nurbs.knots();
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < knots.len() {
-        let knot = knots[i];
-        let run = knots[i..]
-            .iter()
-            .take_while(|&&k| (k - knot).abs() <= same)
-            .count();
-        if run >= nurbs.degree() && knot - d0 > same && d1 - knot > same {
-            found.push(knot);
-        }
-        i += run;
-    }
-    found
 }
 
 /// Turns `face`'s outer wire round where it runs its contact edges the way
@@ -1621,19 +1470,6 @@ fn compute_chamfer_stripe(
 
     let surf1 = topo.face(face1)?.surface().clone();
     let surf2 = topo.face(face2)?.surface().clone();
-    // Across the seam of a B-spline face that closes round on itself, the
-    // contact's pcurve leaves the knot domain, and the trimmed face's mesh
-    // and measure come out wrong as well.
-    for (face, surface) in [(face1, &surf1), (face2, &surf2)] {
-        if let FaceSurface::Nurbs(nurbs) = surface
-            && (nurbs.is_periodic_u() || nurbs.is_periodic_v())
-        {
-            return Err(BlendError::UnsupportedSurface {
-                face,
-                surface_tag: "a B-spline face that closes round on itself".to_owned(),
-            });
-        }
-    }
 
     let spine = Spine::from_single_edge(topo, edge_id)?;
 
@@ -2093,55 +1929,5 @@ mod tests {
             );
         }
         assert_contacts(&stripe, [(r - d, 0.0), (wall_r, wall_z)]);
-    }
-
-    /// The arc of the ellipse where the plane `z = 4 + 0.3 y` cuts a
-    /// cylinder of radius 2, from 30 to 150 degrees round the axis, with
-    /// both moved `shift` along x: how far its pcurve on the cylinder
-    /// strays from it, and whether that pcurve is a line.
-    fn ellipse_arc_pcurve(shift: f64) -> (f64, bool) {
-        use brepkit_math::surfaces::CylindricalSurface;
-        let cylinder =
-            CylindricalSurface::new(Point3::new(shift, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 2.0)
-                .unwrap();
-        let root3 = 3.0_f64.sqrt();
-        // The arc is the image of a circle's third under an affine map,
-        // so it is exact as a rational quadratic.
-        let contact = brepkit_math::nurbs::curve::NurbsCurve::new(
-            2,
-            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-            vec![
-                Point3::new(shift + root3, 1.0, 4.3),
-                Point3::new(shift, 4.0, 5.2),
-                Point3::new(shift - root3, 1.0, 4.3),
-            ],
-            vec![1.0, 0.5, 1.0],
-        )
-        .unwrap();
-        let ends = (contact.evaluate(0.0), contact.evaluate(1.0));
-        let curve = EdgeCurve::NurbsCurve(contact.clone());
-        let pcurve =
-            pcurve_along(&cylinder, [Some(std::f64::consts::TAU), None], &curve, ends).unwrap();
-        let (t0, t1) = (pcurve.t_start(), pcurve.t_end());
-        let worst = (0..=200)
-            .map(|k| {
-                let f = f64::from(k) / 200.0;
-                let uv = pcurve.evaluate(t0 + (t1 - t0) * f);
-                (ParametricSurface::evaluate(&cylinder, uv.x(), uv.y()) - contact.evaluate(f))
-                    .length()
-            })
-            .fold(0.0_f64, f64::max);
-        (worst, matches!(pcurve.curve(), Curve2D::Line(_)))
-    }
-
-    /// The fit's tolerance follows the size of the contact, not where it
-    /// lies: 1e7 from the origin, the pcurve comes as close as at the origin.
-    #[test]
-    fn pcurve_along_fits_as_closely_far_from_the_origin() {
-        let (near, near_line) = ellipse_arc_pcurve(0.0);
-        let (far, far_line) = ellipse_arc_pcurve(1e7);
-        assert!(!near_line && !far_line, "a line for a curved image");
-        assert!(near < 1e-6, "{near} off at the origin");
-        assert!(far < 1e-6, "{far} off 1e7 from the origin");
     }
 }
