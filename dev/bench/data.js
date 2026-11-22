@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795310675831,
+  "lastUpdate": 1795333684003,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7019,6 +7019,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19382294,
             "range": "± 75923",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "70d342365fc658913affebf4c8e1944e7a6656ab",
+          "message": "docs(buzzcad): the Tuner corner fix, corpus bumped to its notes\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-21T23:44:34-08:00",
+          "tree_id": "b00f23f0f219066c9408ee6d3a44744b70d58d5f",
+          "url": "https://github.com/Robokan/brepkit/commit/70d342365fc658913affebf4c8e1944e7a6656ab"
+        },
+        "date": 1795333682942,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 951359,
+            "range": "± 2902",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1003878,
+            "range": "± 11618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11337,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 626756,
+            "range": "± 26738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 21250521,
+            "range": "± 334466",
             "unit": "ns/iter"
           }
         ]
