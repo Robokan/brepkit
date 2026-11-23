@@ -440,6 +440,7 @@ pub fn intersect_plane_nurbs_in_region(
         off: &off,
         settle: &settle,
     };
+    let mut iso_runs: Vec<IntersectionCurve> = Vec::new();
     let chains: Vec<Vec<IntersectionPoint>> = match region {
         None => ordered_chains,
         Some(region) => {
@@ -451,16 +452,22 @@ pub fn intersect_plane_nurbs_in_region(
                     .map(|index| index.spans_meeting(&region)),
                 step,
             };
-            // A chain along one of the surface's own parameter curves is
-            // kept whole, to be read as that curve below: a run cut from it
-            // would be fitted through its samples alone, and miss what the
-            // curve does between them.
+            // A chain along one of the surface's own parameter curves is read
+            // as that curve, cut to the chain's runs through the region: a
+            // run fitted through its samples alone would miss what the curve
+            // does between them, and the whole curve (a wall's outline all
+            // round) is left for the faces' trim to cut far from where it
+            // meets them.
             let mut chains = Vec::with_capacity(ordered_chains.len());
             for chain in ordered_chains {
-                if iso_section(surface, plane_normal, plane_d, &chain).is_some() {
-                    chains.push(chain);
-                } else {
-                    chains.extend(runs_through_region(&chain, &kept));
+                let runs = runs_through_region(&chain, &kept);
+                match iso_section(surface, plane_normal, plane_d, &chain) {
+                    Some(whole) => {
+                        let (pieces, crossing) = iso_pieces(&whole, runs);
+                        iso_runs.extend(pieces);
+                        chains.extend(crossing);
+                    }
+                    None => chains.extend(runs),
                 }
             }
             chains
@@ -468,7 +475,8 @@ pub fn intersect_plane_nurbs_in_region(
     };
     // A chain along one of the surface's own parameter curves is that curve:
     // nothing to fit.
-    let mut curves = Vec::with_capacity(chains.len());
+    let mut curves = Vec::with_capacity(chains.len() + iso_runs.len());
+    curves.append(&mut iso_runs);
     let mut to_fit: Vec<Vec<IntersectionPoint>> = Vec::new();
     for chain in chains {
         match iso_section(surface, plane_normal, plane_d, &chain) {
@@ -515,6 +523,65 @@ pub fn intersect_plane_nurbs_in_region(
         });
     }
     Ok(curves)
+}
+
+/// The pieces of a section along one of the surface's parameter curves
+/// (`whole`, rising in its parameter) over each of `runs`, its chain's runs
+/// through a region: the curve cut at the parameters of each run's ends, so
+/// each piece is the surface's curve exactly, with the run's points. A run
+/// that does not run one way along the curve (round a closed chain's
+/// closure) is handed back, to be fitted.
+fn iso_pieces(
+    whole: &IntersectionCurve,
+    runs: Vec<Vec<IntersectionPoint>>,
+) -> (Vec<IntersectionCurve>, Vec<Vec<IntersectionPoint>>) {
+    use crate::nurbs::knot_ops::curve_split;
+    let (Some(first), Some(last)) = (whole.points.first(), whole.points.last()) else {
+        return (Vec::new(), runs);
+    };
+    let (lo, hi) = whole.curve.domain();
+    // The curve runs in `u` where the chain holds `v`.
+    let along_u = (first.param1.1 - last.param1.1).abs() <= (first.param1.0 - last.param1.0).abs();
+    let at = |p: &IntersectionPoint| if along_u { p.param1.0 } else { p.param1.1 };
+    let reach = 1e-9 * (hi - lo);
+    let mut pieces = Vec::new();
+    let mut crossing = Vec::new();
+    for run in runs {
+        let (Some(a), Some(b)) = (run.first(), run.last()) else {
+            continue;
+        };
+        let rising = at(b) > at(a);
+        if !run
+            .windows(2)
+            .all(|w| (at(&w[1]) > at(&w[0])) == rising && at(&w[1]) != at(&w[0]))
+        {
+            crossing.push(run);
+            continue;
+        }
+        let (from, to) = (at(a).min(at(b)).max(lo), at(a).max(at(b)).min(hi));
+        if to - from <= reach {
+            continue;
+        }
+        let mut curve = whole.curve.clone();
+        if from - lo > reach {
+            match curve_split(&curve, from) {
+                Ok((_, right)) => curve = right,
+                Err(_) => continue,
+            }
+        }
+        if hi - to > reach {
+            match curve_split(&curve, to) {
+                Ok((left, _)) => curve = left,
+                Err(_) => continue,
+            }
+        }
+        let mut points = run;
+        if !rising {
+            points.reverse();
+        }
+        pieces.push(IntersectionCurve { curve, points });
+    }
+    (pieces, crossing)
 }
 
 /// How far a fitted section may stray from the plane or the surface.
@@ -1431,13 +1498,22 @@ impl RegionReach {
     /// meets, so a gap whose cell meets no span reaching the region stays
     /// clear of it. The chord's box, padded by half the chord, answers first.
     fn gap_meets(&self, a: &IntersectionPoint, b: &IntersectionPoint) -> bool {
+        self.chord_meets(a, b) || self.cell_meets(a, b)
+    }
+
+    /// Whether the box of the chord between two points of a section, padded
+    /// by half the chord, meets the region.
+    fn chord_meets(&self, a: &IntersectionPoint, b: &IntersectionPoint) -> bool {
         let pad = 0.5 * (b.point - a.point).length();
-        if Aabb3::from_points([a.point, b.point])
+        Aabb3::from_points([a.point, b.point])
             .expanded(pad)
             .intersects(self.region)
-        {
-            return true;
-        }
+    }
+
+    /// Whether the grid cell two points of a section cross meets a knot span
+    /// whose control box reaches the region (true where the spans are not
+    /// indexed).
+    fn cell_meets(&self, a: &IntersectionPoint, b: &IntersectionPoint) -> bool {
         let Some(spans) = &self.spans else {
             return true;
         };
@@ -1495,7 +1571,19 @@ fn runs_through_region(
         while g < gaps && keep[g] {
             g += 1;
         }
-        runs.push(pts[first..=g].to_vec());
+        // Where chords reach the region the run is theirs, with a gap
+        // beyond on either side: a cell's spans reach well past the section
+        // through it, and a run carried out to them leaves the faces' trim a
+        // longer curve to cut. Cells alone keep a run where no chord meets
+        // the region (a bump between two samples).
+        let chord: Vec<usize> = (first..g)
+            .filter(|&k| reach.chord_meets(&pts[k], &pts[k + 1]))
+            .collect();
+        let (lo, hi) = match (chord.first(), chord.last()) {
+            (Some(&c0), Some(&c1)) => (c0.saturating_sub(1).max(first), (c1 + 1).min(g - 1)),
+            _ => (first, g - 1),
+        };
+        runs.push(pts[lo..=hi + 1].to_vec());
     }
     runs
 }
