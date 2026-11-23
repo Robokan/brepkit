@@ -189,3 +189,30 @@ fn section_pieces_ending_at_a_file_s_vertices_fuse_exactly() {
         |_, _| 143_258.12,
     );
 }
+
+/// A block of cylinders and planes cut by a tool whose B-spline walls
+/// cross its cylinders in closed sections. Each section's pcurve on a
+/// cylinder was fitted at chord lengths in 3D, which the face splitter's
+/// reading of its pcurves does not follow: a wall split into nothing and
+/// the cut fell back. Chords in 3D are taken only where the fit at chords
+/// in UV turns back.
+#[test]
+fn closed_sections_on_cylinders_split_their_walls() {
+    let _one_at_a_time = COUNTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut topo = Topology::new();
+    let block = load(&mut topo, "bored_block_cut_block.step");
+    let tool = load(&mut topo, "bored_block_cut_tool.step");
+    let before = mesh_fallback_count();
+    let result = boolean(&mut topo, BooleanOp::Cut, block, tool).unwrap();
+    assert_eq!(mesh_fallback_count(), before, "mesh fallback");
+    let report = validate_solid(&topo, result).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+    // As brepkit measures a reference kernel's result of the same cut.
+    let want = 8_886.359_6;
+    let volume = solid_volume(&topo, result, 0.001).unwrap();
+    assert!((volume - want).abs() < 1e-6 * want, "volume {volume}");
+    // Its mesh is left open where the tool's walls meet the block's bores,
+    // as it was before the pcurves were fitted at chords in 3D: not checked.
+}
