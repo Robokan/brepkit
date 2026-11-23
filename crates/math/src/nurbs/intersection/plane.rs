@@ -440,7 +440,6 @@ pub fn intersect_plane_nurbs_in_region(
         off: &off,
         settle: &settle,
     };
-    let mut iso_runs: Vec<IntersectionCurve> = Vec::new();
     let chains: Vec<Vec<IntersectionPoint>> = match region {
         None => ordered_chains,
         Some(region) => {
@@ -452,22 +451,16 @@ pub fn intersect_plane_nurbs_in_region(
                     .map(|index| index.spans_meeting(&region)),
                 step,
             };
-            // A chain along one of the surface's own parameter curves is read
-            // as that curve, cut to the chain's runs through the region: a
-            // run fitted through its samples alone would miss what the curve
-            // does between them, and the whole curve (a wall's outline all
-            // round) is left for the faces' trim to cut far from where it
-            // meets them.
+            // A chain along one of the surface's own parameter curves is
+            // kept whole, to be read as that curve below: a run cut from it
+            // would be fitted through its samples alone, and miss what the
+            // curve does between them.
             let mut chains = Vec::with_capacity(ordered_chains.len());
             for chain in ordered_chains {
-                let runs = runs_through_region(&chain, &kept);
-                match iso_section(surface, plane_normal, plane_d, &chain) {
-                    Some(whole) => {
-                        let (pieces, crossing) = iso_pieces(&whole, runs);
-                        iso_runs.extend(pieces);
-                        chains.extend(crossing);
-                    }
-                    None => chains.extend(runs),
+                if iso_section(surface, plane_normal, plane_d, &chain).is_some() {
+                    chains.push(chain);
+                } else {
+                    chains.extend(runs_through_region(&chain, &kept));
                 }
             }
             chains
@@ -475,8 +468,7 @@ pub fn intersect_plane_nurbs_in_region(
     };
     // A chain along one of the surface's own parameter curves is that curve:
     // nothing to fit.
-    let mut curves = Vec::with_capacity(chains.len() + iso_runs.len());
-    curves.append(&mut iso_runs);
+    let mut curves = Vec::with_capacity(chains.len());
     let mut to_fit: Vec<Vec<IntersectionPoint>> = Vec::new();
     for chain in chains {
         match iso_section(surface, plane_normal, plane_d, &chain) {
@@ -523,65 +515,6 @@ pub fn intersect_plane_nurbs_in_region(
         });
     }
     Ok(curves)
-}
-
-/// The pieces of a section along one of the surface's parameter curves
-/// (`whole`, rising in its parameter) over each of `runs`, its chain's runs
-/// through a region: the curve cut at the parameters of each run's ends, so
-/// each piece is the surface's curve exactly, with the run's points. A run
-/// that does not run one way along the curve (round a closed chain's
-/// closure) is handed back, to be fitted.
-fn iso_pieces(
-    whole: &IntersectionCurve,
-    runs: Vec<Vec<IntersectionPoint>>,
-) -> (Vec<IntersectionCurve>, Vec<Vec<IntersectionPoint>>) {
-    use crate::nurbs::knot_ops::curve_split;
-    let (Some(first), Some(last)) = (whole.points.first(), whole.points.last()) else {
-        return (Vec::new(), runs);
-    };
-    let (lo, hi) = whole.curve.domain();
-    // The curve runs in `u` where the chain holds `v`.
-    let along_u = (first.param1.1 - last.param1.1).abs() <= (first.param1.0 - last.param1.0).abs();
-    let at = |p: &IntersectionPoint| if along_u { p.param1.0 } else { p.param1.1 };
-    let reach = 1e-9 * (hi - lo);
-    let mut pieces = Vec::new();
-    let mut crossing = Vec::new();
-    for run in runs {
-        let (Some(a), Some(b)) = (run.first(), run.last()) else {
-            continue;
-        };
-        let rising = at(b) > at(a);
-        if !run.windows(2).all(|w| {
-            let step = at(&w[1]) - at(&w[0]);
-            if rising { step > 0.0 } else { step < 0.0 }
-        }) {
-            crossing.push(run);
-            continue;
-        }
-        let (from, to) = (at(a).min(at(b)).max(lo), at(a).max(at(b)).min(hi));
-        if to - from <= reach {
-            continue;
-        }
-        let mut curve = whole.curve.clone();
-        if from - lo > reach {
-            match curve_split(&curve, from) {
-                Ok((_, right)) => curve = right,
-                Err(_) => continue,
-            }
-        }
-        if hi - to > reach {
-            match curve_split(&curve, to) {
-                Ok((left, _)) => curve = left,
-                Err(_) => continue,
-            }
-        }
-        let mut points = run;
-        if !rising {
-            points.reverse();
-        }
-        pieces.push(IntersectionCurve { curve, points });
-    }
-    (pieces, crossing)
 }
 
 /// How far a fitted section may stray from the plane or the surface.

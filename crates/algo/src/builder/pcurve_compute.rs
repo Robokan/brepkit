@@ -254,41 +254,7 @@ fn pcurve_through_uv_samples(
     if matches!(surface, FaceSurface::Plane { .. }) {
         return fit_nurbs2d_through_points(&uv_pts);
     }
-    // Chords in UV, as the face splitter reads its pcurves; chords in 3D
-    // where that fit turns back along its samples (a closed curve round a
-    // thin wall, which a cylinder's angle and length run unevenly along).
-    let at_uv = fit_nurbs2d_through_points(&uv_pts);
-    if (start - end).length() < 1e-9 && turns_back(&at_uv, &uv_pts) {
-        fit_nurbs2d_at_chords_3d(&uv_pts, pts_3d)
-    } else {
-        at_uv
-    }
-}
-
-/// Whether a pcurve fitted through `samples` turns back in a parameter the
-/// samples run one way in: read densely, its `u` (or `v`) steps against
-/// the samples' own direction somewhere.
-fn turns_back(curve: &Curve2D, samples: &[Point2]) -> bool {
-    const STEPS: usize = 8;
-    let Curve2D::Nurbs(nurbs) = curve else {
-        return false;
-    };
-    let (t0, t1) = nurbs.domain();
-    let count = STEPS * samples.len();
-    #[allow(clippy::cast_precision_loss)]
-    let points: Vec<Point2> = (0..=count)
-        .map(|k| curve.evaluate(t0 + (t1 - t0) * k as f64 / count as f64))
-        .collect();
-    let coordinates: [fn(&Point2) -> f64; 2] = [|p| p.x(), |p| p.y()];
-    coordinates.iter().any(|at| {
-        let rising = samples.windows(2).all(|w| at(&w[1]) > at(&w[0]));
-        let falling = samples.windows(2).all(|w| at(&w[1]) < at(&w[0]));
-        (rising || falling)
-            && points.windows(2).any(|w| {
-                let step = at(&w[1]) - at(&w[0]);
-                if rising { step <= 0.0 } else { step >= 0.0 }
-            })
-    })
+    fit_nurbs2d_at_chords_3d(&uv_pts, pts_3d)
 }
 
 /// A NURBS through UV samples, each at the length along the edge's chords

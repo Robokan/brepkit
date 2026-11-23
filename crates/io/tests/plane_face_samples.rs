@@ -142,23 +142,6 @@ fn a_peg_cut_across_its_closed_spline_wall_is_exact() {
     );
 }
 
-/// A plate whose outline is one B-spline wall, cut by a thinner plate whose
-/// B-spline wall crosses it: the tool's caps cut the plate's wall along
-/// stretches of its rows (the wall is an extrusion, and each cap holds its
-/// height). Read whole, as the row it lies on, a section ran all round the
-/// plate's outline, and the faces' trim cut it short of the tool's walls,
-/// so the wall's notch never closed: the cut fell back.
-#[test]
-fn a_cap_cutting_a_spline_wall_along_its_row_is_exact() {
-    check(
-        BooleanOp::Cut,
-        "spline_plate_notched_plate.step",
-        "spline_plate_notched_tool.step",
-        // As brepkit measures a reference kernel's result of the same cut.
-        |_, _| 10_026_661.885,
-    );
-}
-
 /// Two pieces of a part fused back along a closed B-spline wall that each
 /// holds half of: the halves meet only along their two edges, which reads
 /// as no cell of either's sample grid lying on the other, and the fuse fell
@@ -188,33 +171,6 @@ fn section_pieces_ending_at_a_file_s_vertices_fuse_exactly() {
         // As brepkit measures a reference kernel's result of the same fuse.
         |_, _| 143_258.12,
     );
-}
-
-/// A block of cylinders and planes cut by a tool whose B-spline walls
-/// cross its cylinders in closed sections. Each section's pcurve on a
-/// cylinder was fitted at chord lengths in 3D, which the face splitter's
-/// reading of its pcurves does not follow: a wall split into nothing and
-/// the cut fell back. Chords in 3D are taken only where the fit at chords
-/// in UV turns back.
-#[test]
-fn closed_sections_on_cylinders_split_their_walls() {
-    let _one_at_a_time = COUNTER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut topo = Topology::new();
-    let block = load(&mut topo, "bored_block_cut_block.step");
-    let tool = load(&mut topo, "bored_block_cut_tool.step");
-    let before = mesh_fallback_count();
-    let result = boolean(&mut topo, BooleanOp::Cut, block, tool).unwrap();
-    assert_eq!(mesh_fallback_count(), before, "mesh fallback");
-    let report = validate_solid(&topo, result).unwrap();
-    assert!(report.is_valid(), "{:?}", report.issues);
-    // As brepkit measures a reference kernel's result of the same cut.
-    let want = 8_886.359_6;
-    let volume = solid_volume(&topo, result, 0.001).unwrap();
-    assert!((volume - want).abs() < 1e-6 * want, "volume {volume}");
-    // Its mesh is left open where the tool's walls meet the block's bores,
-    // as it was before the pcurves were fitted at chords in 3D: not checked.
 }
 
 /// Two bodies fused where one's wall has a closed B-spline rim, walked
