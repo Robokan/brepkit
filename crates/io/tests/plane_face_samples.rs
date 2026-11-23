@@ -173,3 +173,19 @@ fn halves_of_a_closed_spline_wall_fuse_exactly() {
         |_, _| 1_200.956_7,
     );
 }
+
+/// A rib fused onto a B-spline part whose section with the rib's caps
+/// runs to the part's own vertices, which stand off it by up to 7.5e-3 (a
+/// file's tolerance). The section's pieces ending there read as the whole
+/// curve, each through the other's vertex, so the caps and a wall measured
+/// next to nothing and the fuse lost a third of its volume, read as exact.
+#[test]
+fn section_pieces_ending_at_a_file_s_vertices_fuse_exactly() {
+    check(
+        BooleanOp::Fuse,
+        "rib_on_spline_part_rib.step",
+        "rib_on_spline_part_part.step",
+        // As brepkit measures a reference kernel's result of the same fuse.
+        |_, _| 143_258.12,
+    );
+}
