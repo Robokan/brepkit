@@ -378,14 +378,26 @@ impl ConicalSurface {
 
         let u = y.atan2(x).rem_euclid(std::f64::consts::TAU);
 
-        // The foot on the generator line through the point's angle: a
-        // point on the cone gives its own `v` (`h = v sin a`,
-        // `r = v cos a`) either way, but `h / sin a` alone blows up a
-        // nearly flat cone's (an annulus written as a cone 1e-7 from a
-        // plane, its apex off the face's plane by as much, read `v` 30%
-        // long).
+        // `v` is the point's height over the apex along the generator,
+        // `h / sin a`, which callers read as the cone's level at that height
+        // for points well off the cone too. On a nearly flat cone that
+        // divides by a vanishing sine (an annulus written as a cone 1e-7
+        // from a plane, its apex off the face's plane by as much, read `v`
+        // 30% long), so there it is the foot on the nearer generator line
+        // through the point's angle instead: a point on the cone gives its
+        // own `v` (`h = v sin a`, `r = v cos a`) either way. Past the apex
+        // `v` is negative, `u` still the point's own angle.
         let (sin_a, cos_a) = self.half_angle.sin_cos();
-        let v = h.madd(sin_a, radial.length() * cos_a);
+        let v = if sin_a.abs() > 1e-3 {
+            h / sin_a
+        } else {
+            let r = radial.length() * cos_a;
+            if h * sin_a < 0.0 {
+                h.madd(sin_a, -r)
+            } else {
+                h.madd(sin_a, r)
+            }
+        };
 
         (u, v)
     }
