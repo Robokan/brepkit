@@ -551,10 +551,10 @@ fn iso_pieces(
             continue;
         };
         let rising = at(b) > at(a);
-        if !run
-            .windows(2)
-            .all(|w| (at(&w[1]) > at(&w[0])) == rising && at(&w[1]) != at(&w[0]))
-        {
+        if !run.windows(2).all(|w| {
+            let step = at(&w[1]) - at(&w[0]);
+            if rising { step > 0.0 } else { step < 0.0 }
+        }) {
             crossing.push(run);
             continue;
         }
