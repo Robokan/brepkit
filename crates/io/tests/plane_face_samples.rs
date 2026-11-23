@@ -216,3 +216,19 @@ fn closed_sections_on_cylinders_split_their_walls() {
     // Its mesh is left open where the tool's walls meet the block's bores,
     // as it was before the pcurves were fitted at chords in 3D: not checked.
 }
+
+/// Two bodies fused where one's wall has a closed B-spline rim, walked
+/// against its curve and laid out a period off its pcurve by the boundary
+/// walk, its traversal's way. The trace turned its UVs round again, as for
+/// a rim whose UVs run its curve's own way, and the wall's piece came out
+/// with five free edges: the fuse fell back.
+#[test]
+fn a_closed_spline_rim_walked_against_its_curve_keeps_its_way() {
+    check(
+        BooleanOp::Fuse,
+        "spline_rim_fuse_a.step",
+        "spline_rim_fuse_b.step",
+        // As brepkit measures a reference kernel's result of the same fuse.
+        |_, _| 327_497.242,
+    );
+}

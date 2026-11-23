@@ -320,10 +320,24 @@ pub fn build_wire_loops_dcel_measured(
         .iter()
         .map(|e| {
             let mut h = e.clone();
+            // Only UVs that are the pcurve's own ends run its curve's sense:
+            // a rim laid out by the boundary walk a period off its pcurve
+            // (a closed spline rim walked against its curve) already runs
+            // its traversal's way.
+            let pcurve_start = match &h.pcurve {
+                brepkit_math::curves2d::Curve2D::Line(line) => Some(line.evaluate(0.0)),
+                brepkit_math::curves2d::Curve2D::Nurbs(nurbs) => {
+                    Some(nurbs.evaluate(nurbs.domain().0))
+                }
+                brepkit_math::curves2d::Curve2D::Circle(_)
+                | brepkit_math::curves2d::Curve2D::Ellipse(_) => None,
+            };
+            let own_ends = pcurve_start.is_none_or(|p| (p - h.start_uv).length() <= tol);
             if h.source_edge_idx.is_none()
                 && !h.forward
                 && (h.start_3d - h.end_3d).length() < 1e-10
                 && (h.start_uv - h.end_uv).length() > tol
+                && own_ends
             {
                 std::mem::swap(&mut h.start_uv, &mut h.end_uv);
             }
