@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795451074015,
+  "lastUpdate": 1795476292476,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7343,6 +7343,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 27298178,
             "range": "± 43711",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "9b3eeba0c3e8186772eae03b7846ae59a6f70812",
+          "message": "docs(buzzcad): the long-chord sag fix and replay 20261123-134249\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-23T15:21:33-08:00",
+          "tree_id": "d6d6d0713dd4d0fb47bb3dac0db5b034fd8e2de4",
+          "url": "https://github.com/Robokan/brepkit/commit/9b3eeba0c3e8186772eae03b7846ae59a6f70812"
+        },
+        "date": 1795476291659,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 857637,
+            "range": "± 21284",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 908676,
+            "range": "± 19506",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9850,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 570876,
+            "range": "± 4712",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 19221593,
+            "range": "± 75397",
             "unit": "ns/iter"
           }
         ]
