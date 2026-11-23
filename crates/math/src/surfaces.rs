@@ -380,15 +380,18 @@ impl ConicalSurface {
 
         // `v` is the point's height over the apex along the generator,
         // `h / sin a`, which callers read as the cone's level at that height
-        // for points well off the cone too. On a nearly flat cone that
-        // divides by a vanishing sine (an annulus written as a cone 1e-7
-        // from a plane, its apex off the face's plane by as much, read `v`
-        // 30% long), so there it is the foot on the nearer generator line
+        // for points well off the cone too. A point off the cone by `d`
+        // moves that `v` by `d cot a`, so on a cone within 3 degrees of flat
+        // (sine under 0.05) a file's point a hair off it reads far along
+        // (an annulus written as a cone 1e-7 from a plane, its apex off the
+        // face's plane by as much, read `v` 30% long; cones 0.1 to 0.75
+        // degrees off flat measured parts up to 13% large), so there it is
+        // the foot on the nearer generator line
         // through the point's angle instead: a point on the cone gives its
         // own `v` (`h = v sin a`, `r = v cos a`) either way. Past the apex
         // `v` is negative, `u` still the point's own angle.
         let (sin_a, cos_a) = self.half_angle.sin_cos();
-        let v = if sin_a.abs() > 1e-3 {
+        let v = if sin_a.abs() > 0.05 {
             h / sin_a
         } else {
             let r = radial.length() * cos_a;
