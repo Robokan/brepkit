@@ -153,6 +153,7 @@ pub mod chamfer_arcs;
 pub mod chamfer_chain;
 mod chamfer_prism;
 pub mod fillet;
+mod fillet_short_wall;
 
 pub mod offset_face;
 pub mod offset_trim;
