@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795497285699,
+  "lastUpdate": 1795506283799,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7451,6 +7451,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 26428419,
             "range": "± 74746",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "eric.d.vaughan@gmail.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "d17441e1c69a14c5d21f3578213a91618d1b27d3",
+          "message": "fix(blend): merge a chamfer end's two coplanar faces at an inside corner\n\nA chamfer whose edge ends at an inside corner of two end faces in one\nplane (a strip's top running into a post rising above it, its wall into a\nslab beside the post) bares a triangle between them. The triangle was\nspliced into one end face and the other was left beside it in the same\nplane, a face too many. The two are now merged into one.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-23T23:40:36-08:00",
+          "tree_id": "0d1d57f48c911586dc620ead1bd771f904bec708",
+          "url": "https://github.com/Robokan/brepkit/commit/d17441e1c69a14c5d21f3578213a91618d1b27d3"
+        },
+        "date": 1795506283205,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1168572,
+            "range": "± 4271",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1236391,
+            "range": "± 4299",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13777,
+            "range": "± 81",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 783279,
+            "range": "± 2803",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 26614994,
+            "range": "± 328259",
             "unit": "ns/iter"
           }
         ]
