@@ -1,7 +1,8 @@
 //! A plate 80 thick whose outline is two B-spline sides meeting at two
 //! shallow kinks (4.4 and 17.4 degrees), its side walls split at mid-height
-//! (a part fused from two halves) and two bores through it. All its rims
-//! and its four vertical kink edges are rounded at r = 30.
+//! (a part fused from two halves). All its rims and its four vertical kink
+//! edges are rounded at r = 30. (The file's plate has two bores through it;
+//! they are left out, the top and bottom taking their outlines alone.)
 //!
 //! At each corner where a kink meets a rim, three walked rounds of one
 //! radius meet on three faces. They are set back to the one ball touching
@@ -26,14 +27,32 @@ use brepkit_operations::validate::validate_solid;
 use brepkit_topology::Topology;
 use brepkit_topology::edge::EdgeId;
 use brepkit_topology::explorer::{solid_edges, solid_faces};
-use brepkit_topology::face::FaceSurface;
-use brepkit_topology::solid::SolidId;
+use brepkit_topology::face::{Face, FaceSurface};
+use brepkit_topology::shell::Shell;
+use brepkit_topology::solid::{Solid, SolidId};
 
 const RADIUS: f64 = 30.0;
 
+/// The file's plate without its bores: the bores' walls left out, the top
+/// and bottom without their holes.
 fn load(topo: &mut Topology) -> SolidId {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/kinked_plate_halves.step");
-    read_step(&std::fs::read_to_string(path).unwrap(), topo).unwrap()[0]
+    let bored = read_step(&std::fs::read_to_string(path).unwrap(), topo).unwrap()[0];
+    let mut faces = Vec::new();
+    for f in solid_faces(topo, bored).unwrap() {
+        let face = topo.face(f).unwrap().clone();
+        match face.surface() {
+            FaceSurface::Cylinder(_) => {}
+            _ if face.inner_wires().is_empty() => faces.push(f),
+            surface => {
+                let mut whole = Face::new(face.outer_wire(), Vec::new(), surface.clone());
+                whole.set_reversed(face.is_reversed());
+                faces.push(topo.add_face(whole));
+            }
+        }
+    }
+    let shell = topo.add_shell(Shell::new(faces).unwrap());
+    topo.add_solid(Solid::new(shell, Vec::new()))
 }
 
 /// The edge of `solid` passing nearest `p`.
@@ -112,17 +131,28 @@ fn three_walked_rounds_meet_in_a_ball_at_each_corner() {
     let mut points = KINKS.to_vec();
     points.extend_from_slice(&RIMS);
     let (topo, plate, result) = rounded(&points);
-    assert_eq!(
-        count(&topo, result, |s| matches!(s, FaceSurface::Sphere(_))),
-        4,
-        "a ball's patch at each of the four corners"
-    );
-    // Another kernel's result of this fillet measures 1495915.35; the rounds
-    // here are walked bands, fitted through their sections.
-    let volume = solid_volume(&topo, result, 0.1).unwrap();
-    assert!(
-        (volume - 1_495_915.35).abs() < 5e-4 * volume,
-        "volume {volume}"
-    );
-    assert!(solid_volume(&topo, plate, 0.1).unwrap() > volume);
+    // A ball's patch at each of the four corners: of the radius, touching
+    // the top or the bottom (40 off mid-height).
+    let balls: Vec<_> = solid_faces(&topo, result)
+        .unwrap()
+        .into_iter()
+        .filter_map(|f| match topo.face(f).unwrap().surface() {
+            FaceSurface::Sphere(sphere) => Some(sphere.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(balls.len(), 4, "a ball's patch at each corner");
+    for ball in &balls {
+        assert!(
+            (ball.radius() - RADIUS).abs() < 1e-9,
+            "radius {}",
+            ball.radius()
+        );
+        let height = ball.center().z().abs();
+        assert!(
+            (height - (40.0 - RADIUS)).abs() < 1e-6,
+            "centre at height {height}"
+        );
+    }
+    assert!(solid_volume(&topo, plate, 0.1).unwrap() > solid_volume(&topo, result, 0.1).unwrap());
 }

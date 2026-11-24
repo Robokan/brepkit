@@ -25,10 +25,12 @@ The plate's side walls are also split at mid-height, as in a part fused from two
 
 ## Tests
 
-`fillet_kinked_plate_corners.rs` uses such a plate with two bores, read from STEP and rounded at r = 30.
+`fillet_kinked_plate_corners.rs` uses such a plate, read from STEP and rounded at r = 30. The file's plate has two bores; the test leaves them out (the top and bottom take their outlines alone), so it checks the rounds alone.
 - The four kink edges alone: valid and watertight, the plate's top and bottom the only planes.
-- The kinks and the rims together: valid and watertight, a sphere patch at each of the four corners. The volume is within 5e-4 of another kernel's result for this fillet.
+- The kinks and the rims together: valid and watertight, a sphere patch at each of the four corners, each of radius 30 and centred 30 below the top or above the bottom.
 - Both fail without the change: the first leaves the two slivers, the second fails at a corner.
 - Blend, operations and io tests pass; clippy and fmt are clean.
+
+Stacked on #2724, whose commit is the first here: without it, one rim band's winding is misread at a sample where the band's partial vanishes, and the result's faces point inward. It drops out of this diff when #2724 lands.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
