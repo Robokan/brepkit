@@ -74,7 +74,12 @@ pub fn chamfer(
             Ok(result) => Ok(result),
             Err(error) => {
                 let picks: Vec<_> = edges.iter().map(|&e| (e, None)).collect();
-                crate::chamfer_prism::chamfer_by_prisms(topo, solid, &picks, distance, distance)?
+                if let Some(result) = crate::chamfer_prism::chamfer_by_prisms(
+                    topo, solid, &picks, distance, distance,
+                )? {
+                    return Ok(result);
+                }
+                crate::chamfer_arcs::chamfer_rim_arcs(topo, solid, &picks, distance, distance)?
                     .ok_or(error)
             }
         };
