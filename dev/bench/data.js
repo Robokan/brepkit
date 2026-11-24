@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795476292476,
+  "lastUpdate": 1795497285699,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7397,6 +7397,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19221593,
             "range": "± 75397",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "eb1e5d978cc48e016446fb520c8238a59e9d9219",
+          "message": "docs(buzzcad): the rim-arc chamfer and the walked ball corner\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-23T21:10:33-08:00",
+          "tree_id": "0983405abce3144505eb1d99574ea97d1aff366e",
+          "url": "https://github.com/Robokan/brepkit/commit/eb1e5d978cc48e016446fb520c8238a59e9d9219"
+        },
+        "date": 1795497284296,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1168378,
+            "range": "± 2371",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1237103,
+            "range": "± 2322",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13650,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 776046,
+            "range": "± 5232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 26428419,
+            "range": "± 74746",
             "unit": "ns/iter"
           }
         ]
