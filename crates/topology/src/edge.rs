@@ -300,7 +300,15 @@ impl EdgeCurve {
                     // both ends within that read at their projections: read
                     // whole, the edge ran on to the curve's own ends, and the
                     // faces it bounds took in area past their vertices.
+                    // That is taken only where the curve runs on past the
+                    // vertices by more than a hundredth of the edge: a curve
+                    // ending just past them reads whole, as it does in any
+                    // scale, and its vertices take the gap as tolerance.
+                    let chord = (end - start).length();
+                    let runs_on = ((p0 - start).length().max((p1 - end).length()))
+                        .min((p1 - start).length().max((p0 - end).length()));
                     if curve_open
+                        && runs_on > 1e-2 * chord
                         && pa.distance < FILE_EPS
                         && pb.distance < FILE_EPS
                         && dt.abs() > 1e-6 * (d1 - d0)

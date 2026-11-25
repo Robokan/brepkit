@@ -900,12 +900,30 @@ pub fn face_v_period(surface: &FaceSurface) -> Option<f64> {
 /// from one to the other, over a span of parameter so short that the curve
 /// moves less than a tenth of the fit in it.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn pcurve_along(
+    surface: &FaceSurface,
+    curve: &EdgeCurve,
+    ends: (Point3, Point3),
+    across_seam: bool,
+) -> Option<brepkit_topology::pcurve::PCurve> {
+    pcurve_along_within(surface, curve, ends, across_seam, 1000.0, false)
+}
+
+/// [`pcurve_along`] for a curve that may stand off the surface by up to
+/// `spread` times the fit: 1e-7 of the curve's size and one more. With
+/// `image`, a curve no cubic follows closely enough (a long fitted contact
+/// whose image wanders by more than the fit) takes the polyline through its
+/// image at the densest sampling, at the curve's own parameters, so it is
+/// read along the curve at the same rate; a curve crossing a pole does not.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn pcurve_along_within(
     surface: &FaceSurface,
     curve: &EdgeCurve,
     (start, end): (Point3, Point3),
     across_seam: bool,
+    spread: f64,
+    image_fallback: bool,
 ) -> Option<brepkit_topology::pcurve::PCurve> {
     use brepkit_math::curves2d::{Curve2D, Line2D, NurbsCurve2D};
     use brepkit_math::madd::Madd;
@@ -917,10 +935,10 @@ pub fn pcurve_along(
     const LAST: u32 = 4096;
     // A curve off the surface by `off` (a walked contact between its
     // sections, or below the edge of its wall's surface) is matched by the
-    // pcurve within `fit` and `off` more. Farther off than `SPREAD` times
-    // `fit` (1e-4 of the curve's size and one more, as far as the trimmer
-    // lets a contact stand off its face), the curve is not on the surface.
-    const SPREAD: f64 = 1000.0;
+    // pcurve within `fit` and `off` more. Farther off than `spread` times
+    // `fit` (for `pcurve_along`, 1e-4 of the curve's size and one more, as
+    // far as the trimmer lets a contact stand off its face), the curve is
+    // not on the surface.
     let periods = [
         crate::fillet_builder::face_u_period(surface),
         face_v_period(surface),
@@ -990,6 +1008,7 @@ pub fn pcurve_along(
         return None;
     }
     let mut steps = FIRST;
+    let mut densest: Option<(Vec<f64>, Vec<Point2>)> = None;
     while steps <= LAST {
         let count = 2 * steps;
         let step = |k: u32| f64::from(k) / f64::from(count);
@@ -1005,7 +1024,7 @@ pub fn pcurve_along(
             let point = at(f);
             let (mut u, mut v) = project(point, before);
             let off = (support.evaluate(u, v) - point).length();
-            if off > SPREAD * fit {
+            if off > spread * fit {
                 return None;
             }
             farthest = farthest.max(off);
@@ -1132,9 +1151,19 @@ pub fn pcurve_along(
             let pcurve = NurbsCurve2D::new(3, knots, points, weights).ok()?;
             return Some(PCurve::new(Curve2D::Nurbs(pcurve), 0.0, 1.0));
         }
+        if image_fallback && steps * 2 > LAST {
+            densest = Some((fractions, image));
+        }
         steps *= 2;
     }
-    None
+    let (fractions, image) = densest.filter(|_| crossings.is_empty())?;
+    let weights = vec![1.0; image.len()];
+    let mut knots = Vec::with_capacity(fractions.len() + 2);
+    knots.push(0.0);
+    knots.extend_from_slice(&fractions);
+    knots.push(1.0);
+    let pcurve = NurbsCurve2D::new(1, knots, image, weights).ok()?;
+    Some(PCurve::new(Curve2D::Nurbs(pcurve), 0.0, 1.0))
 }
 
 /// The fractions of the run of `at` over 0 to 1 where it passes within

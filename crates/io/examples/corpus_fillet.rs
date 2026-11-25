@@ -10,6 +10,7 @@
 //! cargo run --release -p brepkit-io --example corpus_fillet -- <case dir> [radius]
 //! ```
 #![allow(
+    clippy::collapsible_if,
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::expect_used,
@@ -283,6 +284,15 @@ fn main() {
             "input volume {:.4}",
             brepkit_operations::measure::solid_volume(&topo, sid, 0.1).unwrap()
         );
+    }
+    // ISSUESIN=1 lists the input's own validity issues.
+    if std::env::var("ISSUESIN").is_ok() {
+        for issue in brepkit_operations::validate::validate_solid(&topo, sid)
+            .unwrap()
+            .issues
+        {
+            println!("  input issue: {}", issue.description);
+        }
     }
     // INPUT=1 lists the input's faces, each loop's edges and their curves.
     // OUTIN=path writes the input through brepkit's STEP writer.
@@ -1034,6 +1044,116 @@ fn main() {
                     if std::env::var("ISSUES").is_ok() {
                         for issue in &v.issues {
                             println!("  issue: {issue:?}");
+                            // The edge an issue names: its curve, its
+                            // faces and its vertices.
+                            let d = &issue.description;
+                            if let Some(rest) =
+                                d.strip_prefix("edge ").or_else(|| d.strip_prefix("the pcurve of edge "))
+                            {
+                                if let Some(at) = rest.find(" on face ") {
+                                    let f: String = rest[at + 9..]
+                                        .chars()
+                                        .take_while(char::is_ascii_digit)
+                                        .collect();
+                                    if let Some(fid) = solid_faces(&topo, r.solid)
+                                        .unwrap()
+                                        .into_iter()
+                                        .find(|x| x.index().to_string() == f)
+                                    {
+                                        let face = topo.face(fid).unwrap();
+                                        println!(
+                                            "    face {f}: {} reversed {}",
+                                            face.surface().type_tag(),
+                                            face.is_reversed()
+                                        );
+                                        let n: String =
+                                            rest.chars().take_while(char::is_ascii_digit).collect();
+                                        if let Some(eid) = solid_edges(&topo, r.solid)
+                                            .unwrap()
+                                            .into_iter()
+                                            .find(|x| x.index().to_string() == n)
+                                        {
+                                            if let Some(pc) = topo.pcurves().get(eid, fid) {
+                                                let e = topo.edge(eid).unwrap();
+                                                let (a, b) = (
+                                                    topo.vertex(e.start()).unwrap().point(),
+                                                    topo.vertex(e.end()).unwrap().point(),
+                                                );
+                                                for t in [pc.t_start(), pc.t_end()] {
+                                                    let uv = pc.evaluate(t);
+                                                    println!(
+                                                        "    pcurve at {t}: uv {uv:?} -> {:?} (edge {a:?} .. {b:?})",
+                                                        face.surface().evaluate(uv.x(), uv.y())
+                                                    );
+                                                    for g in solid_faces(&topo, r.solid).unwrap() {
+                                                        if let Some(q) = topo.face(g).unwrap().surface().evaluate(uv.x(), uv.y()) {
+                                                            if (q - a).length() < 1e-3 || (q - b).length() < 1e-3 {
+                                                                println!("      that uv lies on face {}'s surface at an end", g.index());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let n: String =
+                                    rest.chars().take_while(char::is_ascii_digit).collect();
+                                if let Ok(n) = n.parse::<usize>() {
+                                    for e in solid_edges(&topo, r.solid).unwrap() {
+                                        if e.index() != n {
+                                            continue;
+                                        }
+                                        let edge = topo.edge(e).unwrap();
+                                        let (a, b) = (
+                                            topo.vertex(edge.start()).unwrap().point(),
+                                            topo.vertex(edge.end()).unwrap().point(),
+                                        );
+                                        let kinds: Vec<String> = solid_faces(&topo, r.solid)
+                                            .unwrap()
+                                            .into_iter()
+                                            .filter(|&f| {
+                                                let face = topo.face(f).unwrap();
+                                                std::iter::once(face.outer_wire())
+                                                    .chain(face.inner_wires().iter().copied())
+                                                    .any(|w| {
+                                                        topo.wire(w)
+                                                            .unwrap()
+                                                            .edges()
+                                                            .iter()
+                                                            .any(|oe| oe.edge() == e)
+                                                    })
+                                            })
+                                            .map(|f| {
+                                                format!(
+                                                    "{}:{}",
+                                                    f.index(),
+                                                    topo.face(f).unwrap().surface().type_tag()
+                                                )
+                                            })
+                                            .collect();
+                                        println!(
+                                            "    edge {n}: {:?} from {a:?} to {b:?}, faces {kinds:?}, domain {:?}",
+                                            edge.curve().type_tag(),
+                                            edge.curve().domain_with_endpoints(a, b)
+                                        );
+                                        if let brepkit_topology::edge::EdgeCurve::NurbsCurve(c) =
+                                            edge.curve()
+                                        {
+                                            let k = c.knots();
+                                            println!(
+                                                "    degree {}, {} poles, knots {:?}..{:?}, first {:?}, last {:?}",
+                                                c.degree(),
+                                                c.control_points().len(),
+                                                k.first(),
+                                                k.last(),
+                                                c.control_points().first(),
+                                                c.control_points().last()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     format!("{} errors", v.error_count())

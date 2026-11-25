@@ -684,10 +684,24 @@ impl<'a> FilletBuilder<'a> {
                         (start, end),
                         true,
                     );
-                    // A walked contact standing off a file's B-spline wall
-                    // farther than the fit allows takes the line between
-                    // its ends' parameters, as it did before contacts were
-                    // fitted along their edges.
+                    // A walked contact cut back to a cap ends on the cap's
+                    // edge, which a file's edge leaves standing off the
+                    // B-spline wall by its tolerance (1.4e-4 on a part 1 in
+                    // size): it is fitted within ten times the band, and
+                    // one that no cubic follows takes the polyline through
+                    // its image. One standing off farther still takes the
+                    // line between its ends' parameters, as it did before
+                    // contacts were fitted along their edges.
+                    let fitted = fitted.or_else(|| {
+                        crate::builder_utils::pcurve_along_within(
+                            &source_surface,
+                            &EdgeCurve::NurbsCurve(contact.clone()),
+                            (start, end),
+                            true,
+                            1e4,
+                            true,
+                        )
+                    });
                     if let Some(pcurve) = fitted {
                         pcurve
                     } else {

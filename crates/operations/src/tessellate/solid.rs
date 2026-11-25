@@ -1465,7 +1465,11 @@ pub(super) fn tessellate_solid_core(
                 .iter()
                 .map(|&p| ((p - circle.center()).length() - circle.radius()).abs())
                 .fold(f64::INFINITY, f64::min);
-            if clearance >= 2.0 * sag || clearance <= 0.0 {
+            // A hole touching the rim (within the linear tolerance) meets
+            // it at a point no chord can clear: no finer sampling helps.
+            if clearance >= 2.0 * sag
+                || clearance <= brepkit_math::tolerance::Tolerance::new().linear
+            {
                 continue;
             }
             let half_step = (1.0 - 0.5 * clearance / circle.radius())

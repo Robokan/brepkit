@@ -3402,7 +3402,18 @@ fn rebuild_mapped_parametric_face(
                 topo.vertex(piece.start())?.point(),
                 topo.vertex(piece.end())?.point(),
             );
-            crate::builder_utils::pcurve_along(&surface, piece.curve(), ends, false)
+            // A piece no cubic follows (a long fitted contact) takes the
+            // polyline through its image, read along it at its own rate.
+            crate::builder_utils::pcurve_along(&surface, piece.curve(), ends, false).or_else(|| {
+                crate::builder_utils::pcurve_along_within(
+                    &surface,
+                    piece.curve(),
+                    ends,
+                    false,
+                    1e4,
+                    true,
+                )
+            })
         };
         let closed_piece = fitted_piece.or_else(|| {
             closed_seam_splits
