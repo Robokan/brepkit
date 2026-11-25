@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use brepkit_math::nurbs::basis::weight_is_sound;
 use brepkit_math::nurbs::knot_ops::curve_split;
 use brepkit_math::nurbs::{NurbsCurve, NurbsSurface};
 use brepkit_math::vec::{Point3, Vec3};
@@ -195,7 +196,8 @@ impl Params {
     }
 
     fn point(&mut self) -> Result<Point3, IoError> {
-        Ok(Point3::new(self.real()?, self.real()?, self.real()?))
+        let point = Point3::new(self.real()?, self.real()?, self.real()?);
+        crate::bounded_point(point, || "an IGES point".to_string())
     }
 
     /// A count of things the entity goes on to list. It can be no more than the
@@ -579,10 +581,16 @@ fn read_plane(params: &mut Params) -> Result<FaceSurface, IoError> {
             reason: "IGES plane has zero normal".to_string(),
         });
     }
-    Ok(FaceSurface::Plane {
+    let plane = FaceSurface::Plane {
         normal: normal * (1.0 / length),
         d: d / length,
-    })
+    };
+    if !plane.is_well_formed() {
+        return Err(IoError::ParseError {
+            reason: "IGES plane has a normal or distance it cannot be evaluated with".to_string(),
+        });
+    }
+    Ok(plane)
 }
 
 /// Refuses knots evaluation could not walk, in one parameter direction, since
@@ -630,7 +638,7 @@ fn read_curve(params: &mut Params) -> Result<Stretch, IoError> {
     let (low, high) = (knots[degree], knots[last + 1]);
     let slack = (high - low) * SPAN_SLACK;
     let within = |t: f64| low - slack <= t && t <= high + slack;
-    if !weights.iter().all(|&weight| weight > 0.0) || !within(from) || !within(to) {
+    if !weights.iter().all(|&weight| weight_is_sound(weight)) || !within(from) || !within(to) {
         return Err(IoError::ParseError {
             reason: "an IGES curve has a weight or span it cannot use".to_string(),
         });
@@ -639,6 +647,12 @@ fn read_curve(params: &mut Params) -> Result<Stretch, IoError> {
         NurbsCurve::new(degree, knots, points, weights).map_err(|e| IoError::ParseError {
             reason: format!("an IGES curve is malformed: {e}"),
         })?;
+    if !curve.is_well_formed() {
+        return Err(IoError::ParseError {
+            reason: "an IGES curve has knots, weights or points it cannot be evaluated with"
+                .to_string(),
+        });
+    }
     Ok(Stretch::Curve { curve, from, to })
 }
 
@@ -668,7 +682,11 @@ fn read_surface(params: &mut Params) -> Result<FaceSurface, IoError> {
             row[j] = params.real()?;
         }
     }
-    if !weights.iter().flatten().all(|&weight| weight > 0.0) {
+    if !weights
+        .iter()
+        .flatten()
+        .all(|&weight| weight_is_sound(weight))
+    {
         return Err(IoError::ParseError {
             reason: "an IGES surface has a weight it cannot use".to_string(),
         });
@@ -683,6 +701,12 @@ fn read_surface(params: &mut Params) -> Result<FaceSurface, IoError> {
         .map_err(|e| IoError::ParseError {
             reason: format!("an IGES surface is malformed: {e}"),
         })?;
+    if !surface.is_well_formed() {
+        return Err(IoError::ParseError {
+            reason: "an IGES surface has knots, weights or points it cannot be evaluated with"
+                .to_string(),
+        });
+    }
     Ok(FaceSurface::Nurbs(surface))
 }
 
@@ -925,6 +949,53 @@ mod tests {
         read_surface(&mut Params::of(&entity(1, 128, params))).is_ok()
     }
 
+    fn plane_is_read(params: &str) -> bool {
+        read_plane(&mut Params::of(&entity(1, 108, params))).is_ok()
+    }
+
+    /// A plane's normal comes from the file. A normal whose length
+    /// overflows scales to no normal at all, and the reader refuses it, as it
+    /// refuses a parameter that is not finite. A circle, which the file holds
+    /// as a rational spline, is refused when a coordinate that sets its
+    /// radius is NaN or infinite.
+    #[test]
+    fn a_plane_or_circle_must_be_one_evaluation_can_walk() {
+        assert!(plane_is_read("108,0.,0.,2.,3.,0,0.,0.,0.,0.;"));
+        for bad in [
+            "108,1E300,1E300,1E300,0.,0,0.,0.,0.,0.;",
+            "108,0.,0.,0.,3.,0,0.,0.,0.,0.;",
+            "108,NaN,0.,1.,3.,0,0.,0.,0.,0.;",
+            "108,0.,0.,1.,1E400,0,0.,0.,0.,0.;",
+        ] {
+            assert!(!plane_is_read(bad), "{bad}");
+        }
+        let arc = |corner: &str| {
+            format!(
+                "126,2,2,0,0,0,0,0.,0.,0.,1.,1.,1.,1.,0.7071067811865476,1.,\
+                 1.,0.,0.,{corner},0.,0.,1.,0.,0.,1.;"
+            )
+        };
+        assert!(curve_is_read(&arc("1.,1.,0.")));
+        for corner in ["NaN,1.,0.", "1E400,1.,0.", "1.,-inf,0."] {
+            assert!(!curve_is_read(&arc(corner)), "{corner}");
+        }
+    }
+
+    /// The parameters of a point are each finite, and a point past the size
+    /// limit is refused as well.
+    #[test]
+    fn a_point_past_the_size_limit_is_refused() {
+        let point = |params: &str| Params::of(&entity(1, 116, params)).point();
+        assert!(point("116,1.,2.,3.,0;").is_ok());
+        for bad in [
+            "116,1E305,0.,0.,0;",
+            "116,0.,-1E305,0.,0;",
+            "116,0.,0.,NaN,0;",
+        ] {
+            assert!(point(bad).is_err(), "{bad}");
+        }
+    }
+
     /// Each rule alone: past `NurbsCurve::new`, which checks only the counts.
     #[test]
     fn a_curve_must_be_one_evaluation_can_walk() {
@@ -943,6 +1014,9 @@ mod tests {
             format!("126,1,1,0,0,0,0,0.,0.,0.,0.,1.,1.,{line},0.,0.;"),
             format!("126,1,1,0,0,0,0,0.,0.,1.,1.,0.,1.,{line},0.,1.;"),
             format!("126,1,1,0,0,0,0,0.,0.,1.,1.,1.,-1.,{line},0.,1.;"),
+            format!("126,1,1,0,0,0,0,0.,0.,1.,1.,1.,1E-310,{line},0.,1.;"),
+            format!("126,1,1,0,0,0,0,0.,0.,1E-310,1E-310,1.,1.,{line},0.,1E-310;"),
+            "126,1,1,0,0,0,0,0.,0.,1.,1.,1E308,1E308,2.,0.,0.,2.,1.,0.,0.,1.;".to_string(),
             format!("126,1,1,0,0,0,0,0.,0.,1.,1.,1.,1.,{line},-5.,1.;"),
             format!("126,1,1,0,0,0,0,0.,0.,1.,1.,1.,1.,{line},0.,9.;"),
         ] {
@@ -966,6 +1040,15 @@ mod tests {
             format!("128,1,1,1,1,0,0,0,0,0,{flat},1.,0.5,0.,-1.,{weights},{corners};"),
             format!("128,1,1,1,1,0,0,0,0,0,0.,0.,0.,0.,{flat},{weights},{corners};"),
             format!("128,1,1,1,1,0,0,0,0,0,{flat},{flat},1.,0.,1.,1.,{corners};"),
+            format!("128,1,1,1,1,0,0,0,0,0,{flat},{flat},1.,1E-310,1.,1.,{corners},0.,1.,0.,1.;"),
+            format!(
+                "128,1,1,1,1,0,0,0,0,0,{flat},{flat},1E308,1E308,1E308,1E308,\
+                 2.,0.,0.,3.,0.,0.,2.,1.,0.,3.,1.,0.,0.,1.,0.,1.;"
+            ),
+            format!(
+                "128,1,1,1,1,0,0,0,0,0,0.,0.,1E-310,1E-310,{flat},{weights},{corners},\
+                 0.,1E-310,0.,1.;"
+            ),
         ] {
             assert!(!surface_is_read(&bad), "{bad}");
         }

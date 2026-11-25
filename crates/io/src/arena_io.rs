@@ -373,7 +373,9 @@ pub fn serialize_solid(topo: &Topology, solid_id: SolidId) -> Result<Vec<u8>, Io
 /// # Errors
 ///
 /// Returns [`IoError`] if the buffer is malformed, references an out-of-range
-/// local index, or any entity construction fails.
+/// local index, holds a curve, surface or pcurve that is not well formed (see
+/// [`EdgeCurve::is_well_formed`], [`FaceSurface::is_well_formed`] and
+/// [`Curve2D::is_well_formed`]), or any entity construction fails.
 pub fn deserialize_solid(bytes: &[u8], topo: &mut Topology) -> Result<SolidId, IoError> {
     let dump: SerializedSolid = serde_json::from_slice(bytes).map_err(|e| IoError::ParseError {
         reason: format!("arena deserialization failed: {e}"),
@@ -388,24 +390,26 @@ pub fn deserialize_solid(bytes: &[u8], topo: &mut Topology) -> Result<SolidId, I
     }
 
     let mut vertex_ids = Vec::with_capacity(dump.vertices.len());
-    for v in dump.vertices {
-        vertex_ids.push(topo.add_vertex(Vertex::new(v.point, v.tolerance)));
+    for (index, v) in dump.vertices.into_iter().enumerate() {
+        let point = crate::bounded_point(v.point, || format!("arena dump vertex {index}"))?;
+        vertex_ids.push(topo.add_vertex(Vertex::new(point, v.tolerance)));
     }
 
     let mut edge_ids = Vec::with_capacity(dump.edges.len());
-    for e in dump.edges {
+    for (index, e) in dump.edges.into_iter().enumerate() {
         let start = *vertex_ids
             .get(e.start)
             .ok_or_else(|| index_err("vertex", e.start))?;
         let end = *vertex_ids
             .get(e.end)
             .ok_or_else(|| index_err("vertex", e.end))?;
-        edge_ids.push(topo.add_edge(Edge::with_tolerance(
-            start,
-            end,
-            e.curve.into_curve(),
-            e.tolerance,
-        )));
+        let curve = e.curve.into_curve();
+        if !curve.is_well_formed() {
+            return Err(IoError::ParseError {
+                reason: format!("arena dump holds a malformed curve of edge {index}"),
+            });
+        }
+        edge_ids.push(topo.add_edge(Edge::with_tolerance(start, end, curve, e.tolerance)));
     }
 
     let mut wire_ids = Vec::with_capacity(dump.wires.len());
@@ -421,7 +425,7 @@ pub fn deserialize_solid(bytes: &[u8], topo: &mut Topology) -> Result<SolidId, I
     }
 
     let mut face_ids = Vec::with_capacity(dump.faces.len());
-    for f in dump.faces {
+    for (index, f) in dump.faces.into_iter().enumerate() {
         let outer = *wire_ids
             .get(f.outer_wire)
             .ok_or_else(|| index_err("wire", f.outer_wire))?;
@@ -429,7 +433,13 @@ pub fn deserialize_solid(bytes: &[u8], topo: &mut Topology) -> Result<SolidId, I
         for iw in f.inner_wires {
             inner.push(*wire_ids.get(iw).ok_or_else(|| index_err("wire", iw))?);
         }
-        let mut face = Face::new(outer, inner, f.surface.into_surface());
+        let surface = f.surface.into_surface();
+        if !surface.is_well_formed() {
+            return Err(IoError::ParseError {
+                reason: format!("arena dump holds a malformed surface of face {index}"),
+            });
+        }
+        let mut face = Face::new(outer, inner, surface);
         face.set_reversed(f.reversed);
         face_ids.push(topo.add_face(face));
     }
@@ -450,6 +460,14 @@ pub fn deserialize_solid(bytes: &[u8], topo: &mut Topology) -> Result<SolidId, I
         let face = *face_ids
             .get(pc.face)
             .ok_or_else(|| index_err("face", pc.face))?;
+        if !(pc.t_start.is_finite() && pc.t_end.is_finite() && pc.curve.is_well_formed()) {
+            return Err(IoError::ParseError {
+                reason: format!(
+                    "arena dump holds a malformed pcurve of edge {} on face {}",
+                    pc.edge, pc.face
+                ),
+            });
+        }
         topo.pcurves_mut()
             .set(edge, face, PCurve::new(pc.curve, pc.t_start, pc.t_end));
     }
@@ -610,6 +628,426 @@ mod tests {
             assert_eq!(a.axis().0[i].to_bits(), b.axis().0[i].to_bits());
             assert_eq!(a.x_axis().0[i].to_bits(), b.x_axis().0[i].to_bits());
             assert_eq!(a.y_axis().0[i].to_bits(), b.y_axis().0[i].to_bits());
+        }
+    }
+
+    /// A dump holds whatever data its bytes hold. A B-spline curve or surface
+    /// whose degree passes its control points, whose knots fall, or whose
+    /// weights are not positive normal floats panics, hangs or gives a wrong
+    /// solid when it is evaluated, and so does a circle or cylinder of no
+    /// radius or with no frame: such a dump is refused. The dump's text
+    /// cannot hold a number that is not finite, so its parse refuses one.
+    /// The dumps they were made from load and validate.
+    /// A JSON number cannot be NaN, but it can be past the size limit: a
+    /// dump with a vertex there is refused. The dump it was made from loads.
+    #[test]
+    fn a_dump_with_a_vertex_past_the_size_limit_is_refused() {
+        use serde_json::{Value, json};
+
+        let mut topo = Topology::new();
+        let block = make_box(&mut topo, 1.0, 2.0, 3.0).unwrap();
+        let bytes = serialize_solid(&topo, block).unwrap();
+        assert!(deserialize_solid(&bytes, &mut Topology::new()).is_ok());
+        for x in [1e305, -1e305, f64::MAX] {
+            let mut dump: Value = serde_json::from_slice(&bytes).unwrap();
+            dump["vertices"][0]["point"] = json!([x, 0.0, 0.0]);
+            let bad = serde_json::to_vec(&dump).unwrap();
+            let found = deserialize_solid(&bad, &mut Topology::new());
+            assert!(
+                matches!(found, Err(IoError::ParseError { .. })),
+                "{x}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_dump_with_a_malformed_curve_or_surface_is_refused() {
+        use serde_json::{Value, json};
+
+        let mut topo = Topology::new();
+        let plain = make_cylinder(&mut topo, 3.0, 4.0).unwrap();
+        let spline = make_cylinder(&mut topo, 3.0, 4.0).unwrap();
+        brepkit_operations::heal::convert_to_bspline(&mut topo, spline).unwrap();
+        let plain = serialize_solid(&topo, plain).unwrap();
+        let spline = serialize_solid(&topo, spline).unwrap();
+        for bytes in [&plain, &spline] {
+            let mut fresh = Topology::new();
+            let solid = deserialize_solid(bytes, &mut fresh).unwrap();
+            let report = brepkit_operations::validate::validate_solid(&fresh, solid).unwrap();
+            assert!(report.is_valid(), "{:?}", report.issues);
+        }
+
+        // The first entity in `list` whose `field` holds a `variant`, edited.
+        let tamper = |bytes: &[u8], list: &str, field: &str, variant: &str| {
+            let dump: Value = serde_json::from_slice(bytes).unwrap();
+            let at = dump[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|entity| entity[field].get(variant).is_some())
+                .unwrap();
+            let (list, field, variant) = (list.to_owned(), field.to_owned(), variant.to_owned());
+            move |edit: &dyn Fn(&mut Value)| {
+                let mut dump = dump.clone();
+                edit(&mut dump[&list][at][&field][&variant]);
+                serde_json::to_vec(&dump).unwrap()
+            }
+        };
+        let curve = tamper(&spline, "edges", "curve", "NurbsCurve");
+        let surface = tamper(&spline, "faces", "surface", "Nurbs");
+        let circle = tamper(&plain, "edges", "curve", "Circle");
+        let cylinder = tamper(&plain, "faces", "surface", "Cylinder");
+        let plane = tamper(&plain, "faces", "surface", "Plane");
+        let count = |value: &Value| value.as_array().unwrap().len();
+        // One knot vector of `degree` over `points`, from 0 to 1.
+        let clamped = |degree: usize, points: usize| {
+            let mut knots = vec![0.0; degree + 1];
+            knots.extend(vec![1.0; points]);
+            json!(knots)
+        };
+        let reversed = |knots: &mut Value| {
+            let mut values: Vec<f64> = serde_json::from_value(knots.clone()).unwrap();
+            values.reverse();
+            *knots = json!(values);
+        };
+        // A number the text cannot hold where `edit` wrote 0.123456789.
+        let unbounded = |bytes: Vec<u8>| {
+            String::from_utf8(bytes)
+                .unwrap()
+                .replacen("0.123456789", "1e400", 1)
+                .into_bytes()
+        };
+
+        let malformed_curves = [
+            curve(&|c| {
+                let n = count(&c["control_points"]);
+                c["degree"] = json!(n);
+                c["knots"] = clamped(n, n);
+            }),
+            curve(&|c| c["degree"] = json!(count(&c["control_points"]) + 2)),
+            curve(&|c| reversed(&mut c["knots"])),
+            curve(&|c| c["weights"][1] = json!(0.0)),
+            curve(&|c| c["weights"][1] = json!(-1.0)),
+            curve(&|c| c["weights"][1] = json!(1e-310)),
+            curve(&|c| c["weights"] = json!([1.0])),
+            circle(&|c| c["radius"] = json!(0.0)),
+            circle(&|c| c["radius"] = json!(-3.0)),
+            circle(&|c| {
+                for axis in ["normal", "u_axis", "v_axis"] {
+                    c[axis] = json!([0.0, 0.0, 0.0]);
+                }
+            }),
+        ];
+        let malformed_surfaces = [
+            surface(&|s| {
+                let n = count(&s["control_points"]);
+                s["degree_u"] = json!(n);
+                s["knots_u"] = clamped(n, n);
+            }),
+            surface(&|s| s["degree_v"] = json!(count(&s["control_points"][0]) + 2)),
+            surface(&|s| reversed(&mut s["knots_u"])),
+            surface(&|s| reversed(&mut s["knots_v"])),
+            surface(&|s| s["weights"][1][0] = json!(0.0)),
+            surface(&|s| s["weights"][1][0] = json!(-1.0)),
+            surface(&|s| s["weights"][1][0] = json!(1e-310)),
+            surface(&|s| {
+                s["control_points"][1].as_array_mut().unwrap().pop();
+            }),
+            surface(&|s| {
+                s["weights"][0].as_array_mut().unwrap().pop();
+            }),
+            cylinder(&|c| c["radius"] = json!(0.0)),
+            cylinder(&|c| c["radius"] = json!(-3.0)),
+            cylinder(&|c| {
+                for axis in ["axis", "x_axis", "y_axis"] {
+                    c[axis] = json!([0.0, 0.0, 0.0]);
+                }
+            }),
+            plane(&|p| p["normal"] = json!([0.0, 0.0, 0.0])),
+        ];
+        let unreadable = [
+            unbounded(curve(&|c| c["knots"][4] = json!(0.123_456_789))),
+            unbounded(curve(&|c| c["control_points"][1][0] = json!(0.123_456_789))),
+            unbounded(surface(&|s| s["knots_v"][1] = json!(0.123_456_789))),
+            unbounded(surface(&|s| {
+                s["control_points"][1][0][2] = json!(0.123_456_789);
+            })),
+            curve(&|c| c["knots"][4] = Value::Null),
+            surface(&|s| s["control_points"][1][0][2] = Value::Null),
+        ];
+
+        let refused = |bad: &[u8], why: &str| {
+            let found = deserialize_solid(bad, &mut Topology::new());
+            assert!(
+                matches!(&found, Err(IoError::ParseError { reason }) if reason.contains(why)),
+                "{why}: {found:?}"
+            );
+        };
+        for bad in &malformed_curves {
+            refused(bad, "malformed curve");
+        }
+        for bad in &malformed_surfaces {
+            refused(bad, "malformed surface");
+        }
+        for bad in &unreadable {
+            refused(bad, "arena deserialization failed");
+        }
+    }
+
+    /// A dump circle or cylinder of radius 1e300 is well formed, since each
+    /// point it gives is finite. The mesher's grids cannot hold its points:
+    /// their integer cells overflow. Meshing it, the solid or one face, gives
+    /// an error, in a debug build and in a release build.
+    #[test]
+    fn a_dump_too_large_to_mesh_gives_an_error_from_the_mesher() {
+        use brepkit_operations::OperationsError;
+        use brepkit_operations::tessellate::{tessellate, tessellate_solid};
+        use serde_json::{Value, json};
+
+        let mut topo = Topology::new();
+        let rod = make_cylinder(&mut topo, 3.0, 4.0).unwrap();
+        let dump: Value = serde_json::from_slice(&serialize_solid(&topo, rod).unwrap()).unwrap();
+        // Each entity in `list` whose `field` holds a `variant`, its radius
+        // set to 1e300.
+        let enlarged = |list: &str, field: &str, variant: &str| {
+            let mut dump = dump.clone();
+            for entity in dump[list].as_array_mut().unwrap() {
+                if let Some(shape) = entity[field].get_mut(variant) {
+                    shape["radius"] = json!(1e300);
+                }
+            }
+            serde_json::to_vec(&dump).unwrap()
+        };
+        let too_large = |found: &Result<usize, OperationsError>| {
+            matches!(found, Err(OperationsError::InvalidInput { reason })
+                if reason.contains("too far out to mesh"))
+        };
+        // With its rims enlarged every face is too large; with its side
+        // enlarged only the side is, and the caps mesh.
+        for (bytes, every_face) in [
+            (enlarged("edges", "curve", "Circle"), true),
+            (enlarged("faces", "surface", "Cylinder"), false),
+        ] {
+            let mut fresh = Topology::new();
+            let solid = deserialize_solid(&bytes, &mut fresh).unwrap();
+            let found = tessellate_solid(&fresh, solid, 0.1).map(|mesh| mesh.positions.len());
+            assert!(too_large(&found), "{found:?}");
+            for face in solid_faces(&fresh, solid).unwrap() {
+                let side = matches!(
+                    fresh.face(face).unwrap().surface(),
+                    FaceSurface::Cylinder(_)
+                );
+                let found = tessellate(&fresh, face, 0.1).map(|mesh| mesh.positions.len());
+                if every_face || side {
+                    assert!(too_large(&found), "side {side}: {found:?}");
+                } else {
+                    assert!(found.is_ok(), "{found:?}");
+                }
+            }
+        }
+    }
+
+    /// A circle or a surface of revolution whose frame has two axes alike,
+    /// axes not at right angles, or a left-handed turn is not the shape its
+    /// type names: a dump that holds one is refused. A knot span or weights
+    /// whose arithmetic overflows are refused too. The dumps they were made
+    /// from load.
+    #[test]
+    fn a_dump_with_a_skewed_frame_or_an_overflowing_spline_is_refused() {
+        use brepkit_operations::primitives::{make_cone, make_sphere, make_torus};
+        use serde_json::{Value, json};
+
+        let mut topo = Topology::new();
+        let solids = [
+            make_cylinder(&mut topo, 3.0, 4.0).unwrap(),
+            make_cone(&mut topo, 3.0, 1.0, 4.0).unwrap(),
+            make_sphere(&mut topo, 2.5, 8).unwrap(),
+            make_torus(&mut topo, 4.0, 1.0, 8).unwrap(),
+        ];
+        let spline = make_cylinder(&mut topo, 3.0, 4.0).unwrap();
+        brepkit_operations::heal::convert_to_bspline(&mut topo, spline).unwrap();
+        let dumps: Vec<Value> = solids
+            .iter()
+            .chain([&spline])
+            .map(|&s| {
+                let bytes = serialize_solid(&topo, s).unwrap();
+                assert!(deserialize_solid(&bytes, &mut Topology::new()).is_ok());
+                serde_json::from_slice(&bytes).unwrap()
+            })
+            .collect();
+        // The dumps with `edit` made to the first entity in `list` whose
+        // `field` holds a `variant`, if any does.
+        let edited = |list: &str, field: &str, variant: &str, edit: &dyn Fn(&mut Value)| {
+            dumps
+                .iter()
+                .filter_map(|dump| {
+                    let at = dump[list]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .position(|entity| entity[field].get(variant).is_some())?;
+                    let mut dump = dump.clone();
+                    edit(&mut dump[list][at][field][variant]);
+                    Some(serde_json::to_vec(&dump).unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let same = |a: &'static str, b: &'static str| move |g: &mut Value| g[b] = g[a].clone();
+        let flipped = |a: &'static str| {
+            move |g: &mut Value| {
+                let v: Vec<f64> = serde_json::from_value(g[a].clone()).unwrap();
+                g[a] = json!(v.iter().map(|c| -c).collect::<Vec<_>>());
+            }
+        };
+        let shrunk = |key: &'static str| {
+            move |g: &mut Value| {
+                let v: Vec<f64> = serde_json::from_value(g[key].clone()).unwrap();
+                g[key] = json!(v.iter().map(|k| k * 1e-310).collect::<Vec<_>>());
+            }
+        };
+        let kinds = [
+            edited("edges", "curve", "Circle", &same("u_axis", "v_axis")),
+            edited("edges", "curve", "Circle", &flipped("normal")),
+            edited("faces", "surface", "Cylinder", &same("x_axis", "y_axis")),
+            edited("faces", "surface", "Cylinder", &flipped("axis")),
+            edited("faces", "surface", "Cone", &same("x_axis", "y_axis")),
+            edited("faces", "surface", "Cone", &flipped("axis")),
+            edited("faces", "surface", "Sphere", &same("x_axis", "y_axis")),
+            edited("faces", "surface", "Sphere", &flipped("z_axis")),
+            edited("faces", "surface", "Torus", &same("x_axis", "y_axis")),
+            edited("faces", "surface", "Torus", &flipped("z_axis")),
+            edited("edges", "curve", "NurbsCurve", &shrunk("knots")),
+            edited("faces", "surface", "Nurbs", &shrunk("knots_v")),
+            edited("edges", "curve", "NurbsCurve", &|c| {
+                c["weights"] = json!(vec![1e308; c["weights"].as_array().unwrap().len()]);
+            }),
+            edited("faces", "surface", "Nurbs", &|s| {
+                let rows: Vec<Vec<f64>> = serde_json::from_value(s["weights"].clone()).unwrap();
+                s["weights"] = json!(
+                    rows.iter()
+                        .map(|row| vec![1e308; row.len()])
+                        .collect::<Vec<_>>()
+                );
+            }),
+        ];
+        assert!(kinds.iter().all(|dumps| !dumps.is_empty()));
+        let malformed = kinds.concat();
+        for bad in &malformed {
+            let found = deserialize_solid(bad, &mut Topology::new());
+            assert!(
+                matches!(&found, Err(IoError::ParseError { reason }) if reason.contains("malformed")),
+                "{found:?}"
+            );
+        }
+    }
+
+    /// A dump holds whatever data its bytes hold. A pcurve whose B-spline
+    /// has more degrees than control points, or knots that fall, would read
+    /// past its arrays when evaluated: such a dump is refused. The dump it
+    /// was made from loads.
+    #[test]
+    fn a_dump_with_a_malformed_pcurve_is_refused() {
+        use brepkit_math::curves2d::NurbsCurve2D;
+        use brepkit_math::vec::Point2;
+
+        let mut topo = Topology::new();
+        let solid = make_cylinder(&mut topo, 3.0, 4.0).unwrap();
+        let wall = solid_faces(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cylinder(_)))
+            .unwrap();
+        let rim = brepkit_topology::explorer::face_edges(&topo, wall).unwrap()[0];
+        let line = NurbsCurve2D::from_line(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)).unwrap();
+        topo.pcurves_mut()
+            .set(rim, wall, PCurve::new(Curve2D::Nurbs(line), 0.0, 1.0));
+        let bytes = serialize_solid(&topo, solid).unwrap();
+        assert!(deserialize_solid(&bytes, &mut Topology::new()).is_ok());
+
+        let tamper = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut dump: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let nurbs = dump["pcurves"][0]["curve"]
+                .get_mut("Nurbs")
+                .expect("the pcurve is a B-spline");
+            edit(nurbs);
+            serde_json::to_vec(&dump).unwrap()
+        };
+        for bad in [
+            tamper(&|nurbs| {
+                nurbs["degree"] = serde_json::json!(3);
+                nurbs["knots"] = serde_json::json!([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+            }),
+            tamper(&|nurbs| nurbs["knots"] = serde_json::json!([1.0, 1.0, 0.0, 0.0])),
+            tamper(&|nurbs| nurbs["weights"] = serde_json::json!([1.0])),
+        ] {
+            let found = deserialize_solid(&bad, &mut Topology::new());
+            assert!(
+                matches!(&found, Err(IoError::ParseError { reason }) if reason.contains("malformed pcurve")),
+                "{found:?}"
+            );
+        }
+    }
+
+    /// The constructors put an ellipse's larger semi-axis first, and code
+    /// that reads its size from `semi_major` alone relies on that order. A
+    /// dump holds whatever its bytes hold: an edge or a pcurve ellipse with
+    /// its smaller semi-axis first is refused. With its axes in order, the
+    /// dump loads.
+    #[test]
+    fn a_dump_with_an_ellipse_whose_smaller_axis_comes_first_is_refused() {
+        use brepkit_math::curves2d::Ellipse2D;
+        use brepkit_math::vec::Point2;
+        use serde_json::Value;
+
+        let mut topo = Topology::new();
+        let solid = make_cylinder(&mut topo, 3.0, 4.0).unwrap();
+        let wall = solid_faces(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cylinder(_)))
+            .unwrap();
+        let rim = brepkit_topology::explorer::face_edges(&topo, wall).unwrap()[0];
+        let flat = Ellipse2D::new(Point2::new(0.5, 0.5), 0.4, 0.1, 0.0).unwrap();
+        topo.pcurves_mut()
+            .set(rim, wall, PCurve::new(Curve2D::Ellipse(flat), 0.0, 1.0));
+        let ellipse = Ellipse3D::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            3.0,
+            2.0,
+        )
+        .unwrap();
+        topo.edge_mut(rim)
+            .unwrap()
+            .set_curve(EdgeCurve::Ellipse(ellipse));
+        let bytes = serialize_solid(&topo, solid).unwrap();
+        assert!(deserialize_solid(&bytes, &mut Topology::new()).is_ok());
+
+        // The dump with the semi-axes of the ellipse that `pick` finds swapped.
+        let swapped = |pick: &dyn Fn(&mut Value) -> &mut Value| {
+            let mut dump: Value = serde_json::from_slice(&bytes).unwrap();
+            let ellipse = pick(&mut dump);
+            let (major, minor) = (ellipse["semi_major"].clone(), ellipse["semi_minor"].clone());
+            ellipse["semi_major"] = minor;
+            ellipse["semi_minor"] = major;
+            serde_json::to_vec(&dump).unwrap()
+        };
+        let edge = swapped(&|dump| {
+            dump["edges"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find_map(|e| e["curve"].get_mut("Ellipse"))
+                .unwrap()
+        });
+        let pcurve = swapped(&|dump| dump["pcurves"][0]["curve"].get_mut("Ellipse").unwrap());
+        for (bad, why) in [(edge, "malformed curve"), (pcurve, "malformed pcurve")] {
+            let found = deserialize_solid(&bad, &mut Topology::new());
+            assert!(
+                matches!(&found, Err(IoError::ParseError { reason }) if reason.contains(why)),
+                "{why}: {found:?}"
+            );
         }
     }
 }

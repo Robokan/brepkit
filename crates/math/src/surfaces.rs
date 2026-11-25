@@ -29,9 +29,9 @@ impl CylindricalSurface {
     /// Creates a new cylindrical surface.
     ///
     /// # Errors
-    /// Returns an error if radius is not positive or axis is zero.
+    /// Returns an error if radius is not finite and positive or axis is zero.
     pub fn new(origin: Point3, axis: Vec3, radius: f64) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: f64::EPSILON,
@@ -102,14 +102,14 @@ impl CylindricalSurface {
     /// from STEP `AXIS2_PLACEMENT_3D` or BREP round-trips.
     ///
     /// # Errors
-    /// Returns an error if radius is not positive or axis is zero.
+    /// Returns an error if radius is not finite and positive or axis is zero.
     pub fn with_ref_dir(
         origin: Point3,
         axis: Vec3,
         radius: f64,
         ref_dir: Vec3,
     ) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: f64::EPSILON,
@@ -131,6 +131,16 @@ impl CylindricalSurface {
     pub fn translated(&self, offset: Vec3) -> Self {
         Self {
             origin: self.origin + offset,
+            ..self.clone()
+        }
+    }
+
+    /// This cylinder with its frame at `origin`, the same surface where
+    /// `origin` lies on its axis: its `v` then counts from there.
+    #[must_use]
+    pub(crate) fn framed_at(&self, origin: Point3) -> Self {
+        Self {
+            origin,
             ..self.clone()
         }
     }
@@ -234,7 +244,7 @@ impl ConicalSurface {
     /// # Errors
     /// Returns an error if half-angle is not in `(0, π/2)` or axis is zero.
     pub fn new(apex: Point3, axis: Vec3, half_angle: f64) -> Result<Self, MathError> {
-        if half_angle <= 0.0 || half_angle >= std::f64::consts::FRAC_PI_2 {
+        if !(half_angle > 0.0 && half_angle < std::f64::consts::FRAC_PI_2) {
             return Err(MathError::ParameterOutOfRange {
                 value: half_angle,
                 min: f64::EPSILON,
@@ -314,7 +324,7 @@ impl ConicalSurface {
         half_angle: f64,
         ref_dir: Vec3,
     ) -> Result<Self, MathError> {
-        if half_angle <= 0.0 || half_angle >= std::f64::consts::FRAC_PI_2 {
+        if !(half_angle > 0.0 && half_angle < std::f64::consts::FRAC_PI_2) {
             return Err(MathError::ParameterOutOfRange {
                 value: half_angle,
                 min: f64::EPSILON,
@@ -482,9 +492,9 @@ impl SphericalSurface {
     /// Creates a new spherical surface.
     ///
     /// # Errors
-    /// Returns an error if radius is not positive.
+    /// Returns an error if radius is not finite and positive.
     pub fn new(center: Point3, radius: f64) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: f64::EPSILON,
@@ -503,9 +513,9 @@ impl SphericalSurface {
     /// Creates a spherical surface with a custom orientation.
     ///
     /// # Errors
-    /// Returns an error if radius is not positive or the z-axis is zero.
+    /// Returns an error if radius is not finite and positive or the z-axis is zero.
     pub fn with_axis(center: Point3, radius: f64, z_axis: Vec3) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: f64::EPSILON,
@@ -530,14 +540,14 @@ impl SphericalSurface {
     /// [`ToroidalSurface::with_axis_and_ref_dir`] does for a torus.
     ///
     /// # Errors
-    /// Returns an error if radius is not positive or `z_axis` is zero.
+    /// Returns an error if radius is not finite and positive or `z_axis` is zero.
     pub fn with_axis_and_ref_dir(
         center: Point3,
         radius: f64,
         z_axis: Vec3,
         ref_dir: Vec3,
     ) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: f64::EPSILON,
@@ -796,17 +806,21 @@ pub struct ToroidalSurface {
 impl ToroidalSurface {
     /// Creates a new toroidal surface.
     ///
+    /// A minor radius larger than the major one is allowed: it gives a
+    /// spindle torus, whose tube crosses the axis. Fillets build such tori,
+    /// and the projection and the classifiers read them.
+    ///
     /// # Errors
-    /// Returns an error if either radius is not positive or `minor_radius > major_radius`.
+    /// Returns an error if either radius is not finite and positive.
     pub fn new(center: Point3, major_radius: f64, minor_radius: f64) -> Result<Self, MathError> {
-        if major_radius <= 0.0 {
+        if !(major_radius > 0.0 && major_radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: major_radius,
                 min: f64::EPSILON,
                 max: f64::MAX,
             });
         }
-        if minor_radius <= 0.0 {
+        if !(minor_radius > 0.0 && minor_radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: minor_radius,
                 min: f64::EPSILON,
@@ -829,21 +843,21 @@ impl ToroidalSurface {
     /// coordinate frame is derived from it.
     ///
     /// # Errors
-    /// Returns an error if either radius is not positive or axis is zero.
+    /// Returns an error if either radius is not finite and positive or axis is zero.
     pub fn with_axis(
         center: Point3,
         major_radius: f64,
         minor_radius: f64,
         z_axis: Vec3,
     ) -> Result<Self, MathError> {
-        if major_radius <= 0.0 {
+        if !(major_radius > 0.0 && major_radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: major_radius,
                 min: f64::EPSILON,
                 max: f64::MAX,
             });
         }
-        if minor_radius <= 0.0 {
+        if !(minor_radius > 0.0 && minor_radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: minor_radius,
                 min: f64::EPSILON,
@@ -870,7 +884,7 @@ impl ToroidalSurface {
     /// # Errors
     ///
     /// Returns [`MathError::ParameterOutOfRange`] if either radius is
-    /// non-positive, or [`MathError::ZeroVector`] if `z_axis` is zero.
+    /// not finite and positive, or [`MathError::ZeroVector`] if `z_axis` is zero.
     ///
     /// # Panics
     ///
@@ -883,14 +897,14 @@ impl ToroidalSurface {
         z_axis: Vec3,
         ref_dir: Vec3,
     ) -> Result<Self, MathError> {
-        if major_radius <= 0.0 {
+        if !(major_radius > 0.0 && major_radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: major_radius,
                 min: f64::EPSILON,
                 max: f64::MAX,
             });
         }
-        if minor_radius <= 0.0 {
+        if !(minor_radius > 0.0 && minor_radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: minor_radius,
                 min: f64::EPSILON,
@@ -981,6 +995,71 @@ impl ToroidalSurface {
                 self.center.y() + hy,
                 self.center.z() + hz,
             ),
+        }
+    }
+
+    /// Axis-aligned bounding box of the patch over the ring angles from `u0`
+    /// up to `u1` and the tube angles from `v0` up to `v1`; a range of a
+    /// whole turn or more takes all of it. The box holds the ring sector
+    /// that the patch's distances from the axis sweep, moved along the axis
+    /// through the heights that its tube angles reach.
+    #[must_use]
+    pub fn patch_aabb(&self, (u0, u1): (f64, f64), (v0, v1): (f64, f64)) -> Aabb3 {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        let holds = |at: f64| v1 - v0 >= TAU || (at - v0).rem_euclid(TAU) <= v1 - v0;
+        // The extreme of `f` on the tube angles, `sign` picking the largest
+        // or the least: `sign` itself where the range holds `f`'s own peak
+        // there, otherwise the value at one of the range's ends.
+        let most = |f: fn(f64) -> f64, peak: f64, sign: f64| {
+            if holds(peak) {
+                sign
+            } else if sign > 0.0 {
+                f(v0).max(f(v1))
+            } else {
+                f(v0).min(f(v1))
+            }
+        };
+        let (cos_lo, cos_hi) = (most(f64::cos, PI, -1.0), most(f64::cos, 0.0, 1.0));
+        let (sin_lo, sin_hi) = (
+            most(f64::sin, -FRAC_PI_2, -1.0),
+            most(f64::sin, FRAC_PI_2, 1.0),
+        );
+        // A tube point past the axis lies on the far side of it, half a turn
+        // round from its ring angle.
+        let ring = |rho: f64| {
+            let turn = if rho < 0.0 { PI } else { 0.0 };
+            crate::curves::Circle3D::with_axes(
+                self.center,
+                self.z_axis,
+                rho.abs(),
+                self.x_axis,
+                self.y_axis,
+            )
+            .map_or(
+                Aabb3 {
+                    min: self.center,
+                    max: self.center,
+                },
+                |c| c.arc_aabb(u0 + turn, u1 + turn),
+            )
+        };
+        let r = self.minor_radius;
+        let flat =
+            ring(r.madd(cos_lo, self.major_radius)).union(ring(r.madd(cos_hi, self.major_radius)));
+        let (low, high) = (self.z_axis * (r * sin_lo), self.z_axis * (r * sin_hi));
+        Aabb3 {
+            min: flat.min
+                + Vec3::new(
+                    low.x().min(high.x()),
+                    low.y().min(high.y()),
+                    low.z().min(high.z()),
+                ),
+            max: flat.max
+                + Vec3::new(
+                    low.x().max(high.x()),
+                    low.y().max(high.y()),
+                    low.z().max(high.z()),
+                ),
         }
     }
 
@@ -1164,16 +1243,21 @@ pub struct RevolutionSurface {
 impl RevolutionSurface {
     /// Creates a surface of revolution from a set of meridian profile points.
     ///
-    /// Each point `(radius, height)` defines the generatrix in the rotation plane.
+    /// Each point `(radius, height)` defines the generatrix in the rotation
+    /// plane, and [`Self::evaluate`] walks the segments between neighbours.
     ///
     /// # Errors
-    /// Returns an error if the profile is empty or the axis is zero.
+    /// Returns an error if the profile is empty or has one point, the radii
+    /// and heights differ in count, a radius is negative, a radius or height
+    /// is not finite or is past [`SIZE_LIMIT`](crate::curves::SIZE_LIMIT)
+    /// in magnitude, or the axis is zero.
     pub fn new(
         origin: Point3,
         axis: Vec3,
         radii: Vec<f64>,
         heights: Vec<f64>,
     ) -> Result<Self, MathError> {
+        use crate::curves::SIZE_LIMIT;
         if radii.is_empty() || heights.is_empty() {
             return Err(MathError::EmptyInput);
         }
@@ -1181,6 +1265,30 @@ impl RevolutionSurface {
             return Err(MathError::InvalidWeights {
                 expected: radii.len(),
                 got: heights.len(),
+            });
+        }
+        if radii.len() < 2 {
+            return Err(MathError::ParameterOutOfRange {
+                value: 1.0,
+                min: 2.0,
+                max: f64::MAX,
+            });
+        }
+        if let Some(&r) = radii.iter().find(|r| !(0.0..=SIZE_LIMIT).contains(*r)) {
+            return Err(MathError::ParameterOutOfRange {
+                value: r,
+                min: 0.0,
+                max: SIZE_LIMIT,
+            });
+        }
+        if let Some(&h) = heights
+            .iter()
+            .find(|h| !(-SIZE_LIMIT..=SIZE_LIMIT).contains(*h))
+        {
+            return Err(MathError::ParameterOutOfRange {
+                value: h,
+                min: -SIZE_LIMIT,
+                max: SIZE_LIMIT,
             });
         }
         let f = Frame3::from_normal(origin, axis)?;

@@ -653,6 +653,118 @@ pub fn close_wire_gaps(
     Ok(gaps_closed)
 }
 
+/// Raises the tolerance of each vertex of `faces` that lies off the end of
+/// one of its edges' curves to that gap.
+///
+/// The gap is read as [`crate::validate::validate_solid`] reads it, at the
+/// end of the edge's span, and the new tolerance is the gap plus the linear
+/// tolerance. A file gives each vertex as a point and each curve as its own
+/// control points, so a curve can end off its vertex by more than the
+/// file's tolerance, and a file has no vertex tolerance to cover it.
+///
+/// A gap of a tenth of the edge's size or more is not raised: such a vertex
+/// does not lie at its curve's end, and the edge is read on another part of
+/// its curve or is broken. An open edge's size is the distance between its
+/// two vertices, and a closed edge's is the size of its whole curve. A
+/// vertex with such a gap on one edge keeps its tolerance for all its
+/// edges, so that the gap is still reported.
+///
+/// Returns the number of vertices whose tolerance was raised.
+///
+/// # Errors
+/// Returns an error if a topology lookup fails.
+pub fn cover_curve_end_gaps(
+    topo: &mut Topology,
+    faces: &[FaceId],
+) -> Result<usize, crate::OperationsError> {
+    const PART_OF_EDGE: f64 = 0.1;
+    let linear = Tolerance::new().linear;
+    let mut seen = HashSet::new();
+    // The largest gap at each vertex, or `None` once an edge's gap at it is
+    // past that edge's limit.
+    let mut gaps: HashMap<VertexId, Option<f64>> = HashMap::new();
+    for &face in faces {
+        for eid in brepkit_topology::explorer::face_edges(topo, face)? {
+            if !seen.insert(eid) {
+                continue;
+            }
+            let edge = topo.edge(eid)?;
+            if !edge.curve().is_well_formed() {
+                continue;
+            }
+            let (start, end) = (edge.start(), edge.end());
+            let (ends, size) = if start == end {
+                (vec![start], closed_curve_size(edge.curve()))
+            } else {
+                let (a, b) = (topo.vertex(start)?.point(), topo.vertex(end)?.point());
+                (vec![start, end], (b - a).length())
+            };
+            for vid in ends {
+                let found = brepkit_check::validate::check_vertex_on_curve(topo, vid, eid, 0.0)
+                    .map_err(|e| crate::OperationsError::InvalidInput {
+                        reason: e.to_string(),
+                    })?;
+                let Some(gap) = found.first().and_then(|issue| issue.deviation) else {
+                    continue;
+                };
+                if gap <= topo.vertex(vid)?.tolerance() {
+                    continue;
+                }
+                let entry = gaps.entry(vid).or_insert(Some(0.0));
+                *entry = if gap < PART_OF_EDGE * size {
+                    entry.map(|largest| largest.max(gap))
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    let mut raised = 0;
+    for (&vid, &gap) in &gaps {
+        if let Some(gap) = gap {
+            topo.vertex_mut(vid)?.set_tolerance(gap + linear);
+            raised += 1;
+        }
+    }
+    Ok(raised)
+}
+
+/// The size of a closed curve as a whole, wherever its ends lie on it and
+/// in any pose: a circle's diameter, an ellipse's longer axis, and the
+/// largest distance between two of a B-spline's control points.
+fn closed_curve_size(curve: &EdgeCurve) -> f64 {
+    match curve {
+        EdgeCurve::Line => 0.0,
+        EdgeCurve::Circle(circle) => 2.0 * circle.radius(),
+        EdgeCurve::Ellipse(ellipse) => 2.0 * ellipse.semi_major().max(ellipse.semi_minor()),
+        EdgeCurve::NurbsCurve(curve) => widest_apart(curve.control_points()),
+    }
+}
+
+/// The largest distance between two of `points`. Past 512 points, twice the
+/// largest distance from the first point, which is no less and at most
+/// twice as much, so that the cost stays linear.
+fn widest_apart(points: &[Point3]) -> f64 {
+    const PAIRS_UP_TO: usize = 512;
+    let Some(&first) = points.first() else {
+        return 0.0;
+    };
+    if points.len() > PAIRS_UP_TO {
+        return 2.0
+            * points
+                .iter()
+                .map(|&p| (p - first).length())
+                .fold(0.0, f64::max);
+    }
+    let mut widest = 0.0_f64;
+    for (i, &p) in points.iter().enumerate() {
+        for &q in &points[i + 1..] {
+            widest = widest.max((q - p).length());
+        }
+    }
+    widest
+}
+
 /// The control hull of a NURBS curve over `[t0, t1]` alone: the curve is
 /// split to that span, and the span lies inside its control points.
 fn nurbs_span_hull(
@@ -1732,10 +1844,13 @@ fn edge_position_key(
     Ok(if a <= b { (a, b, mid) } else { (b, a, mid) })
 }
 
-/// Whether boundary loops on a curved surface leave a band with no seam the
-/// mesher cannot cover: a loop goes once around a cylinder's or cone's axis.
-/// On a torus or NURBS surface any face with several loops counts, which errs
-/// toward keeping faces apart.
+/// Whether boundary loops on a curved surface leave a face that the mesher
+/// cannot cover and a later boolean misreads. On a cylinder or cone, a loop
+/// goes once around the axis, which leaves a band with no seam. On a sphere,
+/// no loop keeps a pole of the sphere off the face: the face holds both poles,
+/// and the sphere's chart reads none of its loops as a boundary. On a torus or
+/// NURBS surface any face with several loops counts, which errs toward keeping
+/// faces apart.
 fn seamless_band(
     topo: &Topology,
     surface: &FaceSurface,
@@ -1744,8 +1859,16 @@ fn seamless_band(
     let (origin, axis) = match surface {
         FaceSurface::Cylinder(c) => (c.origin(), c.axis()),
         FaceSurface::Cone(c) => (c.apex(), c.axis()),
-        // The mesher covers a merged sphere face, latitude bands included.
-        FaceSurface::Plane { .. } | FaceSurface::Sphere(_) => return Ok(false),
+        FaceSurface::Sphere(sphere) => {
+            for lp in loops {
+                let points = loop_points(topo, lp, 32)?;
+                if crate::tessellate::sphere_loop_reads_right(sphere, &points) == Some(true) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        FaceSurface::Plane { .. } => return Ok(false),
         FaceSurface::Torus(_) | FaceSurface::Nurbs(_) => return Ok(true),
     };
     let Ok(frame) = brepkit_math::frame::Frame3::from_normal(origin, axis) else {
@@ -1756,34 +1879,7 @@ fn seamless_band(
         d.dot(frame.y).atan2(d.dot(frame.x))
     };
     for lp in loops {
-        let mut points = Vec::new();
-        for oe in lp {
-            let e = topo.edge(oe.edge())?;
-            let (a, b) = (
-                topo.vertex(e.start())?.point(),
-                topo.vertex(e.end())?.point(),
-            );
-            // A closed circle or ellipse runs its whole turn.
-            let (t0, t1) = if e.start() == e.end()
-                && matches!(e.curve(), EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_))
-            {
-                (0.0, std::f64::consts::TAU)
-            } else {
-                e.curve().domain_with_endpoints(a, b)
-            };
-            let mut samples: Vec<Point3> = (0..8)
-                .map(|k| {
-                    let t = (t1 - t0).madd(f64::from(k) / 8.0, t0);
-                    e.curve().evaluate_with_endpoints(t, a, b)
-                })
-                .collect();
-            if !oe.is_forward() {
-                samples.push(e.curve().evaluate_with_endpoints(t1, a, b));
-                samples.reverse();
-                samples.pop();
-            }
-            points.extend(samples);
-        }
+        let points = loop_points(topo, lp, 8)?;
         let mut turn = 0.0;
         for (i, &p) in points.iter().enumerate() {
             let q = points[(i + 1) % points.len()];
@@ -1800,6 +1896,44 @@ fn seamless_band(
         }
     }
     Ok(false)
+}
+
+/// Points along a loop in the order it runs, `per_edge` from each edge's
+/// start up to, not at, its end.
+fn loop_points(
+    topo: &Topology,
+    lp: &[OrientedEdge],
+    per_edge: u32,
+) -> Result<Vec<Point3>, crate::OperationsError> {
+    let mut points = Vec::new();
+    for oe in lp {
+        let e = topo.edge(oe.edge())?;
+        let (a, b) = (
+            topo.vertex(e.start())?.point(),
+            topo.vertex(e.end())?.point(),
+        );
+        // A closed circle or ellipse runs its whole turn.
+        let (t0, t1) = if e.start() == e.end()
+            && matches!(e.curve(), EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_))
+        {
+            (0.0, std::f64::consts::TAU)
+        } else {
+            e.curve().domain_with_endpoints(a, b)
+        };
+        let mut samples: Vec<Point3> = (0..per_edge)
+            .map(|k| {
+                let t = (t1 - t0).madd(f64::from(k) / f64::from(per_edge), t0);
+                e.curve().evaluate_with_endpoints(t, a, b)
+            })
+            .collect();
+        if !oe.is_forward() {
+            samples.push(e.curve().evaluate_with_endpoints(t1, a, b));
+            samples.reverse();
+            samples.pop();
+        }
+        points.extend(samples);
+    }
+    Ok(points)
 }
 
 /// Order boundary edges into one or more closed loops.
@@ -1880,6 +2014,78 @@ fn order_edges_into_loops(
     }
 
     Ok(loops)
+}
+
+/// Add the missing seam to each cylinder or cone face of `faces` whose rims
+/// wind its axis with no seam between them.
+///
+/// The seam runs between the two rims, or up a cone's one rim to its apex.
+/// `apexes` holds the vertex at a face's cone apex where the face already
+/// has one. A face the seam cannot be fitted to is left as it is, with a
+/// warning.
+///
+/// # Errors
+///
+/// Returns an error if a face, wire, edge or vertex of `faces` is missing.
+pub fn close_seams<S: std::hash::BuildHasher>(
+    topo: &mut Topology,
+    faces: &[FaceId],
+    apexes: &HashMap<FaceId, VertexId, S>,
+) -> Result<(), crate::OperationsError> {
+    brepkit_heal::fix::seam::close_seams(topo, faces, apexes).map_err(|e| {
+        crate::OperationsError::InvalidInput {
+            reason: format!("closing seams failed: {e}"),
+        }
+    })
+}
+
+/// Start a closed circle edge's curve at its vertex.
+///
+/// # Errors
+///
+/// Returns an error if `edge` or its vertex is missing.
+pub fn anchor_circle(topo: &mut Topology, edge: EdgeId) -> Result<(), crate::OperationsError> {
+    brepkit_heal::fix::seam::anchor_circle(topo, edge).map_err(|e| {
+        crate::OperationsError::InvalidInput {
+            reason: format!("anchoring a circle failed: {e}"),
+        }
+    })
+}
+
+/// `solid`, or a copy of it with a seam on each face that [`close_seams`]
+/// closes.
+///
+/// The boolean engine splits a face of revolution along its seam and cannot
+/// read a band bounded by its rims alone.
+///
+/// # Errors
+///
+/// Returns an error if a topology lookup fails.
+pub(crate) fn with_seams(
+    topo: &mut Topology,
+    solid: SolidId,
+) -> Result<SolidId, crate::OperationsError> {
+    let lacks = |topo: &Topology, f: FaceId| {
+        brepkit_heal::fix::seam::lacks_seam(topo, f).map_err(|e| {
+            crate::OperationsError::InvalidInput {
+                reason: format!("reading a face's seam failed: {e}"),
+            }
+        })
+    };
+    let mut any = false;
+    for f in brepkit_topology::explorer::solid_faces(topo, solid)? {
+        if lacks(topo, f)? {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return Ok(solid);
+    }
+    let copy = crate::copy::copy_solid(topo, solid)?;
+    let faces = brepkit_topology::explorer::solid_faces(topo, copy)?;
+    close_seams(topo, &faces, &HashMap::new())?;
+    Ok(copy)
 }
 
 /// Convert all analytic geometry in a solid to NURBS (B-Spline) representation.

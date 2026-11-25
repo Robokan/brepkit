@@ -327,6 +327,49 @@ impl Revolution {
         }
     }
 
+    /// `dv/dt` of the point the chart's projection reads for a point moving
+    /// at `velocity` through `p`, at `(u, v)`. The projection reads `v` from
+    /// the height along the axis on a cylinder and a cone, and from the
+    /// angle round the meridian's centre on a ball and a torus, so an edge
+    /// off the surface (a chord of a rim) is read where its points project.
+    fn dv_dt(&self, p: Point3, velocity: Vec3, u: f64, v: f64) -> f64 {
+        let (sin_u, cos_u) = u.sin_cos();
+        let out = self.x * cos_u + self.y * sin_u;
+        let (along, across) = (self.z.dot(velocity), out.dot(velocity));
+        let centre = match self.profile {
+            Profile::Cylinder { .. } => return along,
+            Profile::Cone { cos_a, sin_a } => {
+                return if sin_a.abs() > 1e-15 {
+                    along / sin_a
+                } else if cos_a.abs() > 1e-15 {
+                    across / cos_a
+                } else {
+                    0.0
+                };
+            }
+            Profile::Sphere { .. } => self.centre,
+            Profile::Torus { major, .. } => self.centre + out * major,
+        };
+        let reach = (Vec3::new(p.x(), p.y(), p.z()) - centre).length();
+        if reach > 0.0 {
+            let (sin_v, cos_v) = v.sin_cos();
+            cos_v.madd(along, -sin_v * across) / reach
+        } else {
+            0.0
+        }
+    }
+
+    /// The same surface with `u` taken from `angle`: `u - angle` in it is
+    /// `u` here.
+    fn turned(self, angle: f64) -> Self {
+        let (sin, cos) = angle.sin_cos();
+        Self {
+            x: self.x * cos + self.y * sin,
+            y: self.y * cos - self.x * sin,
+            ..self
+        }
+    }
+
     /// Each [`integrand`] at `v` as a trigonometric polynomial in `u`.
     fn series(&self, v: f64, about: Vec3) -> [Trig; 8] {
         let (a, b, da, db) = self.profile.at(v);
@@ -400,6 +443,13 @@ impl Revolution {
             ),
         ];
         self.series(v, about).map(|g| g.integral(u, &waves))
+    }
+
+    /// The most each [`integrand`] can be at `v`, the sum of its waves'
+    /// sizes: how far [`Self::antiderivative`] moves for a step in `u`.
+    fn slope_bound(&self, v: f64, about: Vec3) -> [f64; 8] {
+        self.series(v, about)
+            .map(|g| g.0.iter().fold(0.0, |sum, c| sum + c.abs()))
     }
 
     /// The mean of each [`integrand`] over a turn at `v`.
@@ -498,14 +548,48 @@ pub(super) fn integrate_by_boundary<S: ParametricSurface>(
         chart.surface.partial_u(u, v).length() <= 1e-6 * chart.surface.partial_v(u, v).length()
     };
     let quarter = std::f64::consts::FRAC_PI_2;
+    // `F` is taken from where the first wire starts rather than from the
+    // frame's `u = 0`, which may lie most of a turn away: there `F` is the
+    // integral over most of a turn, and the wires' sums cancel it out to the
+    // face's far smaller one, losing its digits on the way. `F(u, v) -
+    // F(u₀, v)` serves as well, for the face's wires together do not wind
+    // round `v`; so does a wire's `u` a whole turn on, which moves it by
+    // `∮ 2π ḡ(v) dv`, nothing, or on a torus a whole turn of its tube, which
+    // the count of whole surfaces below takes off.
+    let u_from = wires.first().and_then(|w| w.first()).map_or(0.0, |e| {
+        let walk = Walk::new(e.curve, e.start, e.end);
+        (chart.project)(walk.point(walk.tau(e.from))).0
+    });
+    let from_start = chart.revolution.turned(u_from);
+    // The straight step in `(u, v)` from where one edge's curve ends to where
+    // the next one's starts. Each curve is read from its own parameters, and
+    // two of them can part at a vertex by its tolerance (a long arc of a
+    // huge ellipse reads its ends 1e-7 along itself). The step keeps each
+    // loop closed, so its integral does not hang on where `F` is taken from.
+    let bridge = |acc: &mut [f64; 8], twice_area: &mut f64, from: (f64, f64), to: (f64, f64)| {
+        let (du, dv) = (to.0 - from.0, to.1 - from.1);
+        if dv.abs() > 0.0 {
+            for gp in gauss {
+                let s = 0.5.madd(gp.x, 0.5);
+                let g = from_start.antiderivative(
+                    du.madd(s, from.0) - u_from,
+                    dv.madd(s, from.1),
+                    about,
+                );
+                add(acc, &g, 0.5 * gp.w * dv);
+            }
+        }
+        *twice_area += from.0.madd(dv, -(from.1 * du));
+    };
     let mut total = [0.0; 8];
     let (mut turns_sum, mut winds, mut patch, mut holes) = (0_i64, false, false, true);
     for wire in wires {
         let first = wire.first()?;
-        let entry = first
-            .curve
-            .evaluate_with_endpoints(first.from, first.start, first.end);
-        let (mut u, v_start) = (chart.project)(entry);
+        let first_walk = Walk::new(first.curve, first.start, first.end);
+        let entry = first_walk.point(first_walk.tau(first.from));
+        let (u_entry, v_start) = (chart.project)(entry);
+        // Each wire starts within half a turn of the first.
+        let mut u = u_from + wrap_pi(u_entry - u_from);
         let u_start = u;
         let mut v = v_start;
         let v_wrap = |x: f64| if chart.v_periodic { wrap_pi(x) } else { x };
@@ -513,19 +597,31 @@ pub(super) fn integrate_by_boundary<S: ParametricSurface>(
         let mut twice_area = 0.0;
         let (mut exit, mut chord) = (entry, 0.0);
         for edge in wire {
-            let point = |t: f64| edge.curve.evaluate_with_endpoints(t, edge.start, edge.end);
+            let walk = Walk::new(edge.curve, edge.start, edge.end);
+            let (from, to) = (walk.tau(edge.from), walk.tau(edge.to));
+            let point = |t: f64| walk.point(t);
             let at = |t: f64| (chart.project)(point(t));
-            let (enter, leave) = (point(edge.from), point(edge.to));
+            let (enter, leave) = (point(from), point(to));
             chord = (leave - enter).length();
             if (enter - exit).length() > 1e-6 + 1e-3 * chord {
                 return None;
             }
             exit = leave;
+            let (ue, ve) = at(from);
+            let entered = (u + wrap_pi(ue - u), v + v_wrap(ve - v));
+            bridge(&mut acc, &mut twice_area, (u, v), entered);
+            (u, v) = entered;
             // A piece that turns a quarter turn about the axis is halved (a
             // NURBS rim's knot span may be a third of a circle); one that
             // still does at a thousandth of its edge runs past a pole.
-            let floor = 1e-3 * (edge.to - edge.from).abs();
-            let mut pending = edge_pieces(edge);
+            let floor = 1e-3 * (to - from).abs();
+            let mut pending = edge_pieces(&BoundaryEdge {
+                curve: edge.curve,
+                start: edge.start,
+                end: edge.end,
+                from,
+                to,
+            });
             pending.reverse();
             while let Some((ta, tb)) = pending.pop() {
                 let (ua, va) = at(ta);
@@ -573,10 +669,15 @@ pub(super) fn integrate_by_boundary<S: ParametricSurface>(
                     let mut sums = [0.0; 9];
                     let mut rounding = 0.0_f64;
                     for (t, un, vn, w) in nodes {
-                        let [(u1, v1), (u2, v2), (u3, v3), (u4, v4)] =
-                            [t + h, t - h, t + 2.0 * h, t - 2.0 * h].map(at);
+                        let [u1, u2, u3, u4] =
+                            [t + h, t - h, t + 2.0 * h, t - 2.0 * h].map(|x| at(x).0);
                         let du = 8.0f64.madd(wrap_pi(u1 - u2), -wrap_pi(u3 - u4)) / (12.0 * h);
-                        let dv = 8.0f64.madd(v_wrap(v1 - v2), -v_wrap(v3 - v4)) / (12.0 * h);
+                        // `dv/dt` of the projected edge from the edge's
+                        // velocity. A stencil's differences carry the
+                        // rounding of each point, which a curve far from its
+                        // own centre (a long arc of a huge ellipse) has in
+                        // plenty.
+                        let dv = chart.revolution.dv_dt(point(t), walk.velocity(t), un, vn);
                         // Each difference rounds by an ulp of its coordinate.
                         let (nu, nv) = (
                             1.5 * f64::EPSILON * (1.0 + un.abs()) / h.abs(),
@@ -584,10 +685,18 @@ pub(super) fn integrate_by_boundary<S: ParametricSurface>(
                         );
                         // A latitude (a rim circle about the axis) adds nothing.
                         if dv.abs() > 1e-12 * (1.0 + vn.abs()) {
-                            let g = chart.revolution.antiderivative(un, vn, about);
-                            for (s, x) in sums.iter_mut().zip(g) {
+                            let g = from_start.antiderivative(un - u_from, vn, about);
+                            // `F` rounds as `u` does, by its slope's ulps of
+                            // `u`, which counts where `F` itself is near
+                            // nothing: along an edge on the ruling where the
+                            // wires start, every piece's integral is rounding.
+                            let slopes = chart.revolution.slope_bound(vn, about);
+                            let u_rounding = 4.0 * f64::EPSILON * (1.0 + un.abs() + u_from.abs());
+                            for ((s, x), slope) in sums.iter_mut().zip(g).zip(slopes) {
                                 *s += w * dv * x;
-                                rounding = rounding.max((w * nv * x).abs());
+                                rounding = rounding
+                                    .max((w * nv * x).abs())
+                                    .max((w * dv * slope).abs() * u_rounding);
                             }
                         }
                         sums[8] += w * (un * dv - vn * du);
@@ -649,6 +758,16 @@ pub(super) fn integrate_by_boundary<S: ParametricSurface>(
         if chart.v_periodic && (v - v_start - tube_turns * TAU).abs() > 1e-6 {
             return None;
         }
+        #[allow(clippy::cast_precision_loss)]
+        let closed = (
+            (turns as f64).madd(TAU, u_start),
+            if chart.v_periodic {
+                tube_turns.madd(TAU, v_start)
+            } else {
+                v_start
+            },
+        );
+        bridge(&mut acc, &mut twice_area, (u, v), closed);
         if chart.v_periodic && tube_turns != 0.0 {
             if turns != 0 {
                 return None;
@@ -1393,13 +1512,23 @@ pub(super) fn nurbs_face_over_domain(
     }))
 }
 
-/// A face on an open NURBS surface, its integrals by Green's theorem as
+/// A face on a NURBS surface, its integrals by Green's theorem as
 /// [`integrate_by_boundary`] takes them, with `F(u, v) = ∫ g(s, v) ds` from
 /// the start of `u`'s domain in panels between the surface's knots, and
 /// each edge cut where it crosses a knot line, so every panel's integrand
-/// is smooth. `None` for a surface that closes on itself or shrinks to a
-/// point along a side (its `(u, v)` would not be one-to-one), a wire a
-/// point of which does not project, or a region of no area.
+/// is smooth.
+///
+/// A surface that closes on itself along one direction (a wall turned in
+/// B-spline form) is cut open along its seam. Each wire's coordinate that way
+/// is carried on across the seam, which is a knot line too, so the wire's
+/// path in `(u, v)` closes up as on an open surface. Across `u`, each period
+/// on adds a whole turn's integral, `F(u + P, v) = F(u, v) + F(u₁, v)`;
+/// across `v`, `F` repeats as `v` does.
+///
+/// `None` for a surface that closes both ways or shrinks to a point along a
+/// side (its `(u, v)` would not be one-to-one), a wire that winds round the
+/// closed direction, a wire a point of which does not project, or a region
+/// of no area.
 pub(super) fn nurbs_face_by_boundary(
     topo: &Topology,
     face: &Face,
@@ -1413,9 +1542,9 @@ pub(super) fn nurbs_face_by_boundary(
     let FaceSurface::Nurbs(s) = face.surface() else {
         return Ok(None);
     };
-    if !open_and_poleless(s) {
+    let Some(closure) = closure(s) else {
         return Ok(None);
-    }
+    };
     let Some(wires) = boundary_wires(topo, face)? else {
         return Ok(None);
     };
@@ -1540,8 +1669,11 @@ pub(super) fn nurbs_face_by_boundary(
                 cps[nu - 1][nv - 1],
                 cps[0][nv - 1],
             ];
+            // A side closed on itself starts and ends at one corner: it
+            // is no measure.
             1e-9 * (0..4)
                 .map(|k| (corners[(k + 1) % 4] - corners[k]).length())
+                .filter(|&d| d > 0.0)
                 .fold(f64::INFINITY, f64::min)
         }
     };
@@ -1551,10 +1683,26 @@ pub(super) fn nurbs_face_by_boundary(
             && matches!(curve, EdgeCurve::NurbsCurve(c)
                 if is_side(s, c, 0, side_reach) || is_side(s, c, 2, side_reach))
     };
+    // On a surface closed along one direction, the coordinate that way is
+    // carried on along each wire across the seam: a point's copy of it a
+    // whole number of periods on from the last point's.
+    let closed = match closure {
+        Closure::Open => None,
+        Closure::AlongU => Some((0_usize, u1 - u0, u0)),
+        Closure::AlongV => Some((1_usize, v1 - v0, v0)),
+    };
+    let coord = |q: (f64, f64), pick: usize| if pick == 0 { q.0 } else { q.1 };
+    let lift = |near: f64, x: f64, period: f64| period.madd(((near - x) / period).round(), x);
     let mut pieces: Vec<Piece<'_, '_>> = Vec::new();
     for (k, wire) in wires.iter().enumerate() {
+        let first = pieces.len();
+        // The closed coordinate where the wire starts and where it stands.
+        let (mut began, mut run): (Option<f64>, Option<f64>) = (None, None);
         for edge in wire {
-            if along_v_side(edge.curve) {
+            // On a closed surface a side is followed all the same: it
+            // carries the closed coordinate a turn round.
+            let side = along_v_side(edge.curve);
+            if side && closed.is_none() {
                 continue;
             }
             let on = |t: f64, seed: Option<(f64, f64)>| on(edge, t, seed);
@@ -1571,6 +1719,23 @@ pub(super) fn nurbs_face_by_boundary(
                     samples.push((t, q));
                     seed = Some(q);
                 }
+                let mut lifted: Vec<f64> = Vec::with_capacity(9);
+                if let Some((pick, period, _)) = closed {
+                    for &(_, q) in &samples {
+                        let x = coord(q, pick);
+                        let at = run.map_or(x, |r| lift(r, x, period));
+                        // A step that long could as well run the other way.
+                        if run.is_some_and(|r| (at - r).abs() > 0.25 * period) {
+                            return Ok(None);
+                        }
+                        began.get_or_insert(at);
+                        run = Some(at);
+                        lifted.push(at);
+                    }
+                }
+                if side {
+                    continue;
+                }
                 let mut cuts = vec![ta, tb];
                 // A sample on a knot line is a cut itself; the bisection
                 // below only takes a knot strictly between two samples.
@@ -1582,12 +1747,46 @@ pub(super) fn nurbs_face_by_boundary(
                         cuts.push(t);
                     }
                 }
-                for w in samples.windows(2) {
+                for (i, w) in samples.windows(2).enumerate() {
                     let ((t_a, a), (t_b, b)) = (w[0], w[1]);
                     for (knots, pick) in [(&u_knots, 0_usize), (&v_knots, 1_usize)] {
-                        let coord = |q: (f64, f64)| if pick == 0 { q.0 } else { q.1 };
+                        // Along the closed direction the knot lines repeat
+                        // every period, the seam among them, and are found on
+                        // the coordinate carried on.
+                        if let Some((_, period, seam)) = closed.filter(|c| c.0 == pick) {
+                            let (la, lb) = (lifted[i], lifted[i + 1]);
+                            let (low, high) = (la.min(lb), la.max(lb));
+                            for &line in knots.iter().chain([&seam]) {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let (first, last) = (
+                                    ((low - line) / period).floor() as i64,
+                                    ((high - line) / period).ceil() as i64,
+                                );
+                                for m in first..=last {
+                                    #[allow(clippy::cast_precision_loss)]
+                                    let x = period.madd(m as f64, line);
+                                    if x <= low || x >= high {
+                                        continue;
+                                    }
+                                    let (mut lo, mut hi) = (t_a, t_b);
+                                    for _ in 0..50 {
+                                        let mid = 0.5 * (lo + hi);
+                                        let Some(q) = on(mid, Some(a)) else {
+                                            return Ok(None);
+                                        };
+                                        if (lift(la, coord(q, pick), period) - x) * (la - x) > 0.0 {
+                                            lo = mid;
+                                        } else {
+                                            hi = mid;
+                                        }
+                                    }
+                                    cuts.push(0.5 * (lo + hi));
+                                }
+                            }
+                            continue;
+                        }
                         for &k in knots {
-                            if (coord(a) - k) * (coord(b) - k) >= 0.0 {
+                            if (coord(a, pick) - k) * (coord(b, pick) - k) >= 0.0 {
                                 continue;
                             }
                             let (mut lo, mut hi) = (t_a, t_b);
@@ -1596,7 +1795,7 @@ pub(super) fn nurbs_face_by_boundary(
                                 let Some(q) = on(mid, Some(a)) else {
                                     return Ok(None);
                                 };
-                                if (coord(q) - k) * (coord(a) - k) > 0.0 {
+                                if (coord(q, pick) - k) * (coord(a, pick) - k) > 0.0 {
                                     lo = mid;
                                 } else {
                                     hi = mid;
@@ -1606,19 +1805,59 @@ pub(super) fn nurbs_face_by_boundary(
                         }
                     }
                 }
+                // A piece's points are read on the copy of the closed
+                // coordinate nearest a sample of it: one that turns far is
+                // cut at every sample, so each piece stays within a quarter
+                // turn of it.
+                if let Some((_, period, _)) = closed {
+                    let (lo, hi) = lifted
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+                            (lo.min(x), hi.max(x))
+                        });
+                    if hi - lo > 0.125 * period {
+                        cuts.extend(samples[1..8].iter().map(|&(t, _)| t));
+                    }
+                }
                 cuts.sort_by(f64::total_cmp);
                 if tb < ta {
                     cuts.reverse();
                 }
                 cuts.dedup_by(|x, y| (*x - *y).abs() <= 1e-12 * (tb - ta).abs());
-                let start = samples[0].1;
-                pieces.extend(cuts.windows(2).map(|w| Piece {
-                    wire: k,
-                    edge,
-                    from: w[0],
-                    to: w[1],
-                    start,
+                pieces.extend(cuts.windows(2).map(|w| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let nearest = (8.0 * (f64::midpoint(w[0], w[1]) - ta) / (tb - ta))
+                        .round()
+                        .clamp(0.0, 8.0) as usize;
+                    Piece {
+                        wire: k,
+                        edge,
+                        from: w[0],
+                        to: w[1],
+                        start: samples[nearest].1,
+                        lifted: lifted.get(nearest).copied().unwrap_or(0.0),
+                    }
                 }));
+            }
+        }
+        // A wire that winds round the closed direction bounds a band with
+        // another: which side of it the face lies on its area cannot tell.
+        if let (Some((_, period, _)), Some(b), Some(r)) = (closed, began, run)
+            && ((r - b) / period).abs() > 1e-6
+        {
+            return Ok(None);
+        }
+        // A wire that closes up may be read on any copy of the domain, a
+        // whole turn on along `u` adding `∮ F(u₁, v) dv = 0`: the copy it
+        // mostly lies in takes the fewest whole turns.
+        if let Some((0, period, seam)) = closed {
+            let wire_pieces = &mut pieces[first..];
+            #[allow(clippy::cast_precision_loss)]
+            let mean =
+                wire_pieces.iter().map(|p| p.lifted).sum::<f64>() / wire_pieces.len().max(1) as f64;
+            let shift = period * ((mean - seam) / period).floor();
+            for piece in wire_pieces {
+                piece.lifted -= shift;
             }
         }
     }
@@ -1634,18 +1873,40 @@ pub(super) fn nurbs_face_by_boundary(
         let mut along = |t: f64| -> Option<[f64; 8]> {
             let c = on(edge, t, Some(seed))?;
             seed = c;
-            // `dv/dt` from the curve's velocity in the surface's tangent
-            // plane, by the first fundamental form.
+            // `dv/dt` of the point's nearest point on the surface, where the
+            // chart reads it: from the curve's velocity in the surface's
+            // tangent plane by the first fundamental form, less the
+            // surface's second partials along the point's offset from it
+            // where it lies off it (a chord of a rim), as the nearest point
+            // keeps the offset square to both partials.
+            let at = edge.curve.evaluate_with_endpoints(t, edge.start, edge.end);
             let velocity = edge_velocity(edge.curve, t, edge.start, edge.end);
             let d = s.first_derivatives(c.0, c.1);
             let (su, sv) = (d.1, d.2);
-            let (e, f, g) = (su.dot(su), su.dot(sv), sv.dot(sv));
+            let (mut e, mut f, mut g) = (su.dot(su), su.dot(sv), sv.dot(sv));
+            let off = Vec3::new(at.x(), at.y(), at.z()) - d.0;
+            if off.length() > 1e-12 * size {
+                let second = s.derivatives(c.0, c.1, 2);
+                e -= off.dot(second[2][0]);
+                f -= off.dot(second[1][1]);
+                g -= off.dot(second[0][2]);
+            }
             let det = e.madd(g, -f * f);
             if det <= 1e-24 * (e * g).max(1e-300) {
                 return None;
             }
             let dv = e.madd(sv.dot(velocity), -f * su.dot(velocity)) / det;
             let mut term = antiderivative(c.0, c.1)?;
+            // Each turn on round `u` adds the integral of a whole turn.
+            if let Some((0, period, _)) = closed {
+                let turns = ((piece.lifted - c.0) / period).round();
+                if turns != 0.0 {
+                    let whole = antiderivative(u1, c.1)?;
+                    for (x, w) in term.iter_mut().zip(whole) {
+                        *x = turns.madd(w, *x);
+                    }
+                }
+            }
             for x in &mut term {
                 *x *= dv;
             }
@@ -1704,6 +1965,72 @@ struct Piece<'e, 'a> {
     from: f64,
     to: f64,
     start: (f64, f64),
+    /// On a surface closed along one direction, the coordinate that way
+    /// carried on along the wire to the sample `start` is read at.
+    lifted: f64,
+}
+
+/// How the boundary integrals walk an edge: by `τ`, its parameter less
+/// `base`. A conic (`base` its parameter at its start vertex) is read as its
+/// point there plus its chord from there, by the half-angle forms
+/// `cos(b + τ) − cos b = −2 sin(b + τ/2) sin(τ/2)` and
+/// `sin(b + τ) − sin b = 2 cos(b + τ/2) sin(τ/2)`. The conic's own form
+/// rounds the angle and the centre's coordinates: a short arc of an ellipse
+/// 2e8 across has its centre 1e8 away, and one rounding of its angle moves
+/// its point 4e-8 along it. The chord keeps its digits, and two faces on one
+/// edge walk the same points whichever way each runs it. Any other curve is
+/// read at its own parameter (`base` is nothing).
+pub(super) struct Walk<'a> {
+    curve: &'a EdgeCurve,
+    start: Point3,
+    end: Point3,
+    base: f64,
+    at_base: Point3,
+}
+
+impl<'a> Walk<'a> {
+    pub(super) fn new(curve: &'a EdgeCurve, start: Point3, end: Point3) -> Self {
+        let base = match curve {
+            EdgeCurve::Circle(c) => c.project(start),
+            EdgeCurve::Ellipse(e) => e.project(start),
+            EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => 0.0,
+        };
+        let at_base = curve.evaluate_with_endpoints(base, start, end);
+        Self {
+            curve,
+            start,
+            end,
+            base,
+            at_base,
+        }
+    }
+
+    /// `τ` at the curve's parameter `t`.
+    pub(super) fn tau(&self, t: f64) -> f64 {
+        t - self.base
+    }
+
+    /// The point at `τ`.
+    pub(super) fn point(&self, tau: f64) -> Point3 {
+        let (major, minor, x, y) = match self.curve {
+            EdgeCurve::Circle(c) => (c.radius(), c.radius(), c.u_axis(), c.v_axis()),
+            EdgeCurve::Ellipse(e) => (e.semi_major(), e.semi_minor(), e.u_axis(), e.v_axis()),
+            EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => {
+                return self
+                    .curve
+                    .evaluate_with_endpoints(self.base + tau, self.start, self.end);
+            }
+        };
+        let half = 0.5 * tau;
+        let s = half.sin();
+        let (sin_m, cos_m) = (self.base + half).sin_cos();
+        self.at_base + x * (-2.0 * major * sin_m * s) + y * (2.0 * minor * cos_m * s)
+    }
+
+    /// The derivative in `τ` at `τ`.
+    pub(super) fn velocity(&self, tau: f64) -> Vec3 {
+        edge_velocity(self.curve, self.base + tau, self.start, self.end)
+    }
 }
 
 /// `d/dt` of `curve` at `t` as `evaluate_with_endpoints` runs it from
@@ -1714,6 +2041,32 @@ fn edge_velocity(curve: &EdgeCurve, t: f64, start: Point3, end: Point3) -> Vec3 
         EdgeCurve::Circle(c) => c.tangent(t) * c.radius(),
         EdgeCurve::Ellipse(e) => e.tangent(t),
         EdgeCurve::NurbsCurve(n) => n.derivatives(t, 1)[1],
+    }
+}
+
+/// Which way a NURBS surface closes on itself.
+#[derive(Clone, Copy)]
+enum Closure {
+    Open,
+    AlongU,
+    AlongV,
+}
+
+/// Which way a NURBS surface that shrinks to a point along no side closes
+/// on itself; `None` for one that closes both ways or has a pole.
+fn closure(s: &brepkit_math::nurbs::surface::NurbsSurface) -> Option<Closure> {
+    let (sides, near) = side_samples(s);
+    let length = |pts: &[Point3]| pts.windows(2).map(|w| (w[1] - w[0]).length()).sum::<f64>();
+    let same =
+        |a: &[Point3], b: &[Point3]| a.iter().zip(b).all(|(p, q)| (*p - *q).length() <= near);
+    if !sides.iter().all(|p| length(p) > near) {
+        return None;
+    }
+    match (same(&sides[0], &sides[1]), same(&sides[2], &sides[3])) {
+        (false, false) => Some(Closure::Open),
+        (true, false) => Some(Closure::AlongU),
+        (false, true) => Some(Closure::AlongV),
+        (true, true) => None,
     }
 }
 

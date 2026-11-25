@@ -607,8 +607,10 @@ fn build_manifold_shell(
 /// - Too few faces (< `MIN_SOLID_FACES`)
 /// - No edges or vertices (empty topology)
 /// - Unclosed wires and non-manifold edges (hard errors)
-/// - Euler characteristic, boundary edges, degenerate faces, and face area
-///   via [`crate::validate::validate_solid`] (logged as warnings)
+/// - The Euler-Poincaré relation on each piece, with its genus and inner
+///   loops, as [`crate::validate::validate_solid`] reads it (hard error)
+/// - Boundary edges, degenerate faces, and face area via
+///   [`crate::validate::validate_solid`] (logged as warnings)
 ///
 /// This is the strict acceptance gate for results that still have a fallback
 /// available (the GFA pipeline). The mesh fallback's terminal sanity check is
@@ -726,6 +728,15 @@ pub(super) fn validate_boolean_result(
                  {non_manifold_edges} non-manifold edge(s), and \
                  {free_edges} free boundary edge(s)"
             ),
+        });
+    }
+
+    // A closed shell whose counts break the Euler-Poincaré relation has a
+    // face that is not the patch its wires make it (a hole lost, a vertex
+    // that should be two), though every count above holds.
+    if let Some(misfit) = crate::validate::solid_euler_misfit(topo, solid)? {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: format!("boolean result: {misfit}"),
         });
     }
 
@@ -1098,8 +1109,12 @@ pub(super) fn separate_touching_pieces(
         .to_vec();
     let n = face_ids.len();
     // Each face's wires, and each edge's uses by face (a seam counts twice).
+    // The edges are kept in the order the faces first use them, and the
+    // copies are made in that order, so their ids do not hang on the order
+    // of a hash map.
     let mut face_wires: Vec<Vec<WireId>> = Vec::with_capacity(n);
     let mut uses: HashMap<EdgeId, Vec<usize>> = HashMap::new();
+    let mut edge_order: Vec<EdgeId> = Vec::new();
     for (fi, &fid) in face_ids.iter().enumerate() {
         let face = topo.face(fid)?;
         let wires: Vec<WireId> = std::iter::once(face.outer_wire())
@@ -1107,7 +1122,12 @@ pub(super) fn separate_touching_pieces(
             .collect();
         for &wid in &wires {
             for oe in topo.wire(wid)?.edges() {
-                uses.entry(oe.edge()).or_default().push(fi);
+                uses.entry(oe.edge())
+                    .or_insert_with(|| {
+                        edge_order.push(oe.edge());
+                        Vec::new()
+                    })
+                    .push(fi);
             }
         }
         face_wires.push(wires);
@@ -1116,19 +1136,27 @@ pub(super) fn separate_touching_pieces(
     if pieces < 2 {
         return Ok(pieces);
     }
-    // The pieces using each edge and each vertex.
-    let mut edge_pieces: HashMap<EdgeId, Vec<usize>> = HashMap::new();
-    for (&eid, faces) in &uses {
+    // The pieces using each edge and each vertex, in the edges' order.
+    let mut edge_pieces: Vec<(EdgeId, Vec<usize>)> = Vec::with_capacity(edge_order.len());
+    for &eid in &edge_order {
+        let Some(faces) = uses.get(&eid) else {
+            continue;
+        };
         let mut ps: Vec<usize> = faces.iter().map(|&fi| piece_of[fi]).collect();
         ps.sort_unstable();
         ps.dedup();
-        edge_pieces.insert(eid, ps);
+        edge_pieces.push((eid, ps));
     }
-    let mut vertex_pieces: HashMap<VertexId, Vec<usize>> = HashMap::new();
-    for (&eid, ps) in &edge_pieces {
-        let edge = topo.edge(eid)?;
+    let mut vertex_pieces: Vec<(VertexId, Vec<usize>)> = Vec::new();
+    let mut vertex_at: HashMap<VertexId, usize> = HashMap::new();
+    for (eid, ps) in &edge_pieces {
+        let edge = topo.edge(*eid)?;
         for vid in [edge.start(), edge.end()] {
-            let entry = vertex_pieces.entry(vid).or_default();
+            let at = *vertex_at.entry(vid).or_insert_with(|| {
+                vertex_pieces.push((vid, Vec::new()));
+                vertex_pieces.len() - 1
+            });
+            let entry = &mut vertex_pieces[at].1;
             entry.extend(ps.iter().copied());
             entry.sort_unstable();
             entry.dedup();
@@ -1136,17 +1164,15 @@ pub(super) fn separate_touching_pieces(
     }
     // Copies for every piece after the first a shared entity reaches.
     let mut vertex_copy: HashMap<(VertexId, usize), VertexId> = HashMap::new();
-    for (&vid, ps) in &vertex_pieces {
-        let vertex = topo.vertex(vid)?;
+    for (vid, ps) in &vertex_pieces {
+        let vertex = topo.vertex(*vid)?;
         let (point, tolerance) = (vertex.point(), vertex.tolerance());
         for &p in ps.iter().skip(1) {
-            vertex_copy.insert((vid, p), topo.add_vertex(Vertex::new(point, tolerance)));
+            vertex_copy.insert((*vid, p), topo.add_vertex(Vertex::new(point, tolerance)));
         }
     }
     let mut edge_copy: HashMap<(EdgeId, usize), EdgeId> = HashMap::new();
-    let edge_list: Vec<(EdgeId, Vec<usize>)> =
-        edge_pieces.iter().map(|(&e, ps)| (e, ps.clone())).collect();
-    for (eid, ps) in edge_list {
+    for (eid, ps) in edge_pieces {
         let edge = topo.edge(eid)?.clone();
         for &p in &ps {
             let remap = |v: VertexId| vertex_copy.get(&(v, p)).copied().unwrap_or(v);
@@ -2755,75 +2781,6 @@ fn face_normal_at_point(face: &Face, point: Point3) -> Vec3 {
     } else {
         raw_normal
     }
-}
-
-/// Register pcurves for all edges on their faces.
-///
-/// For each face, iterates its outer and inner wires, and for each edge,
-/// computes the 2D pcurve (projection of the 3D edge curve into the face's
-/// surface parameter space) and stores it in the topology's pcurve registry.
-///
-/// This enables `build_manifold_shells` to look up pcurves for validated
-/// binormal computation on curved surfaces.
-#[allow(dead_code)]
-pub(super) fn register_pcurves(
-    topo: &mut Topology,
-    face_ids: &[FaceId],
-) -> Result<(), crate::OperationsError> {
-    use brepkit_algo::compute_pcurve_on_surface;
-    use brepkit_topology::pcurve::PCurve;
-
-    for &fid in face_ids {
-        let face = topo.face(fid)?;
-        let surface = face.surface().clone();
-
-        // Collect wire points for PlaneFrame construction (plane faces only).
-        let wire_pts: Vec<Point3> = {
-            let wire = topo.wire(face.outer_wire())?;
-            wire.edges()
-                .iter()
-                .filter_map(|oe| {
-                    topo.edge(oe.edge()).ok().and_then(|e| {
-                        topo.vertex(e.start())
-                            .ok()
-                            .map(brepkit_topology::vertex::Vertex::point)
-                    })
-                })
-                .collect()
-        };
-
-        let wire_ids: Vec<_> = {
-            let f = topo.face(fid)?;
-            std::iter::once(f.outer_wire())
-                .chain(f.inner_wires().iter().copied())
-                .collect()
-        };
-
-        for wid in wire_ids {
-            let wire = topo.wire(wid)?;
-            let edges: Vec<_> = wire.edges().to_vec();
-            for oe in &edges {
-                let eid = oe.edge();
-                // Skip if already registered.
-                if topo.pcurves().contains(eid, fid) {
-                    continue;
-                }
-
-                let edge = topo.edge(eid)?;
-                let start = topo.vertex(edge.start())?.point();
-                let end = topo.vertex(edge.end())?.point();
-                let curve_3d = edge.curve();
-
-                let pcurve_2d =
-                    compute_pcurve_on_surface(curve_3d, start, end, &surface, &wire_pts, None);
-
-                // Parameter range: [0, 1] for the pcurve.
-                let pc = PCurve::new(pcurve_2d, 0.0, 1.0);
-                topo.pcurves_mut().set(eid, fid, pc);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Compute the binormal direction using a pcurve from the registry.

@@ -5,6 +5,7 @@
 //! for analytic-analytic surface intersections.
 
 use crate::madd::Madd;
+use std::cell::RefCell;
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use crate::MathError;
@@ -17,6 +18,10 @@ use crate::nurbs::intersection::{IntersectionCurve, IntersectionPoint};
 use crate::surfaces::{ConicalSurface, CylindricalSurface, SphericalSurface, ToroidalSurface};
 use crate::tolerance::Tolerance;
 use crate::vec::{Point3, Vec3};
+
+mod cover;
+mod section_fit;
+use section_fit::{crosses_at, fit_section, settle_on_section};
 
 /// Exact curve type resulting from plane-analytic surface intersection.
 #[derive(Debug, Clone)]
@@ -1359,6 +1364,20 @@ pub fn plane_torus_section_point(
     d: f64,
     p: Point3,
 ) -> Option<Point3> {
+    plane_torus_newton(torus, normal, d, p, 0.0)
+}
+
+/// [`plane_torus_section_point`], but where the steps so far have moved `p`
+/// by less than `short`, the point they reach: the section's point lies
+/// within about the square of the last step times the section's curvature
+/// of it.
+fn plane_torus_newton(
+    torus: &ToroidalSurface,
+    normal: Vec3,
+    d: f64,
+    p: Point3,
+    short: f64,
+) -> Option<Point3> {
     let scale = normal.length();
     if scale <= 0.0 || !scale.is_finite() {
         return None;
@@ -1412,6 +1431,9 @@ pub fn plane_torus_section_point(
         let along_n = c.madd(-f_torus, f_plane) / det;
         let along_g = c.madd(-f_plane, f_torus) / det;
         x = x - n * along_n - g * along_g;
+        if (x - p).length() < short {
+            return Some(x);
+        }
     }
     let (f_plane, f_torus, _) = residuals(x)?;
     (f_plane.abs() <= 1e3 * rounding && f_torus.abs() <= 1e3 * rounding).then_some(x)
@@ -1483,7 +1505,7 @@ pub fn fit_plane_torus_section(
             let middle = curve.evaluate(f64::midpoint(params[i], params[i + 1]));
             // A point of the section half a spacing or more away lies on
             // another stretch of it (a thin tube's other loop).
-            let on = plane_torus_section_point(torus, normal, d, middle)
+            let on = plane_torus_newton(torus, normal, d, middle, 0.25 * tol)
                 .filter(|on| (*on - middle).length() < 0.5 * gap);
             match on {
                 Some(on) if (on - middle).length() <= tol => {}
@@ -2271,7 +2293,189 @@ fn intersect_analytic_analytic_impl(
     if let Some(result) = try_algebraic_intersection(&a, &b, v_range_hint_a, v_range_hint_b)? {
         return Ok(result);
     }
+    marched_sections(a, b, grid_res, v_range_hint_a, v_range_hint_b, region)
+}
 
+/// `x + y t` with one rounding, at the end: Dekker's split product and
+/// Knuth's two-sum keep the rounding of `y t` and of the sum, and the last
+/// addition rounds their total once.
+fn add_product(x: f64, y: f64, t: f64) -> f64 {
+    let split = |v: f64| {
+        let c = 134_217_729.0 * v;
+        let hi = c - (c - v);
+        (hi, v - hi)
+    };
+    let p = y * t;
+    let ((yh, yl), (th, tl)) = (split(y), split(t));
+    let p_err = yl.madd(tl, yl.madd(th, yh.madd(tl, yh.madd(th, -p))));
+    let s = x + p;
+    let back = s - x;
+    let s_err = (x - (s - back)) + (p - back);
+    s + (s_err + p_err)
+}
+
+/// An analytic surface moved by a vector, held while the marcher works on it.
+enum Moved {
+    Cylinder(CylindricalSurface),
+    Cone(ConicalSurface),
+    Sphere(SphericalSurface),
+    Torus(ToroidalSurface),
+}
+
+impl Moved {
+    /// `surface` moved so that `anchor` lies at the origin, how far its `v`
+    /// moved, and a bound on how far the move's rounding shifted it.
+    ///
+    /// A cylinder's frame, which can sit anywhere along its axis, goes to
+    /// the point of the axis nearest `anchor`, so the surface reads alike
+    /// wherever its frame sat, and its `v` drops by as much. That point is
+    /// the old frame plus a multiple of the axis, each coordinate summed with
+    /// one rounding at the end ([`add_product`]), so it lies within a float
+    /// step of the axis however far the old frame sat: moved by plain sums,
+    /// a frame 1e12 along a tilted axis landed 4.7e-6 off it. Each other
+    /// surface's frame point (an apex or a centre) is fixed by its shape and
+    /// moves by one subtraction, rounding each coordinate by up to half its
+    /// float spacing.
+    fn new(surface: &AnalyticSurface<'_>, anchor: Point3) -> (Self, f64, f64) {
+        let size = |p: Point3| p.x().abs().max(p.y().abs()).max(p.z().abs());
+        let shift = Point3::new(0.0, 0.0, 0.0) - anchor;
+        match surface {
+            AnalyticSurface::Cylinder(c) => {
+                let (o, a) = (c.origin(), c.axis());
+                let along = a.dot(anchor - o);
+                let foot = Point3::new(
+                    add_product(o.x(), a.x(), along),
+                    add_product(o.y(), a.y(), along),
+                    add_product(o.z(), a.z(), along),
+                );
+                let near = foot + shift;
+                let error = 4.0 * f64::EPSILON * (size(foot) + size(near));
+                (Self::Cylinder(c.framed_at(near)), along, error)
+            }
+            AnalyticSurface::Cone(c) => {
+                let near = c.translated(shift);
+                let error = 2.0 * f64::EPSILON * size(near.apex());
+                (Self::Cone(near), 0.0, error)
+            }
+            AnalyticSurface::Sphere(s) => {
+                let near = s.translated(shift);
+                let error = 2.0 * f64::EPSILON * size(near.center());
+                (Self::Sphere(near), 0.0, error)
+            }
+            AnalyticSurface::Torus(t) => {
+                let near = t.translated(shift);
+                let error = 2.0 * f64::EPSILON * size(near.center());
+                (Self::Torus(near), 0.0, error)
+            }
+        }
+    }
+
+    const fn surface(&self) -> AnalyticSurface<'_> {
+        match self {
+            Self::Cylinder(c) => AnalyticSurface::Cylinder(c),
+            Self::Cone(c) => AnalyticSurface::Cone(c),
+            Self::Sphere(s) => AnalyticSurface::Sphere(s),
+            Self::Torus(t) => AnalyticSurface::Torus(t),
+        }
+    }
+}
+
+/// The sections of `a` and `b` that the general marcher traces from seeds
+/// on a grid over `a`, confined to `region` when one is given.
+///
+/// The marcher works with both surfaces moved by the same vector to the
+/// middle of the region, or of `a`'s patch, each cylinder's frame moved
+/// along its axis to there, and moves its curves back. Far
+/// from the origin the spacing of floats in one coordinate would otherwise
+/// decide whether a point lies on both surfaces and whether they cross
+/// there, and a pair moved there would not read as it does near the origin:
+/// a touch as a crossing, a shallow crossing as a touch. Moving a curve back
+/// rounds each coordinate by up to half its spacing there, and moving each
+/// surface shifts it by a bound [`Moved::new`] gives, so each fit is held
+/// that much within the linear tolerance; where that leaves less than half
+/// of it, a traced section is refused before its fit.
+fn marched_sections(
+    a: AnalyticSurface<'_>,
+    b: AnalyticSurface<'_>,
+    grid_res: usize,
+    v_range_hint_a: Option<(f64, f64)>,
+    v_range_hint_b: Option<(f64, f64)>,
+    region: Option<Aabb3>,
+) -> Result<Vec<IntersectionCurve>, MathError> {
+    let size = |p: Point3| p.x().abs().max(p.y().abs()).max(p.z().abs());
+    let (anchor, reach) = if let Some(r) = region {
+        (r.min + (r.max - r.min) * 0.5, (r.max - r.min).length())
+    } else {
+        let (surf_a, _, (u0, u1), default_v_a) = surface_closures(&a);
+        let (v0, v1) = v_range_hint_a.unwrap_or(default_v_a);
+        let (first, last) = (surf_a(u0, v0), surf_a(u1, v1));
+        let reach = patch_diagonal(surf_a.as_ref(), (u0, u1), (v0, v1));
+        (first + (last - first) * 0.5, reach)
+    };
+    let shift = anchor - Point3::new(0.0, 0.0, 0.0);
+    let ((near_a, dv_a, moved_a), (near_b, dv_b, moved_b)) =
+        (Moved::new(&a, anchor), Moved::new(&b, anchor));
+    let v_range = |surface: &AnalyticSurface<'_>, hint: Option<(f64, f64)>, dv: f64| {
+        let (lo, hi) = hint.unwrap_or_else(|| surface_closures(surface).3);
+        Some((lo - dv, hi - dv))
+    };
+    let linear = Tolerance::new().linear;
+    let fit_tol =
+        ((-f64::EPSILON).madd(size(anchor) + reach, linear) - moved_a - moved_b).min(linear);
+    let near_region = region.map(|r| Aabb3 {
+        min: r.min - shift,
+        max: r.max - shift,
+    });
+    let curves = marched_sections_near(
+        near_a.surface(),
+        near_b.surface(),
+        grid_res,
+        v_range(&a, v_range_hint_a, dv_a),
+        v_range(&b, v_range_hint_b, dv_b),
+        near_region,
+        fit_tol,
+    )?;
+    curves
+        .into_iter()
+        .map(|c| {
+            let ctrl = c
+                .curve
+                .control_points()
+                .iter()
+                .map(|&p| p + shift)
+                .collect();
+            let curve = NurbsCurve::new(
+                c.curve.degree(),
+                c.curve.knots().to_vec(),
+                ctrl,
+                c.curve.weights().to_vec(),
+            )?;
+            let points = c
+                .points
+                .into_iter()
+                .map(|ip| IntersectionPoint {
+                    point: ip.point + shift,
+                    ..ip
+                })
+                .collect();
+            Ok(IntersectionCurve { curve, points })
+        })
+        .collect()
+}
+
+/// [`marched_sections`] on surfaces near the origin, each fit held within
+/// `fit_tol` of both surfaces. A traced section is refused before its fit
+/// where `fit_tol` is less than half the linear tolerance.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn marched_sections_near(
+    a: AnalyticSurface<'_>,
+    b: AnalyticSurface<'_>,
+    grid_res: usize,
+    v_range_hint_a: Option<(f64, f64)>,
+    v_range_hint_b: Option<(f64, f64)>,
+    region: Option<Aabb3>,
+    fit_tol: f64,
+) -> Result<Vec<IntersectionCurve>, MathError> {
     let (surf_a, norm_a, u_range_a, default_v_a) = surface_closures(&a);
     let (surf_b, norm_b, u_range_b, default_v_b) = surface_closures(&b);
     let v_range_a = v_range_hint_a.unwrap_or(default_v_a);
@@ -2282,88 +2486,138 @@ fn intersect_analytic_analytic_impl(
     let diag_b = patch_diagonal(surf_b.as_ref(), u_range_b, v_range_b);
     let char_size = diag_a.min(diag_b).max(0.1);
 
-    // Sample surface A on a grid. For each grid point, project it
-    // analytically onto surface B to find the closest point, then check
-    // if the distance is below threshold (indicating near-intersection).
-    #[allow(clippy::type_complexity)]
-    let mut seeds: Vec<(Point3, (f64, f64), (f64, f64))> = Vec::new();
-    // Coarse threshold scales with the surface size — the distance from
-    // a grid point on A to its projection on B can be large even near
-    // the intersection (e.g., sphere R=2 and cylinder R=1 → gap ≈ 1).
-    let seed_threshold = diag_a.max(diag_b).max(1.0) * 0.5;
-    let mut min_dist = f64::INFINITY;
-
+    let march_step = (char_size * 0.02).clamp(0.005, 0.5);
+    let meet = region;
     #[allow(clippy::cast_precision_loss)]
-    for ia in 0..grid_res {
-        for ja in 0..grid_res {
-            let ua =
-                u_range_a.0 + (u_range_a.1 - u_range_a.0) * (ia as f64 + 0.5) / (grid_res as f64);
-            let va =
-                v_range_a.0 + (v_range_a.1 - v_range_a.0) * (ja as f64 + 0.5) / (grid_res as f64);
+    let margin = 2.0 * char_size / grid_res as f64;
+    let region = region.map(|r| r.expanded(margin));
 
-            let pa = surf_a(ua, va);
-
-            // Analytically project onto surface B.
-            let (ub, vb) = project_analytic(&b, pa, u_range_b, v_range_b);
-            let pb = surf_b(ub, vb);
-            let dist = (pa - pb).length();
-            min_dist = min_dist.min(dist);
-
-            if dist < seed_threshold {
-                // Use the coarse seed directly. The marching algorithm
-                // corrects positions at each step via projection, so seeds
-                // don't need to be on the exact intersection — they just
-                // need to be close enough for the marcher to converge.
-                let mid = Point3::new(
-                    (pa.x() + pb.x()) * 0.5,
-                    (pa.y() + pb.y()) * 0.5,
-                    (pa.z() + pb.z()) * 0.5,
+    // Seeds: the middle of each cell of a grid over a patch whose distance
+    // from the other surface is within the cell's reach from its middle (see
+    // [`cell_reach`]), and the box of those cells. Every point of the section
+    // lies in a cell of each patch, no farther from its middle than that, so
+    // each cell it crosses gives a seed. A cell whose distance or reach
+    // cannot be read (its middle on the other surface's axis, centre or apex)
+    // may hold the section: it is kept, its middle its seed, and where its
+    // reach is unknown its box is all of space.
+    let cells = |surface: &AnalyticSurface<'_>,
+                 surf: &dyn Fn(f64, f64) -> Point3,
+                 (u_range, v_range): ((f64, f64), (f64, f64)),
+                 other: &AnalyticSurface<'_>,
+                 near: Option<Aabb3>| {
+        #[allow(clippy::cast_precision_loss)]
+        let n = grid_res as f64;
+        let (du, dv) = ((u_range.1 - u_range.0) / n, (v_range.1 - v_range.0) / n);
+        let mut found = Vec::new();
+        let mut kept = Vec::new();
+        let mut held: Option<Aabb3> = None;
+        for i in 0..grid_res {
+            for j in 0..grid_res {
+                #[allow(clippy::cast_precision_loss)]
+                let (u, v) = (
+                    du.madd(i as f64 + 0.5, u_range.0),
+                    dv.madd(j as f64 + 0.5, v_range.0),
                 );
-                seeds.push((mid, (ua, va), (ub, vb)));
+                let middle = surf(u, v);
+                let reach = cell_reach(surface, (0.5 * du, 0.5 * dv), v);
+                let placed = reach.is_finite()
+                    && middle.x().is_finite()
+                    && middle.y().is_finite()
+                    && middle.z().is_finite();
+                if placed && near.is_some_and(|r| !r.expanded(reach).contains_point(middle)) {
+                    continue;
+                }
+                let reading = section_fit::Carrier::distance(other, middle)
+                    .filter(|(d, n)| d.is_finite() && n.length().is_finite());
+                // The rounding of the distance, so a cell is dropped only
+                // where it surely holds no point of the other surface.
+                let slack = || {
+                    let size = middle.x().abs().max(middle.y().abs()).max(middle.z().abs());
+                    128.0
+                        * f64::EPSILON
+                        * (section_fit::Carrier::scale(surface, middle)
+                            + section_fit::Carrier::scale(other, middle)
+                            + size)
+                };
+                let (dist, seed) = match reading {
+                    Some((d, _))
+                        if placed
+                            && d.abs() > reach
+                            && (d.abs() > 2.0 * reach || d.abs() - slack() > reach) =>
+                    {
+                        continue;
+                    }
+                    Some((d, n)) => (d.abs(), middle - n * (0.5 * d)),
+                    None => (f64::INFINITY, middle),
+                };
+                found.push((dist, seed));
+                kept.push((i, j));
+                let cell = if placed {
+                    Aabb3 {
+                        min: middle,
+                        max: middle,
+                    }
+                    .expanded(reach)
+                } else {
+                    Aabb3 {
+                        min: Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+                        max: Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
+                    }
+                };
+                held = Some(held.map_or(cell, |h| h.union(cell)));
             }
         }
-    }
+        (found, held, kept)
+    };
+    let (mut candidates, held, kept_a) =
+        cells(&a, surf_a.as_ref(), (u_range_a, v_range_a), &b, region);
 
-    // Cheap rejection: the grid samples surface A; the closest sample's
-    // distance to B lower-bounds how near the two bounded patches come. A
-    // transversal crossing puts a sample within ~one grid cell of it
-    // (distance on the order of a cell), so if even the nearest sample is
-    // several cells away the patches cannot cross — skip the expensive
-    // marching and return empty. Result-preserving: non-crossing pairs
-    // already march to nothing, just slowly (this is the gridfinity lip's
-    // ~80 inner-wall × outer-wall pairs that dominate pavefiller time).
-    let reject_dist = (char_size / grid_res as f64) * 3.0;
-    if min_dist > reject_dist {
+    // With no seed on A, no point of the section lies on A's patch. A test
+    // on the nearest cell's distance to B against three cells of the smaller
+    // patch's size read a rod's shallow crossing of a cone's patch, whose
+    // cells are each 4900 across, as no crossing.
+    let Some(held) = held else {
         return Ok(vec![]);
+    };
+    // The seeds below come from cells' middles, and a cell's seed settles
+    // on one curve: a second loop in the same cells of both patches had
+    // none. Cut A's kept cells until each is proved to hold no point of
+    // the section, or at most one arc of it, or is too small for a fit to
+    // resolve (see [`cover::Cover`]). Each class of linked cells holds one
+    // arc of a part of the section: after the march, a marched point lies
+    // in it, or a seed from it settles on a marched curve or starts a march.
+    let mut cover = cover::Cover::new(
+        &a,
+        &b,
+        (u_range_a, v_range_a),
+        v_range_b,
+        grid_res,
+        &kept_a,
+        meet.zip(region),
+        Tolerance::new().linear,
+        cover::MOST_LEAVES,
+    );
+    // Where the cuts did not all settle, two loops in one cell of one patch
+    // can lie in two cells of the other, which lie within their reach of
+    // A's seeds' cells.
+    if !cover.complete() {
+        candidates.extend(cells(&b, surf_b.as_ref(), (u_range_b, v_range_b), &a, Some(held)).0);
     }
-
-    if seeds.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Aggressively deduplicate seeds — we only need 1-2 per intersection
-    // branch. Scale dedup radius to ~2% of characteristic surface size
-    // (at least 10× the march step size) to avoid redundant marches.
-    let march_step = (char_size * 0.02).clamp(0.005, 0.5);
-    let dedup_radius = march_step * 10.0;
-    let mut unique_seeds = Vec::new();
-    for seed in &seeds {
-        let dominated = unique_seeds
-            .iter()
-            .any(|s: &(Point3, (f64, f64), (f64, f64))| (s.0 - seed.0).length() < dedup_radius);
-        if !dominated {
-            unique_seeds.push(*seed);
-        }
-    }
+    candidates.sort_by(|p, q| p.0.total_cmp(&q.0));
 
     // A seed is only near the intersection; settle it onto the curve before
     // asking whether it lies in the region, so a coarse grid point beside a
     // short in-region span still starts its march, and march from there, so
-    // the march does not begin outside the region and stop at once.
-    let region = region.map(|r| r.expanded(2.0 * char_size / grid_res as f64));
-    if let Some(r) = region {
-        for seed in &mut unique_seeds {
-            let mut p = seed.0;
+    // the march does not begin outside the region and stop at once. The
+    // projections from one surface to the other also settle where the two
+    // pass closest without meeting, with both normals along the gap: a
+    // seed there lies on no curve, and a march from it never closes on it.
+    // Nor does a seed where the two surfaces touch without crossing (their
+    // normals within about 1e-6 of parallel): the section there can be a
+    // lone point, and no direction along it is defined.
+    let settle = |mid: Point3| {
+        let on = settle_on_section(&a, &b, mid).or_else(|| {
+            let mut p = mid;
             for _ in 0..8 {
                 let (ua, va) = project_analytic(&a, p, u_range_a, v_range_a);
                 let pa = surf_a(ua, va);
@@ -2378,21 +2632,53 @@ fn intersect_analytic_analytic_impl(
                     break;
                 }
             }
-            seed.0 = p;
-        }
-        unique_seeds.retain(|seed| r.contains_point(seed.0));
-    }
+            settle_on_section(&a, &b, p)
+        });
+        // The steps settle on the section of the whole surfaces, which can
+        // lie on a part neither patch holds (a cone's other nappe).
+        let near_patches = |q: Point3| {
+            let (ua, va) = project_analytic(&a, q, u_range_a, v_range_a);
+            let (ub, vb) = project_analytic(&b, q, u_range_b, v_range_b);
+            (q - surf_a(ua, va)).length() <= march_step
+                && (q - surf_b(ub, vb)).length() <= march_step
+        };
+        let Some(on) = on.filter(|&on| {
+            crosses_at(&a, &b, on)
+                && near_patches(on)
+                && region.is_none_or(|r| r.contains_point(on))
+        }) else {
+            return Ok(None);
+        };
+        // A crossing whose curvature cannot be read cannot be marched; the
+        // section is refused, not traced without it.
+        station(&a, &b, on, Vec3::new(0.0, 0.0, 0.0))
+            .map(Some)
+            .ok_or(MathError::ConvergenceFailure { iterations: 0 })
+    };
+    let off_patch = |q: Point3| {
+        let (ua, va) = project_analytic(&a, q, u_range_a, v_range_a);
+        let (ub, vb) = project_analytic(&b, q, u_range_b, v_range_b);
+        (!is_u_periodic(&a) && (ua <= u_range_a.0 || ua >= u_range_a.1))
+            || va <= v_range_a.0
+            || va >= v_range_a.1
+            || (!is_u_periodic(&b) && (ub <= u_range_b.0 || ub >= u_range_b.1))
+            || vb <= v_range_b.0
+            || vb >= v_range_b.1
+    };
 
-    // March from each seed.
-    let mut curves = Vec::new();
-    let mut used_seeds = vec![false; unique_seeds.len()];
-
-    for si in 0..unique_seeds.len() {
-        if used_seeds[si] {
-            continue;
-        }
-        used_seeds[si] = true;
-
+    // March from each seed, nearest first, unless it settles on a curve
+    // already marched. Seeds on both patches march first: one just past a
+    // patch's edge marches along a curve that one inside may already have
+    // marched, which its middle then lies on.
+    // March from a seed on the section and fit what the march traces,
+    // unless its middle lies on a curve already marched. The march's points
+    // where its branch is then marched, `None` where it traces no curve. A
+    // march is kept among the marched only with its curve: a march with no
+    // curve reaches no part of the section.
+    let trace = |seed: Point3,
+                 marched: &mut Vec<Vec<Point3>>,
+                 curves: &mut Vec<IntersectionCurve>|
+     -> Result<Option<Vec<Point3>>, MathError> {
         let march_result = march_analytic_intersection(
             &a,
             &b,
@@ -2400,7 +2686,7 @@ fn intersect_analytic_analytic_impl(
             norm_a.as_ref(),
             surf_b.as_ref(),
             norm_b.as_ref(),
-            unique_seeds[si].0,
+            seed,
             u_range_a,
             v_range_a,
             u_range_b,
@@ -2409,39 +2695,205 @@ fn intersect_analytic_analytic_impl(
             is_u_periodic(&a),
             is_u_periodic(&b),
             region,
-        );
+        )
+        .ok_or(MathError::ConvergenceFailure {
+            iterations: MARCH_STEPS,
+        })?;
+        if march_result.len() < 2 {
+            return Ok(None);
+        }
+        let middle = march_result[march_result.len() / 2];
+        if marched.iter().any(|m| on_march(&a, &b, middle, m)) {
+            return Ok(Some(march_result));
+        }
 
-        if march_result.len() >= 2 {
-            for (sj, other) in unique_seeds.iter().enumerate() {
-                if !used_seeds[sj]
-                    && march_result
-                        .iter()
-                        .any(|p| (*p - other.0).length() < dedup_radius)
-                {
-                    used_seeds[sj] = true;
+        // Two points far closer than a step only crowd the fit.
+        let crowd = 1e-3 * march_step;
+        let mut spaced: Vec<Point3> = Vec::with_capacity(march_result.len());
+        for (k, &p) in march_result.iter().enumerate() {
+            let last = k + 1 == march_result.len();
+            match spaced.last() {
+                Some(&q) if (p - q).length() < crowd => {
+                    if last && spaced.len() > 1 {
+                        spaced.pop();
+                        spaced.push(p);
+                    }
                 }
+                _ => spaced.push(p),
             }
-
-            let ipts: Vec<IntersectionPoint> = march_result
-                .iter()
-                .map(|&pt| IntersectionPoint {
-                    point: pt,
-                    param1: (0.0, 0.0),
-                    param2: (0.0, 0.0),
-                })
-                .collect();
-
-            let degree = 3.min(march_result.len() - 1);
-            if let Ok(curve) = interpolate(&march_result, degree) {
-                curves.push(IntersectionCurve {
-                    curve,
-                    points: ipts,
-                });
+        }
+        if spaced.len() < 2 {
+            // A march shorter than that, clipped to a short piece of the
+            // section, keeps both its ends.
+            match (march_result.first(), march_result.last()) {
+                (Some(&first), Some(&last)) if (last - first).length() > 0.0 => {
+                    spaced = vec![first, last];
+                }
+                _ => return Ok(None),
             }
+        }
+        if fit_tol < 0.5 * Tolerance::new().linear {
+            return Err(MathError::ConvergenceFailure { iterations: 0 });
+        }
+        let (curve, points) = fit_section(&a, &b, &spaced, fit_tol)?;
+        let ipts: Vec<IntersectionPoint> = points
+            .iter()
+            .map(|&pt| IntersectionPoint {
+                point: pt,
+                param1: (0.0, 0.0),
+                param2: (0.0, 0.0),
+            })
+            .collect();
+        marched.push(march_result.clone());
+        curves.push(IntersectionCurve {
+            curve,
+            points: ipts,
+        });
+        Ok(Some(march_result))
+    };
+
+    let mut curves = Vec::new();
+    let mut marched: Vec<Vec<Point3>> = Vec::new();
+    let mut past_edges = Vec::new();
+    let mut k = 0;
+    while k < candidates.len() + past_edges.len() {
+        let seed = if k < candidates.len() {
+            let mid = candidates[k].1;
+            k += 1;
+            let Some(seed) = settle(mid)? else {
+                continue;
+            };
+            if off_patch(seed.p) {
+                past_edges.push(seed);
+                continue;
+            }
+            seed
+        } else {
+            k += 1;
+            past_edges[k - 1 - candidates.len()]
+        };
+        if marched.iter().any(|m| on_march(&a, &b, seed.p, m)) {
+            continue;
+        }
+        trace(seed.p, &mut marched, &mut curves)?;
+    }
+
+    for m in &marched {
+        cover.mark_marched(m);
+    }
+    let (marched, curves) = (RefCell::new(marched), RefCell::new(curves));
+    // A probe whose nearest point on a fitted curve lies, as near as that
+    // fit's bound, on the class's arc. Near a node a march from the probe
+    // itself can stall.
+    let fitted = |cover: &cover::Cover<'_, '_>, class: &[usize], z: Point3| {
+        curves.borrow().iter().any(|c| {
+            crate::nurbs::projection::project_point_to_curve(&c.curve, z, 1e-12)
+                .is_ok_and(|f| cover.holds(class, f.point, fit_tol))
+        })
+    };
+    // A probe settled on the section, on a marched branch or marched from.
+    let mut seed = |z: Point3| -> Result<Option<Vec<Point3>>, MathError> {
+        let Some(seed) = settle(z)? else {
+            return Ok(None);
+        };
+        if marched.borrow().iter().any(|m| on_march(&a, &b, seed.p, m)) {
+            return Ok(Some(vec![seed.p]));
+        }
+        let traced = trace(seed.p, &mut marched.borrow_mut(), &mut curves.borrow_mut())?;
+        Ok(Some(traced.unwrap_or_default()))
+    };
+    // Where the cuts did not all settle, the cover proves nothing, and the
+    // two patches' seeds above stand as they are.
+    while cover.complete() {
+        let classes = cover.classes();
+        if classes.is_empty() {
+            break;
+        }
+        for class in classes {
+            cover.resolve(&class, &fitted, &mut seed)?;
         }
     }
 
-    Ok(curves)
+    Ok(curves.into_inner())
+}
+
+/// How far a point of the patch of `surface` within `du` and `dv` of
+/// parameter from `(u, v)` can lie from that point: the steps times the
+/// greatest rates at which the surface moves with each parameter there.
+fn cell_reach(surface: &AnalyticSurface<'_>, (du, dv): (f64, f64), v: f64) -> f64 {
+    match surface {
+        AnalyticSurface::Cylinder(c) => du.madd(c.radius(), dv),
+        AnalyticSurface::Cone(c) => (du * c.half_angle().cos()).madd(v.abs() + dv, dv),
+        AnalyticSurface::Sphere(s) => (du + dv) * s.radius(),
+        AnalyticSurface::Torus(t) => {
+            du.madd(t.major_radius() + t.minor_radius(), dv * t.minor_radius())
+        }
+    }
+}
+
+/// Whether `p`, a point of the section of `a` and `b`, lies on the branch
+/// a march traced through `points`. The chord of the march nearest `p` must
+/// pass no farther from it than a fifth of its length, four times the sag
+/// of an arc that turns as far as a step may (twice [`MARCH_TURN`]). From
+/// that chord's nearest point, Newton steps move onto the section and along
+/// its tangent toward `p`, each on the sheets `p` and the chord's ends lie
+/// on (a cone's nappe, a torus's tube): `p` lies on the branch where they
+/// come within the linear tolerance of it. A point of another branch,
+/// however near the chord (another nappe 1e-4 away), stays that far from
+/// where they settle.
+fn on_march(
+    a: &AnalyticSurface<'_>,
+    b: &AnalyticSurface<'_>,
+    p: Point3,
+    points: &[Point3],
+) -> bool {
+    use section_fit::Carrier;
+    let nearest = points
+        .windows(2)
+        .map(|w| {
+            let chord = w[1] - w[0];
+            let len2 = chord.dot(chord);
+            let s = if len2 > 0.0 {
+                ((p - w[0]).dot(chord) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let foot = w[0] + chord * s;
+            ((p - foot).length(), len2.sqrt(), foot, w)
+        })
+        .min_by(|x, y| x.0.total_cmp(&y.0));
+    let Some((off, len, foot, w)) = nearest else {
+        return false;
+    };
+    let sheets = |q: Point3| (a.sheet(q), b.sheet(q));
+    if off > MARCH_TURN * len || sheets(w[0]) != sheets(p) || sheets(w[1]) != sheets(p) {
+        return false;
+    }
+    let tol = Tolerance::new().linear;
+    let mut guess = foot;
+    for _ in 0..8 {
+        let Some(q) = settle_on_section(a, b, guess) else {
+            return false;
+        };
+        if sheets(q) != sheets(p) {
+            return false;
+        }
+        let miss = p - q;
+        if miss.length() <= tol {
+            return true;
+        }
+        let (Some((_, na)), Some((_, nb))) = (a.distance(q), b.distance(q)) else {
+            return false;
+        };
+        let t = na.cross(nb);
+        let sin = t.length();
+        if sin <= 0.0 {
+            return false;
+        }
+        let t = t * (1.0 / sin);
+        guess = q + t * miss.dot(t);
+    }
+    false
 }
 
 /// The diagonal of the patch `surf` spans over `u_range` by `v_range`: the
@@ -4056,15 +4508,51 @@ fn ruling_cone_cylinder(
         return None;
     }
     let samples = ruling_samples(cyl, &roots);
-    // A window of meeting rulings narrower than the sampling would vanish
+    // The samples that truly meet the cone. One that the tolerance alone
+    // admits lies past its window's end: the end bisected from it, and a
+    // loop traced from it, lie off the cone.
+    let meeting: Vec<Option<(Point3, Point3)>> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &pair)| pair.filter(|_| roots(ruling_u(i)).0 >= 0.0))
+        .collect();
+    // A window of meeting rulings that no sample truly meets would vanish
     // (a cone's tip just through the wall) while the others still made
-    // loops; a finer scan finds every window, and any that the sampling
-    // covers thinly goes to the marcher.
+    // loops; a finer scan finds every window, and one with no such sample
+    // goes to the marcher. A window with one is sampled afresh between its
+    // ends, however few samples it holds.
     let scan = WINDOW_SCAN * RULING_SAMPLES;
+    #[allow(clippy::cast_precision_loss)]
+    let scan_u = |k: usize| TAU * (k as f64 + 0.5) / scan as f64;
+    let discs: Vec<f64> = (0..scan).map(|k| roots(scan_u(k)).0).collect();
+    // A window narrower than the scan's step lies between two scan points
+    // that miss, where the discriminant peaks: each such peak is found, and
+    // one that reaches the tolerance goes to the marcher.
+    for k in 0..scan {
+        let (before, here, after) = (
+            discs[(k + scan - 1) % scan],
+            discs[k],
+            discs[(k + 1) % scan],
+        );
+        if here >= -lin_tol || here < before || here < after {
+            continue;
+        }
+        let (mut lo, mut hi) = (scan_u(k) - TAU / scan as f64, scan_u(k) + TAU / scan as f64);
+        for _ in 0..100 {
+            let (a, b) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+            if roots(a).0 < roots(b).0 {
+                lo = a;
+            } else {
+                hi = b;
+            }
+        }
+        if roots(f64::midpoint(lo, hi)).0 >= -lin_tol {
+            return None;
+        }
+    }
     // Ruling sample `i` lies midway between scan points
     // `WINDOW_SCAN i + 7` and `WINDOW_SCAN i + 8`.
-    #[allow(clippy::cast_precision_loss)]
-    let meets = |k: usize| roots(TAU * ((k % scan) as f64 + 0.5) / scan as f64).0 >= -lin_tol;
+    let meets = |k: usize| discs[k % scan] >= -lin_tol;
     if let Some(start) = (0..scan).find(|&k| !meets(k)) {
         let mut k = start;
         while k < start + scan {
@@ -4076,10 +4564,11 @@ fn ruling_cone_cylinder(
             while k < start + scan && meets(k) {
                 k += 1;
             }
-            let covered = (first..k)
-                .filter(|&j| j % WINDOW_SCAN == WINDOW_SCAN / 2 - 1 && meets(j + 1))
-                .count();
-            if covered < WINDOW_MIN_SAMPLES {
+            let sampled = (first..k).any(|j| {
+                j % WINDOW_SCAN == WINDOW_SCAN / 2 - 1
+                    && meeting[(j / WINDOW_SCAN) % RULING_SAMPLES].is_some()
+            });
+            if !sampled {
                 return None;
             }
         }
@@ -4087,7 +4576,7 @@ fn ruling_cone_cylinder(
     let loops = if samples.iter().all(Option::is_some) {
         closed_ruling_loops(cyl, &roots, &samples)
     } else {
-        partial_ruling_loops(cyl, &roots, &samples)
+        partial_ruling_loops(cyl, &roots, &meeting)
     };
     if loops.is_empty() {
         return None;
@@ -4306,9 +4795,8 @@ fn window_cone_sphere(
 }
 
 /// Scan points per ruling sample when looking for windows of meeting
-/// rulings, and the fewest samples a window needs to be fit.
+/// rulings.
 const WINDOW_SCAN: usize = 16;
-const WINDOW_MIN_SAMPLES: usize = 8;
 
 /// Rulings sampled around a swept cylinder, half a step off u = 0 so the
 /// branches of a self-touching curve (equal crossing cylinders) do not share
@@ -5140,12 +5628,245 @@ fn correct_to_intersection(
     p
 }
 
-/// March along the intersection of two surfaces from a seed point.
+/// The most a march step turns the section's tangent, in radians.
+const MARCH_TURN: f64 = 0.2;
+
+/// The share of the distance to the section's next branch that a march
+/// step's guess may miss the section by.
+const MARCH_BASIN: f64 = 0.25;
+
+/// The most steps a march takes each way.
+const MARCH_STEPS: usize = 4096;
+
+/// A point of the section of two surfaces, with what a march step from it
+/// needs.
+#[derive(Clone, Copy)]
+struct Station {
+    p: Point3,
+    /// The unit tangent of the section, along the march.
+    t: Vec3,
+    /// The curvature of the section.
+    bend: f64,
+    /// The distance, across the section, at which the two surfaces' second
+    /// order models through `p` cross again: a lower estimate of how far
+    /// the section's next branch lies.
+    gap: f64,
+}
+
+/// The station at `p`, a point of the section of `a` and `b`, its tangent
+/// along `toward`; `None` where the two surfaces touch there (their
+/// normals within about 1e-6 of parallel) or a distance has no gradient.
 ///
-/// Uses the cross product of surface normals as the tangent direction
-/// and projects back onto both surfaces using analytical projection
-/// (for cylinders/spheres) or grid search (fallback).
-#[allow(clippy::too_many_arguments)]
+/// The section's curvature vector `k` lies across it, and the curve's
+/// normal curvature on each surface, the second derivative of its distance
+/// along the tangent, is `-k . n` for that surface's normal `n`. Across the
+/// section, each surface's trace is a curve of the curvature its distance
+/// gives along the trace; two circles that cross at angle `θ`, of
+/// curvatures `κa` and `κb`, cross again no nearer than `2 sin θ / (κa + κb)`.
+fn station(
+    a: &AnalyticSurface<'_>,
+    b: &AnalyticSurface<'_>,
+    p: Point3,
+    toward: Vec3,
+) -> Option<Station> {
+    use section_fit::Carrier;
+    let (_, na) = a.distance(p)?;
+    let (_, nb) = b.distance(p)?;
+    let cross = na.cross(nb);
+    let sin = cross.length();
+    if sin < 1e-6 {
+        return None;
+    }
+    let mut t = cross * (1.0 / sin);
+    if t.dot(toward) < 0.0 {
+        t = -t;
+    }
+    let (ka, kb) = (a.bend(p, t)?, b.bend(p, t)?);
+    let c = na.dot(nb);
+    let det = sin * sin;
+    let along_a = c.madd(kb, -ka) / det;
+    let along_b = c.madd(ka, -kb) / det;
+    let bend = (2.0 * along_a * along_b)
+        .madd(c, along_a.madd(along_a, along_b * along_b))
+        .max(0.0)
+        .sqrt();
+    let (qa, qb) = (a.bend(p, t.cross(na))?, b.bend(p, t.cross(nb))?);
+    let spread = qa.abs() + qb.abs();
+    let gap = if spread > 0.0 {
+        2.0 * sin / spread
+    } else {
+        f64::INFINITY
+    };
+    bend.is_finite().then_some(Station { p, t, bend, gap })
+}
+
+impl Station {
+    /// The longest step from here: one that turns the tangent by no more
+    /// than [`MARCH_TURN`], and whose guess along the tangent misses the
+    /// section by no more than [`MARCH_BASIN`] of the gap.
+    fn reach(&self, longest: f64) -> f64 {
+        if self.bend > 0.0 {
+            longest
+                .min(MARCH_TURN / self.bend)
+                .min((2.0 * MARCH_BASIN * self.gap / self.bend).sqrt())
+        } else {
+            longest
+        }
+    }
+}
+
+/// A point within `reach` of `p` where both surfaces pass and their normals
+/// lie parallel, each within the rounding of the point's place: a point
+/// where the section's branches meet or the surfaces touch. Both distances
+/// must lie within the rounding of the point against the surfaces' frames,
+/// `near`. The normals must lie within the rounding each picks up from its
+/// curvature times its distance from its frame, or, where that is less,
+/// within the angle whose cosine rounds to one, the square root of the
+/// float spacing, 1.5e-8: a leg and the bend on its top, turned and moved,
+/// touch at 4e-9 off parallel, after the rounding of the turn.
+///
+/// Gauss-Newton steps find the point near `p` on `a` where `b`'s normal
+/// lies along `a`'s, from `a`'s distance and the cross product of the
+/// normals, whose derivative along each axis comes from each distance's
+/// second derivative (its value along `e + v` less that along `e - v` is
+/// four times `e . H v`). Each step is taken once, twice or three times,
+/// whichever misses least: where the touch is of higher order the cross
+/// product falls as a power of the way left, and a single step covers only
+/// a share of it, as Newton steps do on a double root, and then moves back
+/// onto `a` along its normal. The steps run until they stop gaining, and
+/// the best point is read. `None` where it fails:
+/// two surfaces that cross at a shallow angle, 2e-6, with no touch near,
+/// keep their normals that far apart.
+fn singular_point(
+    a: &AnalyticSurface<'_>,
+    b: &AnalyticSurface<'_>,
+    p: Point3,
+    reach: f64,
+) -> Option<Point3> {
+    use section_fit::Carrier;
+    let axes = [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    ];
+    let miss = |x: Point3| {
+        let (Some((da, na)), Some((_, nb))) = (a.distance(x), b.distance(x)) else {
+            return f64::INFINITY;
+        };
+        da.hypot(reach * na.cross(nb).length())
+    };
+    let mut best: Option<(f64, Point3, bool)> = None;
+    let mut q = p;
+    for _ in 0..32 {
+        let (da, na) = a.distance(q)?;
+        let (db, nb) = b.distance(q)?;
+        let cross = na.cross(nb);
+        let mut hessians = [[Vec3::new(0.0, 0.0, 0.0); 3]; 2];
+        for (h, s) in hessians.iter_mut().zip([a, b]) {
+            for (j, &v) in axes.iter().enumerate() {
+                let mut row = [0.0; 3];
+                for (k, &e) in axes.iter().enumerate() {
+                    row[k] = 0.25 * (s.bend(q, e + v)? - s.bend(q, e - v)?);
+                }
+                h[j] = Vec3::new(row[0], row[1], row[2]);
+            }
+        }
+        let curvature = |h: &[Vec3; 3]| h.iter().fold(0.0, |m: f64, v| m.max(v.length()));
+        let (ka, kb) = (curvature(&hessians[0]), curvature(&hessians[1]));
+        let near = 64.0 * f64::EPSILON * (a.scale(q) + b.scale(q));
+        let parallel = (64.0 * f64::EPSILON * ka.madd(a.scale(q), kb.madd(b.scale(q), 2.0)))
+            .max(f64::EPSILON.sqrt());
+        let here = cross.length();
+        let holds = da.abs() <= near && db.abs() <= near && here <= parallel;
+        if best.is_none_or(|(c, _, _)| here < c) {
+            best = Some((here, q, holds));
+        }
+        // Rows: `a`'s distance, then the cross product's parts, each a
+        // length once scaled by `reach`.
+        let mut rows = vec![(na, da)];
+        for (k, &e) in axes.iter().enumerate() {
+            let grad = Vec3::new(
+                (hessians[0][0].cross(nb) + na.cross(hessians[1][0])).dot(e),
+                (hessians[0][1].cross(nb) + na.cross(hessians[1][1])).dot(e),
+                (hessians[0][2].cross(nb) + na.cross(hessians[1][2])).dot(e),
+            );
+            let value = [cross.x(), cross.y(), cross.z()][k];
+            rows.push((grad * reach, value * reach));
+        }
+        let mut m = [[0.0; 3]; 3];
+        let mut rhs = [0.0; 3];
+        for (g, r) in &rows {
+            let g = [g.x(), g.y(), g.z()];
+            for i in 0..3 {
+                rhs[i] -= g[i] * r;
+                for j in 0..3 {
+                    m[i][j] = g[i].madd(g[j], m[i][j]);
+                }
+            }
+        }
+        let damp = 1e-12 * (m[0][0] + m[1][1] + m[2][2]);
+        for (i, row) in m.iter_mut().enumerate() {
+            row[i] += damp;
+        }
+        let Some(step) = solve3(m, rhs) else {
+            break;
+        };
+        // Each candidate moves back onto `a` along its normal, where a touch
+        // leaves it on `b` too.
+        let onto_a = |x: Point3| a.distance(x).map_or(x, |(d, n)| x - n * d);
+        let next = [1.0, 2.0, 3.0]
+            .iter()
+            .map(|&k| onto_a(q + step * k))
+            .min_by(|x, y| miss(*x).total_cmp(&miss(*y)))?;
+        if (next - p).length() > reach || miss(next) >= miss(q) {
+            break;
+        }
+        q = next;
+    }
+    best.and_then(|(_, x, holds)| holds.then_some(x))
+}
+
+/// The solution of `m x = rhs` for a symmetric 3 by 3 `m`, by Cramer's rule;
+/// `None` where `m` is singular.
+fn solve3(m: [[f64; 3]; 3], rhs: [f64; 3]) -> Option<Vec3> {
+    let det = |c: [[f64; 3]; 3]| {
+        c[0][0] * c[1][1].madd(c[2][2], -c[1][2] * c[2][1])
+            - c[0][1] * c[1][0].madd(c[2][2], -c[1][2] * c[2][0])
+            + c[0][2] * c[1][0].madd(c[2][1], -c[1][1] * c[2][0])
+    };
+    let d = det(m);
+    if d.abs() <= 0.0 || !d.is_finite() {
+        return None;
+    }
+    let mut out = [0.0; 3];
+    for (k, x) in out.iter_mut().enumerate() {
+        let mut c = m;
+        for (row, r) in c.iter_mut().zip(rhs) {
+            row[k] = r;
+        }
+        *x = det(c) / d;
+    }
+    Some(Vec3::new(out[0], out[1], out[2]))
+}
+
+/// March along the section of two surfaces from `seed`, a point on it, each
+/// way, until the march comes back to the seed, leaves a patch or the
+/// region, or stops by a point where the section's branches meet or the
+/// surfaces touch (see [`singular_point`]); `None` where it stops anywhere
+/// else or runs out of steps.
+///
+/// Each step goes along the tangent, no farther than [`Station::reach`],
+/// and moves onto the section by Newton steps. It is taken again at half the
+/// length unless the move onto the section stays within [`MARCH_BASIN`] of
+/// the gap at both ends and on the sheets the seed lies on (a cone's nappe,
+/// a torus's tube), so the step stays on its branch, the tangent turns by
+/// less than twice [`MARCH_TURN`], and the step goes forward by at least
+/// half its length (so it does not pass a turn of the section). A march
+/// closes where the seed lies within its next step, ahead along the
+/// tangent and near it, and the section there runs the way it ran from the
+/// seed: the march comes back to the seed along the curve, from the seed's
+/// own side.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn march_analytic_intersection(
     a: &AnalyticSurface<'_>,
     b: &AnalyticSurface<'_>,
@@ -5162,17 +5883,9 @@ fn march_analytic_intersection(
     u_periodic_a: bool,
     u_periodic_b: bool,
     region: Option<Aabb3>,
-) -> Vec<Point3> {
-    let max_steps = 500;
-    let h_min = 1e-6;
+) -> Option<Vec<Point3>> {
     let h_max = initial_step * 4.0;
-    // Fixed closure threshold: the adaptive step `h` varies with curvature
-    // and can shrink below the actual miss distance at the seed re-approach.
-    // Use `initial_step * 5` to robustly detect closure on the first pass.
-    let closure_dist = initial_step * 5.0;
-    // Angular thresholds for curvature-adaptive stepping.
-    let max_angle = 10.0_f64.to_radians();
-    let min_angle = 2.0_f64.to_radians();
+    let h_min = initial_step * 1e-6;
 
     // Whether `q` lies off either patch, its feet clamped to a patch's edge.
     let off_patch = |q: Point3| {
@@ -5218,96 +5931,105 @@ fn march_analytic_intersection(
         (lo > 0.0).then(|| on_curve(from, step * lo))
     };
 
+    let start = station(a, b, seed, Vec3::new(0.0, 0.0, 0.0))?;
+    // The sheets of both surfaces a point lies on: a step stays on its own.
+    let sheets = |q: Point3| {
+        use section_fit::Carrier;
+        (a.sheet(q), b.sheet(q))
+    };
+    let home_sheets = sheets(seed);
+
     // March forward from seed, collecting points.
     let mut forward = Vec::new();
     // March backward from seed, collecting points (reversed at end).
     let mut backward = Vec::new();
 
+    // A loop the forward march closes is whole: marched back as well, it
+    // would come round a second time.
+    let mut looped = false;
     for (direction, points) in [(1.0_f64, &mut forward), (-1.0_f64, &mut backward)] {
-        let mut current = seed;
-        let mut h = initial_step;
-        let mut prev_tangent: Option<Vec3> = None;
+        if looped {
+            break;
+        }
+        let home = start.t * direction;
+        let mut here = Station { t: home, ..start };
+        let mut h = here.reach(h_max.min(initial_step));
+        let mut ended = false;
 
-        for _ in 0..max_steps {
-            let (ua, va) = project_analytic(a, current, u_range_a, v_range_a);
-            let (ub, vb) = project_analytic(b, current, u_range_b, v_range_b);
-
-            let na = norm_a(ua, va);
-            let nb = norm_b(ub, vb);
-
-            let tangent = na.cross(nb);
-            let t_len = tangent.length();
-            if t_len < 1e-10 {
-                break;
-            }
-            let t_dir = tangent * (direction / t_len);
-
-            // Curvature-adaptive step: check angular deviation from previous tangent.
-            if let Some(prev_t) = prev_tangent {
-                let cos_angle = prev_t.dot(t_dir).clamp(-1.0, 1.0);
-                let angle = cos_angle.acos();
-                if angle > max_angle && h > h_min {
-                    h = (h * 0.5).max(h_min);
-                } else if angle < min_angle {
-                    h = (h * 2.0).min(h_max);
-                }
-            }
-            prev_tangent = Some(t_dir);
-
-            let next = Point3::new(
-                h.madd(t_dir.x(), current.x()),
-                h.madd(t_dir.y(), current.y()),
-                h.madd(t_dir.z(), current.z()),
-            );
-
-            let (ua2, va2) = project_analytic(a, next, u_range_a, v_range_a);
-            let (ub2, vb2) = project_analytic(b, next, u_range_b, v_range_b);
-
-            let pa = surf_a(ua2, va2);
-            let pb = surf_b(ub2, vb2);
-            let mid = Point3::new(
-                (pa.x() + pb.x()) * 0.5,
-                (pa.y() + pb.y()) * 0.5,
-                (pa.z() + pb.z()) * 0.5,
-            );
-            let out_a = (!u_periodic_a && (ua2 <= u_range_a.0 || ua2 >= u_range_a.1))
-                || va2 <= v_range_a.0
-                || va2 >= v_range_a.1;
-            let out_b = (!u_periodic_b && (ub2 <= u_range_b.0 || ub2 >= u_range_b.1))
-                || vb2 <= v_range_b.0
-                || vb2 >= v_range_b.1;
-
-            // A step whose feet leave a patch can still end on it once the
-            // step is brought onto the intersection; then the march goes on
-            // from there.
-            let mut mid = mid;
-            if out_a || out_b || off_patch(mid) {
-                let end = on_curve(current, t_dir * h);
-                if off_patch(end) {
-                    // The step crosses a patch's edge. End the curve on that
-                    // edge, neither a step short of it nor past it, where the
-                    // faces' other sections meet it.
-                    points.extend(last_on_patch(current, t_dir * h));
+        for _ in 0..MARCH_STEPS {
+            h = h.min(here.reach(h_max));
+            if !points.is_empty() {
+                let to_seed = seed - here.p;
+                let ahead = to_seed.dot(here.t);
+                let aside = (to_seed - here.t * ahead).length();
+                if ahead > 0.0
+                    && ahead <= h
+                    && aside <= MARCH_TURN * ahead
+                    && aside <= MARCH_BASIN * here.gap.min(start.gap)
+                    && home.dot(here.t) >= (2.0 * MARCH_TURN).cos()
+                {
+                    points.push(seed);
+                    looped = true;
+                    ended = true;
                     break;
                 }
-                mid = end;
-            }
-            if region.is_some_and(|r| !r.contains_point(mid)) {
-                points.push(mid);
-                break;
             }
 
-            // Check for loop closure — if we've collected enough points and
-            // the current point is close to the seed, the curve is closed.
-            // Require ≥10 steps to avoid premature closure near the seed.
-            let dist_to_seed = (mid - seed).length();
-            if points.len() > 10 && dist_to_seed < closure_dist {
-                points.push(seed);
+            let next = loop {
+                if h < h_min {
+                    break None;
+                }
+                let guess = Point3::new(
+                    h.madd(here.t.x(), here.p.x()),
+                    h.madd(here.t.y(), here.p.y()),
+                    h.madd(here.t.z(), here.p.z()),
+                );
+                let taken = settle_on_section(a, b, guess)
+                    .and_then(|q| station(a, b, q, here.t))
+                    .filter(|next| {
+                        let missed = (next.p - guess).length();
+                        missed <= MARCH_BASIN * here.gap.min(next.gap)
+                            && missed <= 0.5 * h
+                            && next.t.dot(here.t) >= (2.0 * MARCH_TURN).cos()
+                            && (next.p - here.p).dot(here.t) >= 0.5 * h
+                            && sheets(next.p) == home_sheets
+                    });
+                match taken {
+                    Some(next) => break Some(next),
+                    None => h *= 0.5,
+                }
+            };
+            // A step a millionth of the first that still leaves its branch,
+            // turns back, or finds no crossing ends the curve only on a
+            // point near where the section's branches meet or the surfaces
+            // touch, as at a patch's edge. Anywhere else the march cannot
+            // follow the section, and the section is refused.
+            let Some(next) = next else {
+                let end = singular_point(a, b, here.p, initial_step)?;
+                points.push(end);
+                ended = true;
+                break;
+            };
+
+            if off_patch(next.p) {
+                // The step crosses a patch's edge. End the curve on that
+                // edge, neither a step short of it nor past it, where the
+                // faces' other sections meet it.
+                points.extend(last_on_patch(here.p, next.p - here.p));
+                ended = true;
                 break;
             }
-
-            points.push(mid);
-            current = mid;
+            if region.is_some_and(|r| !r.contains_point(next.p)) {
+                points.push(next.p);
+                ended = true;
+                break;
+            }
+            points.push(next.p);
+            here = next;
+            h *= 2.0;
+        }
+        if !ended {
+            return None;
         }
     }
 
@@ -5336,15 +6058,21 @@ fn march_analytic_intersection(
         *end = edge;
     }
 
-    // Refine all points onto the intersection curve via Newton correction.
+    // Settle each point onto the intersection curve, to rounding where
+    // Newton steps on both surfaces' distances converge.
     for pt in &mut result {
-        *pt = correct_to_intersection(
-            a, b, surf_a, norm_a, surf_b, norm_b, *pt, u_range_a, v_range_a, u_range_b, v_range_b,
-            5,
-        );
+        let from = *pt;
+        *pt = settle_on_section(a, b, from)
+            .filter(|on| (*on - from).length() <= initial_step)
+            .unwrap_or_else(|| {
+                correct_to_intersection(
+                    a, b, surf_a, norm_a, surf_b, norm_b, *pt, u_range_a, v_range_a, u_range_b,
+                    v_range_b, 5,
+                )
+            });
     }
 
-    result
+    Some(result)
 }
 
 /// Project a 3D point onto an analytic surface using the surface's
@@ -5365,9 +6093,17 @@ fn project_analytic(
             let (u, v) = sphere.project_point(point);
             (u.clamp(u_range.0, u_range.1), v.clamp(v_range.0, v_range.1))
         }
+        // A foot on the negative nappe lies along `-radial(u)` from the apex:
+        // its `u` is half a turn from the point's own side of the axis.
         AnalyticSurface::Cone(cone) => {
             let (u, v) = cone.project_point(point);
-            (u.clamp(u_range.0, u_range.1), v.clamp(v_range.0, v_range.1))
+            let v = v.clamp(v_range.0, v_range.1);
+            let u = if v < 0.0 {
+                (u + std::f64::consts::PI).rem_euclid(TAU)
+            } else {
+                u
+            };
+            (u.clamp(u_range.0, u_range.1), v)
         }
         AnalyticSurface::Torus(torus) => {
             let (u, v) = torus.project_point(point);
@@ -6109,6 +6845,84 @@ mod tests {
         }
     }
 
+    /// A pin whose tip just pierces a rod's wall meets the rulings within
+    /// 2.2e-4 of the wall's top, between two of the 128 samples. The
+    /// sample nearest them misses the pin, its discriminant -5.9e-8 within
+    /// the tolerance alone: a loop traced from it would lie 3e-5 off the
+    /// pin. The window lies between two scan points too, and the rulings
+    /// leave the pin to the marcher.
+    #[test]
+    fn a_pin_tip_between_two_samples_is_not_traced_from_a_miss() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let slope = 0.04375_f64;
+        let pin = ConicalSurface::new(
+            Point3::new(0.0, 5.005, 10.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            (1.0 / slope).atan(),
+        )
+        .unwrap();
+        let turn = FRAC_PI_2 + 5e-5 - PI / 128.0;
+        let rod = CylindricalSurface::with_ref_dir(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            5.0,
+            Vec3::new(turn.cos(), turn.sin(), 0.0),
+        )
+        .unwrap();
+        assert!(ruling_cone_cylinder(&pin, &rod, true).is_none());
+    }
+
+    /// A taper pin through a rod, the rod turned about its axis: the pin's
+    /// narrow end meets fewer than 8 of the rod's 128 sampled rulings in
+    /// some turns, and the rulings still trace both of its loops there.
+    #[test]
+    fn a_taper_pin_through_a_turned_rod_traces_both_loops() {
+        use crate::traits::ParametricCurve;
+        let slope = 0.7_f64 / 16.0;
+        let half = (1.0 / slope).atan();
+        for flip in [false, true] {
+            let (apex_y, axis_y) = if flip {
+                (-8.0 - 0.8 / slope, 1.0)
+            } else {
+                (-8.0 + 1.5 / slope, -1.0)
+            };
+            let pin = ConicalSurface::new(
+                Point3::new(0.0, apex_y, 10.0),
+                Vec3::new(0.0, axis_y, 0.0),
+                half,
+            )
+            .unwrap();
+            for spin in [0.0_f64, 0.3, 0.9, 1.4, 2.0, 2.6, 3.0, 3.6] {
+                let rod = CylindricalSurface::with_ref_dir(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                    5.0,
+                    Vec3::new(spin.cos(), spin.sin(), 0.0),
+                )
+                .unwrap();
+                let curves = ruling_cone_cylinder(&pin, &rod, true);
+                assert!(curves.is_some(), "spin {spin} flip {flip}: no trace");
+                let curves = curves.unwrap();
+                assert_eq!(curves.len(), 2, "spin {spin} flip {flip}: loops");
+                for c in &curves {
+                    let (t0, t1) = c.curve.domain();
+                    for k in 0..=1000 {
+                        let p = ParametricCurve::evaluate(
+                            &c.curve,
+                            (t1 - t0).madd(f64::from(k) / 1000.0, t0),
+                        );
+                        let on_rod = p.x().hypot(p.y()) - 5.0;
+                        let on_pin = p.x().hypot(p.z() - 10.0) - slope * (p.y() - apex_y).abs();
+                        assert!(
+                            on_rod.abs() < 1e-7 && on_pin.abs() < 1e-7,
+                            "spin {spin} flip {flip}: off by {on_rod:.2e}, {on_pin:.2e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn oblique_cone_cylinder_defers_where_rulings_cannot_trace_it() {
         let t = 2.0_f64.atan();
@@ -6534,6 +7348,31 @@ mod tests {
         let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
         let across = [Point3::new(5.5, 0.0, 0.0), Point3::new(-5.5, 0.0, 0.0)];
         assert!(fit_plane_torus_section(&torus, Vec3::new(0.0, 0.0, 1.0), 0.0, &across).is_err());
+    }
+
+    /// The fit's check stops its Newton steps once they have moved a middle
+    /// by less than a quarter of the bound. A middle it then reads as within
+    /// the bound is within it, and a middle farther off moves onto the same
+    /// point of the section as before, so the fit keeps the same points.
+    #[test]
+    fn a_short_newton_check_reads_each_middle_as_the_full_one_does() {
+        let torus = ToroidalSurface::new(Point3::new(1.0, -2.0, 0.5), 4.0, 1.5).unwrap();
+        let (n, d) = (Vec3::new(0.0, 2.0, 0.0), 2.0 * (2.1 - 2.0));
+        let tol = PLANE_TORUS_FIT * 5.5;
+        for ipts in plane_torus_loops(&torus, n, d, 128) {
+            for (ip, power) in ipts.iter().zip((0..10).cycle()) {
+                let off = Vec3::new(0.3, -0.7, 0.2) * (1e-13 * 10f64.powi(power));
+                let p = ip.point + off;
+                let full = plane_torus_section_point(&torus, n, d, p).unwrap();
+                let short = plane_torus_newton(&torus, n, d, p, 0.25 * tol).unwrap();
+                if (short - p).length() < 0.25 * tol {
+                    assert!((full - p).length() <= tol, "{:.2e}", (full - p).length());
+                    assert!((full - short).length() < 1e-15);
+                } else {
+                    assert_eq!(full, short);
+                }
+            }
+        }
     }
 
     /// Points near a plane's section of a torus move onto it, on the plane
@@ -7341,6 +8180,96 @@ mod tests {
         );
     }
 
+    /// A rod of radius 0.6 along `y` through the ring (4, 1.5) at `x = 0.5`,
+    /// `z = 1` leaves the tube through its top, and meets it in one loop on
+    /// each side of the ring. The march back to a loop's seed can be several
+    /// steps long; each loop's curve lies on both surfaces all along it.
+    #[test]
+    fn a_marched_loop_closes_on_both_surfaces() {
+        let torus = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
+        let rod =
+            CylindricalSurface::new(Point3::new(0.5, 0.0, 1.0), Vec3::new(0.0, 1.0, 0.0), 0.6)
+                .unwrap();
+        let region = Aabb3 {
+            min: Point3::new(-0.1, -5.5, 0.4),
+            max: Point3::new(1.1, 5.5, 1.5),
+        };
+        let curves = intersect_analytic_analytic_in_region(
+            AnalyticSurface::Cylinder(&rod),
+            AnalyticSurface::Torus(&torus),
+            32,
+            Some((-10.0, 10.0)),
+            None,
+            region,
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 2);
+        for c in &curves {
+            let (t0, t1) = c.curve.domain();
+            let worst = (0..=4000)
+                .map(|k| {
+                    let p = c.curve.evaluate((t1 - t0).madd(f64::from(k) / 4000.0, t0));
+                    let on_torus = ((p.x().hypot(p.y()) - 4.0).hypot(p.z()) - 1.5).abs();
+                    let on_rod = ((p.x() - 0.5).hypot(p.z() - 1.0) - 0.6).abs();
+                    on_torus.max(on_rod)
+                })
+                .fold(0.0, f64::max);
+            assert!(worst <= 1e-7, "off the surfaces by {worst}");
+        }
+    }
+
+    /// A funnel's outer wall, a 45 degree cone, crosses the tube of a lip
+    /// that leans a thousandth of a radian off the cone's axis in one loop
+    /// round the axis. The marcher closes the loop on its seed, and the loop
+    /// runs round the axis once.
+    #[test]
+    fn a_marched_loop_round_an_axis_runs_round_it_once() {
+        let skin = 1.6 * std::f64::consts::SQRT_2;
+        let tilt = 0.001_f64;
+        let torus = ToroidalSurface::with_axis(
+            Point3::new(0.0, 0.0, 70.5),
+            80.8 + skin / 2.0,
+            2.0,
+            Vec3::new(0.0, -tilt.sin(), tilt.cos()),
+        )
+        .unwrap();
+        let cone = ConicalSurface::new(
+            Point3::new(0.0, 0.0, -9.5 - skin),
+            Vec3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let region = Aabb3 {
+            min: Point3::new(-84.0, -84.0, 68.0),
+            max: Point3::new(84.0, 84.0, 73.0),
+        };
+        let curves = intersect_analytic_analytic_in_region(
+            AnalyticSurface::Cone(&cone),
+            AnalyticSurface::Torus(&torus),
+            32,
+            Some((16.6, 116.3)),
+            None,
+            region,
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 1);
+        let (t0, t1) = curves[0].curve.domain();
+        let (start, end) = (curves[0].curve.evaluate(t0), curves[0].curve.evaluate(t1));
+        assert!((start - end).length() < 1e-9, "{start:?} to {end:?}");
+        let n = 4000;
+        let mut turn = 0.0;
+        let mut last = start.y().atan2(start.x());
+        for k in 1..=n {
+            let p = curves[0]
+                .curve
+                .evaluate((t1 - t0).madd(f64::from(k) / f64::from(n), t0));
+            let at = p.y().atan2(p.x());
+            turn += (at - last + std::f64::consts::PI).rem_euclid(TAU) - std::f64::consts::PI;
+            last = at;
+        }
+        assert!((turn.abs() - TAU).abs() < 1e-6, "turns {}", turn / TAU);
+    }
+
     /// A 45 degree cone about the axis of the ring (4, 1.5), its apex at
     /// `z = apex` below the ring: its generator `ρ = z − apex` stands
     /// `|4 + apex| / √2` from the tube's centre in the half-plane.
@@ -7694,7 +8623,8 @@ mod tests {
                 true,
                 true,
                 None,
-            );
+            )
+            .unwrap();
             for p in [points[0], points[points.len() - 1]] {
                 let on_edge = (p.z() - 192.0).abs() < 1e-6 || (p.y().abs() - 40.0).abs() < 1e-6;
                 assert!(on_edge, "step {step}: the march ends at {p:?}");
@@ -8636,5 +9566,1474 @@ mod tests {
         };
         assert!((circle.center() - (o + out * 3.0)).length() < 1e-12);
         assert!((circle.radius() - 1.0).abs() < 1e-12);
+    }
+
+    /// A taper pin through a rod turned `spin` about its axis, as
+    /// `a_taper_pin_through_a_turned_rod_traces_both_loops` builds it: the pin,
+    /// its faces' `v` range, and its apex's `y`.
+    fn taper_pin_and_rod(
+        flip: bool,
+        spin: f64,
+    ) -> (ConicalSurface, (f64, f64), f64, CylindricalSurface) {
+        let slope = 0.7_f64 / 16.0;
+        let half = (1.0 / slope).atan();
+        let (apex_y, axis_y) = if flip {
+            (-8.0 - 0.8 / slope, 1.0)
+        } else {
+            (-8.0 + 1.5 / slope, -1.0)
+        };
+        let pin = ConicalSurface::new(
+            Point3::new(0.0, apex_y, 10.0),
+            Vec3::new(0.0, axis_y, 0.0),
+            half,
+        )
+        .unwrap();
+        let (h0, h1) = ((-8.0 - apex_y).abs(), (8.0 - apex_y).abs());
+        let v_pin = (h0.min(h1) / half.sin(), h0.max(h1) / half.sin());
+        let rod = CylindricalSurface::with_ref_dir(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            5.0,
+            Vec3::new(spin.cos(), spin.sin(), 0.0),
+        )
+        .unwrap();
+        (pin, v_pin, apex_y, rod)
+    }
+
+    /// The overlap of the taper pin's and the rod's faces, a little wide.
+    const TAPER_PIN_REGION: Aabb3 = Aabb3 {
+        min: Point3::new(-1.6, -5.1, 8.4),
+        max: Point3::new(1.6, 5.1, 11.6),
+    };
+
+    /// The farthest that `n` points of `curve` lie off a surface, by `off`.
+    fn farthest_along(curve: &NurbsCurve, n: u32, off: impl Fn(Point3) -> f64) -> f64 {
+        let (t0, t1) = curve.domain();
+        (0..=n)
+            .map(|k| off(curve.evaluate((t1 - t0).madd(f64::from(k) / f64::from(n), t0))))
+            .fold(0.0, f64::max)
+    }
+
+    /// The general marcher traces a taper pin's two loops on a rod (which the
+    /// rulings trace, so the marcher is called on its own here), a cone and a
+    /// tilted tube, and a cone's band across a wide cylinder. Its cubic fits
+    /// stay within the linear tolerance of both surfaces between their
+    /// points, not only at them: fits through the marched points alone lay
+    /// 2e-5 to 1.1e-4 off both, with the points 0.08 to 0.31 apart.
+    #[test]
+    fn marched_cone_cylinder_sections_stay_on_both_between_their_points() {
+        let lin = Tolerance::new().linear;
+        for flip in [false, true] {
+            for spin in [0.0_f64, 0.3, 0.9, 1.4, 2.0, 2.6, 3.0, 3.6] {
+                let (pin, v_pin, apex_y, rod) = taper_pin_and_rod(flip, spin);
+                let half = pin.half_angle();
+                let off_pin = |p: Point3| {
+                    let rho = p.x().hypot(p.z() - 10.0);
+                    let h = (p.y() - apex_y).abs();
+                    rho.madd(half.sin(), -h * half.cos()).abs()
+                };
+                let off_rod = |p: Point3| (p.x().hypot(p.y()) - 5.0).abs();
+                for rod_first in [true, false] {
+                    let (a, b, va, vb) = if rod_first {
+                        (
+                            AnalyticSurface::Cylinder(&rod),
+                            AnalyticSurface::Cone(&pin),
+                            Some((0.0, 20.0)),
+                            Some(v_pin),
+                        )
+                    } else {
+                        (
+                            AnalyticSurface::Cone(&pin),
+                            AnalyticSurface::Cylinder(&rod),
+                            Some(v_pin),
+                            Some((0.0, 20.0)),
+                        )
+                    };
+                    let curves =
+                        marched_sections(a, b, 32, va, vb, Some(TAPER_PIN_REGION)).unwrap();
+                    assert_eq!(curves.len(), 2, "spin {spin} flip {flip}: loops");
+                    for c in &curves {
+                        let worst = farthest_along(&c.curve, 4000, |p| off_pin(p).max(off_rod(p)));
+                        assert!(worst <= lin, "spin {spin} flip {flip}: off by {worst:.2e}");
+                    }
+                }
+            }
+        }
+
+        let (cone, tube) = cone_and_tilted_tube();
+        let curves = intersect_analytic_analytic_bounded(
+            AnalyticSurface::Cone(&cone),
+            AnalyticSurface::Cylinder(&tube),
+            32,
+            Some((0.5, 4.0)),
+            Some((-5.0, 5.0)),
+        )
+        .unwrap();
+        assert!(!curves.is_empty());
+        let (sin, cos) = cone.half_angle().sin_cos();
+        let axis = tube.axis();
+        for c in &curves {
+            let worst = farthest_along(&c.curve, 4000, |p| {
+                let on_cone = p.x().hypot(p.y()).madd(sin, -p.z().abs() * cos).abs();
+                let w = p - tube.origin();
+                let on_tube = ((w - axis * axis.dot(w)).length() - 0.1).abs();
+                on_cone.max(on_tube)
+            });
+            assert!(worst <= lin, "tilted tube: off by {worst:.2e}");
+        }
+
+        let half_angle = 14.0_f64.atan2(10.0);
+        let cone = ConicalSurface::new(
+            Point3::new(0.0, 0.0, 273.2),
+            Vec3::new(0.0, 0.0, -1.0),
+            half_angle,
+        )
+        .unwrap();
+        let cyl = CylindricalSurface::new(
+            Point3::new(0.0, -50.0, 215.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            60.0,
+        )
+        .unwrap();
+        let curves = intersect_analytic_analytic_in_region(
+            AnalyticSurface::Cone(&cone),
+            AnalyticSurface::Cylinder(&cyl),
+            32,
+            Some((81.2 / half_angle.sin(), 95.2 / half_angle.sin())),
+            Some((10.0, 90.0)),
+            Aabb3 {
+                min: Point3::new(-59.98, -40.0, 178.0),
+                max: Point3::new(-47.23, 40.0, 192.0),
+            },
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 2);
+        let (sin, cos) = half_angle.sin_cos();
+        for c in &curves {
+            let worst = farthest_along(&c.curve, 4000, |p| {
+                let on_cone = p.x().hypot(p.y()).madd(sin, -(273.2 - p.z()) * cos).abs();
+                let on_cyl = (p.x().hypot(p.z() - 215.0) - 60.0).abs();
+                on_cone.max(on_cyl)
+            });
+            assert!(worst <= lin, "band: off by {worst:.2e}");
+        }
+    }
+
+    /// Between the taper pin's two holes, the pin's side and the rod's wall
+    /// pass closest without meeting. Projections from one to the other
+    /// settle there, both normals along the gap: with the rod turned 0.9, at
+    /// (-2.50, -3.35, 9.88), 0.82 off the rod. The march from that seed never
+    /// came back to it: it ran 1001 points and ended 2.6 from where it began.
+    /// The seed now moves onto both surfaces by Newton steps before the march,
+    /// or is dropped where they cannot take it there, and every loop closes
+    /// on itself.
+    #[test]
+    fn a_seed_where_two_walls_pass_closest_starts_no_march() {
+        let (pin, v_pin, _, rod) = taper_pin_and_rod(false, 0.9);
+        let (a, b) = (AnalyticSurface::Cylinder(&rod), AnalyticSurface::Cone(&pin));
+        let stalled = Point3::new(
+            -2.503_835_657_485_280_5,
+            -3.349_109_255_073_426,
+            9.881_016_348_226_973,
+        );
+        let off_rod = |p: Point3| section_fit::Carrier::distance(&a, p).unwrap().0;
+        let off_pin = |p: Point3| section_fit::Carrier::distance(&b, p).unwrap().0;
+        assert!(off_rod(stalled).abs() > 0.8);
+        let on = settle_on_section(&a, &b, stalled).unwrap();
+        let (d_rod, d_pin) = (off_rod(on), off_pin(on));
+        assert!(
+            d_rod.abs() < 1e-12 && d_pin.abs() < 1e-12,
+            "{d_rod:.1e}, {d_pin:.1e}"
+        );
+
+        let curves = marched_sections(
+            a,
+            b,
+            32,
+            Some((0.0, 20.0)),
+            Some(v_pin),
+            Some(TAPER_PIN_REGION),
+        )
+        .unwrap();
+        assert_eq!(curves.len(), 2);
+        for c in &curves {
+            let (first, last) = (c.points[0].point, c.points[c.points.len() - 1].point);
+            assert!((first - last).length() < 1e-9, "{first:?} to {last:?}");
+            assert!(c.points.len() < 400, "{} points", c.points.len());
+        }
+
+        // Where both normals lie along the gap, no Newton step crosses it.
+        let ball = SphericalSurface::new(Point3::new(3.0, 0.0, 0.0), 1.0).unwrap();
+        let post =
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap();
+        let gap = Point3::new(1.5, 0.0, 0.0);
+        assert!(
+            settle_on_section(
+                &AnalyticSurface::Sphere(&ball),
+                &AnalyticSurface::Cylinder(&post),
+                gap
+            )
+            .is_none()
+        );
+    }
+
+    /// Two rods whose axes cross square, as far apart as their radii add up
+    /// to, touch at one point and cross nowhere. A seed settles onto that
+    /// point, where no direction along a section is defined: the march from
+    /// it wandered up to 1.3e-5 off both rods, and its fit was refused. The
+    /// seed is now dropped, and no section is traced.
+    #[test]
+    fn rods_that_only_touch_trace_no_section() {
+        let wall =
+            CylindricalSurface::new(Point3::new(1.1, 1.1, 1.2), Vec3::new(0.0, 0.0, 1.0), 2.55)
+                .unwrap();
+        let air =
+            CylindricalSurface::new(Point3::new(-3.9, 1.1, 4.7), Vec3::new(0.0, 1.0, 0.0), 2.45)
+                .unwrap();
+        let (a, b) = (
+            AnalyticSurface::Cylinder(&wall),
+            AnalyticSurface::Cylinder(&air),
+        );
+        let touch = Point3::new(-1.45, 1.1, 4.7);
+        assert!(!crosses_at(&a, &b, touch));
+        let region = Aabb3 {
+            min: Point3::new(-2.1625, 0.3875, 1.5375),
+            max: Point3::new(-0.7375, 1.8125, 5.4125),
+        };
+        let curves = marched_sections(
+            a,
+            b,
+            32,
+            Some((1.05, 12.45)),
+            Some((0.0, 30.9)),
+            Some(region),
+        )
+        .unwrap();
+        assert!(curves.is_empty(), "{} sections", curves.len());
+    }
+
+    /// The distance from the double cone `cone`, by the ruling on `p`'s side
+    /// of the axis on `p`'s nappe.
+    fn off_double_cone(cone: &ConicalSurface, p: Point3) -> f64 {
+        let w = p - cone.apex();
+        let h = cone.axis().dot(w);
+        let rho = (w - cone.axis() * h).length();
+        let (sin, cos) = cone.half_angle().sin_cos();
+        rho.madd(sin, -h.abs() * cos).abs()
+    }
+
+    /// Two cones of one axis direction, a unit apart, bounded on their
+    /// negative nappes between `z = -1` and `z = -1/3`, meet in one loop
+    /// there (through `(0.125, sqrt(15)/8, -0.5)`). The marcher traces it
+    /// either way round, and the fit stays on both nappes between its
+    /// points. Read by the ruling of the positive nappe, the shared point lay
+    /// 0.707 off the first cone, and no seed settled on the loop.
+    #[test]
+    fn negative_nappe_sections_are_marched_on_both_cones() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let wide = ConicalSurface::new(Point3::new(0.0, 0.0, 0.0), up, std::f64::consts::FRAC_PI_4)
+            .unwrap();
+        let narrow = ConicalSurface::new(Point3::new(1.0, 0.0, 0.0), up, 0.5_f64.atan()).unwrap();
+        let shared = Point3::new(0.125, 15.0_f64.sqrt() / 8.0, -0.5);
+        for cone in [&wide, &narrow] {
+            let (off, _) =
+                section_fit::Carrier::distance(&AnalyticSurface::Cone(cone), shared).unwrap();
+            assert!(off.abs() < 1e-12, "{off}");
+        }
+        let (r1, r2) = (std::f64::consts::SQRT_2, 5.0_f64.sqrt());
+        let (v_wide, v_narrow) = ((-r1, -r1 / 3.0), (-r2, -r2 / 3.0));
+        for wide_first in [true, false] {
+            let (a, b, va, vb) = if wide_first {
+                (
+                    AnalyticSurface::Cone(&wide),
+                    AnalyticSurface::Cone(&narrow),
+                    v_wide,
+                    v_narrow,
+                )
+            } else {
+                (
+                    AnalyticSurface::Cone(&narrow),
+                    AnalyticSurface::Cone(&wide),
+                    v_narrow,
+                    v_wide,
+                )
+            };
+            let curves = marched_sections(a, b, 32, Some(va), Some(vb), None).unwrap();
+            assert!(!curves.is_empty(), "wide first {wide_first}: no section");
+            for c in &curves {
+                let worst = farthest_along(&c.curve, 4000, |p| {
+                    off_double_cone(&wide, p).max(off_double_cone(&narrow, p))
+                });
+                assert!(worst <= 1e-7, "wide first {wide_first}: off by {worst:.2e}");
+                let below = farthest_along(&c.curve, 4000, |p| (p.z() + 1.0 / 3.0).max(0.0));
+                assert!(
+                    below < 1e-9,
+                    "wide first {wide_first}: above z = -1/3 by {below:.2e}"
+                );
+            }
+        }
+    }
+
+    /// A 45-degree cone holds its negative ruling from (1, 0, -1) to
+    /// (4, 0, -4), and so does a rod of radius 1 along it. The bound on the
+    /// cone reads that ruling as on it, and the fit through its points is
+    /// the ruling; read by the positive nappe, its factor was negative and
+    /// no span could be bounded. A span through the apex, where the factor
+    /// vanishes, has no bound.
+    #[test]
+    fn a_fit_along_a_negative_ruling_is_bounded() {
+        let cone = ConicalSurface::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let along = Vec3::new(1.0, 0.0, -1.0) * std::f64::consts::FRAC_1_SQRT_2;
+        let rod = CylindricalSurface::new(Point3::new(0.0, 1.0, 0.0), along, 1.0).unwrap();
+        let (a, b) = (
+            AnalyticSurface::Cone(&cone),
+            AnalyticSurface::Cylinder(&rod),
+        );
+        let ruling: Vec<Point3> = (1..=4)
+            .map(|k| Point3::new(f64::from(k), 0.0, -f64::from(k)))
+            .collect();
+        let ctrl = [ruling[0], ruling[1], ruling[2], ruling[3]];
+        let bound = section_fit::Carrier::bound(&a, &ctrl).unwrap();
+        assert!(bound < 1e-12, "{bound:.2e}");
+        let (curve, points) = fit_section(&a, &b, &ruling, 1e-7).unwrap();
+        assert_eq!(points.len(), 4);
+        let worst = farthest_along(&curve, 1000, |p| p.y().abs().max((p.x() + p.z()).abs()));
+        assert!(worst < 1e-12, "{worst:.2e}");
+        let through_apex = [
+            Point3::new(-1.0, 0.0, 1.0),
+            Point3::new(-1.0 / 3.0, 0.0, 1.0 / 3.0),
+            Point3::new(1.0 / 3.0, 0.0, -1.0 / 3.0),
+            Point3::new(1.0, 0.0, -1.0),
+        ];
+        assert!(section_fit::Carrier::bound(&a, &through_apex).is_none());
+    }
+
+    /// Two rods, `x^2 + y^2 = 1` and `(x - 3)^2 + z^2 = 4`, touch at
+    /// (1, 0, 0) alone, where a seed near it settles on no crossing. Moved
+    /// 1e6 along x, a seed settled 3.1e-4 from the touch, where both
+    /// distances lay below the rounding of the coordinates and the normals
+    /// 1.5e-4 from parallel, and a march started there; moved 1e12, the
+    /// spacing of one coordinate let a point one float step from the touch
+    /// read as a crossing. The marcher now works near the origin, so the
+    /// rods moved along each axis trace no section, as they do unmoved.
+    #[test]
+    fn a_touch_far_from_the_origin_settles_as_one_near_it_does() {
+        for o in [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1e6, 0.0, 0.0),
+            Vec3::new(1e12, 0.0, 0.0),
+            Vec3::new(0.0, 1e12, 0.0),
+            Vec3::new(0.0, 0.0, 1e12),
+        ] {
+            let post = CylindricalSurface::new(
+                Point3::new(0.0, 0.0, 0.0) + o,
+                Vec3::new(0.0, 0.0, 1.0),
+                1.0,
+            )
+            .unwrap();
+            let beam = CylindricalSurface::new(
+                Point3::new(3.0, 0.0, 0.0) + o,
+                Vec3::new(0.0, 1.0, 0.0),
+                2.0,
+            )
+            .unwrap();
+            let (a, b) = (
+                AnalyticSurface::Cylinder(&post),
+                AnalyticSurface::Cylinder(&beam),
+            );
+            if o.length() == 0.0 {
+                let settled = settle_on_section(&a, &b, Point3::new(1.0, 0.01, 0.01));
+                assert!(
+                    settled.is_none_or(|p| !crosses_at(&a, &b, p)),
+                    "settles on a crossing at {settled:?}"
+                );
+            }
+            let region = Aabb3 {
+                min: Point3::new(0.5, -0.5, -0.5) + o,
+                max: Point3::new(1.5, 0.5, 0.5) + o,
+            };
+            let curves =
+                marched_sections(a, b, 32, Some((-1.0, 1.0)), Some((-1.0, 1.0)), Some(region))
+                    .unwrap();
+            assert!(curves.is_empty(), "moved {o:?}: {} sections", curves.len());
+        }
+    }
+
+    /// A cone opening 0.01 or 0.001 either side of its axis, or lying that
+    /// far off its radial plane, meets a rod on its axis in one circle. The
+    /// fit through points of that circle is bounded on both surfaces within
+    /// the linear tolerance: the cone's factor, `|h| cos + rho sin`, keeps a
+    /// lower bound however slender or flat the cone.
+    #[test]
+    fn fits_on_slender_and_flat_cones_are_bounded() {
+        use std::f64::consts::FRAC_PI_2;
+        for half in [FRAC_PI_2 - 0.01, FRAC_PI_2 - 0.001, 0.01, 0.001] {
+            let cone =
+                ConicalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), half)
+                    .unwrap();
+            let v = 10.0;
+            let (rho, h) = (v * half.cos(), v * half.sin());
+            let rod =
+                CylindricalSurface::new(Point3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 1.0), rho)
+                    .unwrap();
+            let (a, b) = (
+                AnalyticSurface::Cone(&cone),
+                AnalyticSurface::Cylinder(&rod),
+            );
+            let circle: Vec<Point3> = (0..=12)
+                .map(|k| {
+                    let t = TAU * f64::from(k) / 12.0;
+                    Point3::new(rho * t.cos(), rho * t.sin(), h)
+                })
+                .collect();
+            let (curve, points) = fit_section(&a, &b, &circle, 1e-7).unwrap();
+            let worst = farthest_along(&curve, 4000, |p| {
+                off_double_cone(&cone, p).max((p.x().hypot(p.y()) - rho).abs())
+            });
+            assert!(worst <= 1e-7, "half {half}: off by {worst:.2e}");
+            assert!(points.len() < 2000, "half {half}: {} points", points.len());
+        }
+    }
+
+    /// The ring of radii 4 and 1.5 and a rod of radius 0.6 along y through
+    /// (0.5, y, 1), moved 1e6 along each axis, meet in the two loops they
+    /// meet in unmoved, each within the linear tolerance of both surfaces.
+    /// Moved 1e9, where the floats' spacing (1.2e-7) leaves no room for the
+    /// tolerance once a curve is moved back, the traced section is refused
+    /// before any fit, not dropped; its fit ran 7 passes over 1.4 s first.
+    #[test]
+    fn a_section_far_from_the_origin_is_traced_as_near_it() {
+        let ring = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
+        let run = |o: Vec3| {
+            let torus = ring.translated(o);
+            let rod = CylindricalSurface::new(
+                Point3::new(0.5, 0.0, 1.0) + o,
+                Vec3::new(0.0, 1.0, 0.0),
+                0.6,
+            )
+            .unwrap();
+            let region = Aabb3 {
+                min: Point3::new(-0.1, -5.5, 0.4) + o,
+                max: Point3::new(1.1, 5.5, 1.5) + o,
+            };
+            intersect_analytic_analytic_in_region(
+                AnalyticSurface::Cylinder(&rod),
+                AnalyticSurface::Torus(&torus),
+                32,
+                Some((-10.0, 10.0)),
+                None,
+                region,
+            )
+        };
+        for o in [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1e6, 0.0, 0.0),
+            Vec3::new(0.0, 1e6, 0.0),
+            Vec3::new(0.0, 0.0, 1e6),
+        ] {
+            let curves = run(o).unwrap();
+            assert_eq!(curves.len(), 2, "moved {o:?}");
+            for c in &curves {
+                let worst = farthest_along(&c.curve, 4000, |p| {
+                    let q = p - o;
+                    let on_torus = ((q.x().hypot(q.y()) - 4.0).hypot(q.z()) - 1.5).abs();
+                    let on_rod = ((q.x() - 0.5).hypot(q.z() - 1.0) - 0.6).abs();
+                    on_torus.max(on_rod)
+                });
+                assert!(worst <= 1e-7, "moved {o:?}: off by {worst:.2e}");
+            }
+        }
+        for o in [
+            Vec3::new(1e9, 0.0, 0.0),
+            Vec3::new(0.0, 1e9, 0.0),
+            Vec3::new(0.0, 0.0, 1e9),
+        ] {
+            assert!(
+                matches!(run(o), Err(MathError::ConvergenceFailure { iterations: 0 })),
+                "moved {o:?}: not refused before its fit"
+            );
+        }
+    }
+
+    /// A cylinder's frame can sit anywhere along its axis. The rods
+    /// `x^2 + y^2 = 1` and `(x - 3)^2 + z^2 = 4`, with their frames 1e6 along
+    /// their axes, touch at (1, 0, 0) alone, as with their frames beside it:
+    /// a seed near the touch settled 1.55e-4 from it and read as a crossing,
+    /// and the marcher refused the pair. Now the seed settles on no crossing
+    /// and no section is traced. The ring and rod of the truth audit, the
+    /// rod's frame 1e6 along its axis, meet in the loops they meet in with
+    /// the frame beside them.
+    #[test]
+    fn frames_far_along_a_rods_axis_read_as_near_ones() {
+        let post =
+            CylindricalSurface::new(Point3::new(0.0, 0.0, -1e6), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap();
+        let beam =
+            CylindricalSurface::new(Point3::new(3.0, -1e6, 0.0), Vec3::new(0.0, 1.0, 0.0), 2.0)
+                .unwrap();
+        let (a, b) = (
+            AnalyticSurface::Cylinder(&post),
+            AnalyticSurface::Cylinder(&beam),
+        );
+        let settled = settle_on_section(&a, &b, Point3::new(1.0, 0.01, 0.01));
+        assert!(
+            settled.is_none_or(|p| !crosses_at(&a, &b, p)),
+            "settles on a crossing at {settled:?}"
+        );
+        let region = Aabb3 {
+            min: Point3::new(0.5, -0.5, -0.5),
+            max: Point3::new(1.5, 0.5, 0.5),
+        };
+        let far = Some((1e6 - 1.0, 1e6 + 1.0));
+        let curves = marched_sections(a, b, 32, far, far, Some(region)).unwrap();
+        assert!(curves.is_empty(), "{} sections", curves.len());
+
+        let ring = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
+        let boxes = |frame: f64| {
+            let rod = CylindricalSurface::new(
+                Point3::new(0.5, -frame, 1.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                0.6,
+            )
+            .unwrap();
+            let region = Aabb3 {
+                min: Point3::new(-0.1, -5.5, 0.4),
+                max: Point3::new(1.1, 5.5, 1.5),
+            };
+            let curves = intersect_analytic_analytic_in_region(
+                AnalyticSurface::Cylinder(&rod),
+                AnalyticSurface::Torus(&ring),
+                32,
+                Some((frame - 10.0, frame + 10.0)),
+                None,
+                region,
+            )
+            .unwrap();
+            let mut boxes: Vec<Aabb3> = curves
+                .iter()
+                .map(|c| {
+                    let worst = farthest_along(&c.curve, 4000, |p| {
+                        let on_torus = ((p.x().hypot(p.y()) - 4.0).hypot(p.z()) - 1.5).abs();
+                        let on_rod = ((p.x() - 0.5).hypot(p.z() - 1.0) - 0.6).abs();
+                        on_torus.max(on_rod)
+                    });
+                    assert!(worst <= 1e-7, "frame {frame}: off by {worst:.2e}");
+                    Aabb3::try_from_points(c.points.iter().map(|ip| ip.point)).unwrap()
+                })
+                .collect();
+            boxes.sort_by(|p, q| p.min.y().total_cmp(&q.min.y()));
+            boxes
+        };
+        let (near, far) = (boxes(0.0), boxes(1e6));
+        assert_eq!(near.len(), 2);
+        assert_eq!(far.len(), near.len());
+        for (n, f) in near.iter().zip(&far) {
+            assert!((n.min - f.min).length() < 1e-6 && (n.max - f.max).length() < 1e-6);
+        }
+    }
+
+    /// `a + b` as a float and its rounding error.
+    fn two_sum(a: f64, b: f64) -> (f64, f64) {
+        let s = a + b;
+        let back = s - a;
+        (s, (a - (s - back)) + (b - back))
+    }
+
+    /// `a b` as a float and its rounding error, by Dekker's split.
+    fn two_prod(a: f64, b: f64) -> (f64, f64) {
+        let split = |v: f64| {
+            let c = 134_217_729.0 * v;
+            let hi = c - (c - v);
+            (hi, v - hi)
+        };
+        let p = a * b;
+        let ((ah, al), (bh, bl)) = (split(a), split(b));
+        (p, ((ah * bh - p) + ah * bl + al * bh) + al * bl)
+    }
+
+    /// How far `p` lies from the line through `o` along `a`, in
+    /// double-length arithmetic, so a far `o` costs no digits of the answer
+    /// (nor does `a` being a float step from unit length).
+    fn off_line(o: Point3, a: Vec3, p: Point3) -> f64 {
+        let w = [
+            two_sum(p.x(), -o.x()),
+            two_sum(p.y(), -o.y()),
+            two_sum(p.z(), -o.z()),
+        ];
+        let a = [a.x(), a.y(), a.z()];
+        // A sum of products `a_i y_i` with each `y_i` double-length.
+        let dot = |y: &[(f64, f64); 3]| {
+            let (mut hi, mut lo) = (0.0, 0.0);
+            for (ai, (yh, yl)) in a.iter().zip(y) {
+                let (prod, prod_err) = two_prod(*ai, *yh);
+                let (sum, sum_err) = two_sum(hi, prod);
+                hi = sum;
+                lo += sum_err + prod_err + ai * yl;
+            }
+            two_sum(hi, lo)
+        };
+        let (aw, aw_err) = dot(&w);
+        let (aa, aa_err) = dot(&a.map(|x| (x, 0.0)));
+        // `s = aw / aa` to double length: its float, then the remainder
+        // over `aa`.
+        let s = aw / aa;
+        let (sa, sa_err) = two_prod(s, aa);
+        let rest = ((aw - sa) - sa_err) + aw_err - s * aa_err;
+        let s_err = rest / aa;
+        let across = a.iter().zip(w).map(|(ai, (hi, lo))| {
+            let (prod, prod_err) = two_prod(*ai, s);
+            let (diff, diff_err) = two_sum(hi, -prod);
+            diff + (diff_err + lo - prod_err - ai * s_err)
+        });
+        across.map(|c| c * c).sum::<f64>().sqrt()
+    }
+
+    /// A rod of radius 0.6 on an axis along (0.3, 0.4, 0.5) through the
+    /// centre circle of the ring of radii 4 and 1.5 at (4, 0, 0), its frame
+    /// 1e12 along the axis. Moved to the region by plain sums, such a frame
+    /// landed 2.1e-5 off the axis, and a fit certified against the moved rod
+    /// need not lie within 1e-7 of the input one. The frame now lands within
+    /// 4e-15 of the axis, and both loops lie within 1e-7 of the input rod
+    /// (measured in double-length arithmetic) and of the ring.
+    #[test]
+    fn a_tilted_rod_framed_far_along_its_axis_is_traced_on_it() {
+        let along = Vec3::new(0.3, 0.4, 0.5);
+        let through = Point3::new(4.0, 0.0, 0.0);
+        let ring = ToroidalSurface::new(Point3::new(0.0, 0.0, 0.0), 4.0, 1.5).unwrap();
+        let near_rod = CylindricalSurface::new(through, along, 0.6).unwrap();
+        let axis = near_rod.axis();
+        let far = through + axis * 1e12;
+        let rod = CylindricalSurface::new(far, along, 0.6).unwrap();
+        let anchor = Point3::new(4.0, 0.0, 0.0);
+        let (moved, dv, error) = Moved::new(&AnalyticSurface::Cylinder(&rod), anchor);
+        let AnalyticSurface::Cylinder(moved) = moved.surface() else {
+            unreachable!("a rod moves to a rod");
+        };
+        let foot = moved.origin() + (anchor - Point3::new(0.0, 0.0, 0.0));
+        let off = off_line(rod.origin(), rod.axis(), foot);
+        assert!(
+            off <= error && error < 1e-14,
+            "the frame lies {off:.2e} off the axis"
+        );
+        assert!((dv + 1e12).abs() < 1.0, "v moved by {dv}");
+
+        let region = Aabb3 {
+            min: Point3::new(2.0, -2.0, -2.0),
+            max: Point3::new(6.0, 2.0, 2.0),
+        };
+        let sweep = (1e12 - 10.0, 1e12 + 10.0);
+        let result = marched_sections(
+            AnalyticSurface::Cylinder(&rod),
+            AnalyticSurface::Torus(&ring),
+            32,
+            Some((-sweep.1, -sweep.0)),
+            None,
+            Some(region),
+        );
+        let curves = result.unwrap();
+        assert_eq!(curves.len(), 2);
+        {
+            for c in &curves {
+                let worst = farthest_along(&c.curve, 4000, |p| {
+                    let on_rod = (off_line(rod.origin(), rod.axis(), p) - 0.6).abs();
+                    let on_ring = ((p.x().hypot(p.y()) - 4.0).hypot(p.z()) - 1.5).abs();
+                    on_rod.max(on_ring)
+                });
+                assert!(worst <= 1e-7, "off by {worst:.2e}");
+            }
+        }
+    }
+
+    /// Each surface's closed-form second derivative of its distance along a
+    /// direction matches the distance's central second difference, at points
+    /// on and near the surface, along and across it.
+    #[test]
+    fn each_surface_bends_as_its_distance_does() {
+        use section_fit::Carrier;
+        let cyl =
+            CylindricalSurface::new(Point3::new(0.3, -0.2, 0.5), Vec3::new(0.2, 0.3, 1.0), 0.7)
+                .unwrap();
+        let ball = SphericalSurface::new(Point3::new(-0.4, 0.1, 0.2), 1.3).unwrap();
+        let cone = ConicalSurface::new(Point3::new(0.1, 0.2, -0.3), Vec3::new(-0.3, 0.1, 1.0), 0.6)
+            .unwrap();
+        let ring = ToroidalSurface::new(Point3::new(0.2, -0.1, 0.1), 2.0, 0.6).unwrap();
+        let surfaces = [
+            AnalyticSurface::Cylinder(&cyl),
+            AnalyticSurface::Sphere(&ball),
+            AnalyticSurface::Cone(&cone),
+            AnalyticSurface::Torus(&ring),
+        ];
+        let directions = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.6, -0.48, 0.64),
+        ];
+        let (_, _, _, cone_v) = surface_closures(&AnalyticSurface::Cone(&cone));
+        for (k, s) in surfaces.iter().enumerate() {
+            let (surf, norm, _, (v0, v1)) = surface_closures(s);
+            let (v0, v1) = if matches!(s, AnalyticSurface::Cone(_)) {
+                (cone_v.0.max(0.5), cone_v.1)
+            } else {
+                (v0, v1)
+            };
+            for (u, v) in [(0.3, 0.25), (1.9, 0.5), (4.4, 0.75)] {
+                let v = (v1 - v0).madd(v, v0);
+                for off in [0.0, 0.05, -0.05] {
+                    let p = surf(u, v) + norm(u, v) * off;
+                    let f = |q: Point3| s.distance(q).unwrap().0;
+                    for d in directions {
+                        let d = d * (1.0 / d.length());
+                        let h = 1e-4;
+                        let second = (f(p + d * h) - 2.0 * f(p) + f(p - d * h)) / (h * h);
+                        let exact = s.bend(p, d).unwrap();
+                        assert!(
+                            (second - exact).abs() <= 1e-5 * (1.0 + exact.abs()),
+                            "surface {k} at {p:?} along {d:?}: {exact} against {second}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A cone's distance holds `-|h| cos`, which has no second derivative
+    /// across the apex's plane. Off the axis on that plane, within the
+    /// rounding of `h`, no curvature is read, along the axis or across it,
+    /// so neither a march station nor a search for a touch is built there:
+    /// both find nothing, and no touch is read. Just off the plane each
+    /// curvature reads again.
+    #[test]
+    fn a_cone_reads_no_curvature_on_its_apex_plane() {
+        use section_fit::Carrier;
+        let axis = Vec3::new(0.0, 0.0, 1.0);
+        let cone = ConicalSurface::new(Point3::new(0.0, 0.0, 0.0), axis, 0.7).unwrap();
+        let rod =
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 3.0), Vec3::new(1.0, 0.0, 0.0), 1.0)
+                .unwrap();
+        let (a, b) = (
+            AnalyticSurface::Cone(&cone),
+            AnalyticSurface::Cylinder(&rod),
+        );
+        let across = Vec3::new(1.0, 0.0, 0.0);
+        for on in [
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 1e-17),
+            Point3::new(2.0, 0.0, -1e-17),
+        ] {
+            assert!(a.distance(on).is_some());
+            assert!(a.bend(on, axis).is_none(), "{on:?} along the axis");
+            assert!(a.bend(on, across).is_none(), "{on:?} across");
+            assert!(station(&a, &b, on, axis).is_none(), "{on:?} station");
+            assert!(singular_point(&a, &b, on, 1.0).is_none(), "{on:?} touch");
+        }
+        for off in [Point3::new(2.0, 0.0, 1e-3), Point3::new(2.0, 0.0, -1e-3)] {
+            assert!(a.bend(off, axis).is_some(), "{off:?} along the axis");
+            assert!(a.bend(off, across).is_some(), "{off:?} across");
+        }
+    }
+
+    /// Upright, turned and moved, and mirrored through a slanted plane.
+    fn three_poses() -> [crate::mat::Mat4; 3] {
+        use crate::mat::Mat4;
+        [
+            Mat4::identity(),
+            Mat4::translation(-3.7, 5.5, 14.0) * Mat4::rotation_z(0.7) * Mat4::rotation_x(-0.9),
+            Mat4::scale(-1.0, 1.0, 1.0) * Mat4::rotation_y(0.4),
+        ]
+    }
+
+    /// A cone with its apex at the origin and its axis along z, and a rod of
+    /// radius `r` along x through `(0, 0, z0)`, both moved by `pose`; and
+    /// the points of their section where the rod's angle about its axis is
+    /// `k / n` of a turn, for `k` below `n`, each moved by `pose`.
+    fn posed_cone_and_rod(
+        pose: &crate::mat::Mat4,
+        half: f64,
+        z0: f64,
+        r: f64,
+        n: u32,
+    ) -> (ConicalSurface, CylindricalSurface, Vec<Point3>) {
+        let o = Point3::new(0.0, 0.0, 0.0);
+        let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+        let cone =
+            ConicalSurface::new(pose.mul_point(o), along(Vec3::new(0.0, 0.0, 1.0)), half).unwrap();
+        let rod = CylindricalSurface::new(
+            pose.mul_point(Point3::new(0.0, 0.0, z0)),
+            along(Vec3::new(1.0, 0.0, 0.0)),
+            r,
+        )
+        .unwrap();
+        let mut truth = Vec::new();
+        for k in 0..n {
+            let phi = TAU * f64::from(k) / f64::from(n);
+            let (y, z) = (r * phi.sin(), r.madd(-phi.cos(), z0));
+            let rho = z.abs() / half.tan();
+            let x2 = rho.madd(rho, -y * y);
+            if x2 >= 0.0 {
+                for x in [x2.sqrt(), -x2.sqrt()] {
+                    truth.push(pose.mul_point(Point3::new(x, y, z)));
+                }
+            }
+        }
+        (cone, rod, truth)
+    }
+
+    /// A cone lying 0.01 off its radial plane meets a rod of radius 0.05 at
+    /// height 0.1 in two loops 10 long and 0.1 across, which turn at radius
+    /// 5e-4 at their ends. A cone opening 0.01 about its axis meets rods
+    /// across it in loops 0.2 to 0.6 long. The march's steps of up to 1.5
+    /// passed the turns and left points 2.4e-2 off the rod, and its closure,
+    /// five steps from the seed, joined a loop's far side: each fit was
+    /// refused, but for the rod of radius 0.2, whose second loop was lost
+    /// with no error. The march now follows each loop round once, in every
+    /// pose and either way round: each fit lies within the linear tolerance
+    /// of both surfaces, closes, and passes within 1e-5 of every point of
+    /// the section.
+    #[test]
+    fn thin_loops_on_flat_and_slender_cones_are_marched_round() {
+        use std::f64::consts::FRAC_PI_2;
+        let lin = Tolerance::new().linear;
+        let cases = [
+            (0.01, 0.1, 0.05),
+            (FRAC_PI_2 - 0.01, 3.0, 0.05),
+            (FRAC_PI_2 - 0.01, 10.0, 0.05),
+            (FRAC_PI_2 - 0.01, 10.0, 0.2),
+        ];
+        for (half, z0, r) in cases {
+            for (p, pose) in three_poses().iter().enumerate() {
+                let (cone, rod, truth) = posed_cone_and_rod(pose, half, z0, r, 360);
+                for cone_first in [true, false] {
+                    let label =
+                        format!("half {half} z0 {z0} r {r} pose {p} cone first {cone_first}");
+                    let (a, b, va, vb) = if cone_first {
+                        (
+                            AnalyticSurface::Cone(&cone),
+                            AnalyticSurface::Cylinder(&rod),
+                            (1.0, 20.0),
+                            (-20.0, 20.0),
+                        )
+                    } else {
+                        (
+                            AnalyticSurface::Cylinder(&rod),
+                            AnalyticSurface::Cone(&cone),
+                            (-20.0, 20.0),
+                            (1.0, 20.0),
+                        )
+                    };
+                    let result = marched_sections(a, b, 32, Some(va), Some(vb), None);
+                    assert!(result.is_ok(), "{label}: {:?}", result.as_ref().err());
+                    let curves = result.unwrap();
+                    assert_eq!(curves.len(), 2, "{label}: loops");
+                    let off_rod = |p: Point3| {
+                        let (w, ax) = (p - rod.origin(), rod.axis());
+                        ((w - ax * ax.dot(w)).length() - r).abs()
+                    };
+                    for c in &curves {
+                        let worst = farthest_along(&c.curve, 4000, |p| {
+                            off_double_cone(&cone, p).max(off_rod(p))
+                        });
+                        assert!(worst <= lin, "{label}: off by {worst:.2e}");
+                        let (first, last) = (c.points[0].point, c.points[c.points.len() - 1].point);
+                        assert!((first - last).length() < 1e-9, "{label}: open");
+                    }
+                    for &t in &truth {
+                        let near = curves
+                            .iter()
+                            .map(|c| {
+                                crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                                    .unwrap()
+                                    .distance
+                            })
+                            .fold(f64::INFINITY, f64::min);
+                        assert!(near < 1e-5, "{label}: {t:?} lies {near:.1e} off");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A cone lying 0.001 off its radial plane, its apex at the origin, and
+    /// a rod of radius 0.05 along x through the apex meet in four curves
+    /// along the rod, two on each nappe, a nappe's 1e-4 from the other's.
+    /// With both nappes in the cone's patch, a march step hopped to the other
+    /// nappe and the fit was refused; with each step kept on its nappe, a
+    /// seed on one nappe still lay within the estimated gap of a curve
+    /// marched on the other and started no march, and two of the four curves
+    /// were lost with no error. A seed now joins a marched curve only on its
+    /// nappe and where Newton steps from the curve's chord reach it within
+    /// the linear tolerance.
+    #[test]
+    fn sections_on_both_nappes_of_a_flat_cone_are_each_marched() {
+        let (half, r) = (0.001_f64, 0.05_f64);
+        let lin = Tolerance::new().linear;
+        let t2 = half.tan() * half.tan();
+        for (k, pose) in three_poses().iter().enumerate() {
+            let o = Point3::new(0.0, 0.0, 0.0);
+            let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+            let cone =
+                ConicalSurface::new(pose.mul_point(o), along(Vec3::new(0.0, 0.0, 1.0)), half)
+                    .unwrap();
+            let rod =
+                CylindricalSurface::new(pose.mul_point(o), along(Vec3::new(1.0, 0.0, 0.0)), r)
+                    .unwrap();
+            let mut truth = Vec::new();
+            for j in 0..=90 {
+                let x = 0.9 * (f64::from(j) / 45.0 - 1.0);
+                let z = (t2 * x.madd(x, r * r) / (1.0 + t2)).sqrt();
+                let y = z.madd(-z, r * r).sqrt();
+                for (sy, sz) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+                    truth.push(pose.mul_point(Point3::new(x, sy * y, sz * z)));
+                }
+            }
+            let off_rod = |p: Point3| {
+                let (w, ax) = (p - rod.origin(), rod.axis());
+                ((w - ax * ax.dot(w)).length() - r).abs()
+            };
+            for cone_first in [true, false] {
+                let label = format!("pose {k} cone first {cone_first}");
+                let (a, b) = if cone_first {
+                    (
+                        AnalyticSurface::Cone(&cone),
+                        AnalyticSurface::Cylinder(&rod),
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Cylinder(&rod),
+                        AnalyticSurface::Cone(&cone),
+                    )
+                };
+                let result = marched_sections(a, b, 32, Some((-1.0, 1.0)), Some((-1.0, 1.0)), None);
+                assert!(result.is_ok(), "{label}: {:?}", result.as_ref().err());
+                let curves = result.unwrap();
+                assert_eq!(curves.len(), 4, "{label}: curves");
+                for c in &curves {
+                    let worst = farthest_along(&c.curve, 4000, |p| {
+                        off_double_cone(&cone, p).max(off_rod(p))
+                    });
+                    assert!(worst <= lin, "{label}: off by {worst:.2e}");
+                }
+                for &t in &truth {
+                    let near = curves
+                        .iter()
+                        .map(|c| {
+                            crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                                .unwrap()
+                                .distance
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(near < 1e-5, "{label}: {t:?} lies {near:.1e} off");
+                }
+            }
+        }
+    }
+
+    /// A cone lying 2e-6 off its radial plane, its apex at the origin, and a
+    /// rod of radius 0.1 along x through the apex cross at a shallow angle,
+    /// 2e-6, in a curve whose two sides along the rod meet near
+    /// (50000, 0, 0.1), where it turns at a radius of about 2e-7. The march
+    /// cannot step round that turn and stops there, the normals 2e-6 from
+    /// parallel but no point near where they are parallel: each march ended
+    /// there with a lone point, which was dropped, and the section was lost
+    /// with no error. The march now refuses it, or traces all of it.
+    #[test]
+    fn a_shallow_crossing_too_tight_to_march_is_refused_not_dropped() {
+        let (half, r) = (2e-6_f64, 0.1_f64);
+        let t2 = half.tan() * half.tan();
+        for (k, pose) in three_poses().iter().enumerate() {
+            let o = Point3::new(0.0, 0.0, 0.0);
+            let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+            let cone =
+                ConicalSurface::new(pose.mul_point(o), along(Vec3::new(0.0, 0.0, 1.0)), half)
+                    .unwrap();
+            let rod =
+                CylindricalSurface::new(pose.mul_point(o), along(Vec3::new(1.0, 0.0, 0.0)), r)
+                    .unwrap();
+            let mut truth = Vec::new();
+            for j in 0..=100 {
+                let x = 40_000.0 + 99.9 * f64::from(j);
+                let z = (t2 * x.madd(x, r * r) / (1.0 + t2)).sqrt();
+                if z < r {
+                    let y = z.madd(-z, r * r).sqrt();
+                    for sy in [1.0, -1.0] {
+                        truth.push(pose.mul_point(Point3::new(x, sy * y, z)));
+                    }
+                }
+            }
+            for cone_first in [true, false] {
+                let label = format!("pose {k} cone first {cone_first}");
+                let (a, b) = if cone_first {
+                    (
+                        AnalyticSurface::Cone(&cone),
+                        AnalyticSurface::Cylinder(&rod),
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Cylinder(&rod),
+                        AnalyticSurface::Cone(&cone),
+                    )
+                };
+                let range = Some((40_000.0, 60_000.0));
+                let Ok(curves) = marched_sections(a, b, 32, range, range, None) else {
+                    continue;
+                };
+                for &t in &truth {
+                    let near = curves
+                        .iter()
+                        .map(|c| {
+                            crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                                .unwrap()
+                                .distance
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(near < 1e-5, "{label}: {t:?} lies {near:.1e} off");
+                }
+            }
+        }
+    }
+
+    /// A ball of radius 2 at the origin and a rod of radius 1 along z
+    /// through (1, 0, 0) touch at (2, 0, 0), where their section, two lobes,
+    /// crosses itself. The march steps through that node, where its steps
+    /// grow faster than the gap to the other lobe shrinks; a curve that
+    /// stops instead stops on the node. Either way the curves cover both
+    /// lobes, in every pose and either way round.
+    #[test]
+    fn a_section_that_crosses_itself_is_traced_through_the_node() {
+        let lin = Tolerance::new().linear;
+        for (k, pose) in three_poses().iter().enumerate() {
+            let o = Point3::new(0.0, 0.0, 0.0);
+            let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+            let ball = SphericalSurface::new(pose.mul_point(o), 2.0).unwrap();
+            let rod = CylindricalSurface::new(
+                pose.mul_point(Point3::new(1.0, 0.0, 0.0)),
+                along(Vec3::new(0.0, 0.0, 1.0)),
+                1.0,
+            )
+            .unwrap();
+            let node = pose.mul_point(Point3::new(2.0, 0.0, 0.0));
+            let mut truth = Vec::new();
+            for j in 1..360 {
+                let t = TAU * f64::from(j) / 360.0;
+                let z = 2.0 * (0.5 * t).sin().abs();
+                for sz in [1.0, -1.0] {
+                    truth.push(pose.mul_point(Point3::new(1.0 + t.cos(), t.sin(), sz * z)));
+                }
+            }
+            let off_ball = |p: Point3| ((p - pose.mul_point(o)).length() - 2.0).abs();
+            let off_rod = |p: Point3| {
+                let (w, ax) = (p - rod.origin(), rod.axis());
+                ((w - ax * ax.dot(w)).length() - 1.0).abs()
+            };
+            for ball_first in [true, false] {
+                let label = format!("pose {k} ball first {ball_first}");
+                let (a, b, va, vb) = if ball_first {
+                    (
+                        AnalyticSurface::Sphere(&ball),
+                        AnalyticSurface::Cylinder(&rod),
+                        None,
+                        Some((-3.0, 3.0)),
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Cylinder(&rod),
+                        AnalyticSurface::Sphere(&ball),
+                        Some((-3.0, 3.0)),
+                        None,
+                    )
+                };
+                let result = marched_sections(a, b, 32, va, vb, None);
+                assert!(result.is_ok(), "{label}: {:?}", result.as_ref().err());
+                let curves = result.unwrap();
+                assert!(!curves.is_empty(), "{label}: no section");
+                for c in &curves {
+                    let worst = farthest_along(&c.curve, 4000, |p| off_ball(p).max(off_rod(p)));
+                    assert!(worst <= lin, "{label}: off by {worst:.2e}");
+                    let (t0, t1) = c.curve.domain();
+                    let (first, last) = (c.curve.evaluate(t0), c.curve.evaluate(t1));
+                    if (first - last).length() > lin {
+                        for end in [first, last] {
+                            let miss = (end - node).length();
+                            assert!(miss <= lin, "{label}: an end lies {miss:.1e} from the node");
+                        }
+                    }
+                }
+                for &t in &truth {
+                    let near = curves
+                        .iter()
+                        .map(|c| {
+                            crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                                .unwrap()
+                                .distance
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(near < 1e-5, "{label}: {t:?} lies {near:.1e} off");
+                }
+            }
+        }
+    }
+
+    /// A rod of radius 3 along z up to z = 30 and the ring of radii 20 and 3
+    /// about the y axis through (20, 0, 30), a leg and the bend on its top,
+    /// touch along the circle z = 30 of the rod, and cross below it in a
+    /// curve that runs from (0, 3, 30) round through (3, 0, 14.5) to
+    /// (0, -3, 30): there the touch is of higher order, and the march stops
+    /// short of it. The curve ends where Gauss-Newton steps find both
+    /// surfaces passing with their normals parallel to rounding, within
+    /// 1e-5 of the touch, which rounding leaves no closer to fix, in every
+    /// pose and either way round.
+    #[test]
+    fn a_marched_branch_that_runs_into_a_touch_ends_on_it() {
+        let lin = Tolerance::new().linear;
+        for (k, pose) in three_poses().iter().enumerate() {
+            let o = Point3::new(0.0, 0.0, 0.0);
+            let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+            let leg =
+                CylindricalSurface::new(pose.mul_point(o), along(Vec3::new(0.0, 0.0, 1.0)), 3.0)
+                    .unwrap();
+            let bend = ToroidalSurface::with_axis(
+                pose.mul_point(Point3::new(20.0, 0.0, 30.0)),
+                20.0,
+                3.0,
+                along(Vec3::new(0.0, 1.0, 0.0)),
+            )
+            .unwrap();
+            let touches = [
+                pose.mul_point(Point3::new(0.0, 3.0, 30.0)),
+                pose.mul_point(Point3::new(0.0, -3.0, 30.0)),
+            ];
+            let mut truth = Vec::new();
+            for j in 1..=120 {
+                let x = 3.0 * f64::from(j) / 120.0;
+                let z = 30.0 - (80.0 * x).sqrt();
+                let y = x.madd(-x, 9.0).max(0.0).sqrt();
+                for sy in [1.0, -1.0] {
+                    truth.push(pose.mul_point(Point3::new(x, sy * y, z)));
+                }
+            }
+            let back = pose.inverse().unwrap();
+            let off_leg = |p: Point3| {
+                let (w, ax) = (p - leg.origin(), leg.axis());
+                ((w - ax * ax.dot(w)).length() - 3.0).abs()
+            };
+            let off_bend = |p: Point3| {
+                let q = back.mul_point(p);
+                (((q.x() - 20.0).hypot(q.z() - 30.0) - 20.0).hypot(q.y()) - 3.0).abs()
+            };
+            for leg_first in [true, false] {
+                let label = format!("pose {k} leg first {leg_first}");
+                let (a, b, va, vb) = if leg_first {
+                    (
+                        AnalyticSurface::Cylinder(&leg),
+                        AnalyticSurface::Torus(&bend),
+                        Some((0.0, 30.0)),
+                        None,
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Torus(&bend),
+                        AnalyticSurface::Cylinder(&leg),
+                        None,
+                        Some((0.0, 30.0)),
+                    )
+                };
+                let result = marched_sections(a, b, 32, va, vb, None);
+                assert!(result.is_ok(), "{label}: {:?}", result.as_ref().err());
+                let curves = result.unwrap();
+                assert_eq!(curves.len(), 1, "{label}: curves");
+                let c = &curves[0];
+                let worst = farthest_along(&c.curve, 4000, |p| off_leg(p).max(off_bend(p)));
+                assert!(worst <= lin, "{label}: off by {worst:.2e}");
+                let (t0, t1) = c.curve.domain();
+                for end in [c.curve.evaluate(t0), c.curve.evaluate(t1)] {
+                    let miss = touches
+                        .iter()
+                        .map(|&t| (end - t).length())
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(
+                        miss <= 1e-5,
+                        "{label}: an end lies {miss:.1e} from the touch"
+                    );
+                }
+                for &t in &truth {
+                    let near = crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                        .unwrap()
+                        .distance;
+                    assert!(near < 1e-5, "{label}: {t:?} lies {near:.1e} off");
+                }
+            }
+        }
+    }
+
+    /// A cone opening a quarter turn about z, its apex at the origin, and a
+    /// ball of radius 0.1 about the apex meet in two circles, one on each
+    /// nappe. With the cone's patch from v = -0.5 to 31.5 in a grid of 32,
+    /// the only cells near the ball have their middles on the apex, the
+    /// ball's centre, where the ball's distance has no gradient: they were
+    /// dropped as holding no section, no cell of the cone was kept, and the
+    /// pair traced nothing. A cell whose distance cannot be read may hold the
+    /// section and is kept, so the ball's cells near it are read too.
+    #[test]
+    fn cells_centred_on_a_balls_centre_are_kept() {
+        use std::f64::consts::FRAC_PI_4;
+        let lin = Tolerance::new().linear;
+        let (radius, h) = (0.1_f64, 0.1 * FRAC_PI_4.sin());
+        let rho = 0.1 * FRAC_PI_4.cos();
+        for (k, pose) in three_poses().iter().enumerate() {
+            let o = Point3::new(0.0, 0.0, 0.0);
+            let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+            let cone = ConicalSurface::new(
+                pose.mul_point(o),
+                along(Vec3::new(0.0, 0.0, 1.0)),
+                FRAC_PI_4,
+            )
+            .unwrap();
+            let ball = SphericalSurface::new(pose.mul_point(o), radius).unwrap();
+            let mut truth = Vec::new();
+            for j in 0..72 {
+                let t = TAU * f64::from(j) / 72.0;
+                for z in [h, -h] {
+                    truth.push(pose.mul_point(Point3::new(rho * t.cos(), rho * t.sin(), z)));
+                }
+            }
+            let off_ball = |p: Point3| ((p - pose.mul_point(o)).length() - radius).abs();
+            for cone_first in [true, false] {
+                let label = format!("pose {k} cone first {cone_first}");
+                let (a, b, va, vb) = if cone_first {
+                    (
+                        AnalyticSurface::Cone(&cone),
+                        AnalyticSurface::Sphere(&ball),
+                        Some((-0.5, 31.5)),
+                        None,
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Sphere(&ball),
+                        AnalyticSurface::Cone(&cone),
+                        None,
+                        Some((-0.5, 31.5)),
+                    )
+                };
+                let result = marched_sections(a, b, 32, va, vb, None);
+                assert!(result.is_ok(), "{label}: {:?}", result.as_ref().err());
+                let curves = result.unwrap();
+                assert_eq!(curves.len(), 2, "{label}: circles");
+                for c in &curves {
+                    let worst = farthest_along(&c.curve, 4000, |p| {
+                        off_double_cone(&cone, p).max(off_ball(p))
+                    });
+                    assert!(worst <= lin, "{label}: off by {worst:.2e}");
+                    let (first, last) = (c.points[0].point, c.points[c.points.len() - 1].point);
+                    assert!((first - last).length() < 1e-9, "{label}: open");
+                }
+                for &t in &truth {
+                    let near = curves
+                        .iter()
+                        .map(|c| {
+                            crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                                .unwrap()
+                                .distance
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(near < 1e-5, "{label}: {t:?} lies {near:.1e} off");
+                }
+            }
+        }
+    }
+
+    /// A cone lying 1e-14 off its radial plane, its apex at the origin, and a
+    /// rod of radius 1 along z through (3, 0, 0) cross square to each other
+    /// in a circle. Every point of the cone lies within 64 float steps of its
+    /// apex's plane, where its curvature was not read: each seed on the
+    /// crossing found no station and was dropped, and the pair traced
+    /// nothing with no error. A seed on a crossing whose curvature cannot be
+    /// read now refuses the section. The pair refuses or traces the circle,
+    /// in three poses and either way round, and never returns empty.
+    #[test]
+    fn a_crossing_on_a_nearly_flat_cone_is_traced_or_refused() {
+        let lin = Tolerance::new().linear;
+        for (k, pose) in three_poses().iter().enumerate() {
+            let o = Point3::new(0.0, 0.0, 0.0);
+            let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+            let cone =
+                ConicalSurface::new(pose.mul_point(o), along(Vec3::new(0.0, 0.0, 1.0)), 1e-14)
+                    .unwrap();
+            let rod = CylindricalSurface::new(
+                pose.mul_point(Point3::new(3.0, 0.0, 0.0)),
+                along(Vec3::new(0.0, 0.0, 1.0)),
+                1.0,
+            )
+            .unwrap();
+            let truth: Vec<Point3> = (0..72)
+                .map(|j| {
+                    let t = TAU * f64::from(j) / 72.0;
+                    let (x, y) = (3.0 + t.cos(), t.sin());
+                    pose.mul_point(Point3::new(x, y, 1e-14_f64.tan() * x.hypot(y)))
+                })
+                .collect();
+            let off_rod = |p: Point3| {
+                let (w, ax) = (p - rod.origin(), rod.axis());
+                ((w - ax * ax.dot(w)).length() - 1.0).abs()
+            };
+            for cone_first in [true, false] {
+                let label = format!("pose {k} cone first {cone_first}");
+                let (a, b, va, vb) = if cone_first {
+                    (
+                        AnalyticSurface::Cone(&cone),
+                        AnalyticSurface::Cylinder(&rod),
+                        Some((1.0, 5.0)),
+                        Some((-1.0, 1.0)),
+                    )
+                } else {
+                    (
+                        AnalyticSurface::Cylinder(&rod),
+                        AnalyticSurface::Cone(&cone),
+                        Some((-1.0, 1.0)),
+                        Some((1.0, 5.0)),
+                    )
+                };
+                let Ok(curves) = marched_sections(a, b, 32, va, vb, None) else {
+                    continue;
+                };
+                assert!(!curves.is_empty(), "{label}: no section and no refusal");
+                for c in &curves {
+                    let worst = farthest_along(&c.curve, 4000, |p| {
+                        off_double_cone(&cone, p).max(off_rod(p))
+                    });
+                    assert!(worst <= lin, "{label}: off by {worst:.2e}");
+                }
+                for &t in &truth {
+                    let near = curves
+                        .iter()
+                        .map(|c| {
+                            crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                                .unwrap()
+                                .distance
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(near < 1e-5, "{label}: {t:?} lies {near:.1e} off");
+                }
+            }
+        }
+    }
+
+    /// A rod of radius 0.6 runs along x over the top of the ring of radii 4
+    /// and 1.5, its axis 0.007 inside the tube's top circle, its underside
+    /// 8e-6 below the tube's top. Along the rod the tube's top rises to two
+    /// crests 0.47 apart, where the rod dips into it in two loops about 0.17
+    /// long and 0.005 wide. Each loop is smaller than a cell of either patch,
+    /// and both lie in about one cell of the rod's. A cell's seed settles on
+    /// one loop: one loop was lost with no error. The cells are now cut until
+    /// each part of the section is proved to run through cells that a marched
+    /// point or a seed reaches. Both loops are traced, in three poses and
+    /// either way round, within the linear tolerance of both surfaces. Where
+    /// the two cross at an angle whose sine is `s`, a fit within the
+    /// tolerance of both can lie twice the tolerance over `s` off the
+    /// section, up to 3e-3 at the loops' ends, where `s` is 7e-5: every point
+    /// of the section lies within twice that, or 1e-5, of a curve.
+    #[test]
+    fn two_loops_in_one_cell_of_each_patch_are_both_traced() {
+        let lin = Tolerance::new().linear;
+        let turn = crate::mat::Mat4::rotation_z(0.75 * TAU / 32.0);
+        let (delta, depth) = (0.007_f64, 8e-6_f64);
+        let (y0, z0) = (4.0 - delta, 2.1 - depth);
+        for (k, pose) in three_poses().iter().enumerate() {
+            let pose = *pose * turn;
+            let o = Point3::new(0.0, 0.0, 0.0);
+            let along = |v: Vec3| pose.mul_point(o + v) - pose.mul_point(o);
+            let centre = pose.mul_point(o);
+            let up = along(Vec3::new(0.0, 0.0, 1.0));
+            let ring = ToroidalSurface::with_axis(centre, 4.0, 1.5, up).unwrap();
+            let start = pose.mul_point(Point3::new(0.0, y0, z0));
+            let dir = along(Vec3::new(1.0, 0.0, 0.0));
+            let rod = CylindricalSurface::new(start, dir, 0.6).unwrap();
+            let ring_normal = |p: Point3| {
+                let w = p - centre;
+                let across = w - up * up.dot(w);
+                let tube = centre + across * (4.0 / across.length());
+                (p - tube) * (1.0 / (p - tube).length())
+            };
+            let rod_normal = |p: Point3| {
+                let w = p - start;
+                let across = w - dir * dir.dot(w);
+                across * (1.0 / across.length())
+            };
+            let off_ring = |p: Point3| {
+                let w = p - centre;
+                let h = up.dot(w);
+                ((w - up * h).length() - 4.0).hypot(h) - 1.5
+            };
+            let off_rod = |p: Point3| {
+                let w = p - start;
+                ((w - dir * dir.dot(w)).length() - 0.6).abs()
+            };
+            // Each ruling of the rod meets the ring where a quartic along it
+            // vanishes.
+            let mut truth = Vec::new();
+            for j in -300..=300 {
+                let phi = f64::from(j) * 1e-4;
+                let from =
+                    pose.mul_point(Point3::new(0.0, y0 + 0.6 * phi.sin(), z0 - 0.6 * phi.cos()));
+                for t in intersect_line_torus(&ring, from, dir) {
+                    if t.abs() < 2.0 {
+                        truth.push(from + dir * t);
+                    }
+                }
+            }
+            assert!(truth.len() > 100, "pose {k}: {} points", truth.len());
+            for rod_first in [true, false] {
+                let label = format!("pose {k} rod first {rod_first}");
+                let along_rod = Some((-9.6875, 10.3125));
+                let result = if rod_first {
+                    marched_sections(
+                        AnalyticSurface::Cylinder(&rod),
+                        AnalyticSurface::Torus(&ring),
+                        32,
+                        along_rod,
+                        None,
+                        None,
+                    )
+                } else {
+                    marched_sections(
+                        AnalyticSurface::Torus(&ring),
+                        AnalyticSurface::Cylinder(&rod),
+                        32,
+                        None,
+                        along_rod,
+                        None,
+                    )
+                };
+                assert!(result.is_ok(), "{label}: {:?}", result.as_ref().err());
+                let curves = result.unwrap();
+                assert_eq!(curves.len(), 2, "{label}: loops");
+                for c in &curves {
+                    let worst =
+                        farthest_along(&c.curve, 4000, |p| off_ring(p).abs().max(off_rod(p)));
+                    assert!(worst <= lin, "{label}: off by {worst:.2e}");
+                }
+                for &t in &truth {
+                    let sin = ring_normal(t).cross(rod_normal(t)).length();
+                    let bound = (4.0 * lin / sin).max(1e-5);
+                    let near = curves
+                        .iter()
+                        .map(|c| {
+                            crate::nurbs::projection::project_point_to_curve(&c.curve, t, 1e-12)
+                                .unwrap()
+                                .distance
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(
+                        near <= bound,
+                        "{label}: {t:?} lies {near:.1e} off, past {bound:.1e}"
+                    );
+                }
+            }
+        }
     }
 }

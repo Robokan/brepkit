@@ -5,7 +5,7 @@ use brepkit_math::madd::Madd;
 use brepkit_math::vec::{Point3, Vec3};
 use brepkit_topology::Topology;
 
-use super::edge_sampling::{sample_edge, sample_wire_positions, segments_for_chord_deviation_a};
+use super::edge_sampling::{sample_edge, sample_wire_positions};
 use super::{AnalyticKind, MERGE_GRID, PointPool, TriangleMesh, TriangleMeshUV, point_merge_key};
 
 /// Tessellate a cylindrical face using its actual boundary polygon (CDT-based).
@@ -319,14 +319,13 @@ pub(super) fn tessellate_planar(
                     let ep = topo.vertex(edge.end())?.point();
                     edge.curve().domain_with_endpoints(sp, ep)
                 };
-                let arc_range = (t_end - t_start).abs();
-                let n_samples = segments_for_chord_deviation_a(
+                let n_samples = super::edge_sampling::circle_segments(
                     circle.radius(),
-                    arc_range,
+                    (t_end - t_start).abs(),
                     deflection,
                     angular_tol,
                     false,
-                );
+                )?;
                 #[allow(clippy::cast_precision_loss)]
                 sample_curve(
                     &|t| circle.evaluate(t),
@@ -349,19 +348,14 @@ pub(super) fn tessellate_planar(
                     }
                     (ts, te)
                 };
-                let arc_range = t_end - t_start;
-                // Largest radius of curvature (a^2/b) governs uniform-parameter
-                // sampling density; matches the wall edge sampling so the cap
-                // boundary stays watertight against the side faces.
-                let max_curv_radius =
-                    ellipse.semi_major() * ellipse.semi_major() / ellipse.semi_minor();
-                let n_samples = segments_for_chord_deviation_a(
-                    max_curv_radius,
-                    arc_range,
+                // The wall edges' count, so the cap boundary stays watertight
+                // against the side faces.
+                let n_samples = super::edge_sampling::ellipse_segments(
+                    ellipse,
+                    t_end - t_start,
                     deflection,
                     angular_tol,
-                    true,
-                );
+                )?;
                 #[allow(clippy::cast_precision_loss)]
                 sample_curve(
                     &|t| ellipse.evaluate(t),
@@ -382,8 +376,13 @@ pub(super) fn tessellate_planar(
                 let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
                 let (u0, u1) = nurbs.domain();
                 let is_subspan = (t0 - u0).abs() > 1e-12 || (t1 - u1).abs() > 1e-12;
-                let breaks =
-                    super::edge_sampling::nurbs_edge_breaks(nurbs, t0, t1, deflection, angular_tol);
+                let breaks = super::edge_sampling::nurbs_edge_breaks(
+                    nurbs,
+                    t0,
+                    t1,
+                    deflection,
+                    angular_tol,
+                )?;
                 let n_samples = breaks.len() - 1;
                 // A sub-span is already endpoint-ordered (start→end); only a
                 // full-domain curve may run end→start.
@@ -486,6 +485,18 @@ pub(super) fn tessellate_planar(
     } else {
         tessellate_planar_with_holes(topo, face_data, &positions, normal, deflection, angular_tol)
     }
+}
+
+/// Twice the area of a plane face's triangles along its `normal`, each
+/// signed by its winding about the normal. A mesher lays all its triangles
+/// one way round, and this sum tells which way. The sign of one sliver
+/// among them (a vertex a fraction of a micron from the next sample) can
+/// be rounding.
+pub(super) fn winding_area(normal: Vec3, triangles: impl IntoIterator<Item = [Point3; 3]>) -> f64 {
+    triangles
+        .into_iter()
+        .map(|[a, b, c]| (b - a).cross(c - a).dot(normal))
+        .sum()
 }
 
 /// Project a 3D point to 2D by dropping the dominant normal axis.
@@ -1359,16 +1370,12 @@ pub(super) fn tessellate_planar_shared_with_holes(
         }
     }
 
-    let needs_flip = if let Some(&(v0, v1, v2)) = cdt_triangles.first() {
-        let g0 = cdt_to_global[&v0] as usize;
-        let g1 = cdt_to_global[&v1] as usize;
-        let g2 = cdt_to_global[&v2] as usize;
-        let a = merged.positions[g1] - merged.positions[g0];
-        let b = merged.positions[g2] - merged.positions[g0];
-        a.cross(b).dot(normal) < 0.0
-    } else {
-        false
-    };
+    let needs_flip = winding_area(
+        normal,
+        cdt_triangles.iter().map(|&(v0, v1, v2)| {
+            [v0, v1, v2].map(|v| merged.positions[cdt_to_global[&v] as usize])
+        }),
+    ) < 0.0;
 
     for &(v0, v1, v2) in &cdt_triangles {
         let g0 = cdt_to_global[&v0];

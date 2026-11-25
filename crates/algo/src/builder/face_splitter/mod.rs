@@ -7,6 +7,7 @@
 mod containment;
 mod conversion;
 mod edge_splitting;
+mod pole_round;
 mod sampling;
 mod special_cases;
 mod tube_band;
@@ -1161,9 +1162,16 @@ fn attach_whole_holes(sub_faces: &mut [SplitSubFace], holes: &[Vec<OrientedPCurv
     if sub_faces.is_empty() || holes.is_empty() {
         return;
     }
+    // On a periodic surface each loop is read unwrapped: a loop across the
+    // parameter's cut read with a jump of a turn spans the whole period and
+    // takes in every hole.
+    let periods = |sf: &SplitSubFace| super::pcurve_compute::surface_periods(&sf.surface);
     let sub_outer_uv: Vec<Vec<Point2>> = sub_faces
         .iter()
-        .map(|sf| sample_wire_loop_uv(&sf.outer_wire))
+        .map(|sf| {
+            let (u, v) = periods(sf);
+            sample_wire_loop_uv_periodic(&sf.outer_wire, u, v)
+        })
         .collect();
     let sub_interior: Vec<Point2> = sub_outer_uv
         .iter()
@@ -1182,7 +1190,8 @@ fn attach_whole_holes(sub_faces: &mut [SplitSubFace], holes: &[Vec<OrientedPCurv
             .map(|(i, _)| i)
     };
     for hole in holes {
-        let hole_pts = sample_wire_loop_uv(hole);
+        let (u, v) = periods(&sub_faces[0]);
+        let hole_pts = sample_wire_loop_uv_periodic(hole, u, v);
         if hole_pts.len() >= 3 {
             let probe = super::classify_2d::sample_interior_point(&hole_pts);
             let containing: Vec<usize> = (0..sub_faces.len())
@@ -1297,8 +1306,25 @@ fn edge_minus_v_du(
             }
         }
     };
+    // An ellipse on a cylinder or a cone takes its `u` from the edge's start
+    // over the run of its parameter: between two points a hair apart in it,
+    // `u` can run most of a turn (a steep cut's near vertex).
     let at = |f: f64, u_near: f64| -> Option<(f64, f64)> {
         let (u, v) = surface.project_point(point(f))?;
+        if let EdgeCurve::Ellipse(el) = &e.curve_3d {
+            let run = if closed {
+                turn * f
+            } else if flip {
+                -(t1 - t0) * f
+            } else {
+                (t1 - t0) * f
+            };
+            if let Some(lifted) =
+                super::pcurve_compute::ellipse_u_after(el, surface, (e.start_uv.x(), u), run)
+            {
+                return Some((lifted, v - v0));
+            }
+        }
         Some((u_near + wrap(u - u_near), v - v0))
     };
     let trapezoid = |a: (f64, f64), b: (f64, f64)| -0.5 * (a.1 + b.1) * (b.0 - a.0);
@@ -1350,16 +1376,22 @@ fn is_periodic_face_outside(lp: &[OrientedPCurveEdge], surface: &FaceSurface) ->
     if lp.is_empty() || lp.iter().any(|e| e.source_edge_idx.is_some()) {
         return false;
     }
-    let mut pts = sampling::sample_wire_loop_uv_on_surface(lp, surface);
-    for i in 1..pts.len() {
-        let (prev, u) = (pts[i - 1].x(), pts[i].x());
-        pts[i] = Point2::new(u - ((u - prev) / TAU).round() * TAU, pts[i].y());
+    // Each edge keeps its own run in u, and moves by whole turns to meet the
+    // edge before at the vertex they share.
+    let mut pts: Vec<Point2> = Vec::new();
+    let mut end: Option<f64> = None;
+    for (samples, edge_end) in sampling::sample_wire_edges_uv_on_surface(lp, surface) {
+        let Some(start) = samples.first() else {
+            continue;
+        };
+        let shift = end.map_or(0.0, |at| ((at - start.x()) / TAU).round() * TAU);
+        pts.extend(samples.iter().map(|p| Point2::new(p.x() + shift, p.y())));
+        end = Some(edge_end + shift);
     }
-    let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied()) else {
+    let (Some(first), Some(end)) = (pts.first().copied(), end) else {
         return false;
     };
-    let closing = first.x() - ((first.x() - last.x()) / TAU).round() * TAU;
-    (closing - first.x()).abs() < PI && signed_area_2d(&pts) < 0.0
+    (end - first.x()).abs() < PI && signed_area_2d(&pts) < 0.0
 }
 
 /// Whether every piece of `lp` is one of the face's own boundary pieces run
@@ -1837,12 +1869,10 @@ fn boundary_seam_u(
     None
 }
 
-/// Split every section piece that crosses the seam meridian at the crossing
-/// point (bisected on the piece's own curve). Pieces are assumed u-monotone
-/// between their endpoints (chain pieces subtend well under a half-turn);
-/// pieces already ending on the seam, or not straddling it, pass through
-/// unchanged. Split halves clear their UV hints and pave block id, matching
-/// `presplit_sections_at_registry`.
+/// Split every section piece at each point where it crosses the seam
+/// meridian ([`seam_crossings`]). Pieces already ending on the seam, or not
+/// crossing it, pass through unchanged. Split pieces clear their UV hints
+/// and pave block id, matching `presplit_sections_at_registry`.
 fn split_sections_at_seam_meridian(
     sections: &[SectionEdge],
     surface: &FaceSurface,
@@ -1850,49 +1880,21 @@ fn split_sections_at_seam_meridian(
     wire_pts: &[Point3],
     tol: f64,
 ) -> Vec<SectionEdge> {
-    use std::f64::consts::{PI, TAU};
-    let wrap = |d: f64| -> f64 { (d + PI).rem_euclid(TAU) - PI };
-    let delta_u =
-        |p: Point3| -> Option<f64> { surface.project_point(p).map(|(u, _)| wrap(u - seam_u)) };
     let mut out = Vec::with_capacity(sections.len() + 2);
     for s in sections {
-        let (Some(d0), Some(d1)) = (delta_u(s.start), delta_u(s.end)) else {
-            out.push(s.clone());
-            continue;
-        };
-        let straddles = d0 * d1 < 0.0 && (d0 - d1).abs() < PI && d0.abs() > 1e-9 && d1.abs() > 1e-9;
-        if !straddles {
+        let crossings = seam_crossings(s, surface, seam_u, tol);
+        if crossings.is_empty() {
             out.push(s.clone());
             continue;
         }
-        let (t0, t1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
-        let (mut lo, mut hi, f_lo) = (t0, t1, d0);
-        for _ in 0..60 {
-            let tm = 0.5 * (lo + hi);
-            let Some(fm) = delta_u(s.curve_3d.evaluate_with_endpoints(tm, s.start, s.end)) else {
-                break;
-            };
-            if (fm > 0.0) == (f_lo > 0.0) {
-                lo = tm;
-            } else {
-                hi = tm;
-            }
-        }
-        let p = s
-            .curve_3d
-            .evaluate_with_endpoints(0.5 * (lo + hi), s.start, s.end);
-        // The sign of the wrapped offset also flips half a turn from the
-        // seam, where a span read the long way round crosses instead.
-        let on_seam = delta_u(p).is_some_and(|d| d.abs() < 1e-6);
-        if !on_seam || (p - s.start).length() <= tol * 10.0 || (p - s.end).length() <= tol * 10.0 {
-            out.push(s.clone());
-            continue;
-        }
-        let mut first = s.clone();
-        first.end = p;
-        let mut second = s.clone();
-        second.start = p;
-        for piece in [&mut first, &mut second] {
+        let ends: Vec<Point3> = std::iter::once(s.start)
+            .chain(crossings)
+            .chain(std::iter::once(s.end))
+            .collect();
+        for w in ends.windows(2) {
+            let mut piece = s.clone();
+            piece.start = w[0];
+            piece.end = w[1];
             piece.start_uv_a = None;
             piece.end_uv_a = None;
             piece.start_uv_b = None;
@@ -1900,7 +1902,7 @@ fn split_sections_at_seam_meridian(
             piece.pave_block_id = None;
             // A fitted pcurve spans the whole section, and its ends would
             // stand for the piece's ends; a NURBS pcurve reads its UV ends off
-            // its own ends too: each half gets its own on this face.
+            // its own ends too: each piece gets its own on this face.
             if !matches!(piece.curve_3d, EdgeCurve::Line)
                 || matches!(piece.pcurve_a, brepkit_math::curves2d::Curve2D::Nurbs(_))
                 || matches!(piece.pcurve_b, brepkit_math::curves2d::Curve2D::Nurbs(_))
@@ -1916,11 +1918,91 @@ fn split_sections_at_seam_meridian(
                 piece.pcurve_a = pcurve.clone();
                 piece.pcurve_b = pcurve;
             }
+            out.push(piece);
         }
-        out.push(first);
-        out.push(second);
     }
     out
+}
+
+/// The points, in order from its start, where section `s` crosses the seam
+/// meridian at `seam_u`: where its `u`, lifted along it, passes a copy of
+/// the seam's. A crossing within `10 tol` of an end is that end's own. A
+/// closed section stays whole, as the band and hole splitters read it.
+///
+/// The `u` is lifted from samples along the span the section's pcurve
+/// traces ([`super::pcurve_compute::edge_point_at`]: the shorter arc between
+/// the ends of an open circle or ellipse, whichever way its own sense runs),
+/// by the one-way lift along an ellipse on a cylinder or a cone, and from
+/// sample to sample the short way round along any other curve. A piece's
+/// ends alone, read the short way round, cannot tell a piece over half a
+/// turn (a steep cone's ellipse across its near vertex) that crosses the
+/// seam from one that does not. Each crossing is bisected between the two
+/// samples it lies between, on the same span, with `u` lifted from the
+/// first of them the same way.
+fn seam_crossings(s: &SectionEdge, surface: &FaceSurface, seam_u: f64, tol: f64) -> Vec<Point3> {
+    use std::f64::consts::{PI, TAU};
+    const SAMPLES: u32 = 32;
+    let wrap = |d: f64| -> f64 { (d + PI).rem_euclid(TAU) - PI };
+    if (s.start - s.end).length() <= tol {
+        return Vec::new();
+    }
+    let at = super::pcurve_compute::edge_point_at(&s.curve_3d, s.start, s.end);
+    let param = |k: u32| f64::from(k) / f64::from(SAMPLES);
+    let pts: Vec<Point3> = (0..=SAMPLES).map(|k| at(param(k))).collect();
+    let Some(uvs) = super::pcurve_compute::edge_uv_samples(&s.curve_3d, surface, &pts) else {
+        return Vec::new();
+    };
+    // Offsets from the seam, the start's in (-pi, pi], so the seam's copies
+    // lie at whole turns.
+    let shift = wrap(uvs[0].x() - seam_u) - uvs[0].x();
+    let offsets: Vec<f64> = uvs.iter().map(|p| p.x() + shift).collect();
+    // The offset at fraction `t` of the span, lifted from the offset `from`
+    // at fraction `t_from`, at most a thirty-second of the span before it.
+    let lifted = |t: f64, (t_from, from): (f64, f64)| -> Option<f64> {
+        let p = at(t);
+        let (u, _) = surface.project_point(p)?;
+        let ellipse = match &s.curve_3d {
+            EdgeCurve::Ellipse(e) => {
+                let run =
+                    super::pcurve_compute::shorter_arc_delta(e.project(p) - e.project(at(t_from)));
+                super::pcurve_compute::ellipse_u_after(e, surface, (from - shift, u), run)
+            }
+            EdgeCurve::Line | EdgeCurve::Circle(_) | EdgeCurve::NurbsCurve(_) => None,
+        };
+        Some(ellipse.map_or_else(|| from + wrap(u + shift - from), |u| u + shift))
+    };
+    let mut found: Vec<Point3> = Vec::new();
+    for k in 0..SAMPLES {
+        let (a, b) = (offsets[k as usize], offsets[k as usize + 1]);
+        let (lo, hi) = (a.min(b), a.max(b));
+        // Each copy of the seam in (lo, hi], so one met at a sample counts
+        // in one bracket.
+        for copy in (lo / TAU).floor() as i64 + 1..=(hi / TAU).floor() as i64 {
+            let target = TAU * copy as f64;
+            let (mut t_lo, mut t_hi) = (param(k), param(k + 1));
+            let below = a < target;
+            for _ in 0..60 {
+                let mid = 0.5 * (t_lo + t_hi);
+                let Some(off) = lifted(mid, (param(k), a)) else {
+                    break;
+                };
+                if (off < target) == below {
+                    t_lo = mid;
+                } else {
+                    t_hi = mid;
+                }
+            }
+            let p = at(0.5 * (t_lo + t_hi));
+            let on_seam = surface
+                .project_point(p)
+                .is_some_and(|(u, _)| wrap(u - seam_u).abs() < 1e-6);
+            let clear = |q: Point3| (p - q).length() > tol * 10.0;
+            if on_seam && clear(s.start) && clear(s.end) && found.last().is_none_or(|&q| clear(q)) {
+                found.push(p);
+            }
+        }
+    }
+    found
 }
 
 /// Split a u-periodic cylinder/cone lateral into stacked bands along
@@ -2103,7 +2185,8 @@ fn bands_from_winding_chains(
                 let (u_raw0, v0) = surface.project_point(from)?;
                 let (u_raw1, v1) = surface.project_point(to)?;
                 let u0 = u_prev + wrap_pi(u_raw0 - u_prev);
-                let u1 = u0 + wrap_pi(u_raw1 - u_raw0);
+                let u1 = ellipse_section_u_run(s, fwd, surface)
+                    .map_or_else(|| u0 + wrap_pi(u_raw1 - u_raw0), |run| u0 + run);
                 u_prev = u1;
                 let pcurve = match rank {
                     Rank::A => s.pcurve_a.clone(),
@@ -2219,32 +2302,40 @@ fn bands_from_winding_chains(
         let du = surface.evaluate(seam_u + 1e-4, mid)? - surface.evaluate(seam_u - 1e-4, mid)?;
         ref_tan.dot(du) > 0.0
     };
+    // Samples along a section on a cylinder or a cone come lifted
+    // ([`section_uv_run`]); on a periodic spline wall they come raw.
+    let lifted = super::pcurve_compute::surface_periods(surface).0.is_some();
     // Each loop's band, `(u, v)` samples (`u` past the seam, kept on one side
     // of it), disc and hole wires.
     let mut holes: Vec<HoleLoop> = Vec::with_capacity(hole_loops.len());
     for entries in hole_loops {
         let mut uv: Vec<Point2> = Vec::new();
         let mut band: Option<usize> = None;
+        // Each entry's samples lifted along it, and carried on from the
+        // entry before at the vertex they share.
+        let mut end: Option<f64> = None;
         for &(idx, fwd) in entries {
-            let s = &sections[idx];
-            let (d0, d1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
-            for k in 0..HOLE_SAMPLES {
-                let f = f64::from(k) / f64::from(HOLE_SAMPLES);
-                let t = if fwd { f } else { 1.0 - f };
-                let p = s
-                    .curve_3d
-                    .evaluate_with_endpoints((d1 - d0).madd(t, d0), s.start, s.end);
-                let (u, v) = surface.project_point(p)?;
-                let raw = wrap_pi(u - seam_u);
-                let in_band = band_of(raw, v)?;
+            let run = section_uv_run(&sections[idx], fwd, surface, HOLE_SAMPLES)?;
+            let first = run.first()?.x();
+            let mut d = end.map_or_else(
+                || wrap_pi(first - seam_u),
+                |e| e + wrap_pi(first - seam_u - e),
+            );
+            for (k, p) in run.iter().enumerate() {
+                if k > 0 {
+                    let step = p.x() - run[k - 1].x();
+                    d += if lifted { step } else { wrap_pi(step) };
+                }
+                if k + 1 == run.len() {
+                    end = Some(d);
+                    break;
+                }
+                let in_band = band_of(wrap_pi(p.x() - seam_u), p.y())?;
                 if band.is_some_and(|b| b != in_band) {
                     return None;
                 }
                 band = Some(in_band);
-                let d = uv
-                    .last()
-                    .map_or(raw, |prev: &Point2| prev.x() + wrap_pi(raw - prev.x()));
-                uv.push(Point2::new(d, v));
+                uv.push(Point2::new(d, p.y()));
             }
         }
         let band = band?;
@@ -2292,7 +2383,8 @@ fn bands_from_winding_chains(
                     },
                     |prev| prev + wrap_pi(u_raw0 - prev),
                 );
-                let u1 = u0 + wrap_pi(u_raw1 - u_raw0);
+                let u1 = ellipse_section_u_run(s, fwd, surface)
+                    .map_or_else(|| u0 + wrap_pi(u_raw1 - u_raw0), |run| u0 + run);
                 u_prev = Some(u1);
                 out.push(OrientedPCurveEdge {
                     curve_3d: s.curve_3d.clone(),
@@ -2849,6 +2941,47 @@ fn point_inside_region_uv(outer: &[Point2], holes: &[&[Point2]]) -> Option<Point
         .map(|span| Point2::new(f64::midpoint(span[0], span[1]), v))
 }
 
+/// The `(u, v)` of `samples + 1` points of section `s` at even steps of its
+/// domain, read from its start when `forward` and from its end when not,
+/// with `u` lifted along the section ([`super::pcurve_compute::edge_uv_samples`])
+/// from the first point's own `u`.
+fn section_uv_run(
+    s: &SectionEdge,
+    forward: bool,
+    surface: &FaceSurface,
+    samples: u32,
+) -> Option<Vec<Point2>> {
+    let (d0, d1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+    let pts: Vec<Point3> = (0..=samples)
+        .map(|k| {
+            let f = f64::from(k) / f64::from(samples);
+            let f = if forward { f } else { 1.0 - f };
+            s.curve_3d
+                .evaluate_with_endpoints((d1 - d0).madd(f, d0), s.start, s.end)
+        })
+        .collect();
+    super::pcurve_compute::edge_uv_samples(&s.curve_3d, surface, &pts)
+}
+
+/// The run in `u` of section `s` from its start to its end when `forward`,
+/// and back when not, where it is an ellipse on a cylinder or a cone: by
+/// [`super::pcurve_compute::ellipse_u_after`] over the run of its parameter, with no
+/// samples to step over a turn. `None` for another curve or surface.
+fn ellipse_section_u_run(s: &SectionEdge, forward: bool, surface: &FaceSurface) -> Option<f64> {
+    let EdgeCurve::Ellipse(ellipse) = &s.curve_3d else {
+        return None;
+    };
+    let (d0, d1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+    let (from, to, run) = if forward {
+        (s.start, s.end, d1 - d0)
+    } else {
+        (s.end, s.start, d0 - d1)
+    };
+    let (u0, _) = surface.project_point(from)?;
+    let (u1, _) = surface.project_point(to)?;
+    Some(super::pcurve_compute::ellipse_u_after(ellipse, surface, (u0, u1), run)? - u0)
+}
+
 /// Split a u-periodic cylinder/cone lateral (two closed rims, or a pointed
 /// cone's one rim and its apex, plus the seam) along closed section loops of
 /// winding zero when some of them straddle the seam meridian (a bore through a
@@ -2977,22 +3110,30 @@ fn split_periodic_face_around_seam_holes(
             (s.end, s.start)
         }
     };
-    // (delta u from the seam, v) samples along an entry in traversal order.
+    // (offset from the seam, v) samples along an entry in traversal order,
+    // the offset lifted along the entry ([`section_uv_run`]) from the first
+    // sample's, read within half a turn of the seam.
     let entry_samples = |entry: &(usize, bool)| -> Option<Vec<(f64, f64)>> {
-        let s = &sections[entry.0];
-        let (d0, d1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
-        (0..=SAMPLES)
-            .map(|k| {
-                let f = f64::from(k) / f64::from(SAMPLES);
-                let f = if entry.1 { f } else { 1.0 - f };
-                let p = s
-                    .curve_3d
-                    .evaluate_with_endpoints(d0 + (d1 - d0) * f, s.start, s.end);
-                surface
-                    .project_point(p)
-                    .map(|(u, v)| (wrap_pi(u - seam_u), v))
-            })
-            .collect()
+        let uv = section_uv_run(&sections[entry.0], entry.1, surface, SAMPLES)?;
+        let first = uv.first()?.x() - seam_u;
+        let shift = wrap_pi(first) - first;
+        Some(uv.iter().map(|p| (p.x() - seam_u + shift, p.y())).collect())
+    };
+    // Each entry's samples carried on from the entry before at the vertex
+    // they share.
+    let carried = |entries: &[(usize, bool)]| -> Option<Vec<Vec<(f64, f64)>>> {
+        let mut out: Vec<Vec<(f64, f64)>> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut run = entry_samples(entry)?;
+            if let Some(&(prev, _)) = out.last().and_then(|r| r.last()) {
+                let shift = ((prev - run.first()?.0) / TAU).round() * TAU;
+                for p in &mut run {
+                    p.0 += shift;
+                }
+            }
+            out.push(run);
+        }
+        Some(out)
     };
 
     let qscale = 1.0 / tol.max(1e-12);
@@ -3031,27 +3172,23 @@ fn split_periodic_face_around_seam_holes(
         // Unwrapped UV walk: winding, area, centroid; crossings only at
         // vertices; strictly between the rims.
         let mut uv: Vec<(f64, f64)> = Vec::new();
-        let mut u_prev: Option<f64> = None;
-        for entry in &entries {
-            let samples = entry_samples(entry)?;
+        for samples in carried(&entries)? {
             for (k, &(d, v)) in samples.iter().enumerate() {
                 if v < v_bot + close_tol || v > v_top - close_tol {
                     return None;
                 }
-                if k > 0 && k + 1 < samples.len() && d.abs() < 1e-9 {
+                if k > 0 && k + 1 < samples.len() && wrap_pi(d).abs() < 1e-9 {
                     return None;
                 }
-                if k > 0 {
-                    let (pd, _) = samples[k - 1];
-                    let interior = k > 1 && k + 1 < samples.len();
-                    if interior && pd * d < 0.0 && (pd - d).abs() < PI {
-                        return None;
-                    }
+                // Two inner samples on either side of a copy of the seam.
+                if k > 1
+                    && k + 1 < samples.len()
+                    && ((samples[k - 1].0 / TAU).floor() - (d / TAU).floor()).abs() > 0.5
+                {
+                    return None;
                 }
-                let u = u_prev.map_or(d, |up| up + wrap_pi(d - up));
-                u_prev = Some(u);
                 if k + 1 < samples.len() {
-                    uv.push((u, v));
+                    uv.push((d, v));
                 }
             }
         }
@@ -3091,6 +3228,12 @@ fn split_periodic_face_around_seam_holes(
         return None;
     }
 
+    // An entry's run in u, read along it: a piece over half a turn ends on
+    // the turn it runs to, not on the copy nearest its start.
+    let entry_run = |entry: &(usize, bool)| -> Option<f64> {
+        let samples = entry_samples(entry)?;
+        Some(samples.last()?.0 - samples.first()?.0)
+    };
     let materialize = |entries: &[(usize, bool)]| -> Option<Vec<OrientedPCurveEdge>> {
         let mut out = Vec::with_capacity(entries.len());
         let mut u_prev = seam_u;
@@ -3100,7 +3243,8 @@ fn split_periodic_face_around_seam_holes(
             let (u_raw0, v0) = surface.project_point(from)?;
             let (u_raw1, v1) = surface.project_point(to)?;
             let u0 = u_prev + wrap_pi(u_raw0 - u_prev);
-            let u1 = u0 + wrap_pi(u_raw1 - u_raw0);
+            let walked = u0 + entry_run(entry)?;
+            let u1 = walked + wrap_pi(u_raw1 - walked);
             u_prev = u1;
             out.push(OrientedPCurveEdge {
                 curve_3d: s.curve_3d.clone(),
@@ -3147,17 +3291,9 @@ fn split_periodic_face_around_seam_holes(
     // can leave the half where its edge slopes back toward the seam.
     let half_interior = |half: &[(usize, bool)], v_a: f64, v_b: f64| -> Option<Point3> {
         let v_mid = 0.5 * (v_a + v_b);
-        // Offsets from the seam carried continuously along the chain: a half
-        // wider than half a turn runs past the opposite meridian.
-        let mut chain: Vec<(f64, f64)> = Vec::new();
-        for entry in half {
-            for (d, v) in entry_samples(entry)? {
-                let d = chain
-                    .last()
-                    .map_or(d, |&(prev, _)| prev + wrap_pi(d - prev));
-                chain.push((d, v));
-            }
-        }
+        // Offsets from the seam carried along the chain: a half wider than
+        // half a turn runs past the opposite meridian.
+        let chain: Vec<(f64, f64)> = carried(half)?.into_iter().flatten().collect();
         let mut nearest: Option<f64> = None;
         for w in chain.windows(2) {
             let ((d0, v0), (d1, v1)) = (w[0], w[1]);
@@ -3205,14 +3341,14 @@ fn split_periodic_face_around_seam_holes(
         let (first, second) = entries.split_at(split);
         let (_, v_first) = surface.project_point(traversal(&first[0]).0)?;
         let (_, v_second) = surface.project_point(traversal(&second[0]).0)?;
+        // Offsets from the seam carried along the half from its seam vertex:
+        // a half over half a turn runs past the opposite meridian, where a
+        // wrapped offset changes sign.
         let side = |half: &[(usize, bool)]| -> Option<bool> {
             let mut sum = 0.0;
-            for entry in half {
-                let samples = entry_samples(entry)?;
-                sum += samples[1..samples.len() - 1]
-                    .iter()
-                    .map(|&(d, _)| d)
-                    .sum::<f64>();
+            for run in carried(half)? {
+                let last = run.len() - 1;
+                sum += run[1..last].iter().map(|&(d, _)| d).sum::<f64>();
             }
             Some(sum > 0.0)
         };
@@ -3401,11 +3537,15 @@ fn winding_chain_in(
                         .evaluate_with_endpoints(d0 + (d1 - d0) * t, s.start, s.end),
                 )
             };
-            let mut u_prev = at(0)?;
-            for k in 1..=samples {
-                let u = at(k)?;
-                winding += wrap_pi(u - u_prev);
-                u_prev = u;
+            if let Some(run) = ellipse_section_u_run(s, forward, surface) {
+                winding += run;
+            } else {
+                let mut u_prev = at(0)?;
+                for k in 1..=samples {
+                    let u = at(k)?;
+                    winding += wrap_pi(u - u_prev);
+                    u_prev = u;
+                }
             }
             let to_key = q3(to);
             if to_key == origin {
@@ -3645,6 +3785,43 @@ fn greedy_outer_loops_nested(loops: &[Vec<OrientedPCurveEdge>], cw_loops: bool) 
     false
 }
 
+/// Whether both halves of one section lie in loops of the walk wound
+/// against the outline, its holes. A section parts two regions, so at most
+/// one of its halves bounds a hole: two holes side by side are regions the
+/// walk took the wrong way round (sections clear of the outline, walked from
+/// an edge that turns it round each of their regions clockwise). A loop of
+/// no area is left to the degenerate test.
+fn section_between_holes(
+    loops: &[Vec<OrientedPCurveEdge>],
+    frame: &PlaneFrame,
+    cw_loops: bool,
+    tol: f64,
+) -> bool {
+    let mut halves_in_holes: std::collections::HashMap<usize, u32> =
+        std::collections::HashMap::new();
+    for lp in loops {
+        let pts = sampling::sample_wire_loop_uv_via_frame(lp, frame);
+        if pts.len() < 3 {
+            continue;
+        }
+        let area = signed_area_2d(&pts);
+        let perimeter: f64 = pts
+            .iter()
+            .zip(pts.iter().cycle().skip(1))
+            .map(|(a, b)| (*b - *a).length())
+            .sum();
+        if area.abs() <= perimeter * tol || (area < 0.0) == cw_loops {
+            continue;
+        }
+        for e in lp {
+            if let Some(id) = e.source_edge_idx {
+                *halves_in_holes.entry(id).or_default() += 1;
+            }
+        }
+    }
+    halves_in_holes.values().any(|&n| n >= 2)
+}
+
 /// Quantized UV vertex key in the planar arrangement.
 type UvKey = (i64, i64);
 
@@ -3695,7 +3872,8 @@ struct ArrInput {
 /// their geometric midpoints (see the call site in
 /// [`split_plane_face_by_arrangement`]). Only section arcs with a colliding
 /// unordered chord-endpoint pair AND distinct midpoints are split; boundary
-/// edges and identical duplicates are left untouched.
+/// edges and identical duplicates are left untouched. A line between the
+/// same two ends collides with an arc too: its chord is the arc's chord.
 fn split_coendpoint_section_arc_inputs(inputs: &mut Vec<ArrInput>, frame: &PlaneFrame, tol: f64) {
     use std::collections::HashMap;
     type Q2 = (i64, i64);
@@ -3724,32 +3902,60 @@ fn split_coendpoint_section_arc_inputs(inputs: &mut Vec<ArrInput>, frame: &Plane
     };
     let mut pair_mids: HashMap<(Q2, Q2), Vec<Q2>> = HashMap::new();
     for inp in inputs.iter() {
-        if !(inp.is_section && inp.is_arc) {
-            continue;
-        }
-        let Some(mid) = arc_mid(&inp.edge) else {
+        let mid_uv = if matches!(inp.edge.curve_3d, EdgeCurve::Line) {
+            Point2::new(
+                f64::midpoint(inp.a.x(), inp.b.x()),
+                f64::midpoint(inp.a.y(), inp.b.y()),
+            )
+        } else if inp.is_section
+            && inp.is_arc
+            && let Some(mid) = arc_mid(&inp.edge)
+        {
+            frame.project(mid)
+        } else {
             continue;
         };
         let (a, b) = (q2(inp.a), q2(inp.b));
         let key = if a <= b { (a, b) } else { (b, a) };
-        pair_mids
-            .entry(key)
-            .or_default()
-            .push(q2(frame.project(mid)));
+        pair_mids.entry(key).or_default().push(q2(mid_uv));
     }
     let colliding: std::collections::HashSet<(Q2, Q2)> = pair_mids
         .into_iter()
         .filter(|(_, mids)| mids.iter().any(|m| *m != mids[0]))
         .map(|(k, _)| k)
         .collect();
-    if colliding.is_empty() {
+    // A line through both ends of an arc is cut at them, and its piece
+    // between them is the arc's chord too (a circle cut where a line crosses
+    // it): the same band as the arrangement's breaks at ends on a chord.
+    let band = tol * 100.0;
+    let on_segment = |p: Point2, l: &ArrInput| {
+        let d = l.b - l.a;
+        let len2 = d.dot(d);
+        len2 > 0.0 && {
+            let t = (p - l.a).dot(d) / len2;
+            (0.0..=1.0).contains(&t) && (p - (l.a + d * t)).length() <= band
+        }
+    };
+    let along_line: Vec<bool> = inputs
+        .iter()
+        .map(|inp| {
+            inp.is_section
+                && inp.is_arc
+                && inputs.iter().any(|l| {
+                    matches!(l.edge.curve_3d, EdgeCurve::Line)
+                        && on_segment(inp.a, l)
+                        && on_segment(inp.b, l)
+                })
+        })
+        .collect();
+    if colliding.is_empty() && !along_line.contains(&true) {
         return;
     }
     let mut rebuilt: Vec<ArrInput> = Vec::with_capacity(inputs.len() + 2);
-    for inp in inputs.drain(..) {
+    for (i, inp) in inputs.drain(..).enumerate() {
         let (a, b) = (q2(inp.a), q2(inp.b));
         let key = if a <= b { (a, b) } else { (b, a) };
-        let mid3 = if inp.is_section && inp.is_arc && colliding.contains(&key) {
+        let mid3 = if inp.is_section && inp.is_arc && (colliding.contains(&key) || along_line[i]) {
             arc_mid(&inp.edge)
         } else {
             None
@@ -6172,18 +6378,22 @@ fn clip_sections_to_outer_region(
         {
             pts3.reverse();
         }
-        let samples: Vec<Point2> = pts3
-            .into_iter()
-            .filter_map(|p| surface.project_point(p).map(|(u, v)| Point2::new(u, v)))
-            .collect();
+        // Lifted along the edge, and carried on from the edge before at the
+        // vertex they share.
+        pts3.retain(|&p| surface.project_point(p).is_some());
+        let Some(samples) = super::pcurve_compute::edge_uv_samples(&e.curve_3d, surface, &pts3)
+        else {
+            continue;
+        };
+        let shift = match (prev, samples.first()) {
+            (Some(pv), Some(first)) => {
+                let du = ((first.x() - pv.x() + PI).rem_euclid(TAU)) - PI;
+                pv.x() + du - first.x()
+            }
+            _ => 0.0,
+        };
         for s in samples {
-            let unwrapped = match prev {
-                Some(pv) => {
-                    let du = ((s.x() - pv.x() + PI).rem_euclid(TAU)) - PI;
-                    Point2::new(pv.x() + du, s.y())
-                }
-                None => s,
-            };
+            let unwrapped = Point2::new(s.x() + shift, s.y());
             prev = Some(unwrapped);
             poly.push(unwrapped);
         }
@@ -6573,6 +6783,17 @@ fn loops_run_a_section_both_ways(loops: &[Vec<OrientedPCurveEdge>], tol: f64) ->
     })
 }
 
+/// Puts the section breaks of the try whose pieces a face keeps,
+/// `breaks`, in place of the registry `registry` they were copied from.
+fn keep_breaks(
+    registry: &mut Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
+    breaks: Option<std::collections::HashMap<usize, Vec<Point3>>>,
+) {
+    if let (Some(registry), Some(breaks)) = (registry.as_deref_mut(), breaks) {
+        *registry = breaks;
+    }
+}
+
 /// Split a face by its section edges, producing sub-faces.
 ///
 /// If there are no section edges, returns a single sub-face covering
@@ -6616,22 +6837,93 @@ pub fn split_face_2d(
         impl std::hash::BuildHasher,
     >,
     kept_splits: &std::collections::BTreeSet<brepkit_topology::vertex::VertexId>,
-    split_registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
+    mut split_registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
 ) -> Vec<SplitSubFace> {
-    let run_impl = move |secs: &[SectionEdge]| {
-        split_face_2d_impl(
-            topo,
-            face_id,
-            secs,
-            rank,
-            tol,
-            frame,
-            info,
-            edge_images,
-            kept_splits,
-            split_registry,
-        )
-    };
+    // A ball face with a pole of every chart on it is split in a chart with
+    // one pole off it where its own paths find no chart with its poles
+    // clear, and so is one its own paths leave whole or split into nothing.
+    // That split stands only where its loops were read in that chart: about
+    // the pole it holds, or as loops that wind no pole. Elsewhere the face's
+    // own paths stand.
+    if let Ok(face) = topo.face(face_id)
+        && matches!(face.surface(), FaceSurface::Sphere(_))
+        && face.inner_wires().is_empty()
+        && !sections.is_empty()
+    {
+        let up_front = matches!(
+            pole_clear_chart(topo, face_id, face, sections, true),
+            Some(BallChart::PoleOff)
+        );
+        // Each try splits against its own copy of the registry of section
+        // breaks, and only the try whose pieces the face keeps adds its
+        // breaks to it: a try refused or set aside leaves no break that the
+        // kept pieces do not have for a later face to split at.
+        let attempt = |pole_off: Option<&mut bool>| {
+            let mut breaks = split_registry.as_deref().cloned();
+            let pieces = split_face_2d_impl(
+                topo,
+                face_id,
+                sections,
+                rank,
+                tol,
+                frame,
+                info,
+                edge_images,
+                kept_splits,
+                breaks.as_mut(),
+                pole_off,
+            );
+            (pieces, breaks)
+        };
+        if up_front {
+            let mut read_about_a_pole = false;
+            let (pieces, breaks) = attempt(Some(&mut read_about_a_pole));
+            if read_about_a_pole {
+                keep_breaks(&mut split_registry, breaks);
+                return pieces;
+            }
+        }
+        let (first, first_breaks) = attempt(None);
+        let whole = match first.as_slice() {
+            [] => true,
+            [only] => only
+                .outer_wire
+                .iter()
+                .chain(only.inner_wires.iter().flatten())
+                .all(|e| e.source_edge_idx.is_none()),
+            _ => false,
+        };
+        if !whole || up_front {
+            keep_breaks(&mut split_registry, first_breaks);
+            return first;
+        }
+        let mut read_about_a_pole = false;
+        let (retry, retry_breaks) = attempt(Some(&mut read_about_a_pole));
+        return if read_about_a_pole && retry.len() >= 2 {
+            keep_breaks(&mut split_registry, retry_breaks);
+            retry
+        } else {
+            keep_breaks(&mut split_registry, first_breaks);
+            first
+        };
+    }
+    let run_impl =
+        |secs: &[SectionEdge],
+         registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>| {
+            split_face_2d_impl(
+                topo,
+                face_id,
+                secs,
+                rank,
+                tol,
+                frame,
+                info,
+                edge_images,
+                kept_splits,
+                registry,
+                None,
+            )
+        };
 
     // Cheap gate for the common case: no closed curved section, nothing to
     // salvage — skip all frame and polygon work below.
@@ -6643,17 +6935,17 @@ pub fn split_face_2d(
             )
     });
     if !any_closed_curve {
-        return run_impl(sections);
+        return run_impl(sections, split_registry);
     }
 
     // Salvage applies only to plane faces (curved faces route closed circles
     // through their own band/internal-loop paths).
     let Ok(face) = topo.face(face_id) else {
-        return run_impl(sections);
+        return run_impl(sections, split_registry);
     };
     let surface = face.surface().clone();
     if !matches!(surface, FaceSurface::Plane { .. }) {
-        return run_impl(sections);
+        return run_impl(sections, split_registry);
     }
 
     // Build the face's outer polygon in UV so a *genuine* cap (a full closed
@@ -6684,6 +6976,7 @@ pub fn split_face_2d(
     let mut cap_sections: Vec<SectionEdge> = Vec::new();
     let mut cap_points: Vec<Point3> = Vec::new();
     let mut rest_sections: Vec<SectionEdge> = Vec::new();
+    let mut is_cap: Vec<bool> = Vec::with_capacity(sections.len());
     for s in sections {
         // An oblique plane's ellipse lies within its semi-major axis of its
         // centre, so it clears the outline when that circle would.
@@ -6714,47 +7007,101 @@ pub fn split_face_2d(
         } else {
             None
         };
-        match cap_center {
-            Some(_) => {
-                cap_sections.push(s.clone());
-                cap_points.push(s.start);
+        is_cap.push(cap_center.is_some());
+    }
+
+    // A circle that another section meets is no lone cap: it is cut where
+    // they meet and goes to the split with the rest.
+    let Some(meets) = circle_cap_meets(sections, &is_cap, tol.linear) else {
+        log::debug!(
+            "split_face_2d: face {face_id:?} has a whole circle that a section may meet, \
+             at no point found; refused"
+        );
+        return Vec::new();
+    };
+    let mut cut_any = false;
+    for (i, s) in sections.iter().enumerate() {
+        if !is_cap[i] {
+            rest_sections.push(s.clone());
+        } else if let (EdgeCurve::Circle(circle), false) = (&s.curve_3d, meets[i].is_empty()) {
+            let (arcs, breaks) = circle_cut_at(
+                s, circle, &meets[i], &surface, &frame_pts, cap_frame, tol.linear,
+            );
+            if let (Some(pb), Some(reg)) = (s.pave_block_id, split_registry.as_deref_mut()) {
+                reg.entry(pb).or_default().extend(breaks);
             }
-            None => rest_sections.push(s.clone()),
+            rest_sections.extend(arcs);
+            cut_any = true;
+        } else {
+            cap_sections.push(s.clone());
+            cap_points.push(s.start);
         }
     }
 
     // Engage only where the impl would silently drop caps: at least one
     // genuine cap AND not the single-closed fast path (exactly one section,
     // that one closed curve) which the impl already handles correctly.
+    if cap_sections.is_empty() && cut_any {
+        return run_impl(&rest_sections, split_registry);
+    }
     if cap_sections.is_empty() || (cap_sections.len() == 1 && sections.len() == 1) {
-        return run_impl(sections);
+        return run_impl(sections, split_registry);
     }
 
     // The impl ignores closed curves on plane faces outside its single-closed
     // fast path, so withholding the caps does not change how the remaining
     // sections split.
-    let base = run_impl(&rest_sections);
+    let base = run_impl(&rest_sections, split_registry);
 
     distribute_cap_circles(topo, face_id, base, &cap_sections, &cap_points, rank, frame)
+}
+
+/// How a face's ball is charted for its split.
+enum BallChart {
+    /// Another surface, or a ball face no chart is read for: one with no
+    /// sections, one whose outline is all chords or all arcs of its chart's
+    /// equator (a hemisphere, whose own paths read its poles), or one that
+    /// holds a pole of every axis tried.
+    Unclear,
+    /// The face's own chart, whose poles keep clear of its wires and
+    /// sections. A face that holds one of them winds the chart.
+    Own,
+    /// A chart whose poles lie off the face, as far from its wires and
+    /// sections as a spread of axes allows; `clear` when that is as far as
+    /// the face's own chart must keep them to be read as it lies.
+    Turned { chart: FaceSurface, clear: bool },
+    /// Where no chart has both poles off the face and clear of it, and the
+    /// face's own chart has both poles on it or one near its wires: a chart
+    /// with one pole off the face and the other on it, both clear
+    /// ([`pole_off_ball_axis`]). The face's outline winds it once.
+    PoleOff,
 }
 
 /// The face's ball in a chart whose poles lie off the face and clear of its
 /// wires and sections. At a pole every `u` names one point: a wire or a
 /// section that reaches one jumps in `u` there, and the traces cannot follow
-/// it. A pole inside the face would make its outline wind the chart. `None`
-/// for any other surface, for a face with no sections, for a face whose
-/// outline is all chords (a hemisphere of `make_sphere`, whose own paths
-/// read its poles), and for a face whose edges keep clear of its poles.
+/// it. A pole inside the face would make its outline wind the chart.
 fn pole_clear_sphere(
     topo: &Topology,
     face_id: FaceId,
     face: &brepkit_topology::face::Face,
     sections: &[SectionEdge],
-) -> Option<FaceSurface> {
+) -> BallChart {
+    pole_clear_chart(topo, face_id, face, sections, false).unwrap_or(BallChart::Unclear)
+}
+
+/// A ball face's wires and sections seen from its ball's centre: unit
+/// directions sampled along each edge, and whether its outline is all
+/// chords or all arcs of its chart's equator. `None` for another surface,
+/// a face with no sections, or a lookup that fails.
+fn ball_face_directions(
+    topo: &Topology,
+    face: &brepkit_topology::face::Face,
+    sections: &[SectionEdge],
+) -> Option<(Vec<Vec3>, bool)> {
     // Samples per edge: a half turn of a great circle is read every 2.8
     // degrees, inside the 5.7 degrees that counts as near a pole.
     const SAMPLES: u32 = 64;
-    const CANDIDATES: u32 = 256;
     let FaceSurface::Sphere(sphere) = face.surface() else {
         return None;
     };
@@ -6784,34 +7131,127 @@ fn pole_clear_sphere(
             let edge = topo.edge(oe.edge()).ok()?;
             let start = topo.vertex(edge.start()).ok()?.point();
             let end = topo.vertex(edge.end()).ok()?.point();
-            if i == 0 && !(matches!(edge.curve(), EdgeCurve::Line) && (start - end).length() > 0.0)
-            {
+            let chord = matches!(edge.curve(), EdgeCurve::Line) && (start - end).length() > 0.0;
+            if i == 0 && !chord && !special_cases::on_chart_equator(sphere, edge.curve(), 1e-7) {
                 chords_only = false;
             }
             sample(&mut dirs, edge.curve(), start, end);
         }
     }
-    if chords_only {
-        return None;
-    }
     for s in sections {
         sample(&mut dirs, &s.curve_3d, s.start, s.end);
     }
+    Some((dirs, chords_only))
+}
+
+/// A chart of a ball face's ball with one pole off the face and the other
+/// on it, both clear of the face's wires and sections
+/// ([`pole_off_ball_axis`]), whatever its outline.
+fn pole_off_chart(
+    topo: &Topology,
+    face_id: FaceId,
+    face: &brepkit_topology::face::Face,
+    sections: &[SectionEdge],
+) -> Option<FaceSurface> {
+    let FaceSurface::Sphere(sphere) = face.surface() else {
+        return None;
+    };
+    let (dirs, _) = ball_face_directions(topo, face, sections)?;
+    let trim = crate::classifier::SphereFaceTrim::new(topo, face_id).ok()??;
+    let (center, radius) = (sphere.center(), sphere.radius());
+    let axis = pole_off_ball_axis(center, radius, &dirs, &trim)?;
+    brepkit_math::surfaces::SphericalSurface::with_axis(center, radius, axis)
+        .ok()
+        .map(FaceSurface::Sphere)
+}
+
+/// [`pole_clear_sphere`]'s chart; with `pole_off`, [`BallChart::PoleOff`]
+/// where it serves.
+fn pole_clear_chart(
+    topo: &Topology,
+    face_id: FaceId,
+    face: &brepkit_topology::face::Face,
+    sections: &[SectionEdge],
+    pole_off: bool,
+) -> Option<BallChart> {
+    let FaceSurface::Sphere(sphere) = face.surface() else {
+        return None;
+    };
+    let (dirs, chords_only) = ball_face_directions(topo, face, sections)?;
+    if chords_only {
+        return None;
+    }
+    let center = sphere.center();
     // The cosine of the angle from the nearer pole about `axis` to the
     // nearest sample.
     let nearest = |axis: Vec3| dirs.iter().fold(0.0_f64, |m, d| m.max(d.dot(axis).abs()));
-    if nearest(sphere.z_axis()) < 0.1_f64.cos() {
-        return None;
-    }
-    let trim = crate::classifier::SphereFaceTrim::new(topo, face_id).ok()??;
     let radius = sphere.radius();
+    let trim = crate::classifier::SphereFaceTrim::new(topo, face_id)
+        .ok()
+        .flatten();
+    let one_pole_off = |t: &crate::classifier::SphereFaceTrim| {
+        pole_off && pole_off_ball_axis(center, radius, &dirs, t).is_some()
+    };
+    // A face that holds a pole of its own chart winds the chart, however
+    // far its wires keep from the pole: it takes a chart whose poles lie off
+    // it and clear of its wires where one is found.
+    if nearest(sphere.z_axis()) < 0.1_f64.cos() {
+        let z = sphere.z_axis();
+        let mut both_held = false;
+        let turned = trim.as_ref().and_then(|t| {
+            let held = [z, -z].map(|a| t.holds(center + a * radius, 1e-6 * radius));
+            both_held = held[0] && held[1];
+            held.contains(&true)
+                .then(|| clear_ball_axis(center, radius, &dirs, t))
+                .flatten()
+                .filter(|&axis| nearest(axis) < 0.1_f64.cos())
+        });
+        return Some(
+            match turned.and_then(|axis| {
+                brepkit_math::surfaces::SphericalSurface::with_axis(center, radius, axis).ok()
+            }) {
+                Some(chart) => BallChart::Turned {
+                    chart: FaceSurface::Sphere(chart),
+                    clear: true,
+                },
+                None if both_held && trim.as_ref().is_some_and(one_pole_off) => BallChart::PoleOff,
+                None => BallChart::Own,
+            },
+        );
+    }
+    let trim = trim?;
+    let Some(best) = clear_ball_axis(center, radius, &dirs, &trim) else {
+        return one_pole_off(&trim).then_some(BallChart::PoleOff);
+    };
+    brepkit_math::surfaces::SphericalSurface::with_axis(center, radius, best)
+        .ok()
+        .map(|chart| BallChart::Turned {
+            chart: FaceSurface::Sphere(chart),
+            clear: nearest(best) < 0.1_f64.cos(),
+        })
+}
+
+/// Of a spread of axes through `center`, the one whose poles keep farthest
+/// from the unit directions `dirs` (a face's wires and sections seen from
+/// its ball's centre), each pole off the face that `trim` reads. `None`
+/// when every axis has a pole on the face.
+fn clear_ball_axis(
+    center: Point3,
+    radius: f64,
+    dirs: &[Vec3],
+    trim: &crate::classifier::SphereFaceTrim,
+) -> Option<Vec3> {
+    const CANDIDATES: u32 = 256;
+    // The cosine of the angle from the nearer pole about `axis` to the
+    // nearest direction.
+    let nearest = |axis: Vec3| dirs.iter().fold(0.0_f64, |m, d| m.max(d.dot(axis).abs()));
     let off_face = |axis: Vec3| {
         [axis, -axis]
             .iter()
             .all(|&a| !trim.holds(center + a * radius, 1e-6 * radius))
     };
     let golden = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
-    let best = (0..CANDIDATES)
+    (0..CANDIDATES)
         .map(|i| {
             let z = 1.0 - (2.0 * f64::from(i) + 1.0) / f64::from(CANDIDATES);
             let r = (1.0 - z * z).max(0.0).sqrt();
@@ -6820,11 +7260,101 @@ fn pole_clear_sphere(
         })
         .filter(|&axis| off_face(axis))
         .map(|axis| (nearest(axis), axis))
-        .min_by(|a, b| a.0.total_cmp(&b.0))?
-        .1;
-    brepkit_math::surfaces::SphericalSurface::with_axis(center, radius, best)
-        .ok()
-        .map(FaceSurface::Sphere)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, axis)| axis)
+}
+
+/// Of the axes through `center`, one with a pole off the face that `trim`
+/// reads and the other on it, whose poles keep clear of the unit directions
+/// `dirs` (the face's wires and sections seen from its ball's centre): the
+/// pole on the face by 0.1 rad, as a chart of the face's own must, and the
+/// pole off it by 0.035 rad. The pole off the face lies in a hole or past
+/// the outline, and a narrow hole holds it nearer its wires than that. Both
+/// clear the half step between the samples of a half turn of a great circle
+/// (0.025 rad), so no wire runs through either pole between its samples.
+///
+/// A spread of axes is searched, then the best of them is moved in steps
+/// while its poles keep their sides and the nearer pole, measured against
+/// its own clearance, gains. `None` when no axis keeps both clearances.
+fn pole_off_ball_axis(
+    center: Point3,
+    radius: f64,
+    dirs: &[Vec3],
+    trim: &crate::classifier::SphereFaceTrim,
+) -> Option<Vec3> {
+    const CANDIDATES: u32 = 256;
+    const HELD_CLEAR: f64 = 0.1;
+    const OFF_CLEAR: f64 = 0.035;
+    let near = 1e-6 * radius;
+    // The angle from `pole` to the nearest direction.
+    let gap = |pole: Vec3| {
+        dirs.iter()
+            .fold(-1.0_f64, |m, d| m.max(d.dot(pole)))
+            .clamp(-1.0, 1.0)
+            .acos()
+    };
+    // The axis's poles, the one the face holds first, when it holds one.
+    let sides = |axis: Vec3| match (
+        trim.holds(center + axis * radius, near),
+        trim.holds(center - axis * radius, near),
+    ) {
+        (true, false) => Some((axis, -axis)),
+        (false, true) => Some((-axis, axis)),
+        _ => None,
+    };
+    // The nearer pole's gap as a share of its clearance: 1 or more clears.
+    let score = |axis: Vec3| {
+        sides(axis).map(|(held, off)| (gap(held) / HELD_CLEAR).min(gap(off) / OFF_CLEAR))
+    };
+    let golden = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    let (mut best, mut axis) = (0..CANDIDATES)
+        .map(|i| {
+            let z = 1.0 - (2.0 * f64::from(i) + 1.0) / f64::from(CANDIDATES);
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let (s, c) = (golden * f64::from(i)).sin_cos();
+            Vec3::new(r * c, r * s, z)
+        })
+        .filter_map(|axis| score(axis).map(|s| (s, axis)))
+        .max_by(|a, b| a.0.total_cmp(&b.0))?;
+    // The spread's axes lie about 0.16 rad apart: step about the best one,
+    // halving the step where no step gains, down to a ten-thousandth.
+    let mut step = 0.08_f64;
+    for _ in 0..200 {
+        if step < 1e-4 {
+            break;
+        }
+        let side = if axis.x().abs() < 0.9 {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        };
+        let Ok(t1) = axis.cross(side).normalize() else {
+            break;
+        };
+        let t2 = axis.cross(t1);
+        let gain = [t1, -t1, t2, -t2]
+            .into_iter()
+            .filter_map(|d| (axis + d * step).normalize().ok())
+            .filter_map(|a| score(a).map(|s| (s, a)))
+            .filter(|&(s, _)| s > best)
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        match gain {
+            Some((s, a)) => (best, axis) = (s, a),
+            None => step *= 0.5,
+        }
+    }
+    (best >= 1.0).then_some(axis)
+}
+
+/// Whether each end of each section meets exactly one other end (a closed
+/// section's two ends meet each other). Sections cross nowhere but at their
+/// ends, so loops chained from such sections share no point: any two lie
+/// apart or one inside the other. Where three ends or more meet, two loops
+/// can cross there.
+fn sections_meet_in_pairs(sections: &[SectionEdge], weld: f64) -> bool {
+    let ends: Vec<Point3> = sections.iter().flat_map(|s| [s.start, s.end]).collect();
+    ends.iter()
+        .all(|&p| ends.iter().filter(|&&q| (q - p).length() < weld).count() == 2)
 }
 
 /// The centroid of a closed curved section's samples when every sample
@@ -6874,6 +7404,59 @@ fn interior_loop_center(
 /// 0.12% of its radius.
 const OUTLINE_CURVE_SAMPLES: usize = 64;
 
+/// Whether a ball face holds one pole of a chart, with its one wire running
+/// once round the chart's axis. The face's trim must hold one pole
+/// and not the other, and the wire's turn about the axis, read along its
+/// edges' own curves, must be one whole turn either way. A zone between two
+/// latitudes, bounded by a seam and two rims, holds neither pole and runs
+/// its rims round the axis both ways, for no net turn. A wire that comes
+/// within 0.02 rad of the axis, or whose samples step more than a quarter
+/// turn round it, is not read.
+///
+/// `Some(true)` when the face holds the north pole of `chart`, a chart of
+/// its ball, and `Some(false)` when it holds the south pole.
+fn pole_held_round(
+    topo: &Topology,
+    face_id: FaceId,
+    chart: &brepkit_math::surfaces::SphericalSurface,
+) -> Option<bool> {
+    use std::f64::consts::{FRAC_PI_2, TAU};
+    let face = topo.face(face_id).ok()?;
+    if !face.inner_wires().is_empty() {
+        return None;
+    }
+    let (center, radius) = (chart.center(), chart.radius());
+    let (x, y, z) = (chart.x_axis(), chart.y_axis(), chart.z_axis());
+    let trim = crate::classifier::SphereFaceTrim::new(topo, face_id).ok()??;
+    let held = [z, -z].map(|a| trim.holds(center + a * radius, 1e-6 * radius));
+    if held[0] == held[1] {
+        return None;
+    }
+    let pts = sample_wire_outline(topo, face.outer_wire());
+    if pts.len() < 3 {
+        return None;
+    }
+    let mut angles = Vec::with_capacity(pts.len());
+    for p in &pts {
+        let d = *p - center;
+        let (a, b) = (d.dot(x), d.dot(y));
+        if a.hypot(b) < 0.02 * radius {
+            return None;
+        }
+        angles.push(b.atan2(a));
+    }
+    let mut turn = 0.0;
+    for (k, &a) in angles.iter().enumerate() {
+        let next = angles[(k + 1) % angles.len()];
+        let step = (next - a + std::f64::consts::PI).rem_euclid(TAU) - std::f64::consts::PI;
+        if step.abs() > FRAC_PI_2 {
+            return None;
+        }
+        turn += step;
+    }
+    ((turn.abs() / TAU - 1.0).abs() < 1e-6).then_some(held[0])
+}
+
 /// A wire's outline in traversal order: each line's start, and each curved
 /// edge sampled along its own span.
 fn sample_wire_outline(topo: &Topology, wire_id: brepkit_topology::wire::WireId) -> Vec<Point3> {
@@ -6901,6 +7484,67 @@ fn sample_wire_outline(topo: &Topology, wire_id: brepkit_topology::wire::WireId)
             oe.is_forward(),
             &mut pts,
         );
+    }
+    pts
+}
+
+/// [`sample_wire_outline`] in `surface`'s parameters: each edge's samples
+/// lifted along it ([`super::pcurve_compute::edge_uv_samples`]), and moved
+/// by whole periods to meet the edge before at the vertex they share.
+fn sample_wire_outline_uv(
+    topo: &Topology,
+    wire_id: brepkit_topology::wire::WireId,
+    surface: &FaceSurface,
+) -> Vec<Point2> {
+    let Ok(wire) = topo.wire(wire_id) else {
+        return Vec::new();
+    };
+    let (u_period, v_period) = super::pcurve_compute::surface_periods(surface);
+    let turns =
+        |x: f64, to: f64, period: Option<f64>| period.map_or(0.0, |p| ((to - x) / p).round() * p);
+    let mut pts: Vec<Point2> = Vec::new();
+    let mut end: Option<Point2> = None;
+    for oe in wire.edges() {
+        let Ok(edge) = topo.edge(oe.edge()) else {
+            continue;
+        };
+        let (Ok(sv), Ok(ev)) = (topo.vertex(edge.start()), topo.vertex(edge.end())) else {
+            continue;
+        };
+        let n = if matches!(edge.curve(), EdgeCurve::Line) {
+            1
+        } else {
+            OUTLINE_CURVE_SAMPLES
+        };
+        let mut chain = Vec::with_capacity(n + 1);
+        super::pcurve_compute::sample_edge_uniform_native(
+            edge.curve(),
+            sv.point(),
+            ev.point(),
+            n,
+            oe.is_forward(),
+            &mut chain,
+        );
+        chain.push(if oe.is_forward() {
+            ev.point()
+        } else {
+            sv.point()
+        });
+        chain.retain(|&p| surface.project_point(p).is_some());
+        let Some(uv) = super::pcurve_compute::edge_uv_samples(edge.curve(), surface, &chain) else {
+            continue;
+        };
+        let (Some(&first), Some(&last)) = (uv.first(), uv.last()) else {
+            continue;
+        };
+        let shift = end.map_or(brepkit_math::vec::Vec2::new(0.0, 0.0), |at| {
+            brepkit_math::vec::Vec2::new(
+                turns(first.x(), at.x(), u_period),
+                turns(first.y(), at.y(), v_period),
+            )
+        });
+        pts.extend(uv[..uv.len() - 1].iter().map(|&p| p + shift));
+        end = Some(last + shift);
     }
     pts
 }
@@ -7280,25 +7924,20 @@ fn place_section_in_turn(e: &mut OrientedPCurveEdge, surface: &FaceSurface, lo: 
         (e.end_3d, e.start_3d)
     };
     let (t0, t1) = e.curve_3d.domain_with_endpoints(s3, e3);
-    let Some(mut path) = (0..=SAMPLES)
+    let pts: Vec<Point3> = (0..=SAMPLES)
         .map(|k| {
             let t = (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0);
-            surface
-                .project_point(e.curve_3d.evaluate_with_endpoints(t, s3, e3))
-                .map(|(u, _)| u)
+            e.curve_3d.evaluate_with_endpoints(t, s3, e3)
         })
-        .collect::<Option<Vec<f64>>>()
-    else {
+        .collect();
+    // Lifted along the section, then moved by whole periods so its middle
+    // lies in the window.
+    let Some(uv) = super::pcurve_compute::edge_uv_samples(&e.curve_3d, surface, &pts) else {
         return;
     };
-    let mid = path.len() / 2;
-    path[mid] = lo + (path[mid] - lo).rem_euclid(period);
-    for k in (0..mid).rev() {
-        path[k] = nearest(path[k], path[k + 1]);
-    }
-    for k in mid + 1..path.len() {
-        path[k] = nearest(path[k], path[k - 1]);
-    }
+    let mid = uv.len() / 2;
+    let shift = lo + (uv[mid].x() - lo).rem_euclid(period) - uv[mid].x();
+    let path: Vec<f64> = uv.iter().map(|p| p.x() + shift).collect();
     // A marched curve's domain can run from either end.
     let first = e.curve_3d.evaluate_with_endpoints(t0, s3, e3);
     let (at_start, at_end) = if (first - e.start_3d).length() <= (first - e.end_3d).length() {
@@ -7399,6 +8038,289 @@ fn is_sliver(e: &OrientedPCurveEdge, size: f64) -> bool {
     let (t0, t1) = e.curve_3d.domain_with_endpoints(s, t);
     let at = |u: f64| e.curve_3d.evaluate_with_endpoints(u, s, t);
     (at(t0) - at(t1)).length() >= size || (at(f64::midpoint(t0, t1)) - s).length() < size
+}
+
+/// For each whole circle cap among `sections` (`is_cap`), the points where
+/// another section meets it; empty for a cap no section meets, and for every
+/// other section. A pair of caps that cross get the same points. `None` where
+/// no bound proves a section apart from a cap and no point is found where it
+/// meets it ([`circle_meets`]).
+fn circle_cap_meets(
+    sections: &[SectionEdge],
+    is_cap: &[bool],
+    tol: f64,
+) -> Option<Vec<Vec<Point3>>> {
+    let mut meets: Vec<Vec<Point3>> = vec![Vec::new(); sections.len()];
+    for (i, cap) in sections.iter().enumerate() {
+        let EdgeCurve::Circle(circle) = &cap.curve_3d else {
+            continue;
+        };
+        if !is_cap[i] {
+            continue;
+        }
+        for (j, other) in sections.iter().enumerate() {
+            let other_cap = is_cap[j] && matches!(other.curve_3d, EdgeCurve::Circle(_));
+            if j == i || (other_cap && j < i) {
+                continue;
+            }
+            let points = circle_meets(circle, other, tol)?;
+            if other_cap {
+                meets[j].extend(points.iter().copied());
+            }
+            meets[i].extend(points);
+        }
+    }
+    Some(meets)
+}
+
+/// The points where `other`, a section on the plane of `circle`, meets the
+/// whole circle: an end of `other` on it, or a crossing, within the weld
+/// (`100 tol`). Empty where a bound proves `other` keeps farther than the
+/// weld from the circle; `None` where no bound does and no point is found.
+///
+/// A line's points come from the closed form of
+/// [`Circle3D::intersect_segment`], and a circle's from
+/// [`Circle3D::intersect_circle`], kept where they lie on `other`'s arc (read
+/// along its curve or the short way round). An ellipse or a spline is only
+/// proved apart: it lies within its semi-major axis of its centre, and a
+/// spline's pieces within the hull of their control points.
+fn circle_meets(
+    circle: &brepkit_math::curves::Circle3D,
+    other: &SectionEdge,
+    tol: f64,
+) -> Option<Vec<Point3>> {
+    let weld = 100.0 * tol;
+    let (center, r) = (circle.center(), circle.radius());
+    let closed = (other.start - other.end).length() < tol;
+    let mut at: Vec<Point3> = Vec::new();
+    // A computed point that lies on an end of `other` is that end, so the
+    // pieces of both meet at one point.
+    let mut add = |p: Point3| {
+        let p = [other.start, other.end]
+            .into_iter()
+            .find(|e| (*e - p).length() <= weld)
+            .unwrap_or(p);
+        if !at.iter().any(|q| (*q - p).length() <= weld) {
+            at.push(p);
+        }
+    };
+    if !closed {
+        for p in [other.start, other.end] {
+            if ((p - center).length() - r).abs() <= weld {
+                add(p);
+            }
+        }
+    }
+    // The least and greatest distance from the centre to `other`.
+    let (near, far) = match &other.curve_3d {
+        EdgeCurve::Line => {
+            let d = other.end - other.start;
+            let len2 = d.dot(d);
+            let t = if len2 > 0.0 {
+                ((center - other.start).dot(d) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (
+                (other.start + d * t - center).length(),
+                (other.start - center)
+                    .length()
+                    .max((other.end - center).length()),
+            )
+        }
+        EdgeCurve::Circle(q) => {
+            let apart = (q.center() - center).length();
+            ((apart - q.radius()).abs(), apart + q.radius())
+        }
+        EdgeCurve::Ellipse(e) => {
+            let apart = (e.center() - center).length();
+            ((apart - e.semi_major()).max(0.0), apart + e.semi_major())
+        }
+        EdgeCurve::NurbsCurve(n) => {
+            let (t0, t1) = other.curve_3d.domain_with_endpoints(other.start, other.end);
+            return nurbs_apart_from_circle(n, (t0, t1), center, r, weld).then(Vec::new);
+        }
+    };
+    if near > r + weld || far < r - weld {
+        return Some(Vec::new());
+    }
+    match &other.curve_3d {
+        EdgeCurve::Line => {
+            for (p, _) in circle.intersect_segment(other.start, other.end, tol) {
+                add(p);
+            }
+            (!at.is_empty()).then_some(at)
+        }
+        EdgeCurve::Circle(q) => {
+            if (q.center() - center).length() <= weld && (q.radius() - r).abs() <= weld {
+                // `other` runs on the circle: its ends cut it, and a whole
+                // copy of it is left as it was.
+                return Some(at);
+            }
+            let crossings = circle.intersect_circle(q, tol);
+            if crossings.is_empty() {
+                return None;
+            }
+            for (p, _) in crossings {
+                if closed || on_section_arc(q, other, p, weld) {
+                    add(p);
+                }
+            }
+            Some(at)
+        }
+        EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_) => None,
+    }
+}
+
+/// Whether `p`, a point of `circle`, lies on the open arc `section` of it,
+/// read along its curve from its start or the short way round between its
+/// ends, `slack` along it.
+fn on_section_arc(
+    circle: &brepkit_math::curves::Circle3D,
+    section: &SectionEdge,
+    p: Point3,
+    slack: f64,
+) -> bool {
+    use std::f64::consts::TAU;
+    let slack = slack / circle.radius();
+    let at = circle.project(p);
+    let (t0, t1) = section
+        .curve_3d
+        .domain_with_endpoints(section.start, section.end);
+    let along =
+        (at - t0).rem_euclid(TAU) <= (t1 - t0) + slack || (at - t0).rem_euclid(TAU) >= TAU - slack;
+    let start = circle.project(section.start);
+    let delta = super::pcurve_compute::shorter_arc_delta(circle.project(section.end) - start);
+    let (from, run) = if delta >= 0.0 {
+        (start, delta)
+    } else {
+        (start + delta, -delta)
+    };
+    let short =
+        (at - from).rem_euclid(TAU) <= run + slack || (at - from).rem_euclid(TAU) >= TAU - slack;
+    along || short
+}
+
+/// Whether the span `(t0, t1)` of spline `n` keeps farther than `weld` from
+/// the circle about `center` of radius `r`: each piece's control points all
+/// lie within `r - weld` of the centre, or beyond `r + weld` along the line
+/// from the centre to their mean. The pieces start as the knot spans the
+/// range covers, each a Bezier piece of its own; a piece neither test proves
+/// is halved, ten times at most.
+fn nurbs_apart_from_circle(
+    n: &brepkit_math::nurbs::curve::NurbsCurve,
+    (t0, t1): (f64, f64),
+    center: Point3,
+    r: f64,
+    weld: f64,
+) -> bool {
+    let (lo, hi) = (t0.min(t1), t0.max(t1));
+    let mut pending: Vec<(f64, f64, u32)> = n
+        .knots()
+        .windows(2)
+        .map(|w| (w[0].max(lo), w[1].min(hi)))
+        .filter(|(a, b)| a < b)
+        .map(|(a, b)| (a, b, 0))
+        .collect();
+    if pending.is_empty() {
+        return false;
+    }
+    while let Some((a, b, depth)) = pending.pop() {
+        let Ok(homogeneous) = brepkit_math::nurbs::decompose::curve_bezier_between(n, a, b) else {
+            return false;
+        };
+        let mut points = Vec::with_capacity(homogeneous.len());
+        for [x, y, z, w] in homogeneous {
+            if w.is_nan() || w <= 0.0 {
+                return false;
+            }
+            points.push(Point3::new(x / w, y / w, z / w));
+        }
+        if points.is_empty() {
+            return false;
+        }
+        let inside = points.iter().all(|&p| (p - center).length() < r - weld);
+        #[allow(clippy::cast_precision_loss)]
+        let mean = points
+            .iter()
+            .fold(Vec3::new(0.0, 0.0, 0.0), |acc, &p| acc + (p - center))
+            * (1.0 / points.len() as f64);
+        let outside = mean
+            .normalize()
+            .is_ok_and(|toward| points.iter().all(|&p| (p - center).dot(toward) > r + weld));
+        if inside || outside {
+            continue;
+        }
+        if depth >= 10 {
+            return false;
+        }
+        let mid = f64::midpoint(a, b);
+        pending.push((a, mid, depth + 1));
+        pending.push((mid, b, depth + 1));
+    }
+    true
+}
+
+/// The whole circle section `cap` cut at `points` into arcs of at most a
+/// third of a turn, each counter-clockwise about the circle's axis, and the
+/// points it was cut at. A run between two points longer than a third of a
+/// turn is cut in equal parts: sections are read the short way round
+/// between their ends.
+fn circle_cut_at(
+    cap: &SectionEdge,
+    circle: &brepkit_math::curves::Circle3D,
+    points: &[Point3],
+    surface: &FaceSurface,
+    wire_pts: &[Point3],
+    frame: &PlaneFrame,
+    tol: f64,
+) -> (Vec<SectionEdge>, Vec<Point3>) {
+    use std::f64::consts::TAU;
+    let mut cuts: Vec<(f64, Point3)> = points.iter().map(|&p| (circle.project(p), p)).collect();
+    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cuts.dedup_by(|a, b| (a.1 - b.1).length() <= 100.0 * tol);
+    let mut breaks: Vec<Point3> = Vec::new();
+    for (k, &(t, p)) in cuts.iter().enumerate() {
+        breaks.push(p);
+        let next = cuts[(k + 1) % cuts.len()].0;
+        let run = if cuts.len() == 1 {
+            TAU
+        } else {
+            (next - t).rem_euclid(TAU)
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let parts = (run / (TAU / 3.0)).ceil().max(1.0) as u32;
+        for j in 1..parts {
+            breaks.push(circle.evaluate(run.madd(f64::from(j) / f64::from(parts), t)));
+        }
+    }
+    let arcs = (0..breaks.len())
+        .map(|k| {
+            let (start, end) = (breaks[k], breaks[(k + 1) % breaks.len()]);
+            let pcurve = compute_pcurve_on_surface(
+                &cap.curve_3d,
+                start,
+                end,
+                surface,
+                wire_pts,
+                Some(frame),
+            );
+            SectionEdge {
+                curve_3d: cap.curve_3d.clone(),
+                pcurve_a: pcurve.clone(),
+                pcurve_b: pcurve,
+                start,
+                end,
+                start_uv_a: None,
+                end_uv_a: None,
+                start_uv_b: None,
+                end_uv_b: None,
+                target_face: cap.target_face,
+                pave_block_id: None,
+            }
+        })
+        .collect();
+    (arcs, breaks)
 }
 
 /// Carve closed cap circles and ellipses (see [`split_face_2d`]) into the
@@ -7547,6 +8469,7 @@ fn split_face_2d_impl(
     >,
     kept_splits: &std::collections::BTreeSet<brepkit_topology::vertex::VertexId>,
     mut split_registry: Option<&mut std::collections::HashMap<usize, Vec<Point3>>>,
+    pole_off: Option<&mut bool>,
 ) -> Vec<SplitSubFace> {
     let face = match topo.face(face_id) {
         Ok(f) => f,
@@ -7604,7 +8527,21 @@ fn split_face_2d_impl(
     let sections: &[SectionEdge] = deduped_sections.as_deref().unwrap_or(sections);
     let trace_split =
         std::env::var("BK_SPLIT_TRACE").is_ok_and(|v| v == format!("{}", face_id.index()));
-    let rechart = pole_clear_sphere(topo, face_id, face, sections);
+    // With `pole_off`, the face takes a chart with one pole off it, and the
+    // flag reads whether the split in that chart stands.
+    let ball_chart = if pole_off.is_some() {
+        match pole_off_chart(topo, face_id, face, sections) {
+            Some(chart) => BallChart::Turned { chart, clear: true },
+            None => return Vec::new(),
+        }
+    } else {
+        pole_clear_sphere(topo, face_id, face, sections)
+    };
+    let (rechart, ball_chart_clear) = match ball_chart {
+        BallChart::Unclear | BallChart::PoleOff => (None, false),
+        BallChart::Own => (None, true),
+        BallChart::Turned { chart, clear } => (Some(chart), clear),
+    };
     // The sections' pcurves and end hints read the face's own chart.
     let recharted_sections: Vec<SectionEdge>;
     let sections: &[SectionEdge] = match &rechart {
@@ -7998,7 +8935,8 @@ fn split_face_2d_impl(
         // Quantize at the kernel's linear tolerance so dedup only collapses
         // genuinely-coincident sections (a doubly-recorded interference) and
         // never distinct splitters that happen to be close on a small model.
-        let scale = 1.0 / tol.linear.max(1e-12);
+        let cell = tol.linear.max(1e-12);
+        let scale = 1.0 / cell;
         let q = |p: Point3| -> (i64, i64, i64) {
             (
                 (p.x() * scale).round() as i64,
@@ -8006,19 +8944,27 @@ fn split_face_2d_impl(
                 (p.z() * scale).round() as i64,
             )
         };
-        let mut seen = std::collections::HashSet::new();
-        deduped_sections = sections
-            .iter()
-            .filter(|s| {
-                // Key on the endpoints plus a midpoint sample so two distinct
-                // arcs sharing endpoints (e.g. the two halves of a split
-                // circle) are not collapsed into one.
-                let (a, b) = (q(s.start), q(s.end));
-                let mid = q(evaluate_edge_at_t(&s.curve_3d, s.start, s.end, 0.5));
-                seen.insert((if a <= b { (a, b) } else { (b, a) }, mid))
-            })
-            .cloned()
-            .collect();
+        // Two sections with the same quantized ends are one only where a
+        // bound over their whole length holds them together: an arc and the
+        // rest of its circle share their ends, and so do the two halves of a
+        // circle. Ends in one cell lie within `sqrt(3)` cells of each other.
+        let mut seen: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::new();
+        let mut kept: Vec<SectionEdge> = Vec::with_capacity(sections.len());
+        for s in sections {
+            let (a, b) = (q(s.start), q(s.end));
+            let twins = seen
+                .entry(if a <= b { (a, b) } else { (b, a) })
+                .or_default();
+            if twins
+                .iter()
+                .any(|&i| same_section_curve(&kept[i], s, 2.0 * cell))
+            {
+                continue;
+            }
+            twins.push(kept.len());
+            kept.push(s.clone());
+        }
+        deduped_sections = kept;
         &deduped_sections[..]
     };
 
@@ -8060,6 +9006,20 @@ fn split_face_2d_impl(
             // seam connections (e.g., torus), not true line boundaries.
             && (e.start_3d - e.end_3d).length() > tol.linear
     });
+    // A hemisphere bounded by its chart's equator has no seam edge either.
+    let equator_outline = match &surface {
+        FaceSurface::Sphere(sphere) => {
+            !boundary_edges.is_empty()
+                && boundary_edges
+                    .iter()
+                    .all(|e| special_cases::on_chart_equator(sphere, &e.curve_3d, tol.linear))
+        }
+        FaceSurface::Plane { .. }
+        | FaceSurface::Cylinder(_)
+        | FaceSurface::Cone(_)
+        | FaceSurface::Torus(_)
+        | FaceSurface::Nurbs(_) => false,
+    };
     // `split_noseam_face_direct` carves cap+band from OPEN section arcs (it
     // skips full-circle sections, relying on the FF boundary-crossing split to
     // pre-open them). A hemisphere cut by a cylinder yields a CLOSED circle
@@ -8086,10 +9046,11 @@ fn split_face_2d_impl(
                 && !is_point_on_boundary_uv(s.end, &surface, &boundary_edges, 0.01)
         })
         && !sections_form_winding_chain(sections, &surface, tol.linear);
-    if all_boundary_line
+    if (all_boundary_line || equator_outline)
         && !is_plane
         && has_open_section
         && !inside_loops
+        && pole_off.is_none()
         && (u_periodic || v_periodic || matches!(surface, FaceSurface::Sphere(_)))
     {
         let mut pieces = split_noseam_face_direct(
@@ -8239,10 +9200,19 @@ fn split_face_2d_impl(
         return bands;
     }
 
+    // The face's own holes go whole to the pieces that hold them when no
+    // section ends on one: a wall with a tunnel's two holes, crossed above
+    // them by a rod whose footprint straddles the seam on one side and lies
+    // clear of it on the other. The generic paths dropped the clear loop.
     if u_periodic
         && !is_plane
-        && original_inner_wires.is_empty()
-        && let Some(pieces) = split_periodic_face_around_seam_holes(
+        && sections.iter().all(|s| {
+            original_inner_wires.iter().flatten().all(|e| {
+                !point_on_oriented_edge(e, s.start, tol.linear * 100.0)
+                    && !point_on_oriented_edge(e, s.end, tol.linear * 100.0)
+            })
+        })
+        && let Some(mut pieces) = split_periodic_face_around_seam_holes(
             &surface,
             &boundary_edges,
             sections,
@@ -8252,6 +9222,15 @@ fn split_face_2d_impl(
             tol.linear,
         )
     {
+        let held: Vec<usize> = pieces.iter().map(|p| p.inner_wires.len()).collect();
+        attach_whole_holes(&mut pieces, &original_inner_wires);
+        // Each piece's cached interior point was found clear of the section
+        // loops alone, and can lie in a hole it now holds.
+        for (piece, held) in pieces.iter_mut().zip(held) {
+            if piece.inner_wires.len() > held {
+                piece.precomputed_interior = None;
+            }
+        }
         return pieces;
     }
 
@@ -8363,7 +9342,16 @@ fn split_face_2d_impl(
         endpoints_internal && !sections_form_winding_chain(sections, &surface, tol.linear)
     };
 
-    if all_sections_internal {
+    // The shortcut takes each chained loop as a disc, and as a hole of the
+    // rest of the face: that tiles the face only where no two loops cross.
+    // On a ball face, loops that meet (two small circles that cross) go to
+    // the general split. The weld is the one the shortcut chains by.
+    let loops_apart = !matches!(surface, FaceSurface::Sphere(_))
+        || sections_meet_in_pairs(
+            deduped_line_loops.as_deref().unwrap_or(sections),
+            tol.linear * 100.0,
+        );
+    if all_sections_internal && loops_apart {
         let secs = deduped_line_loops.as_deref().unwrap_or(sections);
         log::debug!(
             "split_face_2d: face {face_id:?} routed to internal-loops path ({} sections)",
@@ -8380,6 +9368,11 @@ fn split_face_2d_impl(
             &wire_pts,
             tol.linear,
         ) {
+            // Loops that wind no pole of the chart are holes of the face and
+            // pieces of their own in any chart.
+            if let Some(read) = pole_off {
+                *read = pieces.len() >= 2;
+            }
             return pieces;
         }
     }
@@ -8615,13 +9608,22 @@ fn split_face_2d_impl(
             Vec::new()
         };
 
-    let boundary_edges = split_boundary_edges_at_3d_points(
-        boundary_edges,
-        &split_pts_3d,
-        if is_plane { Some(frame) } else { None },
-        &surface,
-        tol.linear,
-    );
+    let boundary_edges = if ball_chart_clear {
+        edge_splitting::split_clear_ball_edges_at_3d_points(
+            boundary_edges,
+            &split_pts_3d,
+            &surface,
+            tol.linear,
+        )
+    } else {
+        split_boundary_edges_at_3d_points(
+            boundary_edges,
+            &split_pts_3d,
+            if is_plane { Some(frame) } else { None },
+            &surface,
+            tol.linear,
+        )
+    };
 
     // Reorder boundary edges: Line (seam) edges first, then curved (circle)
     // edges. This ensures the wire builder starts loops from seam edges,
@@ -9480,11 +10482,13 @@ fn split_face_2d_impl(
 
     // A section on a cylinder sits at its points' own u, which can be whole
     // turns off the boundary it ends on (an arc leaving u = 0 on a wall laid
-    // out around 2pi). When an end meets a boundary vertex in 3D but no copy
-    // of it in UV, move the section by the one whole-turn shift that joins
-    // every such end.
+    // out around 2pi). So can a section on a ball face charted clear of its
+    // poles, whose wires run across the chart's seam. When an end meets a
+    // boundary vertex in 3D but no copy of it in UV, move the section by the
+    // one whole-turn shift that joins every such end.
     if u_periodic
-        && matches!(surface, FaceSurface::Cylinder(_))
+        && (matches!(surface, FaceSurface::Cylinder(_))
+            || ball_chart_clear && matches!(surface, FaceSurface::Sphere(_)))
         && all_edges.len() > n_boundary_edges
         && let (Some(u_period), _) = super::pcurve_compute::surface_periods(&surface)
     {
@@ -9538,9 +10542,7 @@ fn split_face_2d_impl(
             {
                 #[allow(clippy::cast_precision_loss)]
                 let by = t as f64 * u_period;
-                let e = &mut all_edges[k];
-                e.start_uv = Point2::new(e.start_uv.x() + by, e.start_uv.y());
-                e.end_uv = Point2::new(e.end_uv.x() + by, e.end_uv.y());
+                move_edge_in_uv(&mut all_edges[k], by, 0.0);
             }
         }
     }
@@ -9603,6 +10605,38 @@ fn split_face_2d_impl(
                     e.end_uv = Point2::new(e.end_uv.x() + shift, e.end_uv.y());
                 }
             }
+        }
+    }
+
+    // A ball face that holds one pole of its chart winds the chart: its
+    // outline runs one whole turn of u. A section that meets no vertex of
+    // the outline keeps its points' own u, which can lie a turn off that
+    // window, and its region then never closes. The region that holds the
+    // pole runs that turn too. A zone between two latitudes spans a turn of
+    // u as well, but holds no pole: its seam closes its regions.
+    let mut round_a_pole = false;
+    let mut pole_view: Option<pole_round::PoleView> = None;
+
+    if u_periodic
+        && ball_chart_clear
+        && let FaceSurface::Sphere(chart) = &surface
+        && original_inner_wires.is_empty()
+        && all_edges.len() > n_boundary_edges
+        && let (Some(u_period), _) = super::pcurve_compute::surface_periods(&surface)
+        && let Some(north) = pole_held_round(topo, face_id, chart)
+    {
+        let (lo, hi) = all_edges[..n_boundary_edges]
+            .iter()
+            .flat_map(|e| [e.start_uv.x(), e.end_uv.x()])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), u| {
+                (lo.min(u), hi.max(u))
+            });
+        if (hi - lo - u_period).abs() < 1e-6 {
+            for e in &mut all_edges[n_boundary_edges..] {
+                place_section_in_turn(e, &surface, lo, u_period);
+            }
+            round_a_pole = true;
+            pole_view = Some(pole_round::PoleView::new(chart, north));
         }
     }
 
@@ -9899,7 +10933,21 @@ fn split_face_2d_impl(
     // junction can carry UV copies ~1e-6 apart (the fit-error class), which
     // lands them in different graph cells and the section reads as pendant.
     // Adopting the boundary's UV copy is a sub-weld no-op in 3D.
+    // On a ball face round a pole, a section can end a whole turn from the
+    // boundary's copy of its end: the one-turn window holds the outline and
+    // the section's middle. The section keeps its own copy of the end,
+    // moved onto the boundary's.
     {
+        let turn = if round_a_pole {
+            super::pcurve_compute::surface_periods(&surface).0
+        } else {
+            None
+        };
+        let near_copy = |auv: Point2, uv: Point2| {
+            let du = auv.x() - uv.x();
+            let du = turn.map_or(du, |p| du - (du / p).round() * p);
+            Point2::new(uv.x() + du, auv.y())
+        };
         let (bnd, secs) = all_edges.split_at_mut(n_boundary_edges);
         let mut anchors: Vec<(Point3, Point2)> = bnd
             .iter()
@@ -9914,11 +10962,12 @@ fn split_face_2d_impl(
                 };
                 let snapped = anchors
                     .iter()
+                    .map(|&(a3, auv)| (a3, near_copy(auv, uv)))
                     .filter(|(a3, auv)| {
                         (*a3 - p3).length() < tol.linear && (*auv - uv).length() < 1e-2
                     })
                     .min_by(|(_, a), (_, b)| (*a - uv).length().total_cmp(&(*b - uv).length()))
-                    .map(|(_, auv)| *auv);
+                    .map(|(_, auv)| auv);
                 let final_uv = snapped.unwrap_or(uv);
                 if pick_start {
                     e.start_uv = final_uv;
@@ -10231,9 +11280,36 @@ fn split_face_2d_impl(
             }
         }
     }
-    let all_edges = super::wire_builder::remove_pendant_sections(
-        &all_edges, tol.linear, u_periodic, v_periodic,
-    );
+    // Whether a section piece off a flat face bounds something: its ends lie
+    // apart; its chart image spans 0.01 (the scale of the boundary-proximity
+    // `uv_tol` above, ~0.6 deg in angular coordinates), as a closed circle
+    // round the chart's axis does; or, read about a pole, its curve is not
+    // proved to stay within a weld of its start (a closed circle round no
+    // pole spans neither).
+    let has_extent = |e: &OrientedPCurveEdge| {
+        const ZERO_EXTENT_UV: f64 = 0.01;
+        (e.start_3d - e.end_3d).length() >= tol.linear
+            || (e.start_uv - e.end_uv).length() >= ZERO_EXTENT_UV
+            || (pole_view.is_some() && super::wire_builder::runs_off(e, 100.0 * tol.linear))
+    };
+    // What the face received, read about a pole: each half must run once in
+    // its pieces, whatever the pruning below drops. A piece with no extent
+    // (a self-split remnant) bounds nothing.
+    let received: Option<Vec<OrientedPCurveEdge>> = pole_view.as_ref().map(|_| {
+        all_edges
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| *i < n_boundary_edges || has_extent(e))
+            .map(|(_, e)| e.clone())
+            .collect()
+    });
+    let all_edges = if pole_view.is_some() {
+        super::wire_builder::remove_pendant_sections_but_loops(
+            &all_edges, tol.linear, u_periodic, v_periodic,
+        )
+    } else {
+        super::wire_builder::remove_pendant_sections(&all_edges, tol.linear, u_periodic, v_periodic)
+    };
 
     // Drop zero-extent section edges (a T-junction split at a section's own
     // endpoint mints them); a self-loop edge derails the angular walker into
@@ -10255,15 +11331,7 @@ fn split_face_2d_impl(
         all_edges
             .into_iter()
             .enumerate()
-            .filter(|(i, e)| {
-                // Same scale as the boundary-proximity `uv_tol` above
-                // (~0.6 deg in angular coordinates): a closed circle section
-                // has a zero 3D chord but a full-period UV extent.
-                const ZERO_EXTENT_UV: f64 = 0.01;
-                *i < n_b
-                    || (e.start_3d - e.end_3d).length() >= tol.linear
-                    || (e.start_uv - e.end_uv).length() >= ZERO_EXTENT_UV
-            })
+            .filter(|(i, e)| *i < n_b || has_extent(e))
             .map(|(_, e)| e)
             .collect()
     };
@@ -10325,7 +11393,11 @@ fn split_face_2d_impl(
         })
     });
     // Build wire loops via angular-sorting traversal.
-    let mut loops = build_wire_loops(&all_edges, tol.linear, u_periodic && !strip, v_periodic);
+    let mut loops = if round_a_pole {
+        super::wire_builder::build_wire_loops_round_a_pole(&all_edges, tol.linear)
+    } else {
+        build_wire_loops(&all_edges, tol.linear, u_periodic && !strip, v_periodic)
+    };
     // A woven hole's edges run one way only, and at a corner of the hole
     // where a section leaves on the material's side (a strut's footprint
     // under a window), the greedy walk turns into the hole's next side. The
@@ -10628,7 +11700,8 @@ fn split_face_2d_impl(
         // past a pin's cap) has its region traced the wrong way round.
         let walker_broken = wire_loops_self_cross(&loops, tol.linear)
             || greedy_outer_loops_nested(&loops, cw_loops)
-            || wire_loops_have_degenerate_area(&loops, tol.linear);
+            || wire_loops_have_degenerate_area(&loops, tol.linear)
+            || section_between_holes(&loops, frame, cw_loops, tol.linear);
         if let Some(result) = arr
             && (result.len() > loops.len() || walker_broken)
             && subfaces_cover_boundary(&result, boundary, frame, walker_broken)
@@ -11036,12 +12109,17 @@ fn split_face_2d_impl(
     // A face with holes in the arrangement also takes the trace for a section
     // closed on its own reverse (an arc ending where the face's boundary turns
     // away from it, a wall's notch over a bore: the walker follows the notch).
+    // So does a greedy walk whose regions cover each other with no hole
+    // between them. Where two section circles cross inside the face, the walk
+    // turns right at a crossing and traces the outline of both discs as one
+    // region, each whole circle as a hole, and the lens as a region inside.
     if is_plane
         && !sections.is_empty()
         && ((((woven_inner_wires.is_empty() && !holes_promoted) || woven_spur)
-            && loops
+            && (loops
                 .iter()
-                .any(|lp| split_loop_at_pinch_vertices(lp, tol.linear).len() != 1))
+                .any(|lp| split_loop_at_pinch_vertices(lp, tol.linear).len() != 1)
+                || greedy_outer_loops_nested(&loops, cw_loops)))
             || loops
                 .iter()
                 .any(|lp| loop_has_degenerate_area(lp, tol.linear, Some(frame))))
@@ -11137,12 +12215,7 @@ fn split_face_2d_impl(
     // The way the face's outline winds in (u, v), where it bounds an area
     // there: a face round a pole of its chart (a whole hemisphere) does not.
     let outline_sign = {
-        let (u_period, v_period) = super::pcurve_compute::surface_periods(&surface);
-        let mut uv: Vec<Point2> = sample_wire_outline(topo, face.outer_wire())
-            .into_iter()
-            .filter_map(|p| surface.project_point(p).map(|(u, v)| Point2::new(u, v)))
-            .collect();
-        super::pcurve_compute::unwrap_periodic_params_pub(&mut uv, u_period, v_period);
+        let uv = sample_wire_outline_uv(topo, face.outer_wire(), &surface);
         let area = signed_area_2d(&uv);
         let perimeter: f64 = uv
             .iter()
@@ -11164,6 +12237,36 @@ fn split_face_2d_impl(
             .sum();
         outline_sign.is_some_and(|sign| area.abs() > perimeter * tol.linear && area * sign > 0.0)
     };
+
+    // A ball face round a pole of its chart, its other pole off the face, is
+    // read in a plane about the pole it holds, where every loop bounds an
+    // area ([`pole_round`]).
+    let mut pole_holes: Option<Vec<Vec<Vec<OrientedPCurveEdge>>>> = None;
+    let read_about_pole = pole_view.as_ref().and_then(|view| {
+        pole_round::read(
+            view,
+            &all_edges,
+            received.as_deref()?,
+            n_boundary_edges,
+            loops.clone(),
+            tol.linear,
+        )
+    });
+    let loops = match read_about_pole {
+        Some(pieces) => {
+            let mut per_piece = Vec::with_capacity(pieces.len());
+            for (outline, piece_holes) in pieces {
+                outers.push((outline, 1.0));
+                per_piece.push(piece_holes);
+            }
+            pole_holes = Some(per_piece);
+            Vec::new()
+        }
+        None => loops,
+    };
+    if let Some(read) = pole_off {
+        *read = pole_holes.is_some();
+    }
 
     // A woven hole's pieces carry no section index, like the outline's
     // edges. A loop runs on the outline only where it holds an outline edge.
@@ -11597,6 +12700,12 @@ fn split_face_2d_impl(
             ));
         }
         sub_faces.push(sub_face);
+    }
+
+    if let Some(per_piece) = pole_holes {
+        for (sub_face, piece_holes) in sub_faces.iter_mut().zip(per_piece) {
+            sub_face.inner_wires.extend(piece_holes);
+        }
     }
 
     // Simple hole matching: each hole goes to the outer that contains its
@@ -12347,6 +13456,77 @@ fn torus_loop_uv(sub_face: &SplitSubFace) -> Option<Vec<Point2>> {
     (pts.len() >= 3 && closes).then_some(pts)
 }
 
+/// A point of ball piece `sub_face` that its face's `trim` holds farther than
+/// `near` from its wires, found among the candidates [`interior_point_3d`]
+/// reads across the piece's outline in `(u, v)`. The outline is read in a
+/// chart whose poles lie off the piece and as far from its wires as a spread
+/// of axes allows: through a pole, its `u` jumps. `None` for a piece of
+/// another surface, when no such chart is found or its loop is not read
+/// ([`sphere_loop_uv`]), and when no candidate passes.
+pub fn ball_interior_point_clear(
+    sub_face: &SplitSubFace,
+    trim: &crate::classifier::SphereFaceTrim,
+    near: f64,
+) -> Option<Point3> {
+    const SAMPLES: u32 = 64;
+    let FaceSurface::Sphere(sphere) = &sub_face.surface else {
+        return None;
+    };
+    let (center, radius) = (sphere.center(), sphere.radius());
+    let mut dirs: Vec<Vec3> = Vec::new();
+    for e in sub_face
+        .outer_wire
+        .iter()
+        .chain(sub_face.inner_wires.iter().flatten())
+    {
+        let (start, end) = if e.forward {
+            (e.start_3d, e.end_3d)
+        } else {
+            (e.end_3d, e.start_3d)
+        };
+        let (t0, t1) = e.curve_3d.domain_with_endpoints(start, end);
+        for k in 0..=SAMPLES {
+            let t = (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0);
+            if let Ok(d) = (e.curve_3d.evaluate_with_endpoints(t, start, end) - center).normalize()
+            {
+                dirs.push(d);
+            }
+        }
+    }
+    let axis = clear_ball_axis(center, radius, &dirs, trim)?;
+    let chart = FaceSurface::Sphere(
+        brepkit_math::surfaces::SphericalSurface::with_axis(center, radius, axis).ok()?,
+    );
+    let relaid = |wire: &[OrientedPCurveEdge]| -> Option<Vec<OrientedPCurveEdge>> {
+        wire.iter()
+            .map(|e| {
+                let (su, sv) = chart.project_point(e.start_3d)?;
+                let (eu, ev) = chart.project_point(e.end_3d)?;
+                Some(OrientedPCurveEdge {
+                    start_uv: Point2::new(su, sv),
+                    end_uv: Point2::new(eu, ev),
+                    ..e.clone()
+                })
+            })
+            .collect()
+    };
+    let piece = SplitSubFace {
+        outer_wire: relaid(&sub_face.outer_wire)?,
+        inner_wires: sub_face
+            .inner_wires
+            .iter()
+            .map(|w| relaid(w))
+            .collect::<Option<_>>()?,
+        surface: chart,
+        ..sub_face.clone()
+    };
+    let pts = sphere_loop_uv(&piece)?;
+    let at = |uv: Point2| piece.surface.evaluate(uv.x(), uv.y());
+    let uv =
+        sample_interior_point_where(&pts, |uv| at(uv).is_some_and(|p| trim.holds_clear(p, near)))?;
+    at(uv)
+}
+
 /// A sphere piece's outer loop in `(u, v)`, sampled on its edges' own curves
 /// and read in one continuous `u` window, when its steps in `u` sum to none:
 /// it does not wind the axis, and a pole it runs through is crossed the way
@@ -12462,8 +13642,9 @@ fn winds_the_axis(pts: &[Point2]) -> Option<bool> {
 /// closed loops strictly inside a plane face's boundary (nested coplanar
 /// footprints, or a box wall's socket-profile silhouette), and dedup
 /// repeated segments. Both the coplanar-contact pass and adjacent-face plane-plane
-/// intersections can emit the same footprint segment, so identical
-/// segments (by unordered quantized endpoints) collapse to one.
+/// intersections can emit the same footprint segment, so sections with the
+/// same quantized ends (either way round) that are one curve
+/// ([`same_section_curve`]) collapse to one.
 ///
 /// Returns the deduped sections when every quantized endpoint has degree
 /// exactly 2 (disjoint closed loops) and every endpoint lies strictly
@@ -12477,7 +13658,7 @@ fn plane_internal_line_loops(
     hole_points: &[Point3],
     tol_linear: f64,
 ) -> Option<Vec<SectionEdge>> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     type QPt = (i64, i64, i64);
 
@@ -12520,7 +13701,10 @@ fn plane_internal_line_loops(
         (frame.evaluate(uv.x(), uv.y()) - p).length() <= margin
     };
 
-    let mut seen: HashSet<(QPt, QPt)> = HashSet::new();
+    // Sections kept so far, by their quantized ends. Two sections with the
+    // same ends are one only when they are one curve: two arcs between one
+    // pair of points (a lens), or an arc and its chord, bound a region.
+    let mut seen: HashMap<(QPt, QPt), Vec<usize>> = HashMap::new();
     let mut deduped: Vec<SectionEdge> = Vec::new();
     for s in sections {
         // A section can only bound a sub-face of this plane if it lies on
@@ -12535,9 +13719,15 @@ fn plane_internal_line_loops(
             return None;
         }
         let key = if a <= b { (a, b) } else { (b, a) };
-        if seen.insert(key) {
-            deduped.push(s.clone());
+        let twins = seen.entry(key).or_default();
+        if twins
+            .iter()
+            .any(|&i| same_section_curve(&deduped[i], s, margin))
+        {
+            continue;
         }
+        twins.push(deduped.len());
+        deduped.push(s.clone());
     }
     if deduped.len() < 3 {
         return None;
@@ -12575,13 +13765,20 @@ fn plane_internal_line_loops(
     // split at paves. Drop any segment that another section's endpoint
     // subdivides (collinear, strictly interior) — the sub-segments carry
     // the same geometry. If the sub-segments turn out incomplete, the
-    // degree check below rejects and the generic path takes over.
+    // degree check below rejects and the generic path takes over. Only a
+    // line along the segment is a sub-segment: an arc ending on it (a circle
+    // cut where a line crosses it) leaves it whole, and its loop is no
+    // lone loop.
     //
     // A subdividing endpoint must lie ON the segment, hence inside its
     // bounding box. Index the endpoints in a coarse grid and probe only the
     // cells the segment spans, so a face with many sections (a perforated
     // panel's cap) costs O(sections) here instead of O(sections²).
-    let endpoints: Vec<Point3> = deduped.iter().flat_map(|s| [s.start, s.end]).collect();
+    let endpoints: Vec<(Point3, Point3)> = deduped
+        .iter()
+        .filter(|s| matches!(s.curve_3d, EdgeCurve::Line))
+        .flat_map(|s| [(s.start, s.end), (s.end, s.start)])
+        .collect();
     let grid_cell = {
         let mut sum = 0.0;
         let mut cnt = 0.0;
@@ -12603,9 +13800,9 @@ fn plane_internal_line_loops(
             (p.z() * grid_inv).floor() as i64,
         )
     };
-    let mut ep_grid: HashMap<QPt, Vec<Point3>> = HashMap::new();
-    for &p in &endpoints {
-        ep_grid.entry(cell_of(p)).or_default().push(p);
+    let mut ep_grid: HashMap<QPt, Vec<(Point3, Point3)>> = HashMap::new();
+    for &(p, other_end) in &endpoints {
+        ep_grid.entry(cell_of(p)).or_default().push((p, other_end));
     }
     deduped.retain(|s| {
         if !matches!(s.curve_3d, EdgeCurve::Line) {
@@ -12626,7 +13823,11 @@ fn plane_internal_line_loops(
             s.start.y().max(s.end.y()) + margin,
             s.start.z().max(s.end.z()) + margin,
         ));
-        let subdivided = |p: Point3| -> bool {
+        let off_line = |p: Point3| {
+            let t = (p - s.start).dot(dir) / len2;
+            (p - (s.start + dir * t)).length()
+        };
+        let subdivided = |p: Point3, other_end: Point3| -> bool {
             if (p - s.start).length() < margin || (p - s.end).length() < margin {
                 return false;
             }
@@ -12634,16 +13835,15 @@ fn plane_internal_line_loops(
             if !(0.0..=1.0).contains(&t) {
                 return false;
             }
-            let foot = s.start + dir * t;
-            (p - foot).length() < margin
+            off_line(p) < margin && off_line(other_end) < margin
         };
         for cx in lo.0..=hi.0 {
             for cy in lo.1..=hi.1 {
                 for cz in lo.2..=hi.2 {
                     if let Some(pts) = ep_grid.get(&(cx, cy, cz)) {
-                        for &p in pts {
+                        for &(p, other_end) in pts {
                             crate::perf::bump_face_split_probe();
-                            if subdivided(p) {
+                            if subdivided(p, other_end) {
                                 return false;
                             }
                         }
@@ -12700,6 +13900,372 @@ fn plane_internal_line_loops(
         return None;
     }
     Some(deduped)
+}
+
+/// Whether sections `a` and `b`, whose ends lie within `tol` of each other
+/// (either way round), are one curve within `tol`, by a bound over their
+/// whole length. Two lines are. Two circular or elliptic arcs are where
+/// [`circle_arcs_apart`] or [`ellipse_arcs_apart`] holds them within `tol`,
+/// read the shorter way round between their ends and along the curve from
+/// each start alike. A B-spline is a line's segment when its control points
+/// all lie within `tol` of the segment, as the curve lies in their hull and
+/// runs from end to end; and is another B-spline's trim where
+/// [`nurbs_trims_apart`] holds them within `tol`. Their middles must meet
+/// too, a quick refusal and never a proof. Any other pair is taken for two
+/// curves.
+fn same_section_curve(a: &SectionEdge, b: &SectionEdge, tol: f64) -> bool {
+    use std::borrow::Cow;
+    // Each bound reads a conic's sizes from its radius or semi-axes, true
+    // only on unit, square axes. A line or a B-spline is read as it is.
+    fn unit(s: &SectionEdge) -> Option<(Cow<'_, SectionEdge>, f64)> {
+        let (curve_3d, gap) = crate::builder::pcurve_compute::unit_conic(&s.curve_3d)?;
+        let section = match curve_3d {
+            Cow::Borrowed(_) => Cow::Borrowed(s),
+            Cow::Owned(curve_3d) => Cow::Owned(SectionEdge {
+                curve_3d,
+                ..s.clone()
+            }),
+        };
+        Some((section, gap))
+    }
+    let (Some((a, gap_a)), Some((b, gap_b))) = (unit(a), unit(b)) else {
+        return false;
+    };
+    let (a, b): (&SectionEdge, &SectionEdge) = (&a, &b);
+    // Each stored arc lies within its arc gap of its unit form's, and the
+    // two gaps may take at most a quarter of the tolerance.
+    let off_forms = crate::builder::pcurve_compute::unit_conic_arc_gap(gap_a)
+        + crate::builder::pcurve_compute::unit_conic_arc_gap(gap_b);
+    if off_forms.is_nan() || off_forms > 0.25 * tol {
+        return false;
+    }
+    let along = |s: &SectionEdge, t: f64| {
+        let (t0, t1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+        s.curve_3d
+            .evaluate_with_endpoints((t1 - t0).madd(t, t0), s.start, s.end)
+    };
+    let middles_meet = (evaluate_edge_at_t(&a.curve_3d, a.start, a.end, 0.5)
+        - evaluate_edge_at_t(&b.curve_3d, b.start, b.end, 0.5))
+    .length()
+        <= tol
+        && (along(a, 0.5) - along(b, 0.5)).length() <= tol;
+    let straight = |nurbs: &brepkit_math::nurbs::curve::NurbsCurve, line: &SectionEdge| {
+        let d = line.end - line.start;
+        let len2 = d.dot(d);
+        len2 > 0.0
+            && nurbs.weights().iter().all(|&w| w > 0.0)
+            && nurbs.control_points().iter().all(|&p| {
+                let t = ((p - line.start).dot(d) / len2).clamp(0.0, 1.0);
+                (line.start + d * t - p).length() <= tol
+            })
+    };
+    // An open arc reads two ways: the shorter way round between its ends,
+    // or along its curve from its start. An arc and the rest of its circle
+    // stored from the other end are one arc read the first way and two the
+    // second, so the trims must meet both ways.
+    let readings = |s: &SectionEdge, project: &dyn Fn(Point3) -> f64| {
+        let t0 = project(s.start);
+        let shorter = (
+            t0,
+            crate::builder::pcurve_compute::shorter_arc_delta(project(s.end) - t0),
+        );
+        let (n0, n1) = s.curve_3d.domain_with_endpoints(s.start, s.end);
+        [shorter, (n0, n1 - n0)]
+    };
+    let within = |bound: f64| !bound.is_nan() && bound + off_forms <= tol;
+    match (&a.curve_3d, &b.curve_3d) {
+        (EdgeCurve::Line, EdgeCurve::Line) => true,
+        (EdgeCurve::Circle(p), EdgeCurve::Circle(q)) => {
+            middles_meet && {
+                let (ra, rb) = (
+                    readings(a, &|x| p.project(x)),
+                    readings(b, &|x| q.project(x)),
+                );
+                ra.iter()
+                    .zip(&rb)
+                    .all(|(&ia, &ib)| within(circle_arcs_apart(p, ia, q, ib)))
+            }
+        }
+        (EdgeCurve::Ellipse(p), EdgeCurve::Ellipse(q)) => {
+            middles_meet && {
+                let (ra, rb) = (
+                    readings(a, &|x| p.project(x)),
+                    readings(b, &|x| q.project(x)),
+                );
+                ra.iter()
+                    .zip(&rb)
+                    .all(|(&ia, &ib)| within(ellipse_arcs_apart(p, ia, q, ib)))
+            }
+        }
+        (EdgeCurve::Line, EdgeCurve::NurbsCurve(n)) => straight(n, a),
+        (EdgeCurve::NurbsCurve(n), EdgeCurve::Line) => straight(n, b),
+        (EdgeCurve::NurbsCurve(m), EdgeCurve::NurbsCurve(n)) => {
+            middles_meet
+                && within(nurbs_trims_apart(
+                    m,
+                    a.curve_3d.domain_with_endpoints(a.start, a.end),
+                    n,
+                    b.curve_3d.domain_with_endpoints(b.start, b.end),
+                ))
+        }
+        _ => false,
+    }
+}
+
+/// How far apart, in its own parameter, the span from `a.0` on by `a.1`
+/// lies from the span from `b.0` on by `b.1`, read as sets: the larger gap
+/// between their ends, matched the same way or the other way round,
+/// whichever is less. A span a whole turn longer than another is a turn
+/// apart.
+fn spans_apart((a0, ad): (f64, f64), (b0, bd): (f64, f64)) -> f64 {
+    use crate::builder::pcurve_compute::{max_or_nan, shorter_arc_delta};
+    let same = shorter_arc_delta(b0 - a0);
+    let back = shorter_arc_delta(b0 + bd - a0);
+    let gap = |start: f64, end: f64| max_or_nan(start.abs(), end.abs());
+    let (same, back) = (gap(same, same + bd - ad), gap(back, back - bd - ad));
+    if same.is_nan() || back.is_nan() {
+        f64::NAN
+    } else {
+        same.min(back)
+    }
+}
+
+/// A bound on the Hausdorff distance between the arc of circle `p` from its
+/// parameter `pa.0` on by `pa.1` and the arc of circle `q` over `qa`.
+///
+/// The rotation that takes `q`'s normal (or its reverse, whichever lies
+/// nearer) onto `p`'s carries `q` onto `p`, each point moving at most
+/// `|c_p - c_q| + |r_p - r_q| + r_p |n_p - n_q|` (`n_q` the sign used), and turns its arc
+/// into an arc of `p`. That arc's ends lie within the span gap
+/// ([`spans_apart`]) of `p`'s arc's ends along `p`, so the two arcs of `p`
+/// lie within `r_p` times that gap of each other.
+pub fn circle_arcs_apart(
+    p: &brepkit_math::curves::Circle3D,
+    pa: (f64, f64),
+    q: &brepkit_math::curves::Circle3D,
+    (q0, qd): (f64, f64),
+) -> f64 {
+    let n1 = p.normal();
+    let (n2, sweep) = if n1.dot(q.normal()) < 0.0 {
+        (-q.normal(), -qd)
+    } else {
+        (q.normal(), qd)
+    };
+    let cos = n2.dot(n1);
+    let w = n2.cross(n1);
+    let turn = |e: Vec3| e * cos + w.cross(e) + w * (w.dot(e) / (1.0 + cos));
+    // `|n1 - n2|` is `2 sin(angle / 2)`, read from the components with no
+    // cancellation, where `sqrt(2 - 2 cos)` loses a small turn to rounding;
+    // a few units of rounding cover normals unit only within it. Normals
+    // alike to the bit make `w` nothing, and the turn moves no point.
+    let alike = [(n1.x(), n2.x()), (n1.y(), n2.y()), (n1.z(), n2.z())]
+        .iter()
+        .all(|&(a, b)| (a + 0.0).to_bits() == (b + 0.0).to_bits());
+    let tilt = if alike {
+        0.0
+    } else {
+        8.0f64.madd(f64::EPSILON, (n1 - n2).length())
+    };
+    let moved =
+        (p.center() - q.center()).length() + (p.radius() - q.radius()).abs() + p.radius() * tilt;
+    let (s, c) = q0.sin_cos();
+    let start = turn(q.u_axis() * c + q.v_axis() * s);
+    let start = start.dot(p.v_axis()).atan2(start.dot(p.u_axis()));
+    p.radius().madd(spans_apart(pa, (start, sweep)), moved)
+}
+
+/// A bound on the Hausdorff distance between the arc of ellipse `p` from
+/// its parameter `pa.0` on by `pa.1` and the arc of ellipse `q` over `qa`.
+///
+/// With `q`'s axes taken with signs `su`, `sv`, its point at `t2` is
+/// `c_q + a_q cos t (su U_q) + b_q sin t (sv V_q)`, `t` its parameter on `p`
+/// (`cos t = su cos t2`, `sin t = sv sin t2`), so it stands within
+/// `|c_p - c_q| + sqrt(|a_q su U_q - a_p U_p|^2 + |b_q sv V_q - b_p V_p|^2)` of
+/// `p`'s point at `t`. The arc of `p` over the matching span then lies within
+/// `a_p` times the span gap ([`spans_apart`]) of `p`'s own arc.
+///
+/// A second bound reads each ellipse as the circle on its axes whose radius
+/// is its mean semi-axis. At each parameter the ellipse lies within half the
+/// gap between its semi-axes of that circle, so [`circle_arcs_apart`] between
+/// the circles plus both half gaps bounds the ellipses too. It reads two round
+/// ellipses on turned axes as one. The least bound stands.
+pub fn ellipse_arcs_apart(
+    p: &brepkit_math::curves::Ellipse3D,
+    pa: (f64, f64),
+    q: &brepkit_math::curves::Ellipse3D,
+    (q0, qd): (f64, f64),
+) -> f64 {
+    let mut best = f64::INFINITY;
+    for (su, sv) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+        let major = q.u_axis() * (su * q.semi_major()) - p.u_axis() * p.semi_major();
+        let minor = q.v_axis() * (sv * q.semi_minor()) - p.v_axis() * p.semi_minor();
+        let moved = (p.center() - q.center()).length() + major.length().hypot(minor.length());
+        let start = (sv * q0.sin()).atan2(su * q0.cos());
+        let bound = p
+            .semi_major()
+            .madd(spans_apart(pa, (start, su * sv * qd)), moved);
+        if bound.is_nan() {
+            return f64::NAN;
+        }
+        best = best.min(bound);
+    }
+    let round = |e: &brepkit_math::curves::Ellipse3D| {
+        let radius = 0.5 * (e.semi_major() + e.semi_minor());
+        let off = (0.5 * (e.semi_major() - e.semi_minor())).abs() + f64::EPSILON * radius;
+        brepkit_math::curves::Circle3D::with_axes(
+            e.center(),
+            e.normal(),
+            radius,
+            e.u_axis(),
+            e.v_axis(),
+        )
+        .ok()
+        .map(|circle| (circle, off))
+    };
+    if let (Some((cp, off_p)), Some((cq, off_q))) = (round(p), round(q)) {
+        let bound = circle_arcs_apart(&cp, pa, &cq, (q0, qd)) + off_p + off_q;
+        if !bound.is_nan() {
+            best = best.min(bound);
+        }
+    }
+    best
+}
+
+/// A bound on the Hausdorff distance between the trim of B-spline `m` over
+/// its parameters from `ma.0` to `ma.1` and the trim of `n` over `na`.
+///
+/// Where [`nurbs_data_apart`] holds `m` within `d` of `n` at each parameter
+/// (or of `n` read backward), `m`'s trim lies within `d` of `n` over the
+/// same span (or its mirror), and that lies within `n`'s speed bound
+/// ([`nurbs_speed_bound`]) times the larger gap between the spans' ends of
+/// `n`'s own trim. NaN where no bound holds.
+fn nurbs_trims_apart(
+    m: &brepkit_math::nurbs::curve::NurbsCurve,
+    ma: (f64, f64),
+    n: &brepkit_math::nurbs::curve::NurbsCurve,
+    na: (f64, f64),
+) -> f64 {
+    use crate::builder::pcurve_compute::max_or_nan;
+    let Some(speed) = nurbs_speed_bound(n) else {
+        return f64::NAN;
+    };
+    let span = |(x, y): (f64, f64)| (x.min(y), x.max(y));
+    let gap = |a: (f64, f64), b: (f64, f64)| {
+        let (a, b) = (span(a), span(b));
+        max_or_nan((a.0 - b.0).abs(), (a.1 - b.1).abs())
+    };
+    let knots = n.knots();
+    let (lo, hi) = (knots[0], knots[knots.len() - 1]);
+    let (forward, backward) = nurbs_data_apart(m, n);
+    let mut best = f64::NAN;
+    for (data, theirs) in [(forward, na), (backward, (lo + hi - na.0, lo + hi - na.1))] {
+        let Some(d) = data else { continue };
+        let bound = speed.madd(gap(ma, theirs), d);
+        if !bound.is_nan() && (best.is_nan() || bound < best) {
+            best = bound;
+        }
+    }
+    best
+}
+
+/// A bound on the speed of B-spline `n` in its own parameter: with `A` the
+/// homogeneous curve about its first control point `P_0` and `w` its weight,
+/// `C' = (A' - w' (C - P_0)) / w`, each of `A'` and `w'` at most its largest
+/// derivative control point, `|C - P_0|` at most the control polygon's reach
+/// and `w` at least the least weight. `None` for a weight not above nothing
+/// or a bound that is not finite.
+fn nurbs_speed_bound(n: &brepkit_math::nurbs::curve::NurbsCurve) -> Option<f64> {
+    use crate::builder::pcurve_compute::max_or_nan;
+    let (p, pts, ws, knots) = (n.degree(), n.control_points(), n.weights(), n.knots());
+    if pts.is_empty() || ws.iter().any(|&w| w.is_nan() || w <= 0.0) {
+        return None;
+    }
+    // The curve keeps its shape with its weights scaled alike, and read
+    // against the largest they neither underflow nor overflow.
+    let top = ws.iter().fold(0.0_f64, |m, &w| max_or_nan(m, w));
+    let ws: Vec<f64> = ws.iter().map(|&w| w / top).collect();
+    let origin = pts[0];
+    let least = ws.iter().fold(f64::INFINITY, |m, &w| m.min(w));
+    let reach = pts
+        .iter()
+        .fold(0.0_f64, |m, &q| max_or_nan(m, (q - origin).length()));
+    #[allow(clippy::cast_precision_loss)]
+    let degree = p as f64;
+    let (mut lead, mut weight_rate) = (0.0_f64, 0.0_f64);
+    for i in 0..pts.len().saturating_sub(1) {
+        let du = knots[i + p + 1] - knots[i + 1];
+        if du <= 0.0 {
+            continue;
+        }
+        let step = (pts[i + 1] - origin) * ws[i + 1] - (pts[i] - origin) * ws[i];
+        lead = max_or_nan(lead, step.length() * degree / du);
+        weight_rate = max_or_nan(weight_rate, (ws[i + 1] - ws[i]).abs() * degree / du);
+    }
+    let speed = weight_rate.madd(reach, lead) / least;
+    speed.is_finite().then_some(speed)
+}
+
+/// Bounds on how far B-spline `n` stands from `m` at each parameter, read
+/// forward and read backward (`n` at `lo + hi - t` against `m` at `t`): each
+/// `Some` only where the degree and knot vector match to the bit that way
+/// round, and the weights are positive.
+///
+/// On one knot vector the curves share their basis functions `N_i`, and each
+/// point is the mean of the control points under the shares `N_i w_i`. With
+/// the second's weights a common scale times `w_i (1 + e_i)`, `|e_i| <= d`,
+/// each share moves by at most `2d / (1 - d)` of itself. So at each
+/// parameter the second curve lies within
+/// `max |Q_i - P_i| + 2d / (1 - d) max |P_i - P_0|` of the first.
+fn nurbs_data_apart(
+    m: &brepkit_math::nurbs::curve::NurbsCurve,
+    n: &brepkit_math::nurbs::curve::NurbsCurve,
+) -> (Option<f64>, Option<f64>) {
+    let (mk, nk) = (m.knots(), n.knots());
+    let (mp, np) = (m.control_points(), n.control_points());
+    let (mw, nw) = (m.weights(), n.weights());
+    if m.degree() != n.degree() || mk.len() != nk.len() || mp.len() != np.len() || mp.is_empty() {
+        return (None, None);
+    }
+    let positive = |w: &[f64]| w.iter().all(|&x| x.is_finite() && x > 0.0);
+    if !positive(mw) || !positive(nw) {
+        return (None, None);
+    }
+    let max_or_nan = crate::builder::pcurve_compute::max_or_nan;
+    let most = |w: &[f64]| w.iter().copied().fold(0.0_f64, max_or_nan);
+    let (top_m, top_n) = (most(mw), most(nw));
+    let reach = mp
+        .iter()
+        .map(|&p| (p - mp[0]).length())
+        .fold(0.0_f64, max_or_nan);
+    // Each set of weights is read against its own largest, so the ratios
+    // stay near one whatever the scale: raw products of weights can
+    // underflow to 0 / 0 or overflow to inf / inf.
+    let apart = |pairs: &mut dyn Iterator<Item = ((Point3, f64), (Point3, f64))>| {
+        let (mut moved, mut ratio) = (0.0_f64, 0.0_f64);
+        for ((p, wp), (q, wq)) in pairs {
+            moved = max_or_nan(moved, (q - p).length());
+            ratio = max_or_nan(ratio, ((wq / top_n) / (wp / top_m) - 1.0).abs());
+        }
+        let bound = (2.0 * ratio / (1.0 - ratio)).madd(reach, moved);
+        (ratio < 0.5 && bound.is_finite()).then_some(bound)
+    };
+    let ours = || mp.iter().copied().zip(mw.iter().copied());
+    let forward = if mk.iter().zip(nk).all(|(x, y)| x.to_bits() == y.to_bits()) {
+        apart(&mut ours().zip(np.iter().copied().zip(nw.iter().copied())))
+    } else {
+        None
+    };
+    let (lo, hi) = (nk[0], nk[nk.len() - 1]);
+    let backward = if mk
+        .iter()
+        .zip(nk.iter().rev())
+        .all(|(x, &y)| x.to_bits() == (lo + hi - y).to_bits())
+    {
+        apart(&mut ours().zip(np.iter().copied().zip(nw.iter().copied()).rev()))
+    } else {
+        None
+    };
+    (forward, backward)
 }
 
 /// Rescue for [`plane_internal_line_loops`]: every degree-1 endpoint lies
@@ -15154,5 +16720,2526 @@ mod tests {
             e.start_uv,
             e.end_uv
         );
+    }
+
+    /// A unit cylinder's wall from `v = 0` to `v = 10`, seamed at `u = 0`,
+    /// with a hole round the patch from `u = -1` to `u = 4` between `v = 4`
+    /// and `v = 6`: arcs along the two heights, split where they cross the
+    /// seam, and rulings at the patch's sides; and the patch mirrored in the
+    /// seam. The arcs from the seam to `u = 4` run more than half a turn.
+    /// Each piece of the hole in the split faces runs its own way round in
+    /// `u`, and so ends on its own turn.
+    #[test]
+    fn a_seam_hole_piece_over_half_a_turn_keeps_its_far_end_on_its_turn() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::CylindricalSurface;
+        use std::f64::consts::TAU;
+
+        let cyl =
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap();
+        let surface = FaceSurface::Cylinder(cyl);
+        let on = |u: f64, v: f64| surface.evaluate(u, v).unwrap();
+        let ring = |v: f64, up: bool| {
+            let normal = Vec3::new(0.0, 0.0, if up { 1.0 } else { -1.0 });
+            let circle = Circle3D::new(Point3::new(0.0, 0.0, v), normal, 1.0).unwrap();
+            let t = circle.project(on(0.0, v));
+            let ahead = circle.evaluate(t + 0.1);
+            let step = if up { 0.1 } else { -0.1 };
+            assert!(
+                (ahead - on(step, v)).length() < 1e-12,
+                "the ring turns against u"
+            );
+            EdgeCurve::Circle(circle)
+        };
+        let rim = |v: f64, forward: bool| OrientedPCurveEdge {
+            curve_3d: ring(v, true),
+            pcurve: dummy_pcurve(),
+            start_uv: Point2::new(if forward { 0.0 } else { TAU }, v),
+            end_uv: Point2::new(if forward { TAU } else { 0.0 }, v),
+            start_3d: on(0.0, v),
+            end_3d: on(0.0, v),
+            forward,
+            source_edge_idx: None,
+            pave_block_id: None,
+        };
+        let seam = |from: f64, to: f64, u: f64| OrientedPCurveEdge {
+            curve_3d: EdgeCurve::Line,
+            pcurve: dummy_pcurve(),
+            start_uv: Point2::new(u, from),
+            end_uv: Point2::new(u, to),
+            start_3d: on(u, from),
+            end_3d: on(u, to),
+            forward: true,
+            source_edge_idx: None,
+            pave_block_id: None,
+        };
+        let boundary = vec![
+            rim(0.0, true),
+            seam(0.0, 10.0, TAU),
+            rim(10.0, false),
+            seam(10.0, 0.0, 0.0),
+        ];
+        // Each piece's ends in (u, v).
+        let patch: [((f64, f64), (f64, f64)); 6] = [
+            ((-1.0, 4.0), (0.0, 4.0)),
+            ((0.0, 4.0), (4.0, 4.0)),
+            ((4.0, 4.0), (4.0, 6.0)),
+            ((4.0, 6.0), (0.0, 6.0)),
+            ((0.0, 6.0), (-1.0, 6.0)),
+            ((-1.0, 6.0), (-1.0, 4.0)),
+        ];
+        // The patch as given, and mirrored in the seam: its long arm on the
+        // other side.
+        for side in [1.0, -1.0] {
+            let pieces = patch.map(|((u0, v0), (u1, v1))| ((side * u0, v0), (side * u1, v1)));
+            let sections: Vec<SectionEdge> = pieces
+                .iter()
+                .map(|&((u0, v0), (u1, v1))| {
+                    let curve = if (v1 - v0).abs() > 1e-12 {
+                        EdgeCurve::Line
+                    } else {
+                        ring(v0, u1 > u0)
+                    };
+                    SectionEdge {
+                        curve_3d: curve,
+                        ..line_section(on(u0, v0), on(u1, v1))
+                    }
+                })
+                .collect();
+            let mut topo = Topology::new();
+            let face_id = make_unit_square_face(&mut topo);
+            let split = split_periodic_face_around_seam_holes(
+                &surface,
+                &boundary,
+                &sections,
+                Rank::A,
+                false,
+                face_id,
+                1e-7,
+            )
+            .expect("the wall splits round the hole");
+            assert_eq!(split.len(), 3, "side {side}: the remainder and two halves");
+            let mut checked = 0;
+            for face in &split {
+                for e in face
+                    .outer_wire
+                    .iter()
+                    .chain(face.inner_wires.iter().flatten())
+                {
+                    let run = pieces.iter().find_map(|&((u0, v0), (u1, v1))| {
+                        let (a, b) = (on(u0, v0), on(u1, v1));
+                        if (e.start_3d - a).length() < 1e-9 && (e.end_3d - b).length() < 1e-9 {
+                            Some(u1 - u0)
+                        } else if (e.start_3d - b).length() < 1e-9 && (e.end_3d - a).length() < 1e-9
+                        {
+                            Some(u0 - u1)
+                        } else {
+                            None
+                        }
+                    });
+                    let Some(run) = run else { continue };
+                    let got = e.end_uv.x() - e.start_uv.x();
+                    assert!(
+                        (got - run).abs() < 1e-9,
+                        "side {side}: a piece from {:?} to {:?} runs {got} in u, not {run}",
+                        e.start_uv,
+                        e.end_uv
+                    );
+                    checked += 1;
+                }
+            }
+            assert_eq!(
+                checked, 12,
+                "side {side}: each piece in the outline and in its half"
+            );
+        }
+    }
+
+    /// The wall of the cone of [`cone_ellipse_fixture::oblique_cone`] at
+    /// slope 0.99999, between rims at `v = 0.1` and `v = 1e4`, with a hole
+    /// whose loop runs along the ellipse from its parameter 3.12 to 3.4, up a
+    /// ruling to `v = 5000`, back along that height, and down a ruling. The
+    /// ellipse crosses the seam at its parameter 3.1343, and the arc above
+    /// it at the same `u`; both are split there. From the seam the ellipse's
+    /// `u` runs 5.149 to 3.4, nearly all of it round the near vertex. Run
+    /// either way round, every piece of the hole in the split faces runs its
+    /// own way in `u`, by its exact run.
+    ///
+    /// [`cone_ellipse_fixture::oblique_cone`]: crate::builder::pcurve_compute::cone_ellipse_fixture::oblique_cone
+    #[test]
+    fn a_seam_hole_on_a_steep_cone_keeps_each_pieces_run() {
+        use crate::builder::pcurve_compute::cone_ellipse_fixture::{lifted_u, oblique_cone};
+        use brepkit_math::curves::Circle3D;
+        use std::f64::consts::{FRAC_PI_4, TAU};
+
+        let (surface, ellipse) = oblique_cone(0.99999);
+        let on = |u: f64, v: f64| surface.evaluate(u, v).unwrap();
+        let ring = |v: f64, up: bool| {
+            let z = v * FRAC_PI_4.sin();
+            let normal = Vec3::new(0.0, 0.0, if up { 1.0 } else { -1.0 });
+            Circle3D::new(Point3::new(0.0, 0.0, z), normal, v * FRAC_PI_4.cos()).unwrap()
+        };
+        let (a, b) = (3.12, 3.4);
+        let (u_a, u_b) = lifted_u(&surface, &ellipse, a, b);
+        // Where the arc crosses the seam, `u` a whole number of turns.
+        let seam = (u_a / TAU).ceil() * TAU;
+        assert!(seam < u_b);
+        let (mut lo, mut hi) = (a, b);
+        for _ in 0..100 {
+            let mid = f64::midpoint(lo, hi);
+            if lifted_u(&surface, &ellipse, a, mid).1 < seam {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let t_seam = f64::midpoint(lo, hi);
+        assert!(
+            t_seam - a > 1e-3 && u_b - seam > 5.0,
+            "the arc crosses the seam at {t_seam}, and runs {} on from it",
+            u_b - seam
+        );
+        let (_, v_a) = surface.project_point(ellipse.evaluate(a)).unwrap();
+        let (_, v_b) = surface.project_point(ellipse.evaluate(b)).unwrap();
+        let (v_bot, v_high, v_top) = (0.1, 5000.0, 1e4);
+        let rim = |v: f64, forward: bool| OrientedPCurveEdge {
+            curve_3d: EdgeCurve::Circle(ring(v, true)),
+            pcurve: dummy_pcurve(),
+            start_uv: Point2::new(if forward { 0.0 } else { TAU }, v),
+            end_uv: Point2::new(if forward { TAU } else { 0.0 }, v),
+            start_3d: on(0.0, v),
+            end_3d: on(0.0, v),
+            forward,
+            source_edge_idx: None,
+            pave_block_id: None,
+        };
+        let seam_line = |from: f64, to: f64, u: f64| OrientedPCurveEdge {
+            curve_3d: EdgeCurve::Line,
+            pcurve: dummy_pcurve(),
+            start_uv: Point2::new(u, from),
+            end_uv: Point2::new(u, to),
+            start_3d: on(u, from),
+            end_3d: on(u, to),
+            forward: true,
+            source_edge_idx: None,
+            pave_block_id: None,
+        };
+        let boundary = vec![
+            rim(v_bot, true),
+            seam_line(v_bot, v_top, TAU),
+            rim(v_top, false),
+            seam_line(v_top, v_bot, 0.0),
+        ];
+        let section = |curve: EdgeCurve, start: Point3, end: Point3| SectionEdge {
+            curve_3d: curve,
+            ..line_section(start, end)
+        };
+        let at = |t: f64| ellipse.evaluate(t);
+        let high = |u: f64| on(u, v_high);
+        // Each piece as stored, and its run in u from its stored start.
+        let pieces: Vec<(SectionEdge, f64)> = vec![
+            (
+                section(EdgeCurve::Ellipse(ellipse.clone()), at(a), at(t_seam)),
+                seam - u_a,
+            ),
+            (
+                section(EdgeCurve::Ellipse(ellipse.clone()), at(t_seam), at(b)),
+                u_b - seam,
+            ),
+            (section(EdgeCurve::Line, at(b), high(u_b)), 0.0),
+            (
+                section(
+                    EdgeCurve::Circle(ring(v_high, false)),
+                    high(u_b),
+                    high(seam),
+                ),
+                seam - u_b,
+            ),
+            (
+                section(
+                    EdgeCurve::Circle(ring(v_high, false)),
+                    high(seam),
+                    high(u_a),
+                ),
+                u_a - seam,
+            ),
+            (section(EdgeCurve::Line, high(u_a), at(a)), 0.0),
+        ];
+        assert!(v_a < v_high && v_b < v_high);
+        let mut topo = Topology::new();
+        let face_id = make_unit_square_face(&mut topo);
+        // Chained from the first piece as stored, the loop runs along the
+        // ellipse first; from the last ruling stored the other way, it runs
+        // the loop backwards.
+        let mut backwards = pieces.clone();
+        let (last, run) = backwards.pop().unwrap();
+        backwards.insert(
+            0,
+            (
+                SectionEdge {
+                    start: last.end,
+                    end: last.start,
+                    ..last
+                },
+                run,
+            ),
+        );
+        for (way, pieces) in [("along", pieces), ("back", backwards)] {
+            let sections: Vec<SectionEdge> = pieces.iter().map(|(s, _)| s.clone()).collect();
+            let split = split_periodic_face_around_seam_holes(
+                &surface,
+                &boundary,
+                &sections,
+                Rank::A,
+                false,
+                face_id,
+                1e-7,
+            )
+            .expect("the wall splits round the hole");
+            assert_eq!(split.len(), 3, "{way}: the remainder and two halves");
+            let mut checked = 0;
+            for face in &split {
+                for e in face
+                    .outer_wire
+                    .iter()
+                    .chain(face.inner_wires.iter().flatten())
+                {
+                    let run = pieces.iter().find_map(|(s, run)| {
+                        if (e.start_3d - s.start).length() < 1e-6
+                            && (e.end_3d - s.end).length() < 1e-6
+                        {
+                            Some(*run)
+                        } else if (e.start_3d - s.end).length() < 1e-6
+                            && (e.end_3d - s.start).length() < 1e-6
+                        {
+                            Some(-*run)
+                        } else {
+                            None
+                        }
+                    });
+                    let Some(run) = run else { continue };
+                    let got = e.end_uv.x() - e.start_uv.x();
+                    assert!(
+                        (got - run).abs() < 1e-9,
+                        "{way}: a piece from {:?} to {:?} runs {got} in u, not {run}",
+                        e.start_uv,
+                        e.end_uv
+                    );
+                    checked += 1;
+                }
+            }
+            assert_eq!(checked, 12, "{way}: each piece in the outline and its half");
+        }
+    }
+
+    /// Pieces of the ellipse of `cone_ellipse_fixture::oblique_cone` at
+    /// slope 0.99999, each way along it. The piece across the near vertex
+    /// runs most of a turn of `u`, and crosses the seam meridian once, where
+    /// its `u` lifted along it passes the seam's: with the seam at the
+    /// vertex, and half a radian on from the piece's start. Read from its
+    /// ends the short way round, it crossed nowhere. A short piece crosses
+    /// the seam at its middle, and not the meridian opposite.
+    #[test]
+    fn a_section_over_half_a_turn_splits_where_it_crosses_the_seam() {
+        use crate::builder::pcurve_compute::cone_ellipse_fixture::{lifted_u, oblique_cone};
+        use std::f64::consts::{PI, TAU};
+        let (surface, ellipse) = oblique_cone(0.99999);
+        let curve = EdgeCurve::Ellipse(ellipse.clone());
+        let reversed = curve.reversed().unwrap();
+        let check = |(a, b): (f64, f64), seam: f64, crossings: usize| {
+            for (c, start, end) in [
+                (&curve, ellipse.evaluate(a), ellipse.evaluate(b)),
+                (&reversed, ellipse.evaluate(b), ellipse.evaluate(a)),
+            ] {
+                let s = SectionEdge {
+                    curve_3d: c.clone(),
+                    ..line_section(start, end)
+                };
+                let split = split_sections_at_seam_meridian(
+                    &[s],
+                    &surface,
+                    seam.rem_euclid(TAU),
+                    &[],
+                    1e-7,
+                );
+                assert_eq!(split.len(), crossings + 1, "({a}, {b}) at seam {seam}");
+                assert!((split[0].start - start).length() < 1e-12);
+                assert!((split[crossings].end - end).length() < 1e-12);
+                for k in 0..crossings {
+                    let p = split[k].end;
+                    assert!((split[k + 1].start - p).length() < 1e-12);
+                    let t = (ellipse.project(p) - a).rem_euclid(TAU) + a;
+                    assert!((ellipse.evaluate(t) - p).length() < 1e-9, "off the ellipse");
+                    assert!(t > a && t < b, "({a}, {b}) at seam {seam}: crossed at {t}");
+                    let (_, u) = lifted_u(&surface, &ellipse, a, t);
+                    assert!(
+                        (u - seam).abs() < 1e-6,
+                        "({a}, {b}): crossed at u {u}, the seam at {seam}"
+                    );
+                }
+            }
+        };
+        let near = (PI - 0.02, PI + 0.02);
+        let (u_a, u_b) = lifted_u(&surface, &ellipse, near.0, near.1);
+        assert!((u_b - u_a).abs() > PI, "the piece runs {}", u_b - u_a);
+        let (_, u_vertex) = lifted_u(&surface, &ellipse, near.0, PI);
+        check(near, u_vertex, 1);
+        check(near, u_a + 0.5f64.copysign(u_b - u_a), 1);
+        let short = (1.5 * PI, 1.75 * PI);
+        let (u_c, u_d) = lifted_u(&surface, &ellipse, short.0, short.1);
+        assert!((u_d - u_c).abs() < 0.5, "the piece runs {}", u_d - u_c);
+        check(short, f64::midpoint(u_c, u_d), 1);
+        check(short, f64::midpoint(u_c, u_d) + PI, 0);
+    }
+
+    /// An arc of a ring round a unit cylinder from u = 0.2 to u = -0.2, the
+    /// short way round as its pcurve runs, written with the ring's normal
+    /// up and down and each way along it, so in some cases its own sense
+    /// runs the long way between its ends. It crosses the seam at u = 0 at
+    /// (1, 0, z), and not the seam at u = pi on the long way round: walked
+    /// along that long way, it took a point at (-1, 0, z), off the arc.
+    #[test]
+    fn a_ring_arc_crosses_the_seam_on_the_short_way_its_pcurve_runs() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::CylindricalSurface;
+        use std::f64::consts::PI;
+        let z = 2.0;
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        let at = |u: f64| surface.evaluate(u, z).unwrap();
+        for normal in [1.0, -1.0] {
+            let ring = EdgeCurve::Circle(
+                Circle3D::new(Point3::new(0.0, 0.0, z), Vec3::new(0.0, 0.0, normal), 1.0).unwrap(),
+            );
+            for (from, to) in [(0.2, -0.2), (-0.2, 0.2)] {
+                let arc = SectionEdge {
+                    curve_3d: ring.clone(),
+                    ..line_section(at(from), at(to))
+                };
+                let what = format!("normal {normal}, {from} to {to}");
+                let split = split_sections_at_seam_meridian(
+                    std::slice::from_ref(&arc),
+                    &surface,
+                    PI,
+                    &[],
+                    1e-7,
+                );
+                assert_eq!(split.len(), 1, "{what}: split at the far seam");
+                let split = split_sections_at_seam_meridian(&[arc], &surface, 0.0, &[], 1e-7);
+                assert_eq!(split.len(), 2, "{what}: no split at the near seam");
+                assert!(
+                    (split[0].end - at(0.0)).length() < 1e-9,
+                    "{what}: split at {:?}",
+                    split[0].end
+                );
+            }
+        }
+    }
+
+    /// A rational spline on a unit cylinder of quarter arcs from u = 0 to
+    /// -pi/2, back to 0 and on to pi/2, rising from z = 0 to 3 a unit each,
+    /// each way along it. It starts on the seam at u = 0 and crosses it
+    /// again at z = 2, where it splits. A crossing at the seam copy its
+    /// start lies on was dropped wherever it fell.
+    #[test]
+    fn a_section_leaving_the_seam_splits_where_it_crosses_it_again() {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        use brepkit_math::surfaces::CylindricalSurface;
+        use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4};
+        let surface = FaceSurface::Cylinder(
+            CylindricalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0)
+                .unwrap(),
+        );
+        // The point at `u` on the ring of radius `r` about the axis at `z`.
+        let at = |u: f64, z: f64, r: f64| {
+            let axis = Point3::new(0.0, 0.0, z);
+            axis + (surface.evaluate(u, z).unwrap() - axis) * r
+        };
+        let turns = [0.0, -FRAC_PI_2, 0.0, FRAC_PI_2];
+        let mut poles = vec![at(0.0, 0.0, 1.0)];
+        let mut weights = vec![1.0];
+        for (k, z0) in [0.0, 1.0, 2.0].into_iter().enumerate() {
+            let z1 = z0 + 1.0;
+            let middle = 0.5 * (turns[k] + turns[k + 1]);
+            poles.push(at(middle, 0.5 * (z0 + z1), 1.0 / FRAC_PI_4.cos()));
+            poles.push(at(turns[k + 1], z1, 1.0));
+            weights.extend([FRAC_1_SQRT_2, 1.0]);
+        }
+        let third = 1.0 / 3.0;
+        let knots = vec![
+            0.0,
+            0.0,
+            0.0,
+            third,
+            third,
+            2.0 * third,
+            2.0 * third,
+            1.0,
+            1.0,
+            1.0,
+        ];
+        let spline =
+            EdgeCurve::NurbsCurve(NurbsCurve::new(2, knots, poles.clone(), weights).unwrap());
+        let (first, last) = (poles[0], poles[poles.len() - 1]);
+        for (curve, start, end) in [
+            (spline.clone(), first, last),
+            (spline.reversed().unwrap(), last, first),
+        ] {
+            let section = SectionEdge {
+                curve_3d: curve,
+                ..line_section(start, end)
+            };
+            let split = split_sections_at_seam_meridian(&[section], &surface, 0.0, &[], 1e-7);
+            assert_eq!(split.len(), 2, "from {start:?}: {split:?}");
+            assert!(
+                (split[0].end - at(0.0, 2.0, 1.0)).length() < 1e-9,
+                "from {start:?}: split at {:?}",
+                split[0].end
+            );
+        }
+    }
+
+    /// A ball face round its north pole, below which its one rim of three
+    /// arcs runs once round the axis, holds that pole. A zone between two
+    /// latitudes, bounded by a meridian seam and two rims of three arcs each,
+    /// spans a turn of `u` too, but holds no pole and turns its rims both
+    /// ways: the walk that closes a loop a turn round does not run on it.
+    #[test]
+    fn only_a_ball_face_round_a_pole_closes_its_loops_a_turn_round() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::SphericalSurface;
+        use brepkit_topology::edge::{Edge, EdgeId};
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let axis = Vec3::new(0.0, 0.0, 1.0);
+        let rim = |topo: &mut Topology, h: f64| -> Vec<EdgeId> {
+            let w = (1.0 - h * h).sqrt();
+            let circle = Circle3D::new(Point3::new(0.0, 0.0, h), axis, w).unwrap();
+            let vs: Vec<_> = (0..3)
+                .map(|k| {
+                    let a = std::f64::consts::TAU * f64::from(k) / 3.0;
+                    topo.add_vertex(Vertex::new(Point3::new(w * a.cos(), w * a.sin(), h), 1e-7))
+                })
+                .collect();
+            (0..3)
+                .map(|k| {
+                    topo.add_edge(Edge::new(
+                        vs[k],
+                        vs[(k + 1) % 3],
+                        EdgeCurve::Circle(circle.clone()),
+                    ))
+                })
+                .collect()
+        };
+        let sphere = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 1.0).unwrap();
+        let ball = || FaceSurface::Sphere(sphere.clone());
+
+        let mut topo = Topology::new();
+        let low = rim(&mut topo, -0.4);
+        let cap = topo.add_wire(
+            Wire::new(
+                low.iter().map(|&e| OrientedEdge::new(e, true)).collect(),
+                true,
+            )
+            .unwrap(),
+        );
+        let cap = topo.add_face(Face::new(cap, vec![], ball()));
+        assert!(pole_held_round(&topo, cap, &sphere).is_some());
+
+        let high = rim(&mut topo, 0.6);
+        let (from, to) = (
+            topo.edge(low[0]).unwrap().start(),
+            topo.edge(high[0]).unwrap().start(),
+        );
+        let at = topo.vertex(from).unwrap().point();
+        let meridian = Circle3D::new_with_ref(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            1.0,
+            at - Point3::new(0.0, 0.0, 0.0),
+        )
+        .unwrap();
+        let seam = topo.add_edge(Edge::new(from, to, EdgeCurve::Circle(meridian)));
+        let mut zone: Vec<OrientedEdge> = low.iter().map(|&e| OrientedEdge::new(e, true)).collect();
+        zone.push(OrientedEdge::new(seam, true));
+        zone.extend(high.iter().rev().map(|&e| OrientedEdge::new(e, false)));
+        zone.push(OrientedEdge::new(seam, false));
+        let zone = topo.add_wire(Wire::new(zone, true).unwrap());
+        let zone = topo.add_face(Face::new(zone, vec![], ball()));
+        assert!(pole_held_round(&topo, zone, &sphere).is_none());
+    }
+
+    /// The unit ball less the cap round the unit direction `cap` beyond
+    /// `0.95`, one face bounded by the cap's rim; two small circles on it,
+    /// 0.2 rad round, their middles 0.3 rad apart either side of the unit
+    /// direction `m` along the unit direction `e` square to it, so that they
+    /// cross twice, and a whole circle 0.1 rad round the unit direction
+    /// `lone` where one is given, as a circle or as a squeezed spline
+    /// ([`squeezed_spline_circle`]); split by `split_face_2d` along their
+    /// arcs, laid in the order of their circles.
+    fn split_with_crossing_circles(
+        cap: Vec3,
+        m: Vec3,
+        e: Vec3,
+        lone: Option<(Vec3, bool)>,
+    ) -> Vec<SplitSubFace> {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::SphericalSurface;
+        use brepkit_topology::edge::Edge;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let circle =
+            |d: Vec3, rho: f64| Circle3D::new(origin + d * rho.cos(), d, rho.sin()).unwrap();
+        let sphere = SphericalSurface::new(origin, 1.0).unwrap();
+        let surface = FaceSurface::Sphere(sphere);
+        let mut topo = Topology::new();
+        // The rim runs round `-cap`, so that the face lies on its left.
+        let rim = circle(-cap, std::f64::consts::PI - 0.95_f64.acos());
+        let at = topo.add_vertex(Vertex::new(rim.evaluate(0.0), 1e-7));
+        let rim = topo.add_edge(Edge::new(at, at, EdgeCurve::Circle(rim)));
+        let wire = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        let face_id = topo.add_face(Face::new(wire, vec![], surface.clone()));
+
+        let (rho, apart) = (0.2_f64, 0.3_f64);
+        let (s, c) = (0.5 * apart).sin_cos();
+        let n = m.cross(e);
+        let along = rho.cos() / c;
+        let across = (1.0 - along * along).sqrt();
+        let p = origin + m * along + n * across;
+        let q = origin + m * along - n * across;
+        let mut sections = Vec::new();
+        for d in [m * c + e * s, m * c - e * s] {
+            let round = circle(d, rho);
+            // Each arc in pieces under half a turn, as the face-face phase
+            // emits them.
+            let mut arcs = Vec::new();
+            for (from, to) in [(p, q), (q, p)] {
+                let (a, b) = (round.project(from), round.project(to));
+                let span = (b - a).rem_euclid(std::f64::consts::TAU);
+                if span < 0.999 * std::f64::consts::PI {
+                    arcs.push((from, to));
+                } else {
+                    let middle = round.evaluate(a + 0.5 * span);
+                    arcs.extend([(from, middle), (middle, to)]);
+                }
+            }
+            let curve = EdgeCurve::Circle(round);
+            for (from, to) in arcs {
+                let pcurve = super::super::pcurve_compute::compute_pcurve_on_surface(
+                    &curve,
+                    from,
+                    to,
+                    &surface,
+                    &[],
+                    None,
+                );
+                sections.push(SectionEdge {
+                    curve_3d: curve.clone(),
+                    pcurve_a: pcurve,
+                    pcurve_b: dummy_pcurve(),
+                    start: from,
+                    end: to,
+                    start_uv_a: None,
+                    end_uv_a: None,
+                    start_uv_b: None,
+                    end_uv_b: None,
+                    target_face: None,
+                    pave_block_id: None,
+                });
+            }
+        }
+        if let Some((d, squeezed)) = lone {
+            let curve = if squeezed {
+                EdgeCurve::NurbsCurve(squeezed_spline_circle(&circle(d, 0.1)))
+            } else {
+                EdgeCurve::Circle(circle(d, 0.1))
+            };
+            let at = curve.evaluate_with_endpoints(0.0, origin, origin);
+            let pcurve = super::super::pcurve_compute::compute_pcurve_on_surface(
+                &curve,
+                at,
+                at,
+                &surface,
+                &[],
+                None,
+            );
+            sections.push(SectionEdge {
+                curve_3d: curve,
+                pcurve_a: pcurve,
+                pcurve_b: dummy_pcurve(),
+                start: at,
+                end: at,
+                start_uv_a: None,
+                end_uv_a: None,
+                start_uv_b: None,
+                end_uv_b: None,
+                target_face: None,
+                pave_block_id: None,
+            });
+        }
+        let tol = brepkit_math::tolerance::Tolerance::new();
+        let edge_images: std::collections::HashMap<
+            brepkit_topology::edge::EdgeId,
+            Vec<brepkit_topology::edge::EdgeId>,
+        > = std::collections::HashMap::new();
+        let info = SurfaceInfo::Parametric {
+            u_periodic: true,
+            v_periodic: false,
+        };
+        split_face_2d(
+            &topo,
+            face_id,
+            &sections,
+            Rank::A,
+            &tol,
+            None,
+            Some(&info),
+            &edge_images,
+            &std::collections::BTreeSet::new(),
+            None,
+        )
+    }
+
+    /// `circle` as a closed rational quadratic spline in four arcs: three
+    /// over the first 1e-6 of its domain run all but 1e-6 rad of the turn,
+    /// and the fourth runs the rest over the remainder of the domain.
+    fn squeezed_spline_circle(
+        circle: &brepkit_math::curves::Circle3D,
+    ) -> brepkit_math::nurbs::curve::NurbsCurve {
+        use std::f64::consts::TAU;
+        let (c, r) = (circle.center(), circle.radius());
+        let (u, v) = (circle.u_axis(), circle.v_axis());
+        let on = |a: f64| c + u * (r * a.cos()) + v * (r * a.sin());
+        let last = 1e-6;
+        let big = (TAU - last) / 3.0;
+        let ends = [0.0, big, 2.0 * big, TAU - last, TAU];
+        let mut points = vec![on(0.0)];
+        let mut weights = vec![1.0];
+        for w in ends.windows(2) {
+            let half = 0.5 * (w[1] - w[0]);
+            points.push(c + (on(w[0] + half) - c) * (1.0 / half.cos()));
+            weights.push(half.cos());
+            points.push(on(w[1]));
+            weights.push(1.0);
+        }
+        let third = 1e-6 / 3.0;
+        let knots = vec![
+            0.0,
+            0.0,
+            0.0,
+            third,
+            third,
+            2.0 * third,
+            2.0 * third,
+            1e-6,
+            1e-6,
+            1.0,
+            1.0,
+            1.0,
+        ];
+        brepkit_math::nurbs::curve::NurbsCurve::new(2, knots, points, weights).unwrap()
+    }
+
+    /// The arcs a piece's wires run, as the middles of their circles.
+    fn circles_run(piece: &SplitSubFace) -> Vec<Vec<Point3>> {
+        std::iter::once(&piece.outer_wire)
+            .chain(&piece.inner_wires)
+            .map(|w| {
+                w.iter()
+                    .filter_map(|e| match &e.curve_3d {
+                        EdgeCurve::Circle(c) => Some(c.center()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Two small circles that cross on a ball face split it in four: the
+    /// face less both discs, each disc less the other, and their lens. Read
+    /// as two whole discs, the discs overlap on the lens and the face's
+    /// two holes overlap there too.
+    #[test]
+    fn two_small_circles_that_cross_on_a_ball_face_split_it_in_four() {
+        let unit = |x: f64, y: f64, z: f64| Vec3::new(x, y, z).normalize().unwrap();
+        // The face holds the south pole of its own chart; and, with the cap
+        // round +x, both poles, so that it takes a chart with one pole off it.
+        for (cap, m, e) in [
+            (
+                Vec3::new(0.0, 0.0, 1.0),
+                unit(1.0, 0.0, -1.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ),
+            (
+                Vec3::new(1.0, 0.0, 0.0),
+                unit(-0.5, 0.5, -0.7),
+                unit(1.0, 1.0, 0.0),
+            ),
+        ] {
+            let split = split_with_crossing_circles(cap, m, e, None);
+            assert_eq!(split.len(), 4, "cap {cap:?}");
+            // No wire runs one small circle alone: a whole disc.
+            let rim = Point3::new(0.0, 0.0, 0.0) + cap * 0.95;
+            for piece in &split {
+                for wire in circles_run(piece) {
+                    let one_circle = wire.iter().all(|c| (*c - wire[0]).length() < 1e-9);
+                    assert!(
+                        !one_circle || (wire[0] - rim).length() < 1e-9,
+                        "cap {cap:?}: a wire runs a whole small circle"
+                    );
+                }
+            }
+            assert_eq!(split.iter().map(|p| p.inner_wires.len()).sum::<usize>(), 1);
+        }
+    }
+
+    /// Two small circles that cross and a whole circle apart from them,
+    /// a circle or a squeezed spline, split a ball face in five: the whole
+    /// circle's disc stands as a piece, and the face keeps it as a hole.
+    #[test]
+    fn crossing_circles_and_a_lone_circle_on_a_ball_face_split_it_in_five() {
+        let unit = |x: f64, y: f64, z: f64| Vec3::new(x, y, z).normalize().unwrap();
+        let cases = [
+            (
+                Vec3::new(0.0, 0.0, 1.0),
+                unit(1.0, 0.0, -1.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                unit(-1.0, 0.0, -1.0),
+            ),
+            (
+                Vec3::new(1.0, 0.0, 0.0),
+                unit(-0.5, 0.5, -0.7),
+                unit(1.0, 1.0, 0.0),
+                unit(-0.5, -0.5, -0.7),
+            ),
+        ];
+        for (case, squeezed) in cases.iter().flat_map(|c| [(c, false), (c, true)]) {
+            let &(cap, m, e, lone) = case;
+            let split = split_with_crossing_circles(cap, m, e, Some((lone, squeezed)));
+            assert_eq!(split.len(), 5, "cap {cap:?}, squeezed {squeezed}");
+            assert_eq!(
+                split.iter().map(|p| p.inner_wires.len()).sum::<usize>(),
+                2,
+                "cap {cap:?}"
+            );
+            // The lone loop's disc: one wire of one edge, the lone loop.
+            let middle = Point3::new(0.0, 0.0, 0.0) + lone * 0.1_f64.cos();
+            let disc = split.iter().filter(|p| {
+                p.inner_wires.is_empty()
+                    && p.outer_wire.len() == 1
+                    && (p.outer_wire[0].start_3d - middle).length() < 0.11
+            });
+            assert_eq!(disc.count(), 1, "cap {cap:?}, squeezed {squeezed}");
+        }
+    }
+
+    /// The unit ball less the cap round `+z` beyond `0.95`, one face bounded
+    /// by the cap's rim; a circle 0.15 rad round a point of the rim, whose
+    /// arc below the rim cuts a piece off the face; and a whole circle 0.1
+    /// rad round the unit direction `lone`; split by `split_face_2d`.
+    fn split_with_an_arc_and_a_lone_circle(lone: Vec3) -> Vec<SplitSubFace> {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::SphericalSurface;
+        use brepkit_topology::edge::Edge;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let circle =
+            |d: Vec3, rho: f64| Circle3D::new(origin + d * rho.cos(), d, rho.sin()).unwrap();
+        let sphere = SphericalSurface::new(origin, 1.0).unwrap();
+        let surface = FaceSurface::Sphere(sphere);
+        let mut topo = Topology::new();
+        let polar = 0.95_f64.acos();
+        let rim = circle(Vec3::new(0.0, 0.0, -1.0), std::f64::consts::PI - polar);
+        let at = topo.add_vertex(Vertex::new(rim.evaluate(0.0), 1e-7));
+        let rim = topo.add_edge(Edge::new(at, at, EdgeCurve::Circle(rim)));
+        let wire = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        let face_id = topo.add_face(Face::new(wire, vec![], surface.clone()));
+        // The arc's ends: where the circle crosses z = 0.95, by bisection.
+        let round = circle(Vec3::new(polar.sin(), 0.0, polar.cos()), 0.15);
+        let above = |t: f64| round.evaluate(t).z() > 0.95;
+        let steps: Vec<f64> = (0..=360).map(|k| f64::from(k).to_radians()).collect();
+        let crossings: Vec<f64> = steps
+            .windows(2)
+            .filter(|w| above(w[0]) != above(w[1]))
+            .map(|w| {
+                let (mut lo, mut hi) = (w[0], w[1]);
+                for _ in 0..80 {
+                    let mid = f64::midpoint(lo, hi);
+                    if above(mid) == above(lo) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                f64::midpoint(lo, hi)
+            })
+            .collect();
+        assert_eq!(crossings.len(), 2);
+        let (from, to) = if above(f64::midpoint(crossings[0], crossings[1])) {
+            (crossings[1], crossings[0])
+        } else {
+            (crossings[0], crossings[1])
+        };
+        let lone = circle(lone, 0.1);
+        let (ring, p, q) = (lone.evaluate(0.0), round.evaluate(from), round.evaluate(to));
+        let mut sections = Vec::new();
+        for (curve, a, b) in [
+            (EdgeCurve::Circle(round), p, q),
+            (EdgeCurve::Circle(lone), ring, ring),
+        ] {
+            let pcurve = super::super::pcurve_compute::compute_pcurve_on_surface(
+                &curve,
+                a,
+                b,
+                &surface,
+                &[],
+                None,
+            );
+            sections.push(SectionEdge {
+                curve_3d: curve,
+                pcurve_a: pcurve,
+                pcurve_b: dummy_pcurve(),
+                start: a,
+                end: b,
+                start_uv_a: None,
+                end_uv_a: None,
+                start_uv_b: None,
+                end_uv_b: None,
+                target_face: None,
+                pave_block_id: None,
+            });
+        }
+        let tol = brepkit_math::tolerance::Tolerance::new();
+        let edge_images: std::collections::HashMap<
+            brepkit_topology::edge::EdgeId,
+            Vec<brepkit_topology::edge::EdgeId>,
+        > = std::collections::HashMap::new();
+        let info = SurfaceInfo::Parametric {
+            u_periodic: true,
+            v_periodic: false,
+        };
+        split_face_2d(
+            &topo,
+            face_id,
+            &sections,
+            Rank::A,
+            &tol,
+            None,
+            Some(&info),
+            &edge_images,
+            &std::collections::BTreeSet::new(),
+            None,
+        )
+    }
+
+    /// An arc across a ball face's rim and a whole circle apart from it split
+    /// the face in three: the piece the arc cuts off, the whole circle's
+    /// disc, and the rest of the face with the disc as its hole.
+    #[test]
+    fn an_arc_across_the_rim_and_a_lone_circle_split_a_ball_face_in_three() {
+        let lone = Vec3::new(-1.0, 0.0, -1.0).normalize().unwrap();
+        let split = split_with_an_arc_and_a_lone_circle(lone);
+        assert_eq!(split.len(), 3);
+        assert_eq!(split.iter().map(|p| p.inner_wires.len()).sum::<usize>(), 1);
+    }
+
+    /// A square plate 10 wide, and on it two arcs from `(4, 5)` to `(6, 5)`,
+    /// each a quarter of a circle of radius `sqrt(2)`, one bulging up about
+    /// `(5, 4)` and one down about `(5, 6)`, with two lines from those
+    /// points up to `(5, 8)`. The sections and the plate's face.
+    fn two_arcs_between_one_pair_of_points() -> (Topology, FaceId, Vec<SectionEdge>) {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_topology::edge::Edge;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut topo = Topology::new();
+        let corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+            .map(|(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), 1e-7)));
+        let edges: Vec<_> = (0..4)
+            .map(|i| {
+                let edge = Edge::new(corners[i], corners[(i + 1) % 4], EdgeCurve::Line);
+                OrientedEdge::new(topo.add_edge(edge), true)
+            })
+            .collect();
+        let outer = topo.add_wire(Wire::new(edges, true).unwrap());
+        let face = topo.add_face(Face::new(
+            outer,
+            vec![],
+            FaceSurface::Plane {
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                d: 0.0,
+            },
+        ));
+        let (p, q, r) = (
+            Point3::new(4.0, 5.0, 0.0),
+            Point3::new(6.0, 5.0, 0.0),
+            Point3::new(5.0, 8.0, 0.0),
+        );
+        // Each arc runs counter-clockwise about +z from its start, under a
+        // half turn.
+        let arc = |centre_y: f64, from: Point3, to: Point3| {
+            let circle = Circle3D::new(
+                Point3::new(5.0, centre_y, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                std::f64::consts::SQRT_2,
+            )
+            .unwrap();
+            SectionEdge {
+                curve_3d: EdgeCurve::Circle(circle),
+                ..line_section(from, to)
+            }
+        };
+        let sections = vec![
+            arc(4.0, q, p),
+            arc(6.0, p, q),
+            line_section(q, r),
+            line_section(r, p),
+        ];
+        (topo, face, sections)
+    }
+
+    /// The middle of a section along its shorter arc.
+    fn section_middle(s: &SectionEdge) -> Point3 {
+        evaluate_edge_at_t(&s.curve_3d, s.start, s.end, 0.5)
+    }
+
+    /// Two different curves between one pair of points (an arc bulging up
+    /// and one bulging down, or the arc up and the straight line) are two
+    /// sections: the loop finder keeps both. The arc up repeated is one
+    /// section, and goes once.
+    #[test]
+    fn plane_internal_line_loops_keeps_two_curves_that_share_their_ends() {
+        let (topo, face_id, sections) = two_arcs_between_one_pair_of_points();
+        let face = topo.face(face_id).unwrap();
+        let surface = face.surface().clone();
+        let wire_pts = collect_wire_points(&topo, face.outer_wire());
+        let frame = PlaneFrame::from_plane_face(extract_plane_normal(&surface), &wire_pts);
+        let boundary =
+            boundary_edges_to_pcurve(&topo, face.outer_wire(), &surface, &wire_pts, Some(&frame));
+        let chord = line_section(sections[0].start, sections[0].end);
+        for (what, pair) in [
+            ("two arcs", [sections[0].clone(), sections[1].clone()]),
+            ("an arc and a line", [sections[0].clone(), chord]),
+        ] {
+            let mut given = pair.to_vec();
+            given.extend_from_slice(&sections[2..]);
+            if let Some(kept) = plane_internal_line_loops(&given, &frame, &boundary, &[], &[], 1e-7)
+            {
+                for curve in &pair {
+                    let middle = section_middle(curve);
+                    assert!(
+                        kept.iter()
+                            .any(|s| (section_middle(s) - middle).length() < 1e-9),
+                        "{what}: the curve through {middle:?} was dropped, {} of {} kept",
+                        kept.len(),
+                        given.len()
+                    );
+                }
+            }
+        }
+        let repeated = vec![
+            sections[0].clone(),
+            sections[2].clone(),
+            sections[0].clone(),
+            sections[3].clone(),
+        ];
+        let kept = plane_internal_line_loops(&repeated, &frame, &boundary, &[], &[], 1e-7)
+            .expect("the arc up and the two lines close one loop");
+        assert_eq!(kept.len(), 3);
+    }
+
+    /// The same plate split by those sections: the lens between the two
+    /// arcs, the triangle above the arc up, and the rest of the plate, each
+    /// the region its sections bound.
+    #[test]
+    fn two_arcs_between_one_pair_of_points_split_a_plate_into_their_regions() {
+        let (topo, face_id, sections) = two_arcs_between_one_pair_of_points();
+        let subs = split_face_2d(
+            &topo,
+            face_id,
+            &sections,
+            Rank::A,
+            &brepkit_math::tolerance::Tolerance::new(),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::BTreeSet::new(),
+            None,
+        );
+        // Each region's area, by the shoelace formula over its wires, each
+        // edge read at 2000 points.
+        let wire_area = |wire: &[OrientedPCurveEdge]| {
+            let mut pts = Vec::new();
+            for e in wire {
+                for k in 0..2000 {
+                    let t = f64::from(k) / 2000.0;
+                    pts.push(evaluate_edge_at_t(&e.curve_3d, e.start_3d, e.end_3d, t));
+                }
+            }
+            let mut twice = 0.0;
+            for (i, a) in pts.iter().enumerate() {
+                let b = pts[(i + 1) % pts.len()];
+                twice += a.x() * b.y() - b.x() * a.y();
+            }
+            (0.5 * twice).abs()
+        };
+        let mut areas: Vec<f64> = subs
+            .iter()
+            .map(|s| {
+                wire_area(&s.outer_wire) - s.inner_wires.iter().map(|w| wire_area(w)).sum::<f64>()
+            })
+            .collect();
+        areas.sort_by(f64::total_cmp);
+        // Each arc cuts a segment of area pi/2 - 1 off its quarter disc; the
+        // triangle's area is 3.
+        let pi = std::f64::consts::PI;
+        let want = [pi - 2.0, 4.0 - 0.5 * pi, 98.0 - 0.5 * pi];
+        assert_eq!(areas.len(), 3, "regions of areas {areas:?}");
+        for (got, want) in areas.iter().zip(want) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "regions of areas {areas:?}, want {want}"
+            );
+        }
+    }
+
+    /// A section along the B-spline of degree `degree` on `knots` through
+    /// `points` (in z = 0) with `weights`, from its first point to its last.
+    fn spline_section(
+        degree: usize,
+        knots: &[f64],
+        points: &[(f64, f64)],
+        weights: &[f64],
+    ) -> SectionEdge {
+        let points: Vec<Point3> = points
+            .iter()
+            .map(|&(x, y)| Point3::new(x, y, 0.0))
+            .collect();
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            degree,
+            knots.to_vec(),
+            points.clone(),
+            weights.to_vec(),
+        )
+        .unwrap();
+        SectionEdge {
+            curve_3d: EdgeCurve::NurbsCurve(curve),
+            ..line_section(points[0], points[points.len() - 1])
+        }
+    }
+
+    /// The most `y` a section reaches, read at 2001 points along it.
+    fn highest_y(s: &SectionEdge) -> f64 {
+        (0..=2000)
+            .map(|k| evaluate_edge_at_t(&s.curve_3d, s.start, s.end, f64::from(k) / 2000.0).y())
+            .fold(
+                f64::NEG_INFINITY,
+                crate::builder::pcurve_compute::max_or_nan,
+            )
+    }
+
+    /// Two cubics on one knot vector through one set of control points, with
+    /// weights `s` at all four, and `s, 100 s, 100 s, s`, for `s` of 1e-15,
+    /// 1e-200 and 1e200: their ends and middles meet, but the first reaches
+    /// y = 0.289 and the second 0.855. Raw products of the weights underflow
+    /// or overflow at the two far scales. Weights that differ only by a
+    /// common scale are one curve.
+    #[test]
+    fn b_splines_whose_weights_differ_in_ratio_are_two_curves() {
+        let knots = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let points = [(0.0, 0.0), (1.0, 1.0), (2.0, -1.0), (3.0, 0.0)];
+        for s in [1e-15, 1e-200, 1e200] {
+            let even = spline_section(3, &knots, &points, &[s; 4]);
+            let uneven = spline_section(3, &knots, &points, &[s, 100.0 * s, 100.0 * s, s]);
+            assert!((section_middle(&even) - section_middle(&uneven)).length() < 1e-9);
+            let (low, high) = (highest_y(&even), highest_y(&uneven));
+            assert!(
+                (low - 0.289).abs() < 1e-3 && (high - 0.855).abs() < 1e-3,
+                "scale {s}: {low} {high}"
+            );
+            assert!(!same_section_curve(&even, &uneven, 1e-5), "scale {s}");
+            assert!(!same_section_curve(&uneven, &even, 1e-5), "scale {s}");
+            let scaled = spline_section(3, &knots, &points, &[2.5 * s; 4]);
+            assert!(same_section_curve(&even, &scaled, 1e-5), "scale {s}");
+            let scaled = spline_section(
+                3,
+                &knots,
+                &points,
+                &[2.5 * s, 250.0 * s, 250.0 * s, 2.5 * s],
+            );
+            assert!(same_section_curve(&uneven, &scaled, 1e-5), "scale {s}");
+        }
+    }
+
+    /// Two cubics on the parameter span [0, 1e-12] through six control
+    /// points symmetric about (1.5, 0), with inner knots at a quarter and
+    /// three quarters of the span, and at 0.4 and 0.6 of it. Their ends and
+    /// middles meet, but they part by more than the tolerance between.
+    #[test]
+    fn b_splines_with_other_knots_on_a_short_span_are_two_curves() {
+        let span = 1e-12;
+        let knots = |a: f64, b: f64| {
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                a * span,
+                b * span,
+                span,
+                span,
+                span,
+                span,
+            ]
+        };
+        let points = [
+            (0.0, 0.0),
+            (0.6, 1.0),
+            (1.2, 1.0),
+            (1.8, -1.0),
+            (2.4, -1.0),
+            (3.0, 0.0),
+        ];
+        let quarters = spline_section(3, &knots(0.25, 0.75), &points, &[1.0; 6]);
+        let tenths = spline_section(3, &knots(0.4, 0.6), &points, &[1.0; 6]);
+        assert!((section_middle(&quarters) - section_middle(&tenths)).length() < 1e-9);
+        let apart = (highest_y(&quarters) - highest_y(&tenths)).abs();
+        assert!(apart > 1e-3, "the two cubics part by {apart}");
+        assert!(!same_section_curve(&quarters, &tenths, 1e-5));
+        assert!(same_section_curve(&quarters, &quarters.clone(), 1e-5));
+    }
+
+    /// The plate of [`two_arcs_between_one_pair_of_points`] split by
+    /// `sections`, its regions' areas sorted, each read by the shoelace
+    /// formula over its wires with each edge read at 2000 points. An edge
+    /// runs its curve from its stored start, its samples then turned to the
+    /// wire's way, as [`sampling::sample_wire_loop_uv_via_frame`] reads it.
+    /// Each outline must wind counter-clockwise about the plate's normal
+    /// `+z` and each hole clockwise; a region's area is the sum of its
+    /// wires' signed areas.
+    fn plate_region_areas(sections: &[SectionEdge]) -> Vec<f64> {
+        let (topo, face_id, _) = two_arcs_between_one_pair_of_points();
+        let subs = split_face_2d(
+            &topo,
+            face_id,
+            sections,
+            Rank::A,
+            &brepkit_math::tolerance::Tolerance::new(),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::BTreeSet::new(),
+            None,
+        );
+        let wire_area = |wire: &[OrientedPCurveEdge]| {
+            let mut pts = Vec::new();
+            for e in wire {
+                let (s3, e3) = if e.forward {
+                    (e.start_3d, e.end_3d)
+                } else {
+                    (e.end_3d, e.start_3d)
+                };
+                let (t0, t1) = e.curve_3d.domain_with_endpoints(s3, e3);
+                for k in 0..2000 {
+                    let f = f64::from(k) / 2000.0;
+                    let f = if e.forward { f } else { 1.0 - f };
+                    pts.push(
+                        e.curve_3d
+                            .evaluate_with_endpoints((t1 - t0).madd(f, t0), s3, e3),
+                    );
+                }
+            }
+            let mut twice = 0.0;
+            for (i, a) in pts.iter().enumerate() {
+                let b = pts[(i + 1) % pts.len()];
+                twice += a.x() * b.y() - b.x() * a.y();
+            }
+            0.5 * twice
+        };
+        let mut areas: Vec<f64> = subs
+            .iter()
+            .map(|s| {
+                let outline = wire_area(&s.outer_wire);
+                assert!(outline > 0.0, "an outline winds clockwise: {outline}");
+                let holes: Vec<f64> = s.inner_wires.iter().map(|w| wire_area(w)).collect();
+                assert!(
+                    holes.iter().all(|&h| h < 0.0),
+                    "a hole winds counter-clockwise: {holes:?}"
+                );
+                outline + holes.iter().sum::<f64>()
+            })
+            .collect();
+        areas.sort_by(f64::total_cmp);
+        areas
+    }
+
+    /// One circle of radius 2 about (5, 5), as two halves between (7, 5)
+    /// and (3, 5), each half a turn counter-clockwise from its start: two
+    /// trims of one circle with one pair of ends, and the plate splits into
+    /// the disc and the rest. An arc of a sixth of a turn, and the rest of
+    /// its circle stored from the other end, are two curves too: read by
+    /// the shorter way round they are one arc, but read along the circle
+    /// from each start they are the two arcs of the circle.
+    #[test]
+    fn trims_of_one_circle_between_one_pair_of_points_stay_two() {
+        use brepkit_math::curves::Circle3D;
+        let circle =
+            Circle3D::new(Point3::new(5.0, 5.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 2.0).unwrap();
+        let trim = |a: f64, b: f64| SectionEdge {
+            curve_3d: EdgeCurve::Circle(circle.clone()),
+            ..line_section(circle.evaluate(a), circle.evaluate(b))
+        };
+        let pi = std::f64::consts::PI;
+        let (upper, lower) = (trim(0.0, pi), trim(pi, 0.0));
+        assert!(!same_section_curve(&upper, &lower, 1e-5));
+        let areas = plate_region_areas(&[upper, lower]);
+        let want = [4.0 * pi, 100.0 - 4.0 * pi];
+        assert_eq!(areas.len(), 2, "regions of areas {areas:?}");
+        for (got, want) in areas.iter().zip(want) {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "regions of areas {areas:?}, want {want}"
+            );
+        }
+        let (short, rest) = (trim(0.2, 0.2 + pi / 3.0), trim(0.2 + pi / 3.0, 0.2));
+        assert!(!same_section_curve(&short, &rest, 1e-5));
+        assert!(!same_section_curve(&rest, &short, 1e-5));
+        assert!(same_section_curve(&short, &short.clone(), 1e-5));
+    }
+
+    /// The plate of [`two_arcs_between_one_pair_of_points`] laid in the frame
+    /// at `o` with axes `u` and `v`, its normal `u x v`: the plate's (x, y)
+    /// lies at `o + x u + y v`.
+    fn plate_in_frame(o: Point3, u: Vec3, v: Vec3) -> (Topology, FaceId) {
+        use brepkit_topology::edge::Edge;
+        use brepkit_topology::face::Face;
+        use brepkit_topology::vertex::Vertex;
+        use brepkit_topology::wire::{OrientedEdge, Wire};
+
+        let mut topo = Topology::new();
+        let corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+            .map(|(x, y)| topo.add_vertex(Vertex::new(o + u * x + v * y, 1e-7)));
+        let edges: Vec<_> = (0..4)
+            .map(|i| {
+                let edge = Edge::new(corners[i], corners[(i + 1) % 4], EdgeCurve::Line);
+                OrientedEdge::new(topo.add_edge(edge), true)
+            })
+            .collect();
+        let outer = topo.add_wire(Wire::new(edges, true).unwrap());
+        let normal = u.cross(v);
+        let face = topo.add_face(Face::new(
+            outer,
+            vec![],
+            FaceSurface::Plane {
+                normal,
+                d: normal.dot(o - Point3::new(0.0, 0.0, 0.0)),
+            },
+        ));
+        (topo, face)
+    }
+
+    /// The area a wire of lines and circular arcs bounds in the frame at `o`
+    /// with axes `u` and `v`, signed by its way round about `u x v`. Each
+    /// edge adds its chord's term of the shoelace formula, and an arc adds
+    /// the segment between it and its chord, `r^2 (phi - sin phi) / 2` for
+    /// a sweep `phi`, so the sum is exact.
+    fn exact_wire_area(wire: &[OrientedPCurveEdge], o: Point3, u: Vec3, v: Vec3) -> f64 {
+        let local = |p: Point3| ((p - o).dot(u), (p - o).dot(v));
+        let normal = u.cross(v);
+        wire.iter()
+            .map(|e| {
+                let (s3, e3) = if e.forward {
+                    (e.start_3d, e.end_3d)
+                } else {
+                    (e.end_3d, e.start_3d)
+                };
+                let (a, b) = (local(s3), local(e3));
+                let chord = 0.5 * (a.0 * b.1 - b.0 * a.1);
+                let segment = match &e.curve_3d {
+                    EdgeCurve::Line => 0.0,
+                    EdgeCurve::Circle(c) => {
+                        let (t0, t1) = e.curve_3d.domain_with_endpoints(s3, e3);
+                        let phi = t1 - t0;
+                        let r = c.radius();
+                        c.normal().dot(normal).signum() * 0.5 * r * r * (phi - phi.sin())
+                    }
+                    other => unreachable!("a wire edge on {other:?}"),
+                };
+                if e.forward {
+                    chord + segment
+                } else {
+                    -(chord + segment)
+                }
+            })
+            .sum()
+    }
+
+    /// The regions' areas, sorted, of the plate in the frame at `o` with
+    /// axes `u` and `v` split by `sections`. Each outline must wind
+    /// counter-clockwise about `u x v` and each hole clockwise.
+    fn framed_plate_region_areas(
+        o: Point3,
+        u: Vec3,
+        v: Vec3,
+        sections: &[SectionEdge],
+    ) -> Vec<f64> {
+        let (topo, face_id) = plate_in_frame(o, u, v);
+        let subs = split_face_2d(
+            &topo,
+            face_id,
+            sections,
+            Rank::A,
+            &brepkit_math::tolerance::Tolerance::new(),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::BTreeSet::new(),
+            None,
+        );
+        let mut areas: Vec<f64> = subs
+            .iter()
+            .map(|s| {
+                let outline = exact_wire_area(&s.outer_wire, o, u, v);
+                assert!(outline > 0.0, "an outline winds clockwise: {outline}");
+                let holes: Vec<f64> = s
+                    .inner_wires
+                    .iter()
+                    .map(|w| exact_wire_area(w, o, u, v))
+                    .collect();
+                assert!(
+                    holes.iter().all(|&h| h < 0.0),
+                    "a hole winds counter-clockwise: {holes:?}"
+                );
+                outline + holes.iter().sum::<f64>()
+            })
+            .collect();
+        areas.sort_by(f64::total_cmp);
+        areas
+    }
+
+    /// The plate's frames: upright, turned about a slant axis and moved,
+    /// and that turn mirrored in the plane `x = 0`.
+    fn plate_frames() -> [(&'static str, Point3, Vec3, Vec3); 3] {
+        let axis = Vec3::new(1.0, 2.0, 3.0).normalize().unwrap();
+        let (sin, cos) = 0.7f64.sin_cos();
+        let turn = |e: Vec3| e * cos + axis.cross(e) * sin + axis * (axis.dot(e) * (1.0 - cos));
+        let mirror = |e: Vec3| Vec3::new(-e.x(), e.y(), e.z());
+        let (u, v) = (
+            turn(Vec3::new(1.0, 0.0, 0.0)),
+            turn(Vec3::new(0.0, 1.0, 0.0)),
+        );
+        let o = Point3::new(3.0, -2.0, 5.0);
+        [
+            (
+                "upright",
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ),
+            ("turned", o, u, v),
+            (
+                "mirrored",
+                Point3::new(-o.x(), o.y(), o.z()),
+                mirror(u),
+                mirror(v),
+            ),
+        ]
+    }
+
+    /// A circle of radius 2 about the plate's (5, 5), cut at two points a
+    /// sixth of a turn apart into an arc and the rest of the circle: the
+    /// plate splits into the disc and the rest, in each frame. The rest is
+    /// stored from the arc's end round to its start, or from the arc's start
+    /// about the reversed normal; either way its shorter-arc middle is the
+    /// arc's, and only a reading along each curve keeps both.
+    #[test]
+    fn an_arc_and_the_rest_of_its_circle_split_a_plate_into_the_disc_and_the_rest() {
+        use brepkit_math::curves::Circle3D;
+        let pi = std::f64::consts::PI;
+        for (pose, o, u, v) in plate_frames() {
+            let normal = u.cross(v);
+            let centre = o + u * 5.0 + v * 5.0;
+            let circle = Circle3D::new(centre, normal, 2.0).unwrap();
+            let back = Circle3D::new(centre, -normal, 2.0).unwrap();
+            let (p, q) = (circle.evaluate(0.2), circle.evaluate(0.2 + pi / 3.0));
+            let on = |c: &Circle3D, from: Point3, to: Point3| SectionEdge {
+                curve_3d: EdgeCurve::Circle(c.clone()),
+                ..line_section(from, to)
+            };
+            for (how, arc, rest) in [
+                (
+                    "rest from the arc's end",
+                    on(&circle, p, q),
+                    on(&circle, q, p),
+                ),
+                (
+                    "rest about the reversed normal",
+                    on(&circle, p, q),
+                    on(&back, p, q),
+                ),
+                (
+                    "arc about the reversed normal",
+                    on(&back, q, p),
+                    on(&circle, q, p),
+                ),
+            ] {
+                assert!(
+                    (section_middle(&arc) - section_middle(&rest)).length() < 1e-9,
+                    "{pose}, {how}: the shorter-arc middles differ"
+                );
+                let want = [4.0 * pi, 100.0 - 4.0 * pi];
+                for sections in [[arc.clone(), rest.clone()], [rest, arc]] {
+                    let areas = framed_plate_region_areas(o, u, v, &sections);
+                    assert_eq!(areas.len(), 2, "{pose}, {how}: regions of areas {areas:?}");
+                    for (got, want) in areas.iter().zip(want) {
+                        assert!(
+                            (got - want).abs() < 1e-9,
+                            "{pose}, {how}: regions of areas {areas:?}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A closed B-spline (an exact circle of radius 2 about (5, 5), nine
+    /// rational quadratic points) cut at its closure point and at 0.6 of its
+    /// span into two trims with one pair of ends: they are two curves, and
+    /// the plate splits into the disc and the rest.
+    #[test]
+    fn trims_of_one_closed_b_spline_between_one_pair_of_points_stay_two() {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let points: Vec<Point3> = [
+            (7.0, 5.0),
+            (7.0, 7.0),
+            (5.0, 7.0),
+            (3.0, 7.0),
+            (3.0, 5.0),
+            (3.0, 3.0),
+            (5.0, 3.0),
+            (7.0, 3.0),
+            (7.0, 5.0),
+        ]
+        .iter()
+        .map(|&(x, y)| Point3::new(x, y, 0.0))
+        .collect();
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            2,
+            vec![
+                0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+            ],
+            points,
+            vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0],
+        )
+        .unwrap();
+        let (a, b) = (curve.evaluate(0.0), curve.evaluate(0.6));
+        let trim = |from: Point3, to: Point3| SectionEdge {
+            curve_3d: EdgeCurve::NurbsCurve(curve.clone()),
+            ..line_section(from, to)
+        };
+        let (first, second) = (trim(a, b), trim(b, a));
+        assert!(
+            (section_middle(&first) - section_middle(&second)).length() > 1.0,
+            "the two trims read as one piece"
+        );
+        assert!(!same_section_curve(&first, &second, 1e-5));
+        let pi = std::f64::consts::PI;
+        let areas = plate_region_areas(&[first, second]);
+        let want = [4.0 * pi, 100.0 - 4.0 * pi];
+        assert_eq!(areas.len(), 2, "regions of areas {areas:?}");
+        for (got, want) in areas.iter().zip(want) {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "regions of areas {areas:?}, want {want}"
+            );
+        }
+    }
+
+    /// The greatest distance from points of section `a`, read at 2001
+    /// points, to section `b`, read at 20001.
+    fn farthest_from(a: &SectionEdge, b: &SectionEdge) -> f64 {
+        let on_b: Vec<Point3> = (0..=20000)
+            .map(|k| evaluate_edge_at_t(&b.curve_3d, b.start, b.end, f64::from(k) / 20000.0))
+            .collect();
+        (0..=2000)
+            .map(|k| {
+                let p = evaluate_edge_at_t(&a.curve_3d, a.start, a.end, f64::from(k) / 2000.0);
+                on_b.iter()
+                    .map(|&q| (q - p).length())
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0, crate::builder::pcurve_compute::max_or_nan)
+    }
+
+    /// Two arcs of a sweep of pi - 0.1 from one pair of angles: one on the
+    /// unit circle, one on a circle 0.53 of the tolerance larger whose centre
+    /// moves as far toward the arc's quarter point. Their ends and middles
+    /// lie within the tolerance of each other, but at the quarter point
+    /// they stand 1.06 of it apart: they are two curves.
+    #[test]
+    fn arcs_whose_ends_and_middles_meet_but_part_between_are_two_curves() {
+        use brepkit_math::curves::Circle3D;
+        let tol = 1e-5;
+        let (from, sweep) = (0.3_f64, std::f64::consts::PI - 0.1);
+        let quarter = sweep.madd(0.25, from);
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let unit = Circle3D::new(Point3::new(5.0, 5.0, 0.0), z, 1.0).unwrap();
+        let shift = (unit.evaluate(quarter) - unit.center()) * (0.53 * tol);
+        let wider = Circle3D::new(
+            Point3::new(5.0, 5.0, 0.0) + shift,
+            z,
+            0.53f64.madd(tol, 1.0),
+        )
+        .unwrap();
+        let arc = |c: &Circle3D| SectionEdge {
+            curve_3d: EdgeCurve::Circle(c.clone()),
+            ..line_section(c.evaluate(from), c.evaluate(from + sweep))
+        };
+        let (a, b) = (arc(&unit), arc(&wider));
+        assert!((section_middle(&a) - section_middle(&b)).length() < tol);
+        assert!((a.start - b.start).length() < tol && (a.end - b.end).length() < tol);
+        let apart = farthest_from(&b, &a);
+        assert!(apart > tol, "the arcs part by {apart:e}");
+        assert!(!same_section_curve(&a, &b, tol));
+        assert!(!same_section_curve(&b, &a, tol));
+    }
+
+    /// Complementary trims of a closed spline of lines through (0, 0),
+    /// (2, 0), (2, 2), (-2, 3) and a point 4e-6 off (2, 1), over [0, 0.6] and
+    /// [0.6, 1]: their ends meet and their middles lie 4e-6 apart, but they
+    /// are two curves.
+    #[test]
+    fn complementary_trims_of_a_closed_spline_with_meeting_middles_are_two_curves() {
+        let points: Vec<Point3> = [
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (2.0, 2.0),
+            (-2.0, 3.0),
+            (2.0 + 4e-6, 1.0),
+            (0.0, 0.0),
+        ]
+        .iter()
+        .map(|&(x, y)| Point3::new(x, y, 0.0))
+        .collect();
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            1,
+            vec![0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.0],
+            points,
+            vec![1.0; 6],
+        )
+        .unwrap();
+        let trim = |from: Point3, to: Point3| SectionEdge {
+            curve_3d: EdgeCurve::NurbsCurve(curve.clone()),
+            ..line_section(from, to)
+        };
+        let (a, b) = (curve.evaluate(0.0), curve.evaluate(0.6));
+        let (first, second) = (trim(a, b), trim(b, a));
+        assert!((section_middle(&first) - section_middle(&second)).length() < 1e-5);
+        assert!(farthest_from(&first, &second) > 0.5);
+        assert!(!same_section_curve(&first, &second, 1e-5));
+        assert!(!same_section_curve(&second, &first, 1e-5));
+    }
+
+    /// Sections that are one curve still merge: an arc and its copy moved
+    /// 1e-7, the same arc stored from its other end on its circle turned
+    /// over, an elliptic arc and the same arc on its ellipse with both axes
+    /// reversed, and a trim of an open cubic stored either way round.
+    #[test]
+    fn sections_that_are_one_curve_still_merge() {
+        use brepkit_math::curves::{Circle3D, Ellipse3D};
+        let tol = 1e-5;
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let centre = Point3::new(5.0, 5.0, 0.0);
+        let circle = Circle3D::new(centre, z, 2.0).unwrap();
+        let (a, b) = (circle.evaluate(0.4), circle.evaluate(1.9));
+        let arc = SectionEdge {
+            curve_3d: EdgeCurve::Circle(circle),
+            ..line_section(a, b)
+        };
+        let moved = Circle3D::new(centre + Vec3::new(1e-7, 0.0, 0.0), z, 2.0).unwrap();
+        let near = SectionEdge {
+            curve_3d: EdgeCurve::Circle(moved.clone()),
+            ..line_section(moved.evaluate(0.4), moved.evaluate(1.9))
+        };
+        let over = SectionEdge {
+            curve_3d: EdgeCurve::Circle(Circle3D::new(centre, -z, 2.0).unwrap()),
+            ..line_section(b, a)
+        };
+        assert!(same_section_curve(&arc, &near, tol));
+        assert!(same_section_curve(&arc, &over, tol));
+        assert!(same_section_curve(&over, &arc, tol));
+
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let ellipse = Ellipse3D::new_with_ref(centre, z, 3.0, 1.5, x).unwrap();
+        let flipped = Ellipse3D::new_with_ref(centre, z, 3.0, 1.5, -x).unwrap();
+        let (a, b) = (ellipse.evaluate(0.4), ellipse.evaluate(1.9));
+        let elliptic = |e: &Ellipse3D| SectionEdge {
+            curve_3d: EdgeCurve::Ellipse(e.clone()),
+            ..line_section(a, b)
+        };
+        assert!(same_section_curve(
+            &elliptic(&ellipse),
+            &elliptic(&flipped),
+            tol
+        ));
+
+        let cubic = brepkit_math::nurbs::curve::NurbsCurve::new(
+            3,
+            vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 2.0, 0.0),
+                Point3::new(2.0, -1.0, 0.0),
+                Point3::new(3.0, 1.0, 0.0),
+                Point3::new(4.0, 0.0, 0.0),
+            ],
+            vec![1.0; 5],
+        )
+        .unwrap();
+        let (a, b) = (cubic.evaluate(0.2), cubic.evaluate(0.7));
+        let trim = |from: Point3, to: Point3| SectionEdge {
+            curve_3d: EdgeCurve::NurbsCurve(cubic.clone()),
+            ..line_section(from, to)
+        };
+        assert!(same_section_curve(&trim(a, b), &trim(a, b), tol));
+        assert!(same_section_curve(&trim(a, b), &trim(b, a), tol));
+    }
+
+    /// An arc of a circle of radius 1e4 over [3 pi / 8, 7 pi / 8], and the
+    /// same arc with its circle turned by `angle` about the line through
+    /// its centre at angle 1/8 + 0.35 of a turn in its plane.
+    fn large_arc_and_its_turned_copy(angle: f64) -> (SectionEdge, SectionEdge) {
+        use brepkit_math::curves::Circle3D;
+        use std::f64::consts::PI;
+        let centre = Point3::new(3.0, -2.0, 1.0);
+        let normal = Vec3::new(0.2, -0.3, 0.9).normalize().unwrap();
+        let circle = Circle3D::new(centre, normal, 1e4).unwrap();
+        let toward = 0.35 + PI / 8.0;
+        let axis = circle.u_axis() * toward.cos() + circle.v_axis() * toward.sin();
+        let (s, c) = angle.sin_cos();
+        let turn = |v: Vec3| v * c + axis.cross(v) * s + axis * (axis.dot(v) * (1.0 - c));
+        let turned =
+            Circle3D::new_with_ref(centre, turn(normal), 1e4, turn(circle.u_axis())).unwrap();
+        let arc = |k: &Circle3D| SectionEdge {
+            curve_3d: EdgeCurve::Circle(k.clone()),
+            ..line_section(k.evaluate(3.0 * PI / 8.0), k.evaluate(7.0 * PI / 8.0))
+        };
+        (arc(&circle), arc(&turned))
+    }
+
+    /// The most a section's points, read at 2001, stand off the whole
+    /// circle of a circular section `of`.
+    fn off_circle(s: &SectionEdge, of: &SectionEdge) -> f64 {
+        let EdgeCurve::Circle(c) = &of.curve_3d else {
+            return f64::NAN;
+        };
+        (0..=2000)
+            .map(|k| {
+                let p = evaluate_edge_at_t(&s.curve_3d, s.start, s.end, f64::from(k) / 2000.0);
+                let w = p - c.center();
+                let h = w.dot(c.normal());
+                h.hypot((w - c.normal() * h).length() - c.radius())
+            })
+            .fold(0.0, crate::builder::pcurve_compute::max_or_nan)
+    }
+
+    /// An arc of radius 1e4 and its copy turned by 1.06e-9: their ends and
+    /// middles lie within the tolerance of each other, but the copy stands
+    /// 1.06e-5 off between, so they are two curves. Turned by nothing, or by
+    /// 1e-14, the copy is the same curve.
+    #[test]
+    fn a_large_arc_and_its_slightly_turned_copy_merge_only_when_within_the_tolerance() {
+        let tol = 1e-5;
+        let (arc, copy) = large_arc_and_its_turned_copy(1.06e-9);
+        assert!((section_middle(&arc) - section_middle(&copy)).length() < tol);
+        assert!((arc.start - copy.start).length() < tol && (arc.end - copy.end).length() < tol);
+        let off = off_circle(&copy, &arc);
+        assert!(off > tol, "the turned copy stands {off:e} off");
+        assert!(!same_section_curve(&arc, &copy, tol));
+        assert!(!same_section_curve(&copy, &arc, tol));
+        for angle in [0.0, 1e-14] {
+            let (arc, copy) = large_arc_and_its_turned_copy(angle);
+            assert!(same_section_curve(&arc, &copy, tol), "turned by {angle:e}");
+            assert!(same_section_curve(&copy, &arc, tol), "turned by {angle:e}");
+        }
+    }
+
+    /// A section's circle stored on axes `scale` long, its radius divided by
+    /// `scale`: the same points at the same parameters.
+    fn on_long_axes(s: &SectionEdge, scale: f64) -> SectionEdge {
+        let EdgeCurve::Circle(c) = &s.curve_3d else {
+            return s.clone();
+        };
+        let long = brepkit_math::curves::Circle3D::with_axes(
+            c.center(),
+            c.normal(),
+            c.radius() / scale,
+            c.u_axis() * scale,
+            c.v_axis() * scale,
+        )
+        .unwrap();
+        SectionEdge {
+            curve_3d: EdgeCurve::Circle(long),
+            ..s.clone()
+        }
+    }
+
+    /// The pair of [`large_arc_and_its_turned_copy`] with both circles
+    /// stored on axes 1e12 long: the copy turned by 1.06e-9 still stays a
+    /// curve of its own, and the copy turned by nothing still merges. An
+    /// ellipse on axes of other lengths, whose projection misreads its
+    /// points, or on axes slightly askew, is refused.
+    #[test]
+    fn arcs_on_long_axes_merge_as_their_unit_forms_do() {
+        use brepkit_math::curves::Ellipse3D;
+        let tol = 1e-5;
+        for (angle, merges) in [(1.06e-9, false), (0.0, true)] {
+            let (arc, copy) = large_arc_and_its_turned_copy(angle);
+            assert_eq!(
+                same_section_curve(&arc, &copy, tol),
+                merges,
+                "unit, {angle:e}"
+            );
+            let (long_arc, long_copy) = (on_long_axes(&arc, 1e12), on_long_axes(&copy, 1e12));
+            for (a, b) in [
+                (&long_arc, &long_copy),
+                (&arc, &long_copy),
+                (&long_arc, &copy),
+            ] {
+                assert_eq!(
+                    same_section_curve(a, b, tol),
+                    merges,
+                    "long axes, {angle:e}"
+                );
+            }
+        }
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        let centre = Point3::new(5.0, 5.0, 0.0);
+        let ellipse = Ellipse3D::with_axes(centre, z, 3.0, 1.5, x, y).unwrap();
+        let (a, b) = (ellipse.evaluate(0.4), ellipse.evaluate(1.9));
+        let section = |e: Ellipse3D| SectionEdge {
+            curve_3d: EdgeCurve::Ellipse(e),
+            ..line_section(a, b)
+        };
+        let scaled = Ellipse3D::with_axes(centre, z, 1.5, 0.5, x * 2.0, y * 3.0).unwrap();
+        assert!((scaled.evaluate(0.4) - a).length() < 1e-12);
+        assert!(!same_section_curve(
+            &section(ellipse.clone()),
+            &section(scaled),
+            tol
+        ));
+        assert!(same_section_curve(
+            &section(ellipse.clone()),
+            &section(ellipse.clone()),
+            tol
+        ));
+        let askew =
+            Ellipse3D::with_axes(centre, z, 3.0, 1.5, x, (y + x * 1e-6).normalize().unwrap())
+                .unwrap();
+        assert!(!same_section_curve(&section(ellipse), &section(askew), tol));
+    }
+
+    /// The upper half of a circle of radius 2e9, stored on the unit axes
+    /// and on the axes (1, 0, 0) and (0, 1 + 1.4e-14, 0): the two stand
+    /// 2.8e-5 apart at the top, past the 1e-5 margin, so they are two
+    /// curves. A copy on the unit axes is the same curve.
+    #[test]
+    fn a_huge_circle_on_axes_of_slightly_unequal_length_is_its_own_curve() {
+        use brepkit_math::curves::Circle3D;
+        let tol = 1e-5;
+        let (x, y, z) = (
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+        let centre = Point3::new(0.0, 0.0, 0.0);
+        let unit = Circle3D::with_axes(centre, z, 2e9, x, y).unwrap();
+        let longer = Circle3D::with_axes(centre, z, 2e9, x, y * (1.0 + 1.4e-14)).unwrap();
+        let half = |c: &Circle3D| SectionEdge {
+            curve_3d: EdgeCurve::Circle(c.clone()),
+            ..line_section(c.evaluate(0.0), c.evaluate(std::f64::consts::PI))
+        };
+        let top = (longer.evaluate(std::f64::consts::FRAC_PI_2)
+            - unit.evaluate(std::f64::consts::FRAC_PI_2))
+        .length();
+        assert!(top > tol, "the halves stand {top:e} apart at the top");
+        assert!(!same_section_curve(&half(&unit), &half(&longer), tol));
+        assert!(!same_section_curve(&half(&longer), &half(&unit), tol));
+        assert!(same_section_curve(&half(&unit), &half(&unit.clone()), tol));
+    }
+
+    /// A section on the 10 by 10 plate, in the plate's own coordinates.
+    #[derive(Clone, Copy, PartialEq)]
+    enum PlateCut {
+        Line((f64, f64), (f64, f64)),
+        /// The shorter arc about a centre, counter-clockwise from one point
+        /// to the next.
+        Arc((f64, f64), f64, (f64, f64), (f64, f64)),
+    }
+
+    /// The plate's frame in a pose: its origin and the images of its x and
+    /// y axes. A mirrored pose also lists the plate's corners the other way
+    /// round, so its face normal runs against its arcs' axes.
+    struct PlatePose {
+        origin: Point3,
+        x: Vec3,
+        y: Vec3,
+        mirrored: bool,
+    }
+
+    impl PlatePose {
+        fn at(&self, (x, y): (f64, f64)) -> Point3 {
+            self.origin + self.x * x + self.y * y
+        }
+
+        fn normal(&self) -> Vec3 {
+            self.x.cross(self.y)
+        }
+    }
+
+    fn turned(v: Vec3, axis: Vec3, angle: f64) -> Vec3 {
+        let a = axis.normalize().unwrap();
+        v * angle.cos() + a.cross(v) * angle.sin() + a * (a.dot(v) * (1.0 - angle.cos()))
+    }
+
+    /// Upright; turned and moved; and mirrored in its plane, turned and moved.
+    fn plate_poses() -> [PlatePose; 3] {
+        let (ex, ey) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        let a = Vec3::new(1.0, 2.0, 2.0);
+        let b = Vec3::new(-2.0, 1.0, 2.0);
+        [
+            PlatePose {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                x: ex,
+                y: ey,
+                mirrored: false,
+            },
+            PlatePose {
+                origin: Point3::new(3.0, -7.0, 11.0),
+                x: turned(ex, a, 0.9),
+                y: turned(ey, a, 0.9),
+                mirrored: false,
+            },
+            PlatePose {
+                origin: Point3::new(-5.0, 2.0, 4.0),
+                x: turned(ex, b, 2.1),
+                y: -turned(ey, b, 2.1),
+                mirrored: true,
+            },
+        ]
+    }
+
+    /// Twice the signed area a wire of lines and circle arcs bounds about
+    /// `normal`, in closed form, and NaN for a wire with any other curve. An
+    /// arc runs counter-clockwise about its circle's normal from its stored
+    /// start to its stored end, as the face builder lays it: from `start_3d`
+    /// when forward, from `end_3d` when not.
+    fn twice_wire_area(wire: &[OrientedPCurveEdge], normal: Vec3) -> f64 {
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        wire.iter()
+            .map(|e| {
+                let (p, q) = (e.start_3d - origin, e.end_3d - origin);
+                match &e.curve_3d {
+                    EdgeCurve::Line => p.cross(q).dot(normal),
+                    EdgeCurve::Circle(c) => {
+                        let (a, b) = if e.forward {
+                            (e.start_3d, e.end_3d)
+                        } else {
+                            (e.end_3d, e.start_3d)
+                        };
+                        let sweep = if (a - b).length() < 1e-12 {
+                            std::f64::consts::TAU
+                        } else {
+                            (c.project(b) - c.project(a)).rem_euclid(std::f64::consts::TAU)
+                        };
+                        let turn = if e.forward { sweep } else { -sweep };
+                        let r = c.radius();
+                        (c.center() - origin).cross(q - p).dot(normal)
+                            + r * r * turn * c.normal().dot(normal)
+                    }
+                    EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_) => f64::NAN,
+                }
+            })
+            .sum()
+    }
+
+    /// The 10 by 10 plate in `pose`, with square holes (each its lower left
+    /// corner and side), and `cuts` as its sections.
+    fn plate_with_cuts(
+        pose: &PlatePose,
+        cuts: &[PlateCut],
+        holes: &[((f64, f64), f64)],
+    ) -> (Topology, FaceId, Vec<SectionEdge>) {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_topology::builder::{make_planar_face, make_polygon_wire};
+
+        let mut topo = Topology::new();
+        let mut corners: Vec<Point3> = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+            .iter()
+            .map(|&p| pose.at(p))
+            .collect();
+        if pose.mirrored {
+            corners.reverse();
+        }
+        let face = make_planar_face(&mut topo, &corners, 1e-7).unwrap();
+        for &((x, y), side) in holes {
+            let mut square: Vec<Point3> =
+                [(x, y), (x, y + side), (x + side, y + side), (x + side, y)]
+                    .iter()
+                    .map(|&p| pose.at(p))
+                    .collect();
+            if pose.mirrored {
+                square.reverse();
+            }
+            let hole = make_polygon_wire(&mut topo, &square, 1e-7).unwrap();
+            topo.face_mut(face).unwrap().inner_wires_mut().push(hole);
+        }
+        let sections = cuts
+            .iter()
+            .map(|cut| {
+                let (curve_3d, start, end) = match *cut {
+                    PlateCut::Line(a, b) => (EdgeCurve::Line, pose.at(a), pose.at(b)),
+                    PlateCut::Arc(c, r, a, b) => {
+                        let circle =
+                            Circle3D::with_axes(pose.at(c), pose.normal(), r, pose.x, pose.y)
+                                .unwrap();
+                        (EdgeCurve::Circle(circle), pose.at(a), pose.at(b))
+                    }
+                };
+                SectionEdge {
+                    curve_3d,
+                    start,
+                    end,
+                    ..line_section(start, end)
+                }
+            })
+            .collect();
+        (topo, face, sections)
+    }
+
+    /// Each piece's area, its outer wire's less its holes', sorted. Each
+    /// wire must close edge to edge.
+    fn piece_areas(pieces: &[SplitSubFace], normal: Vec3) -> Vec<f64> {
+        let mut areas: Vec<f64> = pieces
+            .iter()
+            .map(|piece| {
+                for wire in std::iter::once(&piece.outer_wire).chain(&piece.inner_wires) {
+                    for (k, e) in wire.iter().enumerate() {
+                        let next = &wire[(k + 1) % wire.len()];
+                        assert!(
+                            (e.end_3d - next.start_3d).length() < 1e-9,
+                            "a wire breaks at {:?}",
+                            e.end_3d
+                        );
+                    }
+                }
+                let holes: f64 = piece
+                    .inner_wires
+                    .iter()
+                    .map(|w| twice_wire_area(w, normal).abs())
+                    .sum();
+                0.5 * (twice_wire_area(&piece.outer_wire, normal).abs() - holes)
+            })
+            .collect();
+        areas.sort_by(f64::total_cmp);
+        areas
+    }
+
+    fn assert_areas(areas: &[f64], expected: &[f64], label: &str) {
+        let mut expected = expected.to_vec();
+        expected.sort_by(f64::total_cmp);
+        assert!(
+            areas.len() == expected.len()
+                && areas
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, e)| (a - e).abs() < 1e-9),
+            "{label}: pieces of area {areas:?}, expected {expected:?}"
+        );
+    }
+
+    /// The arc about (5, 4) of radius root 2 from (6, 5) to (4, 5), the arc
+    /// about (5, 6) bulging the other way, and the line between their ends.
+    fn arcs_and_chord() -> (PlateCut, PlateCut, PlateCut) {
+        use std::f64::consts::SQRT_2;
+        (
+            PlateCut::Arc((5.0, 4.0), SQRT_2, (6.0, 5.0), (4.0, 5.0)),
+            PlateCut::Arc((5.0, 6.0), SQRT_2, (4.0, 5.0), (6.0, 5.0)),
+            PlateCut::Line((4.0, 5.0), (6.0, 5.0)),
+        )
+    }
+
+    /// The plate's arrangement reads an arc and the line between its ends as
+    /// two edges, in either order, so the segment between them is a region:
+    /// on a line across the plate with the arc on either side, with an arc on
+    /// each side, and with the rest of the arc's circle in two arcs; and with
+    /// two lines from the chord's ends to the rim.
+    #[test]
+    fn the_arrangement_keeps_an_arc_apart_from_its_chord() {
+        use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
+        let segment = FRAC_PI_2 - 1.0;
+        let disc_below = 2.0 * PI - segment;
+        let (up, down, chord) = arcs_and_chord();
+        let left = PlateCut::Line((0.0, 5.0), (4.0, 5.0));
+        let right = PlateCut::Line((6.0, 5.0), (10.0, 5.0));
+        let to_apex = PlateCut::Line((6.0, 5.0), (5.0, 10.0));
+        let from_apex = PlateCut::Line((5.0, 10.0), (4.0, 5.0));
+        let bottom = (5.0, 4.0 - SQRT_2);
+        let rest_a = PlateCut::Arc((5.0, 4.0), SQRT_2, (4.0, 5.0), bottom);
+        let rest_b = PlateCut::Arc((5.0, 4.0), SQRT_2, bottom, (6.0, 5.0));
+        let cases = [
+            (
+                vec![up, chord, right, left],
+                vec![segment, 50.0 - segment, 50.0],
+            ),
+            (
+                vec![down, chord, right, left],
+                vec![segment, 50.0 - segment, 50.0],
+            ),
+            (
+                vec![up, chord, to_apex, from_apex],
+                vec![segment, 5.0 - segment, 95.0],
+            ),
+            (
+                vec![up, down, chord, right, left],
+                vec![segment, segment, 50.0 - segment, 50.0 - segment],
+            ),
+            (
+                vec![up, rest_a, rest_b, chord, right, left],
+                vec![segment, disc_below, 50.0 - segment, 50.0 - disc_below],
+            ),
+        ];
+        for (k, (cuts, expected)) in cases.iter().enumerate() {
+            for (i, pose) in plate_poses().iter().enumerate() {
+                for chord_first in [false, true] {
+                    let mut cuts = cuts.clone();
+                    if chord_first {
+                        let at = cuts.iter().position(|c| *c == chord).unwrap();
+                        let line = cuts.remove(at);
+                        cuts.insert(0, line);
+                    }
+                    let (topo, face_id, sections) = plate_with_cuts(pose, &cuts, &[]);
+                    let face = topo.face(face_id).unwrap();
+                    let surface = face.surface().clone();
+                    let wire_pts = collect_wire_points(&topo, face.outer_wire());
+                    let frame =
+                        PlaneFrame::from_plane_face(extract_plane_normal(&surface), &wire_pts);
+                    let boundary = boundary_edges_to_pcurve(
+                        &topo,
+                        face.outer_wire(),
+                        &surface,
+                        &wire_pts,
+                        Some(&frame),
+                    );
+                    let pieces = split_plane_face_by_arrangement(
+                        &surface,
+                        &boundary,
+                        &sections,
+                        Rank::A,
+                        false,
+                        face_id,
+                        &frame,
+                        1e-7,
+                        None,
+                    )
+                    .unwrap();
+                    assert_areas(
+                        &piece_areas(&pieces, pose.normal()),
+                        expected,
+                        &format!("case {k}, pose {i}, chord first {chord_first}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// An arc and its chord inside the plate, clear of its rim, split it with
+    /// the segment between them as a piece of its own: with two lines from the
+    /// chord's ends to (5, 8), with the arc on either side of the chord, with
+    /// an arc on each side, and with the rest of the arc's circle in two arcs;
+    /// in either order, and on a plate with a hole.
+    #[test]
+    fn an_arc_and_its_chord_inside_the_plate_split_off_their_segment() {
+        use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
+        let segment = FRAC_PI_2 - 1.0;
+        let disc = 2.0 * PI;
+        let (up, down, chord) = arcs_and_chord();
+        let l1 = PlateCut::Line((6.0, 5.0), (5.0, 8.0));
+        let l2 = PlateCut::Line((5.0, 8.0), (4.0, 5.0));
+        let bottom = (5.0, 4.0 - SQRT_2);
+        let rest_a = PlateCut::Arc((5.0, 4.0), SQRT_2, (4.0, 5.0), bottom);
+        let rest_b = PlateCut::Arc((5.0, 4.0), SQRT_2, bottom, (6.0, 5.0));
+        // Each case's pieces; the last holds the plate's rim, and with a unit
+        // square hole at (1, 1) it loses 1.
+        let cases = [
+            (vec![up, chord, l1, l2], vec![segment, 3.0 - segment, 97.0]),
+            (
+                vec![down, chord, l1, l2],
+                vec![segment, 3.0, 97.0 - segment],
+            ),
+            (vec![up, chord], vec![segment, 100.0 - segment]),
+            (
+                vec![up, down, chord],
+                vec![segment, segment, 100.0 - 2.0 * segment],
+            ),
+            (
+                vec![up, rest_a, rest_b, chord],
+                vec![segment, disc - segment, 100.0 - disc],
+            ),
+        ];
+        for (k, (cuts, whole)) in cases.iter().enumerate() {
+            let mut holed = whole.clone();
+            if let Some(rim) = holed.last_mut() {
+                *rim -= 1.0;
+            }
+            for (holes, expected) in [(vec![], whole), (vec![((1.0, 1.0), 1.0)], &holed)] {
+                for (i, pose) in plate_poses().iter().enumerate() {
+                    for chord_first in [false, true] {
+                        let mut cuts = cuts.clone();
+                        if chord_first {
+                            let at = cuts.iter().position(|c| *c == chord).unwrap();
+                            let line = cuts.remove(at);
+                            cuts.insert(0, line);
+                        }
+                        let (topo, face, sections) = plate_with_cuts(pose, &cuts, &holes);
+                        let pieces = split_face_2d(
+                            &topo,
+                            face,
+                            &sections,
+                            Rank::A,
+                            &brepkit_math::tolerance::Tolerance::new(),
+                            None,
+                            None,
+                            &std::collections::HashMap::new(),
+                            &std::collections::BTreeSet::new(),
+                            None,
+                        );
+                        let label = format!(
+                            "case {k}, holes {}, pose {i}, chord first {chord_first}",
+                            holes.len()
+                        );
+                        assert_areas(&piece_areas(&pieces, pose.normal()), expected, &label);
+                    }
+                }
+            }
+        }
+    }
+
+    /// An arc and its chord whose ends meet the rest of the cut, which runs to
+    /// the plate's rim, split the plate with the segment between them as a
+    /// piece of its own: a line across the plate through the chord, with the
+    /// arc on either side, and two lines from the chord's ends to the rim.
+    #[test]
+    fn an_arc_and_its_chord_meeting_the_rim_split_off_their_segment() {
+        use std::f64::consts::FRAC_PI_2;
+        let segment = FRAC_PI_2 - 1.0;
+        let (up, down, chord) = arcs_and_chord();
+        let left = PlateCut::Line((0.0, 5.0), (4.0, 5.0));
+        let right = PlateCut::Line((6.0, 5.0), (10.0, 5.0));
+        let to_apex = PlateCut::Line((6.0, 5.0), (5.0, 10.0));
+        let from_apex = PlateCut::Line((5.0, 10.0), (4.0, 5.0));
+        // Each case's pieces, without and with a unit square hole at (1, 1).
+        let cases = [
+            (
+                vec![up, chord, right, left],
+                [segment, 50.0 - segment, 50.0],
+                [segment, 50.0 - segment, 49.0],
+            ),
+            (
+                vec![down, chord, right, left],
+                [segment, 50.0 - segment, 50.0],
+                [segment, 49.0 - segment, 50.0],
+            ),
+            (
+                vec![up, chord, to_apex, from_apex],
+                [segment, 5.0 - segment, 95.0],
+                [segment, 5.0 - segment, 94.0],
+            ),
+        ];
+        for (k, (cuts, whole, holed)) in cases.iter().enumerate() {
+            for (holes, expected) in [(vec![], whole), (vec![((1.0, 1.0), 1.0)], holed)] {
+                for (i, pose) in plate_poses().iter().enumerate() {
+                    for chord_first in [false, true] {
+                        let mut cuts = cuts.clone();
+                        if chord_first {
+                            let at = cuts.iter().position(|c| *c == chord).unwrap();
+                            let line = cuts.remove(at);
+                            cuts.insert(0, line);
+                        }
+                        let (topo, face, sections) = plate_with_cuts(pose, &cuts, &holes);
+                        let pieces = split_face_2d(
+                            &topo,
+                            face,
+                            &sections,
+                            Rank::A,
+                            &brepkit_math::tolerance::Tolerance::new(),
+                            None,
+                            None,
+                            &std::collections::HashMap::new(),
+                            &std::collections::BTreeSet::new(),
+                            None,
+                        );
+                        let label = format!(
+                            "case {k}, holes {}, pose {i}, chord first {chord_first}",
+                            holes.len()
+                        );
+                        assert_areas(&piece_areas(&pieces, pose.normal()), expected, &label);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole circle about `center` of radius `r` in the plate's plane,
+    /// closed at its lowest point, as a section in `pose`.
+    fn plate_circle(pose: &PlatePose, center: (f64, f64), r: f64) -> SectionEdge {
+        let circle = brepkit_math::curves::Circle3D::with_axes(
+            pose.at(center),
+            pose.normal(),
+            r,
+            pose.x,
+            pose.y,
+        )
+        .unwrap();
+        let at = pose.at((center.0, center.1 - r));
+        SectionEdge {
+            curve_3d: EdgeCurve::Circle(circle),
+            start: at,
+            end: at,
+            ..line_section(at, at)
+        }
+    }
+
+    /// Two discs' common area, radii `a` and `b`, centres `d` apart.
+    fn lens_area(a: f64, b: f64, d: f64) -> f64 {
+        let p = a * a * ((d * d + a * a - b * b) / (2.0 * d * a)).acos();
+        let q = b * b * ((d * d + b * b - a * a) / (2.0 * d * b)).acos();
+        let r = 0.5 * ((-d + a + b) * (d + a - b) * (d - a + b) * (d + a + b)).sqrt();
+        p + q - r
+    }
+
+    /// The plate split by `cuts` and whole circles `(centre, radius)` in
+    /// `pose`.
+    fn plate_split_with_circles(
+        pose: &PlatePose,
+        cuts: &[PlateCut],
+        circles: &[((f64, f64), f64)],
+        more: &[SectionEdge],
+    ) -> Vec<SplitSubFace> {
+        let (topo, face, mut sections) = plate_with_cuts(pose, cuts, &[]);
+        for &(c, r) in circles {
+            sections.push(plate_circle(pose, c, r));
+        }
+        sections.extend(more.iter().cloned());
+        split_face_2d(
+            &topo,
+            face,
+            &sections,
+            Rank::A,
+            &brepkit_math::tolerance::Tolerance::new(),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::BTreeSet::new(),
+            None,
+        )
+    }
+
+    /// A whole circle about (5, 4) of radius root 2 on the plate, with a
+    /// chord from (4, 5) to (6, 5), with a line across the plate through the
+    /// same points, or with a circle of radius 1 about (5, 5.5) that crosses
+    /// it: it is cut where they meet, and each region comes out once. A line
+    /// from its centre out across it, and a line clear of it, leave its disc
+    /// whole.
+    #[test]
+    fn a_whole_circle_that_other_sections_meet_is_cut_where_they_meet() {
+        use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
+        let segment = FRAC_PI_2 - 1.0;
+        let disc = 2.0 * PI;
+        let lens = lens_area(SQRT_2, 1.0, 1.5);
+        let cases = [
+            (
+                "chord",
+                vec![PlateCut::Line((4.0, 5.0), (6.0, 5.0))],
+                vec![((5.0, 4.0), SQRT_2)],
+                vec![segment, disc - segment, 100.0 - disc],
+            ),
+            (
+                "across",
+                vec![PlateCut::Line((0.0, 5.0), (10.0, 5.0))],
+                vec![((5.0, 4.0), SQRT_2)],
+                vec![
+                    segment,
+                    disc - segment,
+                    50.0 - segment,
+                    50.0 - disc + segment,
+                ],
+            ),
+            (
+                "two circles",
+                vec![],
+                vec![((5.0, 4.0), SQRT_2), ((5.0, 5.5), 1.0)],
+                vec![lens, disc - lens, PI - lens, 100.0 - disc - PI + lens],
+            ),
+            (
+                "into",
+                vec![PlateCut::Line((5.0, 4.0), (8.0, 4.0))],
+                vec![((5.0, 4.0), SQRT_2)],
+                vec![disc, 100.0 - disc],
+            ),
+            (
+                "clear",
+                vec![PlateCut::Line((0.0, 8.0), (10.0, 8.0))],
+                vec![((5.0, 4.0), SQRT_2)],
+                vec![disc, 80.0 - disc, 20.0],
+            ),
+        ];
+        for (name, cuts, circles, expected) in &cases {
+            for (i, pose) in plate_poses().iter().enumerate() {
+                let pieces = plate_split_with_circles(pose, cuts, circles, &[]);
+                let label = format!("{name}, pose {i}");
+                assert_areas(&piece_areas(&pieces, pose.normal()), expected, &label);
+            }
+        }
+    }
+
+    /// Arcs of the circle about (5, 4) whose ends lie on a line across the
+    /// plate, the line whole or in pieces, and one arc running more than a
+    /// half turn: the segment between the short arc and the line is a piece
+    /// of its own.
+    #[test]
+    fn arcs_ending_on_a_line_across_the_plate_split_off_their_segment() {
+        use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
+        let segment = FRAC_PI_2 - 1.0;
+        let disc = 2.0 * PI;
+        let expected = [
+            segment,
+            disc - segment,
+            50.0 - segment,
+            50.0 - disc + segment,
+        ];
+        let arc = |from: (f64, f64), to: (f64, f64)| PlateCut::Arc((5.0, 4.0), SQRT_2, from, to);
+        let (left, right, bottom) = ((4.0, 5.0), (6.0, 5.0), (5.0, 4.0 - SQRT_2));
+        let east = (5.0 + SQRT_2, 4.0);
+        let across = PlateCut::Line((0.0, 5.0), (10.0, 5.0));
+        let pieces = [
+            PlateCut::Line((0.0, 5.0), left),
+            PlateCut::Line(left, right),
+            PlateCut::Line(right, (10.0, 5.0)),
+        ];
+        let cases = [
+            vec![
+                arc(right, left),
+                arc(left, bottom),
+                arc(bottom, right),
+                across,
+            ],
+            vec![arc(right, left), arc(left, east), arc(east, right), across],
+            [
+                vec![arc(right, left), arc(left, east), arc(east, right)],
+                pieces.to_vec(),
+            ]
+            .concat(),
+        ];
+        for (k, cuts) in cases.iter().enumerate() {
+            for (i, pose) in plate_poses().iter().enumerate() {
+                let pieces = plate_split_with_circles(pose, cuts, &[], &[]);
+                let label = format!("case {k}, pose {i}");
+                assert_areas(&piece_areas(&pieces, pose.normal()), &expected, &label);
+            }
+        }
+    }
+
+    /// A whole circle about (5, 4) of radius root 2 and a quadratic spline
+    /// from (2, 4) to (8, 4) about a control point above it. Over (5, 8) the
+    /// spline keeps more than 0.5 off the circle, which its control points prove, and
+    /// the circle stays a cap; over (5, 6) it crosses the circle at points no
+    /// closed form finds, and the split is refused.
+    #[test]
+    fn a_whole_circle_and_a_spline_that_may_cross_it_refuse_the_split() {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        use std::f64::consts::{PI, SQRT_2};
+        for (i, pose) in plate_poses().iter().enumerate() {
+            for (top, expected) in [(8.0, Some([2.0 * PI, 100.0 - 2.0 * PI])), (6.0, None)] {
+                let points = vec![
+                    pose.at((2.0, 4.0)),
+                    pose.at((5.0, top)),
+                    pose.at((8.0, 4.0)),
+                ];
+                let spline = NurbsCurve::new(
+                    2,
+                    vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                    points.clone(),
+                    vec![1.0; 3],
+                )
+                .unwrap();
+                let section = SectionEdge {
+                    curve_3d: EdgeCurve::NurbsCurve(spline),
+                    ..line_section(points[0], points[2])
+                };
+                let pieces =
+                    plate_split_with_circles(pose, &[], &[((5.0, 4.0), SQRT_2)], &[section]);
+                let label = format!("control at height {top}, pose {i}");
+                match expected {
+                    Some(areas) => {
+                        assert_areas(&piece_areas(&pieces, pose.normal()), &areas, &label);
+                    }
+                    None => assert!(pieces.is_empty(), "{label}: split into {}", pieces.len()),
+                }
+            }
+        }
+    }
+
+    /// A whole circle about (5, 4) of radius root 2 and a quadratic spline in
+    /// two knot spans. Below the circle, over (3, 1) and (7, 1.5), the spline
+    /// keeps well off it in both spans and the circle stays a cap; through
+    /// (3, 1) and (5, 4), its second span runs into the circle and the split
+    /// is refused.
+    #[test]
+    fn a_whole_circle_and_a_spline_of_two_spans_are_read_span_by_span() {
+        use brepkit_math::nurbs::curve::NurbsCurve;
+        use std::f64::consts::{PI, SQRT_2};
+        let below = [(1.0, 1.0), (3.0, 1.0), (7.0, 1.5), (9.0, 1.0)];
+        let through = [(1.0, 1.0), (3.0, 1.0), (5.0, 4.0), (9.0, 4.0)];
+        for (i, pose) in plate_poses().iter().enumerate() {
+            for (poles, expected) in [(below, Some([2.0 * PI, 100.0 - 2.0 * PI])), (through, None)]
+            {
+                let points: Vec<Point3> = poles.iter().map(|&p| pose.at(p)).collect();
+                let spline = NurbsCurve::new(
+                    2,
+                    vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+                    points.clone(),
+                    vec![1.0; 4],
+                )
+                .unwrap();
+                let section = SectionEdge {
+                    curve_3d: EdgeCurve::NurbsCurve(spline),
+                    ..line_section(points[0], points[3])
+                };
+                let pieces =
+                    plate_split_with_circles(pose, &[], &[((5.0, 4.0), SQRT_2)], &[section]);
+                let label = format!("poles {poles:?}, pose {i}");
+                match expected {
+                    Some(areas) => {
+                        assert_areas(&piece_areas(&pieces, pose.normal()), &areas, &label);
+                    }
+                    None => assert!(pieces.is_empty(), "{label}: split into {}", pieces.len()),
+                }
+            }
+        }
     }
 }

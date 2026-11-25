@@ -6,8 +6,8 @@ use brepkit_topology::edge::EdgeCurve;
 use brepkit_topology::face::FaceSurface;
 
 use super::super::pcurve_compute::{
-    compute_boundary_pcurve_on_surface, evaluate_edge_at_t, project_point_on_surface,
-    shorter_arc_delta,
+    compute_boundary_pcurve_on_surface, ellipse_u_after, evaluate_edge_at_t,
+    project_point_on_surface, shorter_arc_delta,
 };
 use super::super::plane_frame::PlaneFrame;
 use super::super::split_types::OrientedPCurveEdge;
@@ -26,7 +26,19 @@ pub(super) fn split_boundary_edges_at_3d_points(
     surface: &FaceSurface,
     tol: f64,
 ) -> Vec<OrientedPCurveEdge> {
-    split_edges_at_3d_points(edges, split_pts_3d, frame, surface, tol, false)
+    split_edges_at_3d_points(edges, split_pts_3d, frame, surface, tol, false, false)
+}
+
+/// [`split_boundary_edges_at_3d_points`] for a ball face charted clear of its
+/// poles: an arc of a circle split there reads its split's `u` on the copy
+/// the arc reaches it on from its start.
+pub(super) fn split_clear_ball_edges_at_3d_points(
+    edges: Vec<OrientedPCurveEdge>,
+    split_pts_3d: &[Point3],
+    surface: &FaceSurface,
+    tol: f64,
+) -> Vec<OrientedPCurveEdge> {
+    split_edges_at_3d_points(edges, split_pts_3d, None, surface, tol, false, true)
 }
 
 /// [`split_boundary_edges_at_3d_points`] for a hole woven into a curved
@@ -42,7 +54,7 @@ pub(super) fn split_hole_edges_at_3d_points(
     surface: &FaceSurface,
     tol: f64,
 ) -> Vec<OrientedPCurveEdge> {
-    split_edges_at_3d_points(edges, split_pts_3d, frame, surface, tol, true)
+    split_edges_at_3d_points(edges, split_pts_3d, frame, surface, tol, true, false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -53,6 +65,7 @@ fn split_edges_at_3d_points(
     surface: &FaceSurface,
     tol: f64,
     nurbs_by_projection: bool,
+    clear_ball: bool,
 ) -> Vec<OrientedPCurveEdge> {
     let conic_band = if nurbs_by_projection {
         tol * 100.0
@@ -195,6 +208,11 @@ fn split_edges_at_3d_points(
                 };
                 if edge.forward { native } else { -native }
             });
+        // An open ellipse arc on a wall (where an earlier cut's wall met
+        // this one) splits on the turn its run from its start reaches: a
+        // projected split takes the principal copy, which can lie a turn
+        // off the arc's own ends, and the face's outline then jumps there.
+        let open_wall_ellipse = ellipse_rim && closed_ring_dir.is_none() && frame.is_none();
         let mut prev_uv = edge.start_uv;
         let mut prev_3d = edge.start_3d;
         // A woven hole keeps its new vertices and its pieces' pcurves on the
@@ -300,37 +318,57 @@ fn split_edges_at_3d_points(
             };
             // On the copy the edge runs on at the split. A spline's parameter
             // need not run evenly in u (its knots), so walk along it from the
-            // edge's start; an arc's, a ring's and a ruling's parameter runs
-            // evenly in the surface's, so the split's place in the edge's own
-            // unwrapped span reads the copy, also on an arc over half a turn.
-            // A walk that cannot finish falls back to that span. A closed
-            // rim's split is on the rim's own turn already: an ellipse rim on
-            // a cone does not advance evenly in u, and moved to the copy
-            // nearest an even advance its split lands a turn off.
+            // edge's start. An ellipse's on a cone does not either (a steep
+            // cut runs most of the turn near the apex end), but its u runs
+            // one way, so the split's advance from the start reads the copy.
+            // An arc's, a ring's and a ruling's parameter runs evenly in the
+            // surface's, so the split's place in the edge's own unwrapped span
+            // reads the copy, also on an arc over half a turn. A walk that
+            // cannot finish falls back to that span. A closed rim's split is
+            // on the rim's own turn already.
             let split_uv = if nurbs_by_projection && closed_ring_dir.is_none() {
-                let span_end = match closed_ring_dir {
-                    Some(dir) => brepkit_math::vec::Point2::new(
-                        std::f64::consts::TAU.madd(dir, edge.start_uv.x()),
-                        edge.start_uv.y(),
-                    ),
-                    None => edge.end_uv,
-                };
                 let along = brepkit_math::vec::Point2::new(
-                    (span_end.x() - edge.start_uv.x()).madd(t, edge.start_uv.x()),
-                    (span_end.y() - edge.start_uv.y()).madd(t, edge.start_uv.y()),
+                    (edge.end_uv.x() - edge.start_uv.x()).madd(t, edge.start_uv.x()),
+                    (edge.end_uv.y() - edge.start_uv.y()).madd(t, edge.start_uv.y()),
                 );
-                let near = match edge.curve_3d {
-                    EdgeCurve::NurbsCurve(_) => {
-                        walked_uv(&edge, t, surface, periods).unwrap_or(along)
+                let near = match &edge.curve_3d {
+                    EdgeCurve::NurbsCurve(_) => walked_uv(&edge, t, surface, periods),
+                    EdgeCurve::Ellipse(ellipse) => {
+                        ellipse_split_u(ellipse, &edge, (t, split_uv.x()), surface, tol)
+                            .map(|u| brepkit_math::vec::Point2::new(u, split_uv.y()))
                     }
-                    EdgeCurve::Line | EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) => along,
+                    EdgeCurve::Line | EdgeCurve::Circle(_) => None,
                 };
-                on_copy_near(split_uv, near, periods)
+                on_copy_near(split_uv, near.unwrap_or(along), periods)
+            } else if open_wall_ellipse
+                && !nurbs_by_projection
+                && let EdgeCurve::Ellipse(ellipse) = &edge.curve_3d
+                && let Some(u) = ellipse_split_u(ellipse, &edge, (t, split_uv.x()), surface, tol)
+            {
+                on_copy_near(
+                    split_uv,
+                    brepkit_math::vec::Point2::new(u, split_uv.y()),
+                    periods,
+                )
+            } else if let (EdgeCurve::Circle(circle), FaceSurface::Sphere(sphere)) =
+                (&edge.curve_3d, surface)
+                && clear_ball
+                && closed_ring_dir.is_none()
+                && let Some(run) =
+                    ball_arc_u_run(circle, (edge.start_3d, edge.forward), split_3d, sphere, tol)
+            {
+                // Projected, the point took the principal copy, which can be
+                // a turn off the arc's own run.
+                on_copy_near(
+                    split_uv,
+                    brepkit_math::vec::Point2::new(edge.start_uv.x() + run, split_uv.y()),
+                    periods,
+                )
             } else {
                 split_uv
             };
             let mut pcurve = boundary_piece_pcurve(&edge, prev_3d, split_3d, surface, frame);
-            if nurbs_by_projection {
+            if nurbs_by_projection || clear_ball || open_wall_ellipse {
                 pcurve = on_copy_of(pcurve, prev_uv, periods);
             }
             result.push(OrientedPCurveEdge {
@@ -348,18 +386,30 @@ fn split_edges_at_3d_points(
             prev_3d = split_3d;
         }
         let mut pcurve = boundary_piece_pcurve(&edge, prev_3d, edge.end_3d, surface, frame);
-        if nurbs_by_projection {
+        if nurbs_by_projection || clear_ball || open_wall_ellipse {
             pcurve = on_copy_of(pcurve, prev_uv, periods);
         }
         // The stored `end_uv` of a closed rim follows the CURVE's direction
         // (`sample_edge_to_uv` ignores orientation), so a reverse-traversed ring
         // would close a period on the wrong side of its own start.
-        let tail_end_uv = match closed_ring_dir {
-            Some(dir) => brepkit_math::vec::Point2::new(
+        let tail_end_uv = match (closed_ring_dir, &edge.curve_3d, surface) {
+            (Some(dir), _, _) => brepkit_math::vec::Point2::new(
                 std::f64::consts::TAU.madd(dir, edge.start_uv.x()),
                 edge.start_uv.y(),
             ),
-            None => edge.end_uv,
+            // A closed rim of a ball face runs back to its start, but its
+            // stored end reads the circle's own sense, which a rim walked
+            // against its circle turns the other way round: the run from
+            // the last split to the start places it.
+            (None, EdgeCurve::Circle(circle), FaceSurface::Sphere(sphere))
+                if clear_ball && (edge.start_3d - edge.end_3d).length() < tol =>
+            {
+                ball_arc_u_run(circle, (prev_3d, edge.forward), edge.end_3d, sphere, tol)
+                    .map_or(edge.end_uv, |run| {
+                        brepkit_math::vec::Point2::new(prev_uv.x() + run, edge.end_uv.y())
+                    })
+            }
+            _ => edge.end_uv,
         };
         result.push(OrientedPCurveEdge {
             curve_3d: edge.curve_3d.clone(),
@@ -728,16 +778,19 @@ pub(super) fn shifted_pcurve(
     }
 }
 
-/// The surface parameters of `edge` at fraction `t` of its domain, unwrapped
-/// continuously from the edge's start UV over a walk along its curve. `None`
-/// on a surface with no period, and when the walk cannot finish: a value
-/// that is not finite, a projection that fails, a step too small to move,
-/// or more than `MAX_STEPS` steps.
+/// The surface parameters of spline edge `edge` at fraction `t` of its
+/// domain, on the copies of the periods the edge reaches them on along its
+/// curve from its start UV. `None` on a surface with no period, for another
+/// curve, and when the run cannot be proved: a value that is not finite, a
+/// projection that fails, or a part of the spline within the tolerance of
+/// the axis (or a torus's core), where the run has no value.
 ///
-/// A step is taken when its middle and its end each move less than an
-/// eighth of a period from the point before, and halved when not: a span of
-/// the curve dense in u on few of its parameters, or one that goes round a
-/// whole period, does not read as a short step.
+/// The run from the edge's start to the point is proved span by span from
+/// the spline's control hulls ([`spline_run`]), so a spline that packs most
+/// of a turn into a short run of its parameter cannot skip it, as a walk
+/// that sampled each step's middle and end could.
+///
+/// [`spline_run`]: crate::builder::fill_images_faces::spline_run
 fn walked_uv(
     edge: &OrientedPCurveEdge,
     t: f64,
@@ -745,13 +798,13 @@ fn walked_uv(
     periods: (Option<f64>, Option<f64>),
 ) -> Option<brepkit_math::vec::Point2> {
     use brepkit_math::vec::Point2;
-    const FIRST_STEPS: f64 = 16.0;
-    const MAX_HALVINGS: u32 = 16;
-    const MAX_STEPS: u32 = 4096;
     let finite = |p: Point2| p.x().is_finite() && p.y().is_finite();
     if periods.0.is_none() && periods.1.is_none() || !t.is_finite() || !finite(edge.start_uv) {
         return None;
     }
+    let EdgeCurve::NurbsCurve(spline) = &edge.curve_3d else {
+        return None;
+    };
     let at =
         crate::builder::pcurve_compute::edge_point_at(&edge.curve_3d, edge.start_3d, edge.end_3d);
     // The fractions run from the domain's first end, which is the edge's
@@ -761,50 +814,101 @@ fn walked_uv(
     } else {
         0.0
     };
-    let uv_at = |f: f64, near: Point2| {
-        surface
-            .project_point(at(f))
-            .map(|(u, v)| Point2::new(u, v))
-            .filter(|&p| finite(p))
-            .map(|p| on_copy_near(p, near, periods))
+    let (d0, d1) = edge
+        .curve_3d
+        .domain_with_endpoints(edge.start_3d, edge.end_3d);
+    let param = |f: f64| (d1 - d0).madd(f, d0);
+    let (du, dv) =
+        crate::builder::fill_images_faces::spline_run(spline, (param(from), param(t)), surface)?;
+    let (u, v) = surface.project_point(at(t))?;
+    let near = Point2::new(edge.start_uv.x() + du, edge.start_uv.y() + dv);
+    Some(on_copy_near(Point2::new(u, v), near, periods)).filter(|&p| finite(p))
+}
+
+/// The `u` of the point at fraction `t` of an ellipse edge on a cylinder or
+/// a cone, `t` read as [`find_splits_on_ellipse`] reads it, on the turn the
+/// edge reaches it along its traversal ([`ellipse_u_after`] from the edge's
+/// start). `u` is the point's projected `u`.
+fn ellipse_split_u(
+    ellipse: &brepkit_math::curves::Ellipse3D,
+    edge: &OrientedPCurveEdge,
+    (t, u): (f64, f64),
+    surface: &FaceSurface,
+    tol: f64,
+) -> Option<f64> {
+    let (t0, t1) = ellipse_edge_span(edge, tol);
+    let run = (t1 - t0) * t;
+    let run = if edge.forward { run } else { -run };
+    ellipse_u_after(ellipse, surface, (edge.start_uv.x(), u), run)
+}
+
+/// The run in `u` along an arc of `circle` from `from` to `to`, two points on
+/// it, about `sphere`'s axis. The arc runs counter-clockwise about the
+/// circle's normal when `forward`, and clockwise otherwise, as a boundary
+/// edge that runs that way does.
+///
+/// Seen along the axis, the arc's points lie on a conic `A + B cos t +
+/// C sin t` in each of the chart's `x` and `y`, so each is zero at no more
+/// than two angles, found in closed form. Between two such angles the arc
+/// keeps to one quarter of the plane about the axis and turns by the wrapped
+/// difference of its ends' `u`, which is less than a quarter turn. `None`
+/// when the arc comes within `tol` of the axis at one of those angles or at
+/// an end: there `u` has no value.
+fn ball_arc_u_run(
+    circle: &brepkit_math::curves::Circle3D,
+    (from, forward): (Point3, bool),
+    to: Point3,
+    sphere: &brepkit_math::surfaces::SphericalSurface,
+    tol: f64,
+) -> Option<f64> {
+    use std::f64::consts::{PI, TAU};
+    let (o, x, y) = (sphere.center(), sphere.x_axis(), sphere.y_axis());
+    let r = circle.radius();
+    let c = circle.center() - o;
+    let (ua, va) = (circle.u_axis(), circle.v_axis());
+    // Each chart axis's coordinate along the arc: `k0 + k1 cos t + k2 sin t`.
+    let coeffs = |axis: brepkit_math::vec::Vec3| (c.dot(axis), r * ua.dot(axis), r * va.dot(axis));
+    let (cx, cy) = (coeffs(x), coeffs(y));
+    let at = |(k0, k1, k2): (f64, f64, f64), t: f64| {
+        let (s, co) = t.sin_cos();
+        k2.madd(s, k1.madd(co, k0))
     };
-    let small = |a: Point2, b: Point2| {
-        periods.0.is_none_or(|p| (b.x() - a.x()).abs() < 0.125 * p)
-            && periods.1.is_none_or(|p| (b.y() - a.y()).abs() < 0.125 * p)
-    };
-    let (mut f, mut uv) = (from, edge.start_uv);
-    let first_step = (t - from) / FIRST_STEPS;
-    let mut step = first_step;
-    let mut halvings = 0;
-    for _ in 0..MAX_STEPS {
-        let tiny = f64::EPSILON * f.abs().max(1.0);
-        if (t - f).abs() <= tiny {
-            return Some(uv);
-        }
-        // A step at least `tiny` long always moves `f`.
-        if step.abs() < tiny {
-            return None;
-        }
-        let last = (t - f).abs() <= step.abs();
-        let next = if last { t } else { f + step };
-        let m = uv_at(0.5 * (f + next), uv)?;
-        let n = uv_at(next, m)?;
-        if halvings < MAX_HALVINGS && !(small(uv, m) && small(m, n)) {
-            step *= 0.5;
-            halvings += 1;
+    let seen = |t: f64| (at(cx, t), at(cy, t));
+    let from = circle.project(from);
+    let dir = if forward { 1.0 } else { -1.0 };
+    let sweep = dir * (dir * (circle.project(to) - from)).rem_euclid(TAU);
+    let mut cuts: Vec<f64> = Vec::new();
+    for (k, other) in [(cx, cy), (cy, cx)] {
+        let amp = k.1.hypot(k.2);
+        if amp <= 0.0 || k.0.abs() > amp {
             continue;
         }
-        if last {
-            return Some(n);
+        let phase = k.2.atan2(k.1);
+        let half = (-k.0 / amp).clamp(-1.0, 1.0).acos();
+        for root in [phase + half, phase - half] {
+            let ahead = (dir * (root - from)).rem_euclid(TAU);
+            if ahead > 0.0 && ahead < dir * sweep {
+                if at(other, root).abs() <= tol {
+                    return None;
+                }
+                cuts.push(ahead);
+            }
         }
-        (f, uv) = (next, n);
-        halvings = 0;
-        step = (2.0 * step)
-            .abs()
-            .min(first_step.abs())
-            .copysign(first_step);
     }
-    None
+    cuts.sort_by(f64::total_cmp);
+    let angle = |t: f64| {
+        let (px, py) = seen(t);
+        (px.hypot(py) > tol).then(|| py.atan2(px))
+    };
+    let mut run = 0.0;
+    let mut last = angle(from)?;
+    for ahead in cuts.into_iter().chain(std::iter::once(dir * sweep)) {
+        let next = angle(dir.madd(ahead, from))?;
+        let step = (next - last + PI).rem_euclid(TAU) - PI;
+        run += step;
+        last = next;
+    }
+    Some(run)
 }
 
 /// `uv` moved by whole periods to the copy nearest `near`.
@@ -824,7 +928,9 @@ fn on_copy_near(
 }
 
 /// The whole periods that bring `pcurve` onto the copy where `uv` lies:
-/// of the copies a few periods either way, the one nearest `uv`.
+/// of the copies a few periods either way, the one nearest `uv`. A line is
+/// read at its start, which a piece's line pcurve takes from the piece's
+/// start: every copy of a line along a period lies on the line itself.
 fn pcurve_shift_to(
     pcurve: &brepkit_math::curves2d::Curve2D,
     uv: brepkit_math::vec::Point2,
@@ -832,7 +938,7 @@ fn pcurve_shift_to(
 ) -> (f64, f64) {
     use brepkit_math::curves2d::Curve2D;
     let distance = |p: brepkit_math::vec::Point2| match pcurve {
-        Curve2D::Line(line) => line.distance_to_point(p),
+        Curve2D::Line(line) => (line.evaluate(0.0) - p).length(),
         Curve2D::Circle(circle) => (circle.evaluate(circle.project(p)) - p).length(),
         Curve2D::Ellipse(ellipse) => (0..=64)
             .map(|k| (ellipse.evaluate(std::f64::consts::TAU * f64::from(k) / 64.0) - p).length())
@@ -997,6 +1103,15 @@ pub(super) fn find_splits_on_nurbs_section(
     let mut splits: Vec<(f64, Point3)> = Vec::new();
     for &sp in split_pts_3d {
         crate::perf::bump_face_split_probe();
+        // A closed edge's own vertex splits nothing off it. Found by its
+        // samples on a spline whose parameter runs unevenly, it can read at a
+        // middle parameter, and mint a piece that ends where it starts and
+        // reads as the whole loop. An open edge keeps these splits: on a
+        // section a micron long its own ends read at middle parameters too,
+        // and its arrangement depends on the pieces.
+        if (edge.start_3d - edge.end_3d).length() <= tol && (sp - edge.start_3d).length() <= tol {
+            continue;
+        }
         // Nearest sample, then ternary-refine the distance over the two
         // neighbouring segments.
         let (mut best_i, mut best_d) = (0usize, f64::MAX);
@@ -1141,9 +1256,30 @@ pub(super) fn find_splits_on_section_ellipse(
     splits
 }
 
+/// The span of its ellipse that an ellipse edge runs on, counter-clockwise
+/// from the stored edge's start.
+///
+/// An open arc spans its stored edge's counter-clockwise range; read in the
+/// traversal's order, a reversed arc's span is its complement, and a point
+/// on the ellipse just past the arc's end (a strut notch's arc ending a hair
+/// short of the seam vertex) split it into a detour through there. A closed
+/// ellipse runs its whole turn from its vertex, counter-clockwise as stored
+/// and clockwise reversed (a mirrored rod's slanted top).
+fn ellipse_edge_span(edge: &OrientedPCurveEdge, tol: f64) -> (f64, f64) {
+    let closed = (edge.start_3d - edge.end_3d).length() < tol;
+    let (stored_start, stored_end) = if edge.forward || closed {
+        (edge.start_3d, edge.end_3d)
+    } else {
+        (edge.end_3d, edge.start_3d)
+    };
+    edge.curve_3d
+        .domain_with_endpoints(stored_start, stored_end)
+}
+
 /// Find split parameters on an ellipse edge. A point within `band` of the
 /// ellipse splits it: at the point itself within `tol`, and at its foot
-/// farther off, so the pieces stay on the ellipse.
+/// farther off, so the pieces stay on the ellipse. A split's parameter is
+/// its fraction of [`ellipse_edge_span`] in the traversal's order.
 pub(super) fn find_splits_on_ellipse(
     ellipse: &brepkit_math::curves::Ellipse3D,
     edge: &OrientedPCurveEdge,
@@ -1151,22 +1287,7 @@ pub(super) fn find_splits_on_ellipse(
     tol: f64,
     band: f64,
 ) -> Vec<(f64, Point3)> {
-    // An open arc spans its stored edge's counter-clockwise range; read in
-    // the traversal's order, a reversed arc's span is its complement, and a
-    // point on the ellipse just past the arc's end (a strut notch's arc ending
-    // a hair short of the seam vertex) split it into a detour through there.
-    // A closed ellipse runs its whole turn from its vertex, counter-clockwise
-    // as stored and clockwise reversed (a mirrored rod's slanted top), so its
-    // splits are ordered along the traversal too.
-    let closed = (edge.start_3d - edge.end_3d).length() < tol;
-    let (stored_start, stored_end) = if edge.forward || closed {
-        (edge.start_3d, edge.end_3d)
-    } else {
-        (edge.end_3d, edge.start_3d)
-    };
-    let (t0, t1) = edge
-        .curve_3d
-        .domain_with_endpoints(stored_start, stored_end);
+    let (t0, t1) = ellipse_edge_span(edge, tol);
     let span = t1 - t0;
     if span.abs() < 1e-14 {
         return Vec::new();
@@ -1490,56 +1611,18 @@ mod tests {
         }
     }
 
-    /// The closed ellipse where the plane `z = 1 + 0.96 x` cuts the cone
-    /// `x^2 + y^2 = z^2`, as a rim starting at its parameter 2, on the cone
-    /// with its seam turned 1.1 off the ellipse's plane of symmetry. Its
-    /// near vertex lies 0.51 from the axis and its far one 25 out, so its
-    /// `u` runs most of the turn round the near vertex. Also the `u` its
-    /// point at parameter 4 reaches along the traversal, walked in steps of
-    /// a thousandth of a turn.
-    fn oblique_cone_rim(forward: bool) -> (FaceSurface, OrientedPCurveEdge, Point3, f64) {
-        use brepkit_math::curves::Ellipse3D;
-        use brepkit_math::surfaces::ConicalSurface;
-        use brepkit_math::vec::Vec3;
-        use std::f64::consts::{FRAC_PI_4, TAU};
+    use crate::builder::pcurve_compute::cone_ellipse_fixture::{
+        assert_pcurve_follows, lifted_u, oblique_cone,
+    };
 
-        let cone = ConicalSurface::with_ref_dir(
-            Point3::new(0.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
-            FRAC_PI_4,
-            Vec3::new(1.1f64.cos(), 1.1f64.sin(), 0.0),
-        )
-        .unwrap();
-        let surface = FaceSurface::Cone(cone);
-        let m = 0.96;
-        let flat = 1.0 - m * m;
-        let x0 = m / flat;
-        let ellipse = Ellipse3D::new_with_ref(
-            Point3::new(x0, 0.0, m.madd(x0, 1.0)),
-            Vec3::new(-m, 0.0, 1.0),
-            m.hypot(1.0) / flat,
-            1.0 / flat.sqrt(),
-            Vec3::new(1.0, 0.0, m),
-        )
-        .unwrap();
-        for k in 0..16 {
-            let p = ellipse.evaluate(f64::from(k) * TAU / 16.0);
-            assert!(
-                (p.x().hypot(p.y()) - p.z()).abs() < 1e-9 * p.z(),
-                "the ellipse lies off the cone at {p:?}"
-            );
-        }
-        let walk = |from: f64, to: f64| -> (f64, f64) {
-            let n = 1000;
-            let (u0, _) = surface.project_point(ellipse.evaluate(from)).unwrap();
-            let mut u = u0;
-            for k in 1..=n {
-                let a = (to - from).madd(f64::from(k) / f64::from(n), from);
-                let (next, _) = surface.project_point(ellipse.evaluate(a)).unwrap();
-                u += (next - u + std::f64::consts::PI).rem_euclid(TAU) - std::f64::consts::PI;
-            }
-            (u0, u)
-        };
+    /// The ellipse of [`oblique_cone`] at slope `m` as a rim starting at its
+    /// parameter 2. Also the `u` its point at parameter 4 reaches along the
+    /// traversal.
+    fn oblique_cone_rim(m: f64, forward: bool) -> (FaceSurface, OrientedPCurveEdge, Point3, f64) {
+        use std::f64::consts::TAU;
+
+        let (surface, ellipse) = oblique_cone(m);
+        let walk = |from: f64, to: f64| lifted_u(&surface, &ellipse, from, to);
         // A closed rim's UVs run its curve's way round, whatever its
         // traversal.
         let (u_start, u_end) = walk(2.0, 2.0 + TAU);
@@ -1565,10 +1648,11 @@ mod tests {
     }
 
     /// The rim split at its parameter 4, run either way round, as an
-    /// outline's edge and as a hole woven into a curved face: the split
-    /// takes the `u` the rim reaches along its traversal, and the two pieces
-    /// run one turn from the start in that sense. A split read on the copy
-    /// nearest an even advance with the parameter lands a turn off.
+    /// outline's edge and as a hole woven into a curved face, at slopes
+    /// 0.96, 0.99 and 0.99999: the split takes the `u` the rim reaches along
+    /// its traversal, and the two pieces run one turn from the start in that
+    /// sense. A split read on the copy nearest an even advance with the
+    /// parameter lands a turn off.
     #[test]
     fn an_oblique_cone_rim_splits_on_the_turn_it_runs() {
         use std::f64::consts::TAU;
@@ -1583,31 +1667,123 @@ mod tests {
             ("outline", split_boundary_edges_at_3d_points),
             ("hole", split_hole_edges_at_3d_points),
         ];
-        for (entry, split_at) in entries {
+        for m in [0.96, 0.99, 0.99999] {
+            for (entry, split_at) in entries {
+                for forward in [true, false] {
+                    let what = format!("slope {m}, {entry}, forward {forward}");
+                    let (surface, edge, split, reached) = oblique_cone_rim(m, forward);
+                    let (start_u, end_u) = (edge.start_uv.x(), edge.end_uv.x());
+                    let native = (end_u - start_u).signum();
+                    let sense = if forward { native } else { -native };
+                    let pieces = split_at(vec![edge], &[split], None, &surface, 1e-7);
+                    assert_eq!(pieces.len(), 2, "{what}: one split, two pieces");
+                    let at = pieces[0].end_uv.x();
+                    assert!(
+                        (at - reached).abs() < 1e-9,
+                        "{what}: the split at u {at}, the rim reaches it at {reached}"
+                    );
+                    assert!((pieces[1].start_uv.x() - at).abs() < 1e-12, "{what}");
+                    assert!((pieces[0].start_uv.x() - start_u).abs() < 1e-12, "{what}");
+                    assert!(
+                        (pieces[1].end_uv.x() - sense.madd(TAU, start_u)).abs() < 1e-9,
+                        "{what}: the rim closes at {}",
+                        pieces[1].end_uv.x()
+                    );
+                    let ahead = sense * (at - start_u);
+                    assert!(
+                        ahead > 0.0 && ahead < TAU,
+                        "{what}: the split lies {ahead} along the turn"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An open arc of the ellipse of [`oblique_cone`], from its parameter 2
+    /// to its parameter 8, nearly a whole turn, woven into the cone as a
+    /// hole and split at seven points, run either way, at slopes 0.96, 0.99
+    /// and 0.99999. Each split takes the `u` and `v` the arc reaches along
+    /// its traversal (at slope 0.96, at parameters 3.7 and 4, its `u` stands
+    /// more than half a turn off an even advance between the arc's ends; at
+    /// slope 0.99999 nearly the whole turn of `u` lies within a hundredth of
+    /// the parameter round the near vertex, at `pi`), and each piece's
+    /// pcurve runs from the piece's start to its end, following the
+    /// ellipse's `(u, v)` with `u` running one way
+    /// ([`assert_pcurve_follows`]).
+    #[test]
+    fn an_oblique_cone_arc_splits_on_the_turn_it_runs() {
+        let params = [2.6, 3.0, 3.4, 3.7, 4.0, 5.0, 7.0];
+        for m in [0.96, 0.99, 0.99999] {
+            let (surface, ellipse) = oblique_cone(m);
+            let at = |a: f64| ellipse.evaluate(a);
             for forward in [true, false] {
-                let what = format!("{entry}, forward {forward}");
-                let (surface, edge, split, reached) = oblique_cone_rim(forward);
-                let (start_u, end_u) = (edge.start_uv.x(), edge.end_uv.x());
-                let native = (end_u - start_u).signum();
-                let sense = if forward { native } else { -native };
-                let pieces = split_at(vec![edge], &[split], None, &surface, 1e-7);
-                assert_eq!(pieces.len(), 2, "{what}: one split, two pieces");
-                let at = pieces[0].end_uv.x();
+                let what = format!("slope {m}, forward {forward}");
+                let (first, last) = if forward { (2.0, 8.0) } else { (8.0, 2.0) };
+                let (start_u, end_u) = lifted_u(&surface, &ellipse, first, last);
+                let (_, start_v) = surface.project_point(at(first)).unwrap();
+                let (_, end_v) = surface.project_point(at(last)).unwrap();
+                let (start_uv, end_uv) = (Point2::new(start_u, start_v), Point2::new(end_u, end_v));
+                let edge = OrientedPCurveEdge {
+                    curve_3d: EdgeCurve::Ellipse(ellipse.clone()),
+                    pcurve: Curve2D::Line(Line2D::new(start_uv, end_uv - start_uv).unwrap()),
+                    start_uv,
+                    end_uv,
+                    start_3d: at(first),
+                    end_3d: at(last),
+                    forward,
+                    source_edge_idx: None,
+                    pave_block_id: None,
+                };
+                let splits: Vec<Point3> = params.iter().map(|&a| at(a)).collect();
+                let pieces =
+                    split_hole_edges_at_3d_points(vec![edge], &splits, None, &surface, 1e-7);
+                assert_eq!(pieces.len(), params.len() + 1, "{what}");
+                let mut order = params.to_vec();
+                if !forward {
+                    order.reverse();
+                }
+                for (piece, &a) in pieces.iter().zip(&order) {
+                    let (_, u) = lifted_u(&surface, &ellipse, first, a);
+                    let (_, v) = surface.project_point(at(a)).unwrap();
+                    assert!(
+                        (piece.end_3d - at(a)).length() < 1e-9 * (1.0 + v.abs()),
+                        "{what}: the split at {a} is out of order"
+                    );
+                    assert!(
+                        (piece.end_uv.x() - u).abs() < 1e-9
+                            && (piece.end_uv.y() - v).abs() < 1e-9 * (1.0 + v.abs()),
+                        "{what}: the split at {a} takes {:?}, the arc reaches it at ({u}, {v})",
+                        piece.end_uv
+                    );
+                }
+                for w in pieces.windows(2) {
+                    assert!((w[1].start_uv - w[0].end_uv).length() < 1e-12, "{what}");
+                }
+                let mut runs = vec![first];
+                runs.extend(order.iter().copied());
+                runs.push(last);
+                for (k, piece) in pieces.iter().enumerate() {
+                    let ends = (piece.pcurve.evaluate(0.0), piece.pcurve.evaluate(1.0));
+                    let size = 1.0 + piece.start_uv.y().abs().max(piece.end_uv.y().abs());
+                    assert!(
+                        (ends.0 - piece.start_uv).length() < 1e-6 * size
+                            && (ends.1 - piece.end_uv).length() < 1e-6 * size,
+                        "{what}: the pcurve of {:?} -> {:?} runs {ends:?}",
+                        piece.start_uv,
+                        piece.end_uv
+                    );
+                    assert_pcurve_follows(
+                        &piece.pcurve,
+                        &surface,
+                        &ellipse,
+                        (runs[k], runs[k + 1]),
+                        &format!("{what}, piece {k}"),
+                    );
+                }
+                assert!((pieces[0].start_uv - start_uv).length() < 1e-12, "{what}");
                 assert!(
-                    (at - reached).abs() < 1e-9,
-                    "{what}: the split at u {at}, the rim reaches it at {reached}"
-                );
-                assert!((pieces[1].start_uv.x() - at).abs() < 1e-12, "{what}");
-                assert!((pieces[0].start_uv.x() - start_u).abs() < 1e-12, "{what}");
-                assert!(
-                    (pieces[1].end_uv.x() - sense.madd(TAU, start_u)).abs() < 1e-9,
-                    "{what}: the rim closes at {}",
-                    pieces[1].end_uv.x()
-                );
-                let ahead = sense * (at - start_u);
-                assert!(
-                    ahead > 0.0 && ahead < TAU,
-                    "{what}: the split lies {ahead} along the turn"
+                    (pieces[params.len()].end_uv - end_uv).length() < 1e-12,
+                    "{what}"
                 );
             }
         }
@@ -1910,6 +2086,79 @@ mod tests {
         assert!((pieces[1].start_3d - between).length() < 1e-9);
         assert!((pieces[1].end_3d - equator).length() < 1e-9);
     }
+
+    /// A latitude rim of a ball face charted clear of its poles, its circle
+    /// turning with `u` or against it, walked either way round and split at
+    /// two points: the pieces run one turn of `u` from the start the way the
+    /// walk runs, the last back to the start, and each piece's pcurve lies
+    /// on the copy its start lies on. The rim's stored end reads its circle's
+    /// own sense, a turn the other way for a rim walked against it.
+    #[test]
+    fn a_ball_rim_split_runs_one_turn_the_way_it_is_walked() {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::surfaces::SphericalSurface;
+        use brepkit_math::vec::Vec3;
+        use std::f64::consts::TAU;
+
+        let surface =
+            FaceSurface::Sphere(SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 1.0).unwrap());
+        let (height, rho) = (0.3_f64, (1.0_f64 - 0.09).sqrt());
+        let at = |a: f64| Point3::new(rho * a.cos(), rho * a.sin(), height);
+        let uv = |p: Point3| {
+            let (u, v) = surface.project_point(p).unwrap();
+            Point2::new(u, v)
+        };
+        let periods = crate::builder::pcurve_compute::surface_periods(&surface);
+        for sense in [1.0_f64, -1.0] {
+            let circle = Circle3D::new(
+                Point3::new(0.0, 0.0, height),
+                Vec3::new(0.0, 0.0, sense),
+                rho,
+            )
+            .unwrap();
+            for forward in [true, false] {
+                let what = format!("circle sense {sense}, forward {forward}");
+                let start = at(1.0);
+                let start_uv = uv(start);
+                let edge = OrientedPCurveEdge {
+                    curve_3d: EdgeCurve::Circle(circle.clone()),
+                    pcurve: Curve2D::Line(Line2D::new(start_uv, Vec2::new(sense, 0.0)).unwrap()),
+                    start_uv,
+                    end_uv: Point2::new(TAU.madd(sense, start_uv.x()), start_uv.y()),
+                    start_3d: start,
+                    end_3d: start,
+                    forward,
+                    source_edge_idx: None,
+                    pave_block_id: None,
+                };
+                let pieces = split_clear_ball_edges_at_3d_points(
+                    vec![edge],
+                    &[at(2.5), at(4.0)],
+                    &surface,
+                    1e-7,
+                );
+                assert_eq!(pieces.len(), 3, "{what}");
+                let walk = if forward { sense } else { -sense };
+                for w in pieces.windows(2) {
+                    assert!((w[0].end_uv - w[1].start_uv).length() < 1e-12, "{what}");
+                }
+                for p in &pieces {
+                    let step = p.end_uv.x() - p.start_uv.x();
+                    assert!(step * walk > 0.0 && step.abs() < TAU, "{what}: step {step}");
+                    assert_eq!(
+                        pcurve_shift_to(&p.pcurve, p.start_uv, periods),
+                        (0.0, 0.0),
+                        "{what}"
+                    );
+                }
+                let last = pieces[2].end_uv.x();
+                assert!(
+                    (last - TAU.madd(walk, start_uv.x())).abs() < 1e-9,
+                    "{what}: the rim closes at u {last}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2157,6 +2406,71 @@ mod hole_copy_tests {
             "the walk took u = {}",
             walked.x()
         );
+    }
+
+    /// An arc of the unit cylinder's ring at z = 3 from u = 0 to u = 6 as a
+    /// rational quadratic spline that packs its first 5.6 radians, four
+    /// pieces, into the first thousandth of its knots, each way along it.
+    /// Its `u` at any fraction past a thousandth lies past 5.6 on its own
+    /// turn. A walk that checked only each step's middle and end saw a step
+    /// back of 0.68, under an eighth of a turn, across those pieces, and
+    /// read the arc a turn short there.
+    #[test]
+    fn the_walk_along_a_spline_cannot_skip_a_turn_packed_into_one_step() {
+        use std::f64::consts::TAU;
+        let surface = unit_cylinder();
+        let periods = crate::builder::pcurve_compute::surface_periods(&surface);
+        let z = 3.0;
+        // The point at `u` on the ring of radius `r` about the axis at z.
+        let axis_point = Point3::new(0.0, 0.0, z);
+        let at = |u: f64, r: f64| axis_point + (surface.evaluate(u, z).unwrap() - axis_point) * r;
+        let ends = [0.0, 1.4, 2.8, 4.2, 5.6, 6.0];
+        let (mut poles, mut weights) = (vec![at(0.0, 1.0)], vec![1.0]);
+        for w in ends.windows(2) {
+            let half = 0.5 * (w[1] - w[0]);
+            poles.extend([at(w[0] + half, 1.0 / half.cos()), at(w[1], 1.0)]);
+            weights.extend([half.cos(), 1.0]);
+        }
+        let mut knots = vec![0.0; 3];
+        for k in 1..=4 {
+            let knot = 0.00025 * f64::from(k);
+            knots.extend([knot, knot]);
+        }
+        knots.extend([1.0; 3]);
+        let arc = NurbsCurve::new(2, knots, poles.clone(), weights).unwrap();
+        let (first, last) = (poles[0], poles[poles.len() - 1]);
+        let edge = |forward: bool| {
+            let (start_3d, end_3d, start_uv, end_uv) = if forward {
+                (first, last, Point2::new(0.0, z), Point2::new(6.0, z))
+            } else {
+                (last, first, Point2::new(6.0, z), Point2::new(0.0, z))
+            };
+            OrientedPCurveEdge {
+                curve_3d: EdgeCurve::NurbsCurve(arc.clone()),
+                pcurve: Curve2D::Line(Line2D::new(start_uv, end_uv - start_uv).unwrap()),
+                start_uv,
+                end_uv,
+                start_3d,
+                end_3d,
+                forward,
+                source_edge_idx: None,
+                pave_block_id: None,
+            }
+        };
+        for forward in [true, false] {
+            for t in [0.05, 0.5, 0.95] {
+                let walked = walked_uv(&edge(forward), t, &surface, periods).unwrap();
+                let param = if forward { t } else { 1.0 - t };
+                let (want, _) = surface.project_point(arc.evaluate(param)).unwrap();
+                let want = want.rem_euclid(TAU);
+                assert!(
+                    want > 5.6 && (walked.x() - want).abs() < 1e-9,
+                    "forward {forward}, t {t}: the walk took u = {}, the arc is at {want}",
+                    walked.x()
+                );
+                assert!((walked.y() - z).abs() < 1e-9);
+            }
+        }
     }
 
     /// A woven hole's rim arc on a cylinder that runs from u = 0 to u = 5,

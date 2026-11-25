@@ -44,8 +44,8 @@ use brepkit_topology::vertex::{Vertex, VertexId};
 use brepkit_topology::wire::{OrientedEdge, Wire, WireId};
 
 use super::{
-    band_meets_cap, cylinder_meets_cap, edge_nearest, rewrite_wire, straight_edge, torus_meets_cap,
-    torus_parallel_meets_plane, torus_parallel_meets_surface,
+    EdgeReads, band_meets_cap, cylinder_meets_cap, edge_nearest, rewrite_wire, straight_edge,
+    torus_meets_cap, torus_parallel_meets_plane, torus_parallel_meets_surface,
 };
 use crate::BlendError;
 
@@ -671,7 +671,7 @@ fn reversed(path: &[OrientedEdge]) -> Vec<OrientedEdge> {
 
 /// Where along `curve` (between `t0` and `t1`, from `a` to `b`) it crosses
 /// the edge: its parameter and point nearest the edge, where they come
-/// within `tol`.
+/// within `tol`. The edge is sampled once for all the reads of its distance.
 fn crossing(
     topo: &Topology,
     edge: EdgeId,
@@ -682,8 +682,9 @@ fn crossing(
     const SAMPLES: usize = 96;
     #[allow(clippy::cast_precision_loss)]
     let param = |k: usize| t0 + (t1 - t0) * (k as f64) / (SAMPLES as f64);
+    let reads = EdgeReads::new(topo, edge)?;
     let gap = |t: f64| -> Result<f64, BlendError> {
-        Ok(edge_nearest(topo, edge, curve.evaluate_with_endpoints(t, a, b), None)?.0)
+        Ok(reads.nearest(curve.evaluate_with_endpoints(t, a, b)).0)
     };
     let mut best = (0, f64::INFINITY);
     for k in 0..=SAMPLES {
@@ -1119,11 +1120,16 @@ fn plan_run_up(
         }
         walls.push((wall, wall_wire, edge_id, from));
         if let Some((tc, x)) = crossing(topo, edge_id, (&c_curve, c_start, c_end), from_e, tol)? {
-            // Not at the contact's far end, and not at the edge's ends.
+            // Not at either end of the contact, and not at the edge's ends.
+            // An outline through `E` itself (an edge of the ledge the trim
+            // left whole past `E`) meets the contact where it starts: the
+            // contact runs off nothing there.
             let (_, xe) = edge_nearest(topo, edge_id, x, None)?;
             let ends = [topo.vertex(from)?.point(), topo.vertex(to)?.point()];
+            let span = (from_e.1 - from_e.0).abs();
             if ends.iter().any(|&end| (end - xe).length() <= 10.0 * tol)
-                || (tc - from_e.1).abs() <= 1e-9 * (from_e.1 - from_e.0).abs()
+                || (tc - from_e.1).abs() <= 1e-9 * span
+                || (tc - from_e.0).abs() <= 1e-9 * span
             {
                 return Ok(None);
             }

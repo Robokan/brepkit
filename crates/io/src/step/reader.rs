@@ -203,14 +203,17 @@ impl<'a> StepBuilder<'a> {
                         solid
                     };
                     if !super::assembly::is_identity(placement) {
+                        check_placed_vertices(self.topo, instance, placement)?;
                         brepkit_operations::transform::transform_solid(
                             self.topo, instance, placement,
                         )?;
+                        check_placed_geometry(self.topo, instance)?;
                     }
                     solid_ids.push(instance);
                 }
             }
         }
+        super::settle_tolerances(self.topo, &solid_ids)?;
         Ok(solid_ids)
     }
 
@@ -308,7 +311,7 @@ impl<'a> StepBuilder<'a> {
             let face_id = self.build_face(face_ref, flip)?;
             face_ids.push(face_id);
         }
-        super::seam::close_seams(self.topo, &face_ids, &self.vertex_loops)?;
+        brepkit_operations::heal::close_seams(self.topo, &face_ids, &self.vertex_loops)?;
 
         let shell = Shell::new(face_ids).map_err(|e| IoError::ParseError {
             reason: format!("failed to build shell from STEP: {e}"),
@@ -320,14 +323,13 @@ impl<'a> StepBuilder<'a> {
     /// A whole sphere written as one face bounded only by a VERTEX_LOOP (a
     /// point on it, as some writers write a ball) has no edge to bound a
     /// face with. It reads as `make_sphere` builds one: two hemispheres
-    /// meeting along a polygon inscribed in the equator about the sphere's
+    /// meeting along one circle edge round the equator about the sphere's
     /// axis. `None` for any other face.
     fn build_whole_sphere(
         &mut self,
         face_ref: u64,
         flip: bool,
     ) -> Result<Option<[brepkit_topology::face::FaceId; 2]>, IoError> {
-        const EQUATOR_SEGMENTS: u32 = 32;
         let attrs = self.get_entity(face_ref)?.attrs.clone();
         let list_refs = parse_list_refs(&attrs);
         let [bound_ref] = list_refs[..] else {
@@ -363,33 +365,20 @@ impl<'a> StepBuilder<'a> {
             (orient_tail.ends_with(".F.") || orient_tail.ends_with(".FALSE.")) != inward;
 
         let (c, r) = (sphere.center(), sphere.radius());
-        let (x, y) = (sphere.x_axis(), sphere.y_axis());
-        let vertices: Vec<_> = (0..EQUATOR_SEGMENTS)
-            .map(|i| {
-                let t = std::f64::consts::TAU * f64::from(i) / f64::from(EQUATOR_SEGMENTS);
-                let p = c + x * (r * t.cos()) + y * (r * t.sin());
-                self.topo.add_vertex(Vertex::new(p, 1e-7))
-            })
-            .collect();
-        let edges: Vec<_> = (0..vertices.len())
-            .map(|i| {
-                let j = (i + 1) % vertices.len();
-                self.topo
-                    .add_edge(Edge::new(vertices[i], vertices[j], EdgeCurve::Line))
-            })
-            .collect();
+        let x = sphere.x_axis();
+        let equator = brepkit_math::curves::Circle3D::new_with_ref(c, sphere.z_axis(), r, x)
+            .map_err(|e| IoError::ParseError {
+                reason: format!("ADVANCED_FACE #{face_ref}: {e}"),
+            })?;
+        let vertex = self.topo.add_vertex(Vertex::new(c + x * r, 1e-7));
+        let edge = self
+            .topo
+            .add_edge(Edge::new(vertex, vertex, EdgeCurve::Circle(equator)));
         // Each loop runs counterclockwise about the outward normal: round
         // the axis it bounds the upper half, the other way the lower.
         let loops = [
-            edges
-                .iter()
-                .map(|&e| OrientedEdge::new(e, true))
-                .collect::<Vec<_>>(),
-            edges
-                .iter()
-                .rev()
-                .map(|&e| OrientedEdge::new(e, false))
-                .collect(),
+            vec![OrientedEdge::new(edge, true)],
+            vec![OrientedEdge::new(edge, false)],
         ];
         let mut halves = Vec::with_capacity(2);
         for oriented in loops {
@@ -911,6 +900,9 @@ impl<'a> StepBuilder<'a> {
             }
             (surface, _) => surface,
         };
+        // A swept or revolved surface, and a sphere put on a new frame, are
+        // built here and not by `build_surface`.
+        let surface = evaluable_surface(surface, surface_ref)?;
 
         // Turning a face over flips its normal, not the side of its surface
         // its loops wind about.
@@ -1138,7 +1130,14 @@ impl<'a> StepBuilder<'a> {
         .unwrap_or(sphere))
     }
 
+    /// The surface `#surface_ref` names. The file can hold any numbers, so a
+    /// surface that cannot give a finite point at each parameter pair of its
+    /// domain is refused.
     fn build_surface(&self, surface_ref: u64) -> Result<FaceSurface, IoError> {
+        evaluable_surface(self.surface_geometry(surface_ref)?, surface_ref)
+    }
+
+    fn surface_geometry(&self, surface_ref: u64) -> Result<FaceSurface, IoError> {
         let entity = self.get_entity(surface_ref)?;
         let entity_type = entity.entity_type.clone();
         let attrs = entity.attrs.clone();
@@ -1336,10 +1335,17 @@ impl<'a> StepBuilder<'a> {
         }
 
         let edge_id = self.topo.add_edge(Edge::new(start_vp, end_vp, curve));
-        super::seam::anchor_circle(self.topo, edge_id)?;
+        brepkit_operations::heal::anchor_circle(self.topo, edge_id)?;
 
         self.edge_cache.insert(ec_ref, edge_id);
         Ok(edge_id)
+    }
+
+    /// The curve `#curve_ref` names. The file can hold any numbers, so a
+    /// curve that cannot give a finite point at each parameter of its domain
+    /// is refused.
+    fn build_curve_geometry(&self, curve_ref: u64) -> Result<EdgeCurve, IoError> {
+        evaluable_curve(self.curve_geometry(curve_ref)?, curve_ref)
     }
 
     /// Build the curve geometry for an edge from a curve entity reference.
@@ -1347,7 +1353,7 @@ impl<'a> StepBuilder<'a> {
     /// Dispatches on the entity type: LINE, CIRCLE, ELLIPSE,
     /// `B_SPLINE_CURVE_WITH_KNOTS`, and a curve on surfaces (simple or complex
     /// record) through its 3D curve.
-    fn build_curve_geometry(&self, curve_ref: u64) -> Result<EdgeCurve, IoError> {
+    fn curve_geometry(&self, curve_ref: u64) -> Result<EdgeCurve, IoError> {
         let entity = self.get_entity(curve_ref)?;
         let entity_type = entity.entity_type.clone();
         let attrs = entity.attrs.clone();
@@ -1462,13 +1468,20 @@ impl<'a> StepBuilder<'a> {
             reason: format!("B_SPLINE_CURVE #{curve_ref} could not parse attributes"),
         })?;
         let (degree, cp_refs, mults, knot_vals) = parsed;
+        let knots = expand_knots(&mults, &knot_vals, cp_refs.len(), degree).ok_or_else(|| {
+            IoError::ParseError {
+                reason: format!(
+                    "B_SPLINE_CURVE #{curve_ref} has a degree of {degree} over {} points, or \
+                     knot multiplicities that do not add up to them",
+                    cp_refs.len()
+                ),
+            }
+        })?;
 
         let mut control_points = Vec::with_capacity(cp_refs.len());
         for &cp_ref in &cp_refs {
             control_points.push(self.build_cartesian_point(cp_ref)?);
         }
-
-        let knots = expand_knots(&mults, &knot_vals);
 
         let n_cps = control_points.len();
         let weights = if let Some(weights) = rational_attrs {
@@ -1486,6 +1499,14 @@ impl<'a> StepBuilder<'a> {
             .map_err(|e| IoError::ParseError {
                 reason: format!("B_SPLINE_CURVE #{curve_ref}: {e}"),
             })?;
+        if !nurbs.is_well_formed() {
+            return Err(IoError::ParseError {
+                reason: format!(
+                    "B_SPLINE_CURVE #{curve_ref} has a degree, knots, weights or points \
+                     it cannot be evaluated with"
+                ),
+            });
+        }
         Ok(EdgeCurve::NurbsCurve(nurbs))
     }
 
@@ -1861,6 +1882,19 @@ impl<'a> StepBuilder<'a> {
             reason: format!("B_SPLINE_SURFACE #{surface_ref} could not parse attributes"),
         })?;
         let (degree_u, degree_v, cp_grid_refs, u_mults, v_mults, u_knots, v_knots) = parsed;
+        let (rows, cols) = (cp_grid_refs.len(), cp_grid_refs.first().map_or(0, Vec::len));
+        let (Some(knots_u), Some(knots_v)) = (
+            expand_knots(&u_mults, &u_knots, rows, degree_u),
+            expand_knots(&v_mults, &v_knots, cols, degree_v),
+        ) else {
+            return Err(IoError::ParseError {
+                reason: format!(
+                    "B_SPLINE_SURFACE #{surface_ref} has degrees of {degree_u} and {degree_v} \
+                     over {rows} by {cols} points, or knot multiplicities that do not add up \
+                     to them"
+                ),
+            });
+        };
 
         let mut cp_grid: Vec<Vec<Point3>> = Vec::new();
         for row_refs in &cp_grid_refs {
@@ -1870,9 +1904,6 @@ impl<'a> StepBuilder<'a> {
             }
             cp_grid.push(row);
         }
-
-        let knots_u = expand_knots(&u_mults, &u_knots);
-        let knots_v = expand_knots(&v_mults, &v_knots);
 
         let n_rows = cp_grid.len();
         let n_cols = cp_grid.first().map_or(0, Vec::len);
@@ -1896,6 +1927,14 @@ impl<'a> StepBuilder<'a> {
         .map_err(|e| IoError::ParseError {
             reason: format!("B_SPLINE_SURFACE #{surface_ref}: {e}"),
         })?;
+        if !nurbs.is_well_formed() {
+            return Err(IoError::ParseError {
+                reason: format!(
+                    "B_SPLINE_SURFACE #{surface_ref} has degrees, knots, weights or points \
+                     it cannot be evaluated with"
+                ),
+            });
+        }
         Ok(FaceSurface::Nurbs(nurbs))
     }
 
@@ -1931,7 +1970,9 @@ impl<'a> StepBuilder<'a> {
                 ),
             });
         }
-        Ok(Point3::new(coords[0], coords[1], coords[2]))
+        crate::bounded_point(Point3::new(coords[0], coords[1], coords[2]), || {
+            format!("CARTESIAN_POINT #{cp_ref}")
+        })
     }
 
     fn build_direction(&self, dir_ref: u64) -> Result<Vec3, IoError> {
@@ -2305,6 +2346,75 @@ fn parse_list_refs(attrs: &str) -> Vec<u64> {
     Vec::new()
 }
 
+/// Refuses `solid` when `placement`, its unit scale and its place in the
+/// assembly, would put a vertex past the size limit: a coordinate within it
+/// in the file's unit can pass it in millimetres. Checked before the solid
+/// moves.
+fn check_placed_vertices(
+    topo: &Topology,
+    solid: SolidId,
+    placement: &brepkit_math::mat::Mat4,
+) -> Result<(), IoError> {
+    for vertex in brepkit_topology::explorer::solid_vertices(topo, solid)? {
+        let point = topo.vertex(vertex)?.point();
+        crate::bounded_point(placement.mul_point(point), || {
+            format!("a vertex at {point:?} scaled and placed")
+        })?;
+    }
+    Ok(())
+}
+
+/// Refuses a placed `solid` whose curve or surface the placement scaled or
+/// moved past what [`EdgeCurve::is_well_formed`] and
+/// [`FaceSurface::is_well_formed`] accept: a radius scales with the unit.
+fn check_placed_geometry(topo: &Topology, solid: SolidId) -> Result<(), IoError> {
+    for face in brepkit_topology::explorer::solid_faces(topo, solid)? {
+        if !topo.face(face)?.surface().is_well_formed() {
+            return Err(IoError::ParseError {
+                reason: "a surface scaled and placed is past the size limit".to_string(),
+            });
+        }
+    }
+    for edge in brepkit_topology::explorer::solid_edges(topo, solid)? {
+        if !topo.edge(edge)?.curve().is_well_formed() {
+            return Err(IoError::ParseError {
+                reason: "a curve scaled and placed is past the size limit".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `curve`, read from `#entity`, if it gives a finite point at each
+/// parameter of its domain on the shape its type names.
+fn evaluable_curve(curve: EdgeCurve, entity: u64) -> Result<EdgeCurve, IoError> {
+    if curve.is_well_formed() {
+        Ok(curve)
+    } else {
+        Err(IoError::ParseError {
+            reason: format!(
+                "curve #{entity} has a size, frame, knots, weights or points \
+                 it cannot be evaluated with"
+            ),
+        })
+    }
+}
+
+/// `surface`, read from `#entity`, if it gives a finite point at each
+/// parameter pair of its domain on the shape its type names.
+fn evaluable_surface(surface: FaceSurface, entity: u64) -> Result<FaceSurface, IoError> {
+    if surface.is_well_formed() {
+        Ok(surface)
+    } else {
+        Err(IoError::ParseError {
+            reason: format!(
+                "surface #{entity} has a size, frame, knots, weights or points \
+                 it cannot be evaluated with"
+            ),
+        })
+    }
+}
+
 /// Extract floating-point numbers from an attribute string.
 ///
 /// Handles both nested `(1.0, 2.0)` and flat `'', #ref, 1.5E+00` formats.
@@ -2623,15 +2733,23 @@ fn parse_nested_refs(s: &str) -> Vec<Vec<u64>> {
 /// Expand knot multiplicities and unique values into a flat knot vector.
 ///
 /// Given `mults = [3, 1, 3]` and `vals = [0.0, 0.5, 1.0]`, produces
-/// `[0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]`.
-fn expand_knots(mults: &[u32], vals: &[f64]) -> Vec<f64> {
-    let mut knots = Vec::new();
-    for (&m, &v) in mults.iter().zip(vals.iter()) {
-        for _ in 0..m {
-            knots.push(v);
-        }
+/// `[0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]`. The file gives the degree and each
+/// multiplicity: `None` unless the degree is less than the number of
+/// `points` and the multiplicities add up to the points, the degree and one
+/// more, so a count from the file cannot overflow or fill memory.
+fn expand_knots(mults: &[u32], vals: &[f64], points: usize, degree: usize) -> Option<Vec<f64>> {
+    let want = brepkit_math::nurbs::basis::knot_count(points, degree)?;
+    let total = mults.iter().zip(vals).try_fold(0_usize, |sum, (&m, _)| {
+        sum.checked_add(usize::try_from(m).ok()?)
+    })?;
+    if degree >= points || total != want {
+        return None;
     }
-    knots
+    let mut knots = Vec::with_capacity(want);
+    for (&m, &v) in mults.iter().zip(vals) {
+        knots.extend(std::iter::repeat_n(v, usize::try_from(m).ok()?));
+    }
+    Some(knots)
 }
 
 /// Parse a B_SPLINE_CURVE_WITH_KNOTS attribute string.
@@ -2957,6 +3075,313 @@ mod tests {
                 "sample at {u} moved"
             );
         }
+    }
+
+    /// The first B-spline curve and surface `step` holds, each as the reader
+    /// builds it.
+    fn build_first_bsplines(
+        step: &str,
+    ) -> (Result<EdgeCurve, IoError>, Result<FaceSurface, IoError>) {
+        let entities = parse_step_entities(step).unwrap();
+        let first = |name: &str| {
+            entities
+                .iter()
+                .filter(|(_, e)| {
+                    e.entity_type == format!("{name}_WITH_KNOTS")
+                        || (e.entity_type.is_empty() && e.attrs.contains(&format!("{name}(")))
+                })
+                .map(|(&id, _)| id)
+                .min()
+        };
+        let mut imported = Topology::new();
+        let builder = StepBuilder::new(&mut imported, &entities, false);
+        let curve = first("B_SPLINE_CURVE").map_or_else(
+            || {
+                Err(IoError::ParseError {
+                    reason: "no curve".into(),
+                })
+            },
+            |id| builder.build_curve_geometry(id),
+        );
+        let surface = first("B_SPLINE_SURFACE").map_or_else(
+            || {
+                Err(IoError::ParseError {
+                    reason: "no surface".into(),
+                })
+            },
+            |id| builder.build_surface(id),
+        );
+        (curve, surface)
+    }
+
+    /// A B-spline's degree, knots, weights and points come from the file,
+    /// and a set no evaluation can walk panics, hangs or gives a wrong solid
+    /// when it is evaluated: the reader refuses it. The file it was made from
+    /// reads. Each edit replaces one number the file holds once in the curve
+    /// and once in the surface (a knot of 0.375, a coordinate of 0.625, a
+    /// weight of 0.875), or a degree and the multiplicities its knots then
+    /// need.
+    #[test]
+    fn a_bspline_the_reader_cannot_evaluate_is_refused() {
+        use brepkit_math::nurbs::{NurbsCurve, NurbsSurface};
+
+        let knots = vec![0.0, 0.0, 0.0, 0.375, 1.0, 1.0, 1.0];
+        let row = |x: f64, y: f64| {
+            vec![
+                Point3::new(x, 0.0, 0.0),
+                Point3::new(x, y, 1.0),
+                Point3::new(x, 1.5, 1.0),
+                Point3::new(x, 2.0, 0.0),
+            ]
+        };
+        let weights = vec![1.0, 0.875, 1.0, 1.0];
+        let curve = NurbsCurve::new(2, knots.clone(), row(0.0, 0.625), weights.clone()).unwrap();
+        let surface = NurbsSurface::new(
+            1,
+            2,
+            vec![0.0, 0.0, 1.0, 1.0],
+            knots,
+            vec![row(0.0, 0.625), row(3.0, 0.75)],
+            vec![weights, vec![1.0; 4]],
+        )
+        .unwrap();
+        let mut topo = Topology::new();
+        let cube = make_unit_cube_non_manifold(&mut topo);
+        let eid = brepkit_topology::explorer::solid_edges(&topo, cube).unwrap()[0];
+        topo.edge_mut(eid)
+            .unwrap()
+            .set_curve(EdgeCurve::NurbsCurve(curve));
+        let fid = brepkit_topology::explorer::solid_faces(&topo, cube).unwrap()[0];
+        topo.face_mut(fid)
+            .unwrap()
+            .set_surface(FaceSurface::Nurbs(surface));
+        let step = writer::write_step(&topo, &[cube]).unwrap();
+        let (knot, point, weight) = (fmt(0.375), fmt(0.625), fmt(0.875));
+        for text in [&knot, &point, &weight] {
+            assert_eq!(step.matches(text.as_str()).count(), 2, "{text}");
+        }
+        let (curve, surface) = build_first_bsplines(&step);
+        assert!(curve.unwrap().is_well_formed());
+        assert!(surface.unwrap().is_well_formed());
+
+        // `text` with `from` replaced by `to` on each line that holds `marker`.
+        let on_lines = |text: &str, marker: &str, from: &str, to: &str| {
+            text.lines()
+                .map(|line| {
+                    if line.contains(marker) {
+                        line.replace(from, to)
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Two more degrees on the curve over its four points, and one more
+        // on the surface over its two rows; their first knots repeat as many
+        // times more.
+        let past_points = {
+            let text = on_lines(
+                &step,
+                "B_SPLINE_CURVE(",
+                "B_SPLINE_CURVE(2,",
+                "B_SPLINE_CURVE(4,",
+            );
+            let text = on_lines(&text, "B_SPLINE_CURVE(", "(3, 1, 3)", "(5, 1, 3)");
+            let text = on_lines(
+                &text,
+                "B_SPLINE_SURFACE(",
+                "B_SPLINE_SURFACE(1, 2,",
+                "B_SPLINE_SURFACE(2, 2,",
+            );
+            on_lines(&text, "B_SPLINE_SURFACE(", "(2, 2)", "(3, 2)")
+        };
+        // A degree whose knot count passes the largest `usize`, and a knot
+        // repeated so often that its knots would fill memory.
+        let huge_degree = {
+            let text = on_lines(
+                &step,
+                "B_SPLINE_CURVE(",
+                "B_SPLINE_CURVE(2,",
+                "B_SPLINE_CURVE(18446744073709551615,",
+            );
+            on_lines(
+                &text,
+                "B_SPLINE_SURFACE(",
+                "B_SPLINE_SURFACE(1, 2,",
+                "B_SPLINE_SURFACE(18446744073709551615, 2,",
+            )
+        };
+        let huge_repeat = {
+            let text = on_lines(&step, "B_SPLINE_CURVE(", "(3, 1, 3)", "(3, 4000000000, 3)");
+            on_lines(&text, "B_SPLINE_SURFACE(", "(2, 2)", "(2, 4000000000)")
+        };
+        let malformed = [
+            past_points,
+            huge_degree,
+            huge_repeat,
+            step.replace(&knot, "2.0"),
+            step.replace(&knot, "NaN"),
+            step.replace(&knot, "1E400"),
+            step.replace(&point, "1E400"),
+            step.replace(&point, "-inf"),
+            step.replace(&weight, "1E-310"),
+            step.replace(&weight, "1E308"),
+            step.replace(&knot, "1E-310"),
+            step.replace(&weight, "0."),
+            step.replace(&weight, "-1."),
+        ];
+        for bad in &malformed {
+            let (curve, surface) = build_first_bsplines(bad);
+            assert!(
+                matches!(curve, Err(IoError::ParseError { .. })),
+                "{curve:?}"
+            );
+            assert!(
+                matches!(surface, Err(IoError::ParseError { .. })),
+                "{surface:?}"
+            );
+        }
+    }
+
+    /// A circle's or a cylinder's radius comes from the file. A radius that
+    /// is not finite and positive gives a curve or surface with no points,
+    /// and one past the size limit, or a centre that is not finite or past
+    /// it, gives points that may not be finite: the reader refuses each. The
+    /// file it was made from reads.
+    #[test]
+    fn a_circle_or_cylinder_the_reader_cannot_evaluate_is_refused() {
+        let mut topo = Topology::new();
+        let rod = brepkit_operations::primitives::make_cylinder(&mut topo, 2.0, 3.0).unwrap();
+        let step = writer::write_step(&topo, &[rod]).unwrap();
+        assert_eq!(read_step(&step, &mut Topology::new()).unwrap().len(), 1);
+
+        // `text` with the last number of each `entity` record set to `value`.
+        let sized = |entity: &str, value: &str| {
+            step.lines()
+                .map(|line| match line.find(&format!("= {entity}(")) {
+                    Some(_) => {
+                        let (head, _) = line.rsplit_once(',').unwrap();
+                        format!("{head},{value});")
+                    }
+                    None => line.to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // `text` with each circle placed on a new point at `x`.
+        let centred = |x: &str| {
+            let mut next = step
+                .lines()
+                .filter_map(|l| l.strip_prefix('#')?.split_once(' ')?.0.parse::<u64>().ok())
+                .max()
+                .unwrap();
+            let placements: Vec<String> = step
+                .lines()
+                .filter(|l| l.contains("= CIRCLE("))
+                .map(|l| {
+                    l.split('#')
+                        .nth(2)
+                        .unwrap()
+                        .split(',')
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            let mut extra = Vec::new();
+            let lines: Vec<String> = step
+                .lines()
+                .map(|line| {
+                    let id = line.strip_prefix('#').and_then(|l| l.split_once(' '));
+                    match id {
+                        Some((id, _))
+                            if placements.iter().any(|p| p == id)
+                                && line.contains("AXIS2_PLACEMENT_3D(") =>
+                        {
+                            next += 1;
+                            extra.push(format!("#{next} = CARTESIAN_POINT('',({x},0.,0.));"));
+                            let open = line.find('(').unwrap();
+                            let at = open + line[open..].find('#').unwrap();
+                            let end = at + line[at..].find(',').unwrap();
+                            format!("{}#{next}{}", &line[..at], &line[end..])
+                        }
+                        _ => line.to_owned(),
+                    }
+                })
+                .collect();
+            lines.join("\n").replacen(
+                "ENDSEC;\nEND-ISO",
+                &format!("{}\nENDSEC;\nEND-ISO", extra.join("\n")),
+                1,
+            )
+        };
+        assert_eq!(
+            read_step(&centred("0."), &mut Topology::new())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut malformed = Vec::new();
+        for entity in ["CIRCLE", "CYLINDRICAL_SURFACE"] {
+            for value in ["NaN", "inf", "-inf", "1.E400", "1.E305", "0.", "-2."] {
+                malformed.push((format!("{entity} {value}"), sized(entity, value)));
+            }
+        }
+        for x in ["NaN", "1.E305"] {
+            malformed.push((format!("centre {x}"), centred(x)));
+        }
+        for (what, bad) in &malformed {
+            let found = read_step(bad, &mut Topology::new());
+            assert!(
+                matches!(found, Err(IoError::ParseError { .. })),
+                "{what}: {found:?}"
+            );
+        }
+    }
+
+    /// A vertex point that is not finite, or past the size limit, gives an
+    /// edge whose ends cannot be read: the reader refuses each. The file it
+    /// was made from reads.
+    #[test]
+    fn a_vertex_point_the_reader_cannot_use_is_refused() {
+        let mut topo = Topology::new();
+        let block = brepkit_operations::primitives::make_box(&mut topo, 1.0, 2.0, 3.0).unwrap();
+        let step = writer::write_step(&topo, &[block]).unwrap();
+        assert_eq!(read_step(&step, &mut Topology::new()).unwrap().len(), 1);
+
+        let point = step
+            .lines()
+            .find_map(|l| l.split_once("= VERTEX_POINT("))
+            .and_then(|(_, rest)| rest.split_once('#'))
+            .map(|(_, rest)| rest.trim_end_matches(");").to_owned())
+            .unwrap();
+        let head = format!("#{point} = CARTESIAN_POINT(");
+        let moved = |x: &str| {
+            step.lines()
+                .map(|line| {
+                    if line.starts_with(&head) {
+                        format!("{head}'',({x},0.,0.));")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_ne!(moved("NaN"), step);
+        for x in ["NaN", "inf", "-inf", "1.E400", "1.E305", "-1.E305"] {
+            let found = read_step(&moved(x), &mut Topology::new());
+            assert!(
+                matches!(found, Err(IoError::ParseError { .. })),
+                "{x}: {found:?}"
+            );
+        }
+    }
+
+    fn fmt(v: f64) -> String {
+        format!("{v:.15E}")
     }
 
     /// `plain` with each edge's curve reference moved onto a new entity that
@@ -4364,8 +4789,12 @@ mod tests {
     fn expand_knots_basic() {
         let mults = [3, 1, 3];
         let vals = [0.0, 0.5, 1.0];
-        let flat = expand_knots(&mults, &vals);
+        let flat = expand_knots(&mults, &vals, 4, 2).unwrap();
         assert_eq!(flat, vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]);
+        assert!(expand_knots(&mults, &vals, 4, 3).is_none());
+        assert!(expand_knots(&mults, &vals, 2, 4).is_none());
+        assert!(expand_knots(&[3, u32::MAX, 3], &vals, 4, 2).is_none());
+        assert!(expand_knots(&mults, &vals, 4, usize::MAX).is_none());
     }
 
     #[test]

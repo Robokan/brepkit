@@ -9,6 +9,7 @@ use brepkit_math::vec::{Point3, Vec3};
 use brepkit_topology::Topology;
 use brepkit_topology::edge::{Edge, EdgeCurve};
 use brepkit_topology::face::{Face, FaceSurface};
+use brepkit_topology::solid::SolidId;
 use brepkit_topology::test_utils::{make_unit_square_face, make_unit_triangle_face};
 use brepkit_topology::vertex::Vertex;
 use brepkit_topology::wire::{OrientedEdge, Wire};
@@ -6199,4 +6200,1123 @@ fn a_narrow_sphere_patch_takes_triangles_for_its_area() {
             );
         }
     }
+}
+
+/// The five poses of the random boolean sweep.
+fn sweep_poses() -> [(&'static str, brepkit_math::mat::Mat4); 5] {
+    use brepkit_math::mat::Mat4;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+        ("turned+mirrored", Mat4::scale(1.0, -1.0, 1.0) * turn),
+        ("rolled", Mat4::rotation_z(2.0)),
+    ]
+}
+
+/// A ball of radius `r` at `c`, turned by `spin` about x, then y, then z.
+fn spun_ball(topo: &mut Topology, c: [f64; 3], r: f64, spin: [f64; 3]) -> SolidId {
+    use brepkit_math::mat::Mat4;
+    let s = crate::primitives::make_sphere(topo, r, 32).unwrap();
+    let m = Mat4::translation(c[0], c[1], c[2])
+        * Mat4::rotation_z(spin[2])
+        * Mat4::rotation_y(spin[1])
+        * Mat4::rotation_x(spin[0]);
+    crate::transform::transform_solid(topo, s, &m).unwrap();
+    s
+}
+
+/// A rod of radius `r` along `axis` (0 x, 1 y, 2 z) through `pq` (the other
+/// two coordinates in cyclic order), from `t0` to `t1`, turned by `spin`
+/// about its axis.
+fn spun_rod(
+    topo: &mut Topology,
+    axis: usize,
+    pq: (f64, f64),
+    r: f64,
+    (t0, t1): (f64, f64),
+    spin: f64,
+) -> SolidId {
+    use brepkit_math::mat::Mat4;
+    use std::f64::consts::FRAC_PI_2;
+    let s = crate::primitives::make_cylinder(topo, r, t1 - t0).unwrap();
+    let along_z = Mat4::translation(pq.0, pq.1, t0) * Mat4::rotation_z(spin);
+    let m = match axis {
+        2 => along_z,
+        0 => Mat4::rotation_z(FRAC_PI_2) * Mat4::rotation_x(FRAC_PI_2) * along_z,
+        _ => Mat4::rotation_x(-FRAC_PI_2) * Mat4::rotation_z(-FRAC_PI_2) * along_z,
+    };
+    crate::transform::transform_solid(topo, s, &m).unwrap();
+    s
+}
+
+/// Checks that each triangle of the solid's mesh faces the way its face
+/// does, its normal on the side of the face's outward surface normal at its
+/// centroid, and that the two triangles on each edge run it opposite ways.
+fn assert_faces_turn_outward(topo: &Topology, solid: SolidId, deflection: f64, name: &str) {
+    let (mesh, offsets) = tessellate_solid_grouped_with_tolerance(
+        topo,
+        solid,
+        deflection,
+        brepkit_math::chord::DEFAULT_ANGULAR_TOL,
+    )
+    .unwrap();
+    let faces = brepkit_topology::explorer::solid_faces(topo, solid).unwrap();
+    for (group, w) in offsets.windows(2).enumerate() {
+        let face = topo.face(faces[group]).unwrap();
+        let sense = if face.is_reversed() { -1.0 } else { 1.0 };
+        for t in (w[0] as usize..w[1] as usize).step_by(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| mesh.positions[mesh.indices[t + k] as usize]);
+            let normal = (b - a).cross(c - a);
+            let centroid = Point3::new(
+                (a.x() + b.x() + c.x()) / 3.0,
+                (a.y() + b.y() + c.y()) / 3.0,
+                (a.z() + b.z() + c.z()) / 3.0,
+            );
+            let outward = match face.surface() {
+                FaceSurface::Plane { normal, .. } => *normal,
+                surface => {
+                    let (u, v) = surface.project_point(centroid).unwrap();
+                    surface.normal(u, v)
+                }
+            } * sense;
+            assert!(
+                normal.dot(outward) > 0.0,
+                "{name} at {deflection}: a triangle of face {group} ({}) turns inward at {centroid:?}",
+                face.surface().type_tag()
+            );
+        }
+    }
+    let mut directed: DetHashMap<(u32, u32), usize> = DetHashMap::default();
+    for tri in mesh.indices.chunks_exact(3) {
+        for k in 0..3 {
+            *directed.entry((tri[k], tri[(k + 1) % 3])).or_default() += 1;
+        }
+    }
+    for (&(a, b), &n) in &directed {
+        assert!(
+            n == 1 && directed.get(&(b, a)) == Some(&1),
+            "{name} at {deflection}: edge {a}-{b} runs {n} times one way and {:?} the other",
+            directed.get(&(b, a))
+        );
+    }
+}
+
+/// Checks that each curved face of the solid with holes, meshed on its own,
+/// turns each triangle the way the face does, and that two triangles on an
+/// edge run it opposite ways.
+fn assert_holed_faces_alone_turn_outward(
+    topo: &Topology,
+    solid: SolidId,
+    deflection: f64,
+    name: &str,
+) {
+    for face_id in brepkit_topology::explorer::solid_faces(topo, solid).unwrap() {
+        let face = topo.face(face_id).unwrap();
+        if face.inner_wires().is_empty() || face.surface().is_planar() {
+            continue;
+        }
+        let what = format!(
+            "{name} at {deflection}: face {} ({}) alone",
+            face_id.index(),
+            face.surface().type_tag()
+        );
+        let mesh = tessellate(topo, face_id, deflection).unwrap();
+        assert!(!mesh.indices.is_empty(), "{what}: no triangles");
+        let sense = if face.is_reversed() { -1.0 } else { 1.0 };
+        let mut directed: DetHashMap<(u32, u32), usize> = DetHashMap::default();
+        for tri in mesh.indices.chunks_exact(3) {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| mesh.positions[i as usize]);
+            let centroid = Point3::new(
+                (a.x() + b.x() + c.x()) / 3.0,
+                (a.y() + b.y() + c.y()) / 3.0,
+                (a.z() + b.z() + c.z()) / 3.0,
+            );
+            let (u, v) = face.surface().project_point(centroid).unwrap();
+            let outward = face.surface().normal(u, v) * sense;
+            assert!(
+                (b - a).cross(c - a).dot(outward) > 0.0,
+                "{what}: a triangle turns inward at {centroid:?}"
+            );
+            for k in 0..3 {
+                *directed.entry((tri[k], tri[(k + 1) % 3])).or_default() += 1;
+            }
+        }
+        for (&(a, b), &n) in &directed {
+            assert!(
+                n == 1 && directed.get(&(b, a)).is_none_or(|&m| m == 1),
+                "{what}: edge {a}-{b} runs {n} times one way and {:?} the other",
+                directed.get(&(b, a))
+            );
+        }
+    }
+}
+
+/// Runs `ops` on `solids` in turn with the mesh fallback off, in each pose,
+/// and checks that the result is valid and meshes closed at two deflections,
+/// each triangle turned outward, with the mesh's volume near the solid's.
+fn assert_chain_meshes_closed(
+    build: impl Fn(&mut Topology) -> Vec<SolidId>,
+    ops: &[crate::boolean::BooleanOp],
+) {
+    let opts = crate::boolean::BooleanOptions {
+        mesh_fallback: false,
+        unify_faces: false,
+        ..crate::boolean::BooleanOptions::default()
+    };
+    for (name, pose) in sweep_poses() {
+        let mut topo = Topology::new();
+        let solids = build(&mut topo);
+        for &s in &solids {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let mut result = solids[0];
+        for (&op, &tool) in ops.iter().zip(&solids[1..]) {
+            result =
+                crate::boolean::boolean_with_options(&mut topo, op, result, tool, opts).unwrap();
+        }
+        let report = crate::validate::validate_solid(&topo, result).unwrap();
+        assert!(report.is_valid(), "{name}: {:?}", report.issues);
+        let volume = crate::measure::solid_volume(&topo, result, 0.0005).unwrap();
+        for deflection in [0.01, 0.05] {
+            let mesh = tessellate_solid(&topo, result, deflection).unwrap();
+            assert_eq!(
+                boundary_edge_count(&mesh),
+                0,
+                "{name} at {deflection}: open"
+            );
+            assert_faces_turn_outward(&topo, result, deflection, name);
+            assert_holed_faces_alone_turn_outward(&topo, result, deflection, name);
+            assert_eq!(
+                non_manifold_edge_count(&mesh),
+                0,
+                "{name} at {deflection}: non-manifold"
+            );
+            let mesh_volume = signed_volume_raw(&mesh);
+            assert!(
+                ((mesh_volume - volume) / volume).abs() < 0.03,
+                "{name} at {deflection}: mesh volume {mesh_volume} against {volume}"
+            );
+        }
+    }
+}
+
+/// A ball less a ball through its top, less a blind rod along x whose
+/// footprint reaches past the ball's equator by 5e-4 in latitude: the
+/// footprint splits where it crosses the equator, and both hemispheres mesh
+/// round their pieces of it, closed and turned outward.
+#[test]
+fn rod_footprint_past_a_balls_equator_meshes_closed() {
+    use crate::boolean::BooleanOp::Cut;
+    assert_chain_meshes_closed(
+        |topo| {
+            vec![
+                spun_ball(topo, [0.0; 3], 1.0, [0.278_691, 0.080_613, 5.167_053]),
+                spun_ball(
+                    topo,
+                    [0.005_691, -0.012_501, 0.805_764],
+                    0.541_239,
+                    [0.259_681, 0.161_073, 1.077_153],
+                ),
+                spun_rod(
+                    topo,
+                    0,
+                    (0.117_418, 0.033_100),
+                    0.202_387,
+                    (-0.193_258, 2.0),
+                    5.787_331,
+                ),
+            ]
+        },
+        &[Cut, Cut],
+    );
+}
+
+/// The volume of the part of a unit ball at the origin inside a rod along x
+/// of radius `rho` round the line through `(0, y0, z0)`, from `x = x0`
+/// inside the ball out past it: over the rod's section, the length from
+/// `x0` to the sphere, summed by Gauss points across the radius and evenly
+/// round the section.
+fn ball_held_by_a_rod(rho: f64, y0: f64, z0: f64, x0: f64) -> f64 {
+    const ROUND: u32 = 512;
+    let step = std::f64::consts::TAU / f64::from(ROUND);
+    let mut sum = 0.0;
+    for gp in brepkit_math::quadrature::gauss_legendre_points(20) {
+        let r = 0.5 * rho * (gp.x + 1.0);
+        let weight = 0.5 * rho * gp.w * r * step;
+        for k in 0..ROUND {
+            let a = step * f64::from(k);
+            let (y, z) = (r.madd(a.cos(), y0), r.madd(a.sin(), z0));
+            sum += weight * ((1.0 - y * y - z * z).sqrt() - x0);
+        }
+    }
+    sum
+}
+
+/// Blind rods along x into an unturned unit ball, each footprint reaching
+/// past the equator at its top by `rise` in latitude, as little as 1e-4.
+/// The footprint splits where it crosses the equator, so in five poses each
+/// cut, intersect and fuse is valid, meshes closed, and holds the volume a
+/// quadrature over the rod's section gives. A ray cast reads points in the
+/// rod above the equator just inside and just outside the ball's wall, in
+/// the ball just above the rod there, and in the ball past the rod's blind
+/// end, each as the operation keeps it.
+#[test]
+fn blind_rods_just_past_a_balls_equator_are_exact() {
+    use crate::boolean::BooleanOp::{Cut, Fuse, Intersect};
+    use brepkit_math::mat::Mat4;
+    let opts = crate::boolean::BooleanOptions {
+        mesh_fallback: false,
+        unify_faces: false,
+        ..crate::boolean::BooleanOptions::default()
+    };
+    let ball_volume = 4.0 / 3.0 * std::f64::consts::PI;
+    for (rise, rho, y0, x0) in [
+        (5e-4_f64, 0.2, 0.1, -0.2),
+        (1e-2, 0.2, 0.1, -0.2),
+        (2e-3, 0.3, -0.2, 0.1),
+        (5e-4, 0.1, 0.4, 0.3),
+        (1e-4, 0.25, 0.0, -0.5),
+    ] {
+        let z0 = rise.sin() - rho;
+        let held = ball_held_by_a_rod(rho, y0, z0, x0);
+        let rod_volume = std::f64::consts::PI * rho * rho * (2.0 - x0);
+        // Where the ball's wall is at height `z` over the rod's axis.
+        let wall = |z: f64| (1.0 - y0 * y0 - z * z).sqrt();
+        let (low, high) = (0.5 * rise.sin(), rise.sin() + 1e-4);
+        // Each probe, and whether it lies in the ball and in the rod.
+        let probes = [
+            (Point3::new(wall(low) - 1e-3, y0, low), true, true),
+            (Point3::new(wall(low) + 1e-3, y0, low), false, true),
+            (Point3::new(wall(high) - 1e-3, y0, high), true, false),
+            (Point3::new(x0 - 0.05, y0, z0), true, false),
+        ];
+        for (op, want) in [
+            (Cut, ball_volume - held),
+            (Intersect, held),
+            (Fuse, ball_volume - held + rod_volume),
+        ] {
+            for (name, pose) in sweep_poses() {
+                let what = format!("rise {rise} radius {rho} {op:?} {name}");
+                let mut topo = Topology::new();
+                let ball = crate::primitives::make_sphere(&mut topo, 1.0, 32).unwrap();
+                let rod = crate::primitives::make_cylinder(&mut topo, rho, 2.0 - x0).unwrap();
+                let place = pose
+                    * Mat4::translation(x0, y0, z0)
+                    * Mat4::rotation_y(std::f64::consts::FRAC_PI_2);
+                crate::transform::transform_solid(&mut topo, rod, &place).unwrap();
+                crate::transform::transform_solid(&mut topo, ball, &pose).unwrap();
+                let result =
+                    crate::boolean::boolean_with_options(&mut topo, op, ball, rod, opts).unwrap();
+                let report = crate::validate::validate_solid(&topo, result).unwrap();
+                assert!(report.is_valid(), "{what}: {:?}", report.issues);
+                let mesh = tessellate_solid(&topo, result, 0.01).unwrap();
+                assert_eq!(boundary_edge_count(&mesh), 0, "{what}: open");
+                assert_eq!(non_manifold_edge_count(&mesh), 0, "{what}: non-manifold");
+                let volume = crate::measure::solid_volume(&topo, result, 0.0005).unwrap();
+                assert!(
+                    ((volume - want) / want).abs() < 1e-7,
+                    "{what}: volume {volume} against {want}"
+                );
+                for &(at, in_ball, in_rod) in &probes {
+                    let kept = match op {
+                        Cut => in_ball && !in_rod,
+                        Intersect => in_ball && in_rod,
+                        Fuse => in_ball || in_rod,
+                    };
+                    let class = crate::classify::classify_point(
+                        &topo,
+                        result,
+                        pose.mul_point(at),
+                        0.0,
+                        1e-7,
+                    )
+                    .unwrap();
+                    let want = if kept {
+                        crate::classify::PointClassification::Inside
+                    } else {
+                        crate::classify::PointClassification::Outside
+                    };
+                    assert_eq!(class, want, "{what}: {at:?}");
+                }
+            }
+        }
+    }
+}
+
+/// A drum fused with a box through its wall, less a rod across it along y
+/// whose footprint passes 6e-3 radians from the drum's seam, which the
+/// drum's rims do not sample: its mesh keeps the seam where the face has it,
+/// clear of the footprint, and closes.
+#[test]
+fn rod_footprint_beside_a_drums_seam_meshes_closed() {
+    use crate::boolean::BooleanOp::{Cut, Fuse};
+    assert_chain_meshes_closed(
+        |topo| {
+            let block = crate::primitives::make_box(topo, 1.424_038, 0.472_777, 1.218_242).unwrap();
+            let place = brepkit_math::mat::Mat4::translation(0.373_583, 0.312_583, 0.628_973);
+            crate::transform::transform_solid(topo, block, &place).unwrap();
+            vec![
+                spun_rod(topo, 2, (0.0, 0.0), 1.0, (0.0, 4.0), 5.664_003),
+                block,
+                spun_rod(
+                    topo,
+                    1,
+                    (3.042_230, 0.311_705),
+                    0.499_299,
+                    (-2.0, 2.0),
+                    1.456_284,
+                ),
+            ]
+        },
+        &[Fuse, Cut],
+    );
+}
+
+/// A unit ball whose two hemispheres meet on a polygon of `segments` straight
+/// edges inscribed in the equator, as a STEP file can bound them.
+fn ball_on_equator_chords(topo: &mut Topology, segments: usize) -> SolidId {
+    use brepkit_math::surfaces::SphericalSurface;
+    use brepkit_topology::shell::Shell;
+    use brepkit_topology::solid::Solid;
+
+    let vertices: Vec<_> = (0..segments)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let theta = std::f64::consts::TAU * i as f64 / segments as f64;
+            topo.add_vertex(Vertex::new(
+                Point3::new(theta.cos(), theta.sin(), 0.0),
+                1e-7,
+            ))
+        })
+        .collect();
+    let edges: Vec<_> = (0..segments)
+        .map(|i| {
+            topo.add_edge(Edge::new(
+                vertices[i],
+                vertices[(i + 1) % segments],
+                EdgeCurve::Line,
+            ))
+        })
+        .collect();
+    let surface = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), 1.0).unwrap();
+    let north = Wire::new(
+        edges.iter().map(|&e| OrientedEdge::new(e, true)).collect(),
+        true,
+    )
+    .unwrap();
+    let south = Wire::new(
+        edges
+            .iter()
+            .rev()
+            .map(|&e| OrientedEdge::new(e, false))
+            .collect(),
+        true,
+    )
+    .unwrap();
+    let faces = [north, south]
+        .into_iter()
+        .map(|wire| {
+            let wire = topo.add_wire(wire);
+            topo.add_face(Face::new(
+                wire,
+                vec![],
+                FaceSurface::Sphere(surface.clone()),
+            ))
+        })
+        .collect();
+    let shell = topo.add_shell(Shell::new(faces).unwrap());
+    topo.add_solid(Solid::new(shell, vec![]))
+}
+
+/// A ball on 32 chords of its equator with flat cuts on the first chord,
+/// each across a circle of angular radius 0.02 at azimuth `phi` whose edge
+/// reaches past the chord's great circle by `rise` in latitude: north of it
+/// for a positive `rise`, from a hole of the southern face, and south of it
+/// for a negative one, from a hole of the northern face. Each circle's vertex
+/// is the point that reaches past. The faces hold the circles as holes, as a
+/// boolean that tests them against the chord leaves them.
+fn ball_with_cuts_on_one_chord(topo: &mut Topology, cuts: &[(f64, f64)]) -> SolidId {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_topology::shell::Shell;
+    use brepkit_topology::solid::Solid;
+
+    let ball = ball_on_equator_chords(topo, 32);
+    let faces = brepkit_topology::explorer::solid_faces(topo, ball).unwrap();
+    let southern = |f: &brepkit_topology::face::FaceId| {
+        let wire = topo.wire(topo.face(*f).unwrap().outer_wire()).unwrap();
+        !wire.edges()[0].is_forward()
+    };
+    let (south, north): (Vec<_>, Vec<_>) = faces.into_iter().partition(southern);
+    let beta: f64 = 0.02;
+    let mut holes = [Vec::new(), Vec::new()];
+    let mut shell_faces = Vec::new();
+    for &(phi, rise) in cuts {
+        let lat = if rise > 0.0 { rise - beta } else { beta + rise };
+        let axis = Vec3::new(lat.cos() * phi.cos(), lat.cos() * phi.sin(), lat.sin());
+        let up = Vec3::new(-lat.sin() * phi.cos(), -lat.sin() * phi.sin(), lat.cos());
+        let toward = if rise > 0.0 { up } else { -up };
+        let centre = Point3::new(0.0, 0.0, 0.0) + axis * beta.cos();
+        let circle = Circle3D::new_with_ref(centre, axis, beta.sin(), toward).unwrap();
+        let vertex = topo.add_vertex(Vertex::new(circle.evaluate(0.0), 1e-7));
+        let edge = topo.add_edge(Edge::new(vertex, vertex, EdgeCurve::Circle(circle)));
+        holes[usize::from(rise < 0.0)]
+            .push(topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, false)], true).unwrap()));
+        let rim = topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, true)], true).unwrap());
+        shell_faces.push(topo.add_face(Face::new(
+            rim,
+            vec![],
+            FaceSurface::Plane {
+                normal: axis,
+                d: beta.cos(),
+            },
+        )));
+    }
+    for (old, holes) in [south[0], north[0]].into_iter().zip(holes) {
+        let face = topo.face(old).unwrap().clone();
+        shell_faces.push(topo.add_face(Face::new(
+            face.outer_wire(),
+            holes,
+            face.surface().clone(),
+        )));
+    }
+    let shell = topo.add_shell(Shell::new(shell_faces).unwrap());
+    topo.add_solid(Solid::new(shell, vec![]))
+}
+
+/// Two holes of a ball's southern face reach past one chord of its
+/// equator: the chord takes the samples of both, in order along it, and
+/// both hemispheres mesh closed and turned outward, whole and each holed
+/// face on its own.
+#[test]
+fn two_holes_past_one_equator_chord_mesh_closed() {
+    assert_chain_meshes_closed(
+        |topo| {
+            vec![ball_with_cuts_on_one_chord(
+                topo,
+                &[(0.06, 4e-4), (0.14, 3e-4)],
+            )]
+        },
+        &[],
+    );
+}
+
+/// A hole of a ball's southern face reaches north past one chord of its
+/// equator, and a hole of its northern face south past the same chord,
+/// apart along it: the chord takes the samples of both, and the ball meshes
+/// closed and turned outward.
+#[test]
+fn holes_from_both_hemispheres_past_one_chord_mesh_closed() {
+    assert_chain_meshes_closed(
+        |topo| {
+            vec![ball_with_cuts_on_one_chord(
+                topo,
+                &[(0.06, 4e-4), (0.14, -3e-4)],
+            )]
+        },
+        &[],
+    );
+}
+
+/// The samples a chord of a ball's equator takes from holes past it, on
+/// both hemispheres, are the same whichever face comes first: both runs
+/// in order along the chord where they lie apart, and none where they
+/// overlap along it. Each of the two overlapping holes alone gives the
+/// chord its samples, the southern one more than one.
+#[test]
+fn a_chord_takes_the_runs_of_both_hemispheres_in_either_order() {
+    for (cuts, least, most) in [
+        (&[(0.06, 4e-4), (0.14, -3e-4)][..], 2, 2),
+        (&[(0.10, 4e-3), (0.10, -3e-3)][..], 0, 0),
+        (&[(0.10, 4e-3)][..], 2, usize::MAX),
+        (&[(0.10, -3e-3)][..], 1, usize::MAX),
+    ] {
+        let mut topo = Topology::new();
+        let ball = ball_with_cuts_on_one_chord(&mut topo, cuts);
+        let faces = brepkit_topology::explorer::solid_faces(&topo, ball).unwrap();
+        let mut pool: DetHashMap<usize, Vec<Point3>> = DetHashMap::default();
+        for &f in &faces {
+            for edge in brepkit_topology::explorer::face_edges(&topo, f).unwrap() {
+                let points = super::edge_sampling::sample_edge(
+                    &topo,
+                    topo.edge(edge).unwrap(),
+                    0.01,
+                    brepkit_math::chord::DEFAULT_ANGULAR_TOL,
+                    false,
+                )
+                .unwrap();
+                pool.insert(edge.index(), points);
+            }
+        }
+        let mut results = Vec::new();
+        for order in [faces.clone(), faces.iter().rev().copied().collect()] {
+            let mut sampled = pool.clone();
+            super::solid::sample_holes_past_sphere_chords(&topo, &order, &mut sampled).unwrap();
+            let mut grown: Vec<(usize, Vec<Point3>)> = sampled
+                .into_iter()
+                .filter(|(index, points)| pool[index].len() != points.len())
+                .collect();
+            grown.sort_by_key(|(index, _)| *index);
+            results.push(grown);
+        }
+        let grown = &results[0];
+        assert!(grown.len() <= 1, "{cuts:?}: {} chords changed", grown.len());
+        let taken: usize = grown.iter().map(|(i, p)| p.len() - pool[i].len()).sum();
+        assert!(
+            (least..=most).contains(&taken),
+            "{cuts:?}: the chord takes {taken} samples"
+        );
+        for (_, points) in grown {
+            let (a, b) = (points[0], points[points.len() - 1]);
+            let ts: Vec<f64> = points.iter().map(|&p| (p - a).dot(b - a)).collect();
+            assert!(ts.windows(2).all(|w| w[1] > w[0]), "{cuts:?}: out of order");
+        }
+        let same = results[0].len() == results[1].len()
+            && results[0].iter().zip(&results[1]).all(|((i, p), (j, q))| {
+                i == j
+                    && p.len() == q.len()
+                    && p.iter().zip(q).all(|(x, y)| (*x - *y).length() < 1e-12)
+            });
+        assert!(same, "{cuts:?}: the order of the faces matters");
+    }
+}
+
+/// A closed rim of radius 4e-7 has every sample within 1e-6 of its one
+/// vertex. Its cap and the wall beside it must still mesh, and meet.
+#[test]
+fn a_tiny_closed_rim_meshes_closed() {
+    let mut topo = Topology::new();
+    let solids = [
+        crate::primitives::make_cylinder(&mut topo, 4e-7, 1e-6).unwrap(),
+        crate::primitives::make_cylinder(&mut topo, 4e-7, 1.0).unwrap(),
+        crate::primitives::make_cone(&mut topo, 1.0, 4e-7, 2.0).unwrap(),
+    ];
+    for (k, solid) in solids.into_iter().enumerate() {
+        for deflection in [0.01, 0.05] {
+            let mesh = tessellate_solid(&topo, solid, deflection).unwrap();
+            let faces = brepkit_topology::explorer::solid_faces(&topo, solid).unwrap();
+            assert!(
+                mesh.indices.len() / 3 >= faces.len(),
+                "solid {k} at {deflection}: {} triangles for {} faces",
+                mesh.indices.len() / 3,
+                faces.len()
+            );
+            assert_eq!(
+                boundary_edge_count(&mesh),
+                0,
+                "solid {k} at {deflection}: open mesh"
+            );
+            assert_eq!(
+                non_manifold_edge_count(&mesh),
+                0,
+                "solid {k} at {deflection}: non-manifold mesh"
+            );
+        }
+    }
+}
+
+/// A cone's mesher reads each wire point's height along the axis over the
+/// sine of the half angle, its distance along a generator. Unit circles at
+/// heights 1 and 2 on a cone of half angle 1e-14 about the origin read as
+/// generators 1e14 long, though the circles lie near the origin: the face
+/// is refused, not meshed out past the grids' reach. A real flat cone, of
+/// half angle 1e-3 with its rims on it, meshes within its own box.
+#[test]
+fn a_cone_whose_wires_read_far_out_along_it_is_refused() {
+    use brepkit_math::mat::Mat4;
+    use brepkit_math::surfaces::ConicalSurface;
+
+    let mut topo = Topology::new();
+    let rod = crate::primitives::make_cylinder(&mut topo, 1.0, 1.0).unwrap();
+    crate::transform::transform_solid(&mut topo, rod, &Mat4::translation(0.0, 0.0, 1.0)).unwrap();
+    let side = brepkit_topology::explorer::solid_faces(&topo, rod)
+        .unwrap()
+        .into_iter()
+        .find(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cylinder(_)))
+        .unwrap();
+    let flat =
+        ConicalSurface::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1e-14).unwrap();
+    topo.face_mut(side)
+        .unwrap()
+        .set_surface(FaceSurface::Cone(flat));
+    let too_far = |found: &Result<usize, crate::OperationsError>| {
+        matches!(found, Err(crate::OperationsError::InvalidInput { reason })
+            if reason.contains("too far out to mesh"))
+    };
+    let face = tessellate(&topo, side, 1.0).map(|m| m.positions.len());
+    assert!(too_far(&face), "{face:?}");
+    let solid = tessellate_solid(&topo, rod, 1.0).map(|m| m.positions.len());
+    assert!(too_far(&solid), "{solid:?}");
+
+    let cone = crate::primitives::make_cone(&mut topo, 11.0, 1.0, 0.01).unwrap();
+    let half_angle = brepkit_topology::explorer::solid_faces(&topo, cone)
+        .unwrap()
+        .into_iter()
+        .find_map(|f| match topo.face(f).unwrap().surface() {
+            FaceSurface::Cone(c) => Some(c.half_angle()),
+            _ => None,
+        })
+        .unwrap();
+    assert!((half_angle - 1e-3).abs() < 1e-6, "{half_angle}");
+    let mesh = tessellate_solid(&topo, cone, 0.01).unwrap();
+    assert!(is_watertight(&mesh));
+    for p in &mesh.positions {
+        assert!(
+            p.x().abs() <= 11.0 + 1e-9 && p.y().abs() <= 11.0 + 1e-9 && p.z().abs() <= 0.01 + 1e-9,
+            "{p:?}"
+        );
+    }
+}
+
+/// A ball of radius 1e10 meshed to a deflection of 0.1 asks the chord
+/// formula for about 2e6 samples round its seam and 2e12 across it: the
+/// solid and face meshers refuse it with an error before they allocate them.
+/// A ball of radius 1e6 at the same deflection keeps each edge and
+/// direction to 2e4 samples, and its grid of about 2e8 is refused where a
+/// mesher sizes it. A circle of radius 1e11 drawn to a deflection of 1e-3
+/// asks for about 6e7 samples, and the wireframe sampler refuses it. A ball
+/// of radius 10, and the large ball at a deflection its size allows, still
+/// mesh closed.
+#[test]
+fn a_face_or_edge_past_the_sample_limit_is_refused() {
+    let refused = |found: &Result<usize, crate::OperationsError>, part: &str| {
+        matches!(found, Err(crate::OperationsError::TooManySamples { what, .. })
+            if what.contains(part))
+    };
+    let mut topo = Topology::new();
+    for (radius, what) in [(1e10, ""), (1e6, "grid")] {
+        let ball = crate::primitives::make_sphere(&mut topo, radius, 16).unwrap();
+        let solid = tessellate_solid(&topo, ball, 0.1).map(|m| m.positions.len());
+        assert!(refused(&solid, what), "{radius}: {solid:?}");
+        for face in brepkit_topology::explorer::solid_faces(&topo, ball).unwrap() {
+            let found = tessellate(&topo, face, 0.1).map(|m| m.positions.len());
+            assert!(refused(&found, what), "{radius}: {found:?}");
+        }
+    }
+
+    let ball = crate::primitives::make_sphere(&mut topo, 1e10, 16).unwrap();
+    let coarse = tessellate_solid(&topo, ball, 1e7).unwrap();
+    assert!(is_watertight(&coarse));
+    let small = crate::primitives::make_sphere(&mut topo, 10.0, 16).unwrap();
+    let mesh = tessellate_solid(&topo, small, 0.1).unwrap();
+    assert!(is_watertight(&mesh));
+
+    let rod = crate::primitives::make_cylinder(&mut topo, 1e11, 1.0).unwrap();
+    let drawn = sample_solid_edges(&topo, rod, 1e-3).map(|lines| lines.positions.len());
+    assert!(refused(&drawn, "edge"), "{drawn:?}");
+
+    // A deflection so fine its chord count passes the largest `usize` is
+    // refused, not wrapped round to a small count.
+    let pin = crate::primitives::make_cylinder(&mut topo, 1.0, 1.0).unwrap();
+    let solid = tessellate_solid(&topo, pin, 1e-300).map(|m| m.positions.len());
+    assert!(refused(&solid, ""), "{solid:?}");
+    for face in brepkit_topology::explorer::solid_faces(&topo, pin).unwrap() {
+        let found = tessellate(&topo, face, 1e-300).map(|m| m.positions.len());
+        assert!(refused(&found, ""), "{found:?}");
+    }
+}
+
+/// The cone meshers count a face's columns at a radius of at least 0.01,
+/// however small the cone. A cone 1e-6 across meshed to 1e-15 has edges of
+/// 2e5 samples, but its meshers would count 2e7 columns at that floor: the
+/// face and solid meshers refuse it before they sample. At 1e-9 it meshes
+/// closed.
+#[test]
+fn a_small_cone_counted_at_the_meshers_radius_floor_is_refused() {
+    let mut topo = Topology::new();
+    let cone = crate::primitives::make_cone(&mut topo, 1e-6, 0.0, 1e-6).unwrap();
+    let refused = |found: &Result<usize, crate::OperationsError>| {
+        matches!(found, Err(crate::OperationsError::TooManySamples { .. }))
+    };
+    let side = brepkit_topology::explorer::solid_faces(&topo, cone)
+        .unwrap()
+        .into_iter()
+        .find(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cone(_)))
+        .unwrap();
+    let face = tessellate(&topo, side, 1e-15).map(|m| m.positions.len());
+    assert!(refused(&face), "{face:?}");
+    let solid = tessellate_solid(&topo, cone, 1e-15).map(|m| m.positions.len());
+    assert!(refused(&solid), "{solid:?}");
+    let mesh = tessellate_solid(&topo, cone, 1e-9).unwrap();
+    assert!(is_watertight(&mesh));
+}
+
+/// A torus band whose rims are joined from several arcs takes a column at
+/// each rim sample as well as its even columns. A torus notched by a box and
+/// meshed to 3e-5 has 1987 even columns over 3725 rows, within the limit,
+/// but samples 3005 columns, past it: the band mesher refuses the grid it
+/// would sample, before it samples a row.
+#[test]
+fn a_band_grid_is_checked_on_the_columns_it_samples() {
+    use brepkit_math::mat::Mat4;
+
+    let mut topo = Topology::new();
+    let tor = crate::primitives::make_torus(&mut topo, 10.0, 3.0, 32).unwrap();
+    let bx = crate::primitives::make_box(&mut topo, 8.0, 8.0, 8.0).unwrap();
+    crate::transform::transform_solid(&mut topo, bx, &Mat4::translation(6.0, -4.0, -4.0)).unwrap();
+    let notched =
+        crate::boolean::boolean(&mut topo, crate::boolean::BooleanOp::Cut, tor, bx).unwrap();
+    let found = tessellate_solid(&topo, notched, 3e-5).map(|m| m.positions.len());
+    assert!(
+        matches!(&found, Err(crate::OperationsError::TooManySamples { what, samples, .. })
+            if what == "a face's grid" && (1.1e7..1.2e7).contains(samples)),
+        "{found:?}"
+    );
+}
+
+/// A torus face with holes goes to the holed-face mesher, which tries the
+/// torus bands and then the constrained triangulation. A ring with a rod
+/// cut through its tube, meshed to 1e-5, asks for a triangulation grid of
+/// about 2e7: the holed-face mesher passes that refusal on, and does not
+/// give the caller an empty mesh to fill with another grid.
+#[test]
+fn a_holed_torus_face_passes_its_sample_refusal_on() {
+    use brepkit_math::mat::Mat4;
+
+    let mut topo = Topology::new();
+    let ring = crate::primitives::make_torus(&mut topo, 10.0, 3.0, 32).unwrap();
+    let rod = crate::primitives::make_cylinder(&mut topo, 1.0, 20.0).unwrap();
+    crate::transform::transform_solid(&mut topo, rod, &Mat4::translation(10.0, 0.0, -10.0))
+        .unwrap();
+    let cut =
+        crate::boolean::boolean(&mut topo, crate::boolean::BooleanOp::Cut, ring, rod).unwrap();
+    let wall = brepkit_topology::explorer::solid_faces(&topo, cut)
+        .unwrap()
+        .into_iter()
+        .find(|&f| {
+            let face = topo.face(f).unwrap();
+            matches!(face.surface(), FaceSurface::Torus(_)) && !face.inner_wires().is_empty()
+        })
+        .unwrap();
+    let face = topo.face(wall).unwrap();
+    let local = super::nonplanar::tessellate_holed_face_local(
+        &topo,
+        wall,
+        face,
+        1e-5,
+        brepkit_math::chord::DEFAULT_ANGULAR_TOL,
+        false,
+    )
+    .map(|m| m.mesh.positions.len());
+    assert!(
+        matches!(local, Err(crate::OperationsError::TooManySamples { .. })),
+        "{local:?}"
+    );
+    let mesh = tessellate(&topo, wall, 0.05).unwrap();
+    assert!(!mesh.indices.is_empty());
+}
+
+/// A pointed cone with a hole in its side is meshed with each side of its
+/// seam sampled down to the apex at the spacing of its rim. A cone 0.02
+/// across and 1000 tall with a rod cut through it, meshed to 1e-4, spaces
+/// its rim 2.6e-4 apart and would take 3.4e6 samples down its 900 long
+/// seam: the mesher refuses it before it takes them. A cone 10 across and
+/// 20 tall, cut the same way, meshes.
+#[test]
+fn a_ruling_past_the_sample_limit_is_refused() {
+    use brepkit_math::mat::Mat4;
+
+    let holed_wall = |rb: f64, h: f64| {
+        let mut topo = Topology::new();
+        let cone = crate::primitives::make_cone(&mut topo, rb, 0.0, h).unwrap();
+        let rod = crate::primitives::make_cylinder(&mut topo, rb * 0.2, rb * 4.0).unwrap();
+        let place = Mat4::translation(0.0, 0.0, h * 0.1)
+            * Mat4::rotation_y(std::f64::consts::FRAC_PI_2)
+            * Mat4::translation(0.0, 0.0, -rb * 2.0);
+        crate::transform::transform_solid(&mut topo, rod, &place).unwrap();
+        let cut =
+            crate::boolean::boolean(&mut topo, crate::boolean::BooleanOp::Cut, cone, rod).unwrap();
+        let wall = brepkit_topology::explorer::solid_faces(&topo, cut)
+            .unwrap()
+            .into_iter()
+            .find(|&f| {
+                let face = topo.face(f).unwrap();
+                matches!(face.surface(), FaceSurface::Cone(_)) && !face.inner_wires().is_empty()
+            })
+            .unwrap();
+        (topo, wall)
+    };
+    let (topo, wall) = holed_wall(1e-2, 1e3);
+    let found = tessellate(&topo, wall, 1e-4).map(|m| m.positions.len());
+    assert!(
+        matches!(&found, Err(crate::OperationsError::TooManySamples { samples, .. })
+            if *samples > 3e6),
+        "{found:?}"
+    );
+    let (topo, wall) = holed_wall(5.0, 20.0);
+    assert!(tessellate(&topo, wall, 1e-2).is_ok());
+}
+
+/// An ellipse is sampled as finely as its deflection needs, with no cap on
+/// its segments. One of equal semi-axes 1e6 drawn to a deflection of 0.1
+/// takes 19,870 segments and keeps each chord within 0.1 of it, where a cap
+/// of 4096 left chords 0.29 off. A face bounded by it is meshed alike. An
+/// ellipse with semi-axes 1e4 and 1e-2 asks for 6.3e6 segments at 0.01, past
+/// the limit for one edge: the wireframe and the face meshers refuse it.
+#[test]
+fn an_ellipse_is_sampled_as_finely_as_its_deflection_needs() {
+    let ellipse_face = |topo: &mut Topology, a: f64, b: f64| {
+        let rim = brepkit_topology::builder::make_ellipse_edge(
+            topo,
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            a,
+            b,
+            1e-7,
+        )
+        .unwrap();
+        let wire = topo.add_wire(Wire::new(vec![OrientedEdge::new(rim, true)], true).unwrap());
+        (
+            rim,
+            brepkit_topology::builder::make_face_from_wire(topo, wire).unwrap(),
+        )
+    };
+    let mut topo = Topology::new();
+    let (rim, disc) = ellipse_face(&mut topo, 1e6, 1e6);
+    let EdgeCurve::Ellipse(ellipse) = topo.edge(rim).unwrap().curve().clone() else {
+        unreachable!("make_ellipse_edge gives an ellipse");
+    };
+    let points = super::edge_sampling::sample_edge(
+        &topo,
+        topo.edge(rim).unwrap(),
+        0.1,
+        brepkit_math::chord::DEFAULT_ANGULAR_TOL,
+        false,
+    )
+    .unwrap();
+    assert!(points.len() > 4097, "{}", points.len());
+    let off = points
+        .windows(2)
+        .map(|w| {
+            let mid = w[0] + (w[1] - w[0]) * 0.5;
+            (ellipse.evaluate(ellipse.project(mid)) - mid).length()
+        })
+        .fold(0.0_f64, f64::max);
+    assert!(off <= 0.1, "{off}");
+    let mesh = tessellate(&topo, disc, 0.1).unwrap();
+    assert!(mesh.positions.len() > 4097, "{}", mesh.positions.len());
+
+    let (_, sliver) = ellipse_face(&mut topo, 1e4, 1e-2);
+    let prism = crate::extrude::extrude(&mut topo, sliver, Vec3::new(0.0, 0.0, 1.0), 1.0).unwrap();
+    let drawn = sample_solid_edges(&topo, prism, 0.01).map(|lines| lines.positions.len());
+    assert!(
+        matches!(drawn, Err(crate::OperationsError::TooManySamples { .. })),
+        "{drawn:?}"
+    );
+    let cap = tessellate(&topo, sliver, 0.01).map(|m| m.positions.len());
+    assert!(
+        matches!(cap, Err(crate::OperationsError::TooManySamples { .. })),
+        "{cap:?}"
+    );
+}
+
+/// A circle arc and a sphere patch are counted over their own spans, not
+/// over a whole turn. A plate bounded by an arc of radius 1e10 across 1e-4
+/// of a turn, and a patch 2e-7 across of a ball of radius 1e10, meshed to
+/// 0.01, take a few dozen samples each: a whole turn of either would ask
+/// for 6e6, past the limit for one edge, but neither mesher samples one.
+#[test]
+fn an_arc_and_a_patch_of_a_huge_circle_and_ball_are_counted_over_their_span() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_math::surfaces::SphericalSurface;
+
+    let r = 1e10;
+    let mut topo = Topology::new();
+    let half = 5e-5_f64;
+    let at = |t: f64| Point3::new(r * t.cos(), r * t.sin(), 0.0);
+    let (v0, v1) = (
+        topo.add_vertex(Vertex::new(at(-half), 1e-7)),
+        topo.add_vertex(Vertex::new(at(half), 1e-7)),
+    );
+    let arc = Circle3D::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), r).unwrap();
+    let rim = topo.add_edge(Edge::new(v0, v1, EdgeCurve::Circle(arc)));
+    let chord = topo.add_edge(Edge::new(v1, v0, EdgeCurve::Line));
+    let wire = topo.add_wire(
+        Wire::new(
+            vec![OrientedEdge::new(rim, true), OrientedEdge::new(chord, true)],
+            true,
+        )
+        .unwrap(),
+    );
+    let plate = topo.add_face(Face::new(
+        wire,
+        vec![],
+        FaceSurface::Plane {
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            d: 0.0,
+        },
+    ));
+    let mesh = tessellate(&topo, plate, 0.01).unwrap();
+    assert!(mesh.positions.len() < 100, "{}", mesh.positions.len());
+
+    let d = 1e-7_f64;
+    let corner =
+        |u: f64, v: f64| Point3::new(r * v.cos() * u.cos(), r * v.cos() * u.sin(), r * v.sin());
+    let vs = [(-d, -d), (d, -d), (d, d), (-d, d)]
+        .map(|(u, v)| topo.add_vertex(Vertex::new(corner(u, v), 1e-7)));
+    let latitude = |v: f64| {
+        EdgeCurve::Circle(
+            Circle3D::with_axes(
+                Point3::new(0.0, 0.0, r * v.sin()),
+                Vec3::new(0.0, 0.0, 1.0),
+                r * v.cos(),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            )
+            .unwrap(),
+        )
+    };
+    let meridian = |u: f64| {
+        EdgeCurve::Circle(
+            Circle3D::with_axes(
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(u.sin(), -u.cos(), 0.0),
+                r,
+                Vec3::new(u.cos(), u.sin(), 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            )
+            .unwrap(),
+        )
+    };
+    let bottom = topo.add_edge(Edge::new(vs[0], vs[1], latitude(-d)));
+    let right = topo.add_edge(Edge::new(vs[1], vs[2], meridian(d)));
+    let top = topo.add_edge(Edge::new(vs[3], vs[2], latitude(d)));
+    let left = topo.add_edge(Edge::new(vs[0], vs[3], meridian(-d)));
+    let wire = topo.add_wire(
+        Wire::new(
+            vec![
+                OrientedEdge::new(bottom, true),
+                OrientedEdge::new(right, true),
+                OrientedEdge::new(top, false),
+                OrientedEdge::new(left, false),
+            ],
+            true,
+        )
+        .unwrap(),
+    );
+    let ball = SphericalSurface::new(Point3::new(0.0, 0.0, 0.0), r).unwrap();
+    let patch = topo.add_face(Face::new(wire, vec![], FaceSurface::Sphere(ball)));
+    let mesh = tessellate(&topo, patch, 0.01).unwrap();
+    assert!(
+        !mesh.indices.is_empty() && mesh.positions.len() < 1000,
+        "{}",
+        mesh.positions.len()
+    );
+}
+
+/// A grid is checked along each of its directions as well as over its
+/// whole. A cone 1e-6 across and 1e-6 tall meshed to 1e-14 has its columns
+/// counted at the meshers' radius floor of 0.01: 2.2e6 of them, past the
+/// limit for one direction, in a grid of only 4.4e6. The face mesher
+/// refuses it, as the solid mesher's rim check does.
+#[test]
+fn a_grid_past_the_limit_in_one_direction_is_refused() {
+    let mut topo = Topology::new();
+    let cone = crate::primitives::make_cone(&mut topo, 1e-6, 0.0, 1e-6).unwrap();
+    let side = brepkit_topology::explorer::solid_faces(&topo, cone)
+        .unwrap()
+        .into_iter()
+        .find(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cone(_)))
+        .unwrap();
+    let refused = |found: &Result<usize, crate::OperationsError>| {
+        matches!(found, Err(crate::OperationsError::TooManySamples { samples, .. })
+            if (2e6..3e6).contains(samples))
+    };
+    let face = tessellate(&topo, side, 1e-14).map(|m| m.positions.len());
+    assert!(refused(&face), "{face:?}");
+    let solid = tessellate_solid(&topo, cone, 1e-14).map(|m| m.positions.len());
+    assert!(refused(&solid), "{solid:?}");
+}
+
+/// A closed spline broken at one corner (its two halves meet at a knot as
+/// deep as its degree, at a turn) has two spans between the same two points.
+/// Each is within a coarse deflection of its chord, but two samples enclose
+/// nothing: the edge keeps three spans, and its face meshes to a triangle
+/// inside its outline, not to nothing. Finer, the mesh reaches the outline's
+/// area, 4/3.
+#[test]
+fn a_closed_spline_with_one_corner_meshes_its_face() {
+    use brepkit_math::nurbs::curve::NurbsCurve;
+
+    let mut topo = Topology::new();
+    let points = [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0), (1.0, -1.0), (0.0, 0.0)]
+        .map(|(x, y)| Point3::new(x, y, 0.0));
+    let curve = NurbsCurve::new(
+        2,
+        vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
+        points.to_vec(),
+        vec![1.0; 5],
+    )
+    .unwrap();
+    let v = topo.add_vertex(Vertex::new(Point3::new(0.0, 0.0, 0.0), 1e-7));
+    let edge = topo.add_edge(Edge::new(v, v, EdgeCurve::NurbsCurve(curve)));
+    let wire = topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, true)], true).unwrap());
+    let face = topo.add_face(Face::new(
+        wire,
+        vec![],
+        FaceSurface::Plane {
+            normal: Vec3::new(0.0, 0.0, -1.0),
+            d: 0.0,
+        },
+    ));
+    let area = |deflection: f64| {
+        let mesh = tessellate_with_tolerance(&topo, face, deflection, 0.0).unwrap();
+        mesh.indices
+            .chunks_exact(3)
+            .map(|t| {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|i| mesh.positions[i as usize]);
+                0.5 * (b - a).cross(c - a).length()
+            })
+            .sum::<f64>()
+    };
+    let coarse = area(1.0);
+    assert!(coarse > 0.0 && coarse <= 4.0 / 3.0, "{coarse}");
+    let fine = area(1e-4);
+    assert!((fine - 4.0 / 3.0).abs() < 1e-3, "{fine}");
+}
+
+/// A sliver of a ball of radius 1e8, between two meridians 1e-4 rad apart
+/// from its pole to its equator, meshed to 2 at an angle of 2e-4: its
+/// meridians take about 7.9e3 samples each, and its rows a segment or two
+/// each, about 1.6e4 samples in all. The rows are counted as the mesher cuts
+/// them, not each as wide as its level: counted so, they came to 3.1e7,
+/// past the limit for one face, and the sliver was refused.
+#[test]
+fn a_sliver_of_a_ball_is_counted_by_its_own_rows() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_math::surfaces::SphericalSurface;
+    use brepkit_topology::shell::Shell;
+    use brepkit_topology::solid::Solid;
+
+    let (r, width) = (1e8, 1e-4_f64);
+    let center = Point3::new(0.0, 0.0, 0.0);
+    let axes = [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(width.cos(), width.sin(), 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    ];
+    let mut topo = Topology::new();
+    let corners = axes.map(|a| topo.add_vertex(Vertex::new(center + a * r, 1e-7)));
+    let edges: Vec<OrientedEdge> = (0..3)
+        .map(|k| {
+            let (a, b) = (axes[k], axes[(k + 1) % 3]);
+            let circle = Circle3D::new(center, a.cross(b), r).unwrap();
+            let edge = Edge::new(corners[k], corners[(k + 1) % 3], EdgeCurve::Circle(circle));
+            OrientedEdge::new(topo.add_edge(edge), true)
+        })
+        .collect();
+    let wire = topo.add_wire(Wire::new(edges, true).unwrap());
+    let sphere = SphericalSurface::new(center, r).unwrap();
+    let face = topo.add_face(Face::new(wire, vec![], FaceSurface::Sphere(sphere)));
+    let shell = topo.add_shell(Shell::new(vec![face]).unwrap());
+    let solid = topo.add_solid(Solid::new(shell, vec![]));
+    let mesh = tessellate_solid_with_tolerance(&topo, solid, 2.0, 2e-4);
+    let samples = mesh
+        .as_ref()
+        .map(|m| (m.positions.len(), m.indices.len() / 3));
+    assert!(
+        matches!(samples, Ok((positions, triangles)) if triangles > 0 && positions < 100_000),
+        "{samples:?}"
+    );
 }

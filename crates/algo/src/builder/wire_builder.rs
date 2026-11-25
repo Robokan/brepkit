@@ -10,7 +10,7 @@ use brepkit_math::madd::Madd;
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 
-use brepkit_math::vec::Point2;
+use brepkit_math::vec::{Point2, Point3, Vec2};
 
 use super::split_types::OrientedPCurveEdge;
 
@@ -71,6 +71,28 @@ pub fn build_wire_loops_with_winding(
     u_periodic: bool,
     v_periodic: bool,
     cw_boundary: bool,
+) -> Vec<Vec<OrientedPCurveEdge>> {
+    trace_loops(edges, tol, (u_periodic, v_periodic), cw_boundary, false)
+}
+
+/// [`build_wire_loops`] on a ball face round a pole of its chart. The
+/// face's outline runs a whole turn of `u`, and so does each region that
+/// holds the pole: such a loop closes a turn on from where it starts, at
+/// the same vertex, which the walk otherwise reads as a false closure
+/// across the seam.
+pub fn build_wire_loops_round_a_pole(
+    edges: &[OrientedPCurveEdge],
+    tol: f64,
+) -> Vec<Vec<OrientedPCurveEdge>> {
+    trace_loops(edges, tol, (true, false), false, true)
+}
+
+fn trace_loops(
+    edges: &[OrientedPCurveEdge],
+    tol: f64,
+    (u_periodic, v_periodic): (bool, bool),
+    cw_boundary: bool,
+    close_a_turn: bool,
 ) -> Vec<Vec<OrientedPCurveEdge>> {
     if edges.is_empty() {
         return Vec::new();
@@ -138,9 +160,12 @@ pub fn build_wire_loops_with_winding(
                 let raw_du = (current_edge.end_uv.x() - edges[start_idx].start_uv.x()).abs();
                 let raw_dv = (current_edge.end_uv.y() - edges[start_idx].start_uv.y()).abs();
                 let seam_threshold = std::f64::consts::PI;
+                let a_turn = close_a_turn && (raw_du - TAU).abs() < 1e-6 && raw_dv < 1e-6;
                 // Reject seam-boundary false closures: vertices on opposite sides
                 // of a periodic seam quantize to the same key but have large UV distance.
-                !(u_periodic && raw_du > seam_threshold || v_periodic && raw_dv > seam_threshold)
+                a_turn
+                    || !(u_periodic && raw_du > seam_threshold
+                        || v_periodic && raw_dv > seam_threshold)
             } else {
                 false
             };
@@ -158,13 +183,11 @@ pub fn build_wire_loops_with_winding(
             // still order by curvature.
             let score = |entry: &VertexEntry| {
                 let turn = turn_score(incoming_angle, entry.angle);
-                if continues_straight(incoming_exact, entry.exact)
-                    || continues_one_conic(
-                        current_edge,
-                        &edges[entry.edge_idx],
-                        incoming_angle,
-                        entry.angle,
-                    )
+                let leaving = &edges[entry.edge_idx];
+                let sections =
+                    current_edge.source_edge_idx.is_some() && leaving.source_edge_idx.is_some();
+                if !sections && continues_straight(incoming_exact, entry.exact)
+                    || continues_one_conic(current_edge, leaving, incoming_angle, entry.angle)
                 {
                     TAU + turn
                 } else {
@@ -303,6 +326,44 @@ pub fn build_wire_loops_dcel_measured(
     v_periodic: bool,
     area_of: Option<LoopArea<'_>>,
     rim_ccw: Option<bool>,
+) -> Vec<Vec<OrientedPCurveEdge>> {
+    dcel_trace(edges, tol, u_periodic, v_periodic, area_of, rim_ccw, None)
+}
+
+/// Whether a loop bounds no area, read in some plane of the caller's.
+pub type LoopFlat<'a> = &'a dyn Fn(&[OrientedPCurveEdge]) -> bool;
+
+/// [`build_wire_loops_dcel_measured`] with no area function, an orbit
+/// dropped as bounding no area where `flat` reads it so. `tol` welds the
+/// graph's nodes in `(u, v)` and nothing else: an area read in another
+/// plane is measured against lengths in that plane, not in `(u, v)`.
+pub fn build_wire_loops_dcel_flat(
+    edges: &[OrientedPCurveEdge],
+    tol: f64,
+    u_periodic: bool,
+    v_periodic: bool,
+    rim_ccw: Option<bool>,
+    flat: LoopFlat<'_>,
+) -> Vec<Vec<OrientedPCurveEdge>> {
+    dcel_trace(
+        edges,
+        tol,
+        u_periodic,
+        v_periodic,
+        None,
+        rim_ccw,
+        Some(flat),
+    )
+}
+
+fn dcel_trace(
+    edges: &[OrientedPCurveEdge],
+    tol: f64,
+    u_periodic: bool,
+    v_periodic: bool,
+    area_of: Option<LoopArea<'_>>,
+    rim_ccw: Option<bool>,
+    flat: Option<LoopFlat<'_>>,
 ) -> Vec<Vec<OrientedPCurveEdge>> {
     if edges.is_empty() {
         return Vec::new();
@@ -481,51 +542,13 @@ pub fn build_wire_loops_dcel_measured(
         if orbit.iter().any(against_rim) {
             continue;
         }
-        // Shoelace over LIFTED vertices: on a periodic surface the node keys
-        // glue the seam (correct cylinder connectivity), but edge UVs are
-        // stored at whichever period copy their pcurve produced — a raw
-        // shoelace over mixed copies is garbage (the full-period remainder
-        // band read as strongly negative and was dropped as "outer"). Lift
-        // the orbit half by half, each by its own step taken the short way
-        // round; the net lift after closing the orbit is the WINDING —
-        // nonzero only for the unbounded rim rings of a periodic face. A
-        // step of exactly half a period (a rim cut in halves, as files write
-        // circles) keeps its stored direction: lifting each vertex against
-        // the last left that to the last bit, and a band below such a rim
-        // read as winding with no area and was dropped.
-        let step = |d: f64, period: Option<f64>| -> f64 {
-            match period {
-                Some(p) if p > 1e-12 && d.abs() > p * 0.5 * (1.0 + 1e-9) => d - (d / p).round() * p,
-                _ => d,
-            }
-        };
-        let mut area = 0.0;
-        let mut perimeter = 0.0;
-        let first = halves[orbit[0]].start_uv;
-        let mut prev = first;
-        for &i in &orbit {
-            let d = halves[i].end_uv - halves[i].start_uv;
-            let b = Point2::new(
-                prev.x() + step(d.x(), u_period),
-                prev.y() + step(d.y(), v_period),
-            );
-            // Taken from the first vertex: far from the origin the
-            // products of raw parameters round away a small orbit's area.
-            let (p, q) = (prev - first, b - first);
-            area += p.x().madd(q.y(), -(q.x() * p.y()));
-            perimeter += (b - prev).length();
-            prev = b;
-        }
-        let lifted_first = prev;
-        // An orbit that winds a period ends a period from its start, and
-        // its sum about the origin holds this term for the gap between.
-        let gap = lifted_first - first;
-        area += first.x().madd(gap.y(), -(gap.x() * first.y()));
-        let area = area_of.map_or(area * 0.5, |f| {
+        let lift = lift_orbit(orbit.iter().map(|&i| &halves[i]), u_period, v_period);
+        let perimeter = lift.perimeter;
+        let area = area_of.map_or(lift.area, |f| {
             f(&orbit.iter().map(|&i| halves[i].clone()).collect::<Vec<_>>())
         });
-        let winding_u = u_period.is_some_and(|p| (lifted_first.x() - first.x()).abs() > p * 0.5);
-        let winding_v = v_period.is_some_and(|p| (lifted_first.y() - first.y()).abs() > p * 0.5);
+        let winding_u = u_period.is_some_and(|p| lift.turn.x().abs() > p * 0.5);
+        let winding_v = v_period.is_some_and(|p| lift.turn.y().abs() > p * 0.5);
         if (winding_u || winding_v) && orbit.iter().all(|&i| i >= n_real) {
             // A period-winding orbit of pure synthetic halves is an unbounded
             // rim ring (the periodic face's counterpart of the planar outer
@@ -536,7 +559,11 @@ pub fn build_wire_loops_dcel_measured(
         }
         // A zero-area orbit walks out-and-back around a dangling chain (the
         // graph can carry genuinely unpaired sections); it is not a region.
-        if area.abs() <= perimeter * tol {
+        let no_area = match flat {
+            Some(f) => f(&orbit.iter().map(|&i| halves[i].clone()).collect::<Vec<_>>()),
+            None => area.abs() <= perimeter * tol,
+        };
+        if no_area {
             continue;
         }
         orbits.push((area, orbit));
@@ -585,9 +612,84 @@ pub fn remove_pendant_sections(
     u_periodic: bool,
     v_periodic: bool,
 ) -> Vec<OrientedPCurveEdge> {
+    peel_pendant_sections(edges, tol, u_periodic, v_periodic, false)
+}
+
+/// [`remove_pendant_sections`], but a vertex that only edges closed on
+/// themselves touch ([`closes_on_itself`]) is no free end: such an edge
+/// bounds a disc of its own (a small circle round no pole of a ball).
+pub fn remove_pendant_sections_but_loops(
+    edges: &[OrientedPCurveEdge],
+    tol: f64,
+    u_periodic: bool,
+    v_periodic: bool,
+) -> Vec<OrientedPCurveEdge> {
+    peel_pendant_sections(edges, tol, u_periodic, v_periodic, true)
+}
+
+/// Whether `e` ends where it starts, a weld (`100 tol`) apart, and its
+/// curve is not proved to stay within a weld of its start ([`runs_off`]).
+/// An edge and its twin read alike.
+pub fn closes_on_itself(e: &OrientedPCurveEdge, tol: f64) -> bool {
+    let weld = 100.0 * tol;
+    (e.start_3d - e.end_3d).length() <= weld && runs_off(e, weld)
+}
+
+/// Whether `e`'s curve may run farther than `reach` from its start: true
+/// unless a bound proves it does not. Read in the curve's own way, so that
+/// an edge and its twin read alike. A line runs between its ends. A conic's
+/// arc of sweep `s` lies within its largest radius times `2 sin(s / 2)`
+/// (`s` at most half a turn) of its start. A spline's piece over each knot
+/// span lies in the hull of its Bezier points where their weights are
+/// positive; a weight that is not, or a piece not read, proves nothing.
+pub fn runs_off(e: &OrientedPCurveEdge, reach: f64) -> bool {
+    use brepkit_math::nurbs::decompose::curve_bezier_between;
+    use brepkit_topology::edge::EdgeCurve;
+    let (from, to) = if e.forward {
+        (e.start_3d, e.end_3d)
+    } else {
+        (e.end_3d, e.start_3d)
+    };
+    let (t0, t1) = e.curve_3d.domain_with_endpoints(from, to);
+    let conic = |radius: f64, at_t0: Point3| {
+        let sweep = (t1 - t0).abs().min(std::f64::consts::PI);
+        (at_t0 - from).length() + 2.0 * radius * (0.5 * sweep).sin() > reach
+    };
+    match &e.curve_3d {
+        EdgeCurve::Line => (to - from).length() > reach,
+        EdgeCurve::Circle(c) => conic(c.radius(), c.evaluate(t0)),
+        EdgeCurve::Ellipse(el) => conic(el.semi_major(), el.evaluate(t0)),
+        EdgeCurve::NurbsCurve(n) => {
+            let (lo, hi) = (t0.min(t1), t0.max(t1));
+            let mut ts = vec![lo];
+            ts.extend(n.knots().iter().copied().filter(|&k| lo < k && k < hi));
+            ts.push(hi);
+            ts.dedup();
+            ts.windows(2).any(|w| {
+                curve_bezier_between(n, w[0], w[1]).map_or(true, |points| {
+                    points.iter().any(|&[x, y, z, w]| {
+                        w <= 0.0 || (Point3::new(x / w, y / w, z / w) - from).length() > reach
+                    })
+                })
+            })
+        }
+    }
+}
+
+fn peel_pendant_sections(
+    edges: &[OrientedPCurveEdge],
+    tol: f64,
+    u_periodic: bool,
+    v_periodic: bool,
+    keep_loops: bool,
+) -> Vec<OrientedPCurveEdge> {
     let u_period = if u_periodic { Some(TAU) } else { None };
     let v_period = if v_periodic { Some(TAU) } else { None };
     let mut alive = vec![true; edges.len()];
+    let closed: Vec<bool> = edges
+        .iter()
+        .map(|e| keep_loops && closes_on_itself(e, tol))
+        .collect();
 
     loop {
         let mut vmap: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
@@ -614,6 +716,7 @@ pub fn remove_pendant_sections(
                 && incident
                     .iter()
                     .all(|&i| edges[i].source_edge_idx == Some(src))
+                && !incident.iter().all(|&i| closed[i])
             {
                 pendant_src = Some(pendant_src.map_or(src, |cur| cur.min(src)));
             }
@@ -643,6 +746,142 @@ pub fn remove_pendant_sections(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// An orbit of halves laid out in UV with each half's vertices lifted off
+/// the period copies they are stored on.
+struct OrbitLift {
+    /// The signed area the lifted vertices enclose.
+    area: f64,
+    /// The length of the lifted vertices' polygon.
+    perimeter: f64,
+    /// How far the last vertex lies from the first. For a closed orbit
+    /// these are whole periods, the turns it makes round each period.
+    turn: Vec2,
+}
+
+/// Lift `halves`, an orbit in order, vertex by vertex: each half moves the
+/// last vertex on by its run ([`half_run`]).
+///
+/// On a periodic surface the node keys glue the seam (correct cylinder
+/// connectivity), but edge UVs are stored at whichever period copy their
+/// pcurve produced: a raw shoelace over mixed copies is garbage (the
+/// full-period remainder band read as strongly negative and was dropped as
+/// "outer"). The net lift after the orbit closes is its winding, nonzero
+/// only for the unbounded rim rings of a periodic face.
+fn lift_orbit<'a>(
+    halves: impl IntoIterator<Item = &'a OrientedPCurveEdge>,
+    u_period: Option<f64>,
+    v_period: Option<f64>,
+) -> OrbitLift {
+    let mut halves = halves.into_iter().peekable();
+    let Some(first) = halves.peek().map(|h| h.start_uv) else {
+        return OrbitLift {
+            area: 0.0,
+            perimeter: 0.0,
+            turn: Vec2::new(0.0, 0.0),
+        };
+    };
+    let mut area = 0.0;
+    let mut perimeter = 0.0;
+    let mut prev = first;
+    for h in halves {
+        let b = prev + half_run(h, u_period, v_period);
+        // Taken from the first vertex: far from the origin the products of
+        // raw parameters round away a small orbit's area.
+        let (p, q) = (prev - first, b - first);
+        area += p.x().madd(q.y(), -(q.x() * p.y()));
+        perimeter += (b - prev).length();
+        prev = b;
+    }
+    // An orbit that winds a period ends a period from its start, and its
+    // sum about the origin holds this term for the gap between.
+    let turn = prev - first;
+    area += first.x().madd(turn.y(), -(turn.x() * first.y()));
+    OrbitLift {
+        area: area * 0.5,
+        perimeter,
+        turn,
+    }
+}
+
+/// How far a half runs in UV from its start to its end.
+///
+/// The ends of a closed half are one point, so its run is whole periods: a
+/// whole rim in one edge goes once round. Taken the short way, its twin's
+/// orbit lost its turn to the last bit of its span, and it stood as a
+/// region of no area in place of an unbounded ring.
+///
+/// An open half runs as its pcurve runs, when the pcurve lies on its ends
+/// ([`pcurve_along_half`]): its end lies on the copy nearest the pcurve's
+/// end. A pcurve follows its curve's samples lifted along the curve, and a
+/// piece of a steep cone's ellipse across its near vertex runs most of a
+/// turn, which its ends read the short way round take for a short step
+/// back.
+///
+/// With no such pcurve, an open half runs the short way round. A step of
+/// exactly half a period (a rim cut in halves, as files write circles)
+/// keeps its stored direction: lifting each vertex against the last left
+/// that to the last bit, and a band below such a rim read as winding with
+/// no area and was dropped.
+fn half_run(h: &OrientedPCurveEdge, u_period: Option<f64>, v_period: Option<f64>) -> Vec2 {
+    let d = h.end_uv - h.start_uv;
+    let closed = (h.start_3d - h.end_3d).length() < 1e-10;
+    let pcurve = if closed {
+        None
+    } else {
+        pcurve_along_half(h, u_period, v_period)
+            .map(|(nurbs, from, to)| nurbs.evaluate(to) - nurbs.evaluate(from))
+    };
+    let along = |d: f64, period: Option<f64>, pcurve: Option<f64>| -> f64 {
+        match (period, pcurve) {
+            (Some(p), _) if p > 1e-12 && closed => (d / p).round() * p,
+            (Some(p), Some(run)) if p > 1e-12 => d - ((d - run) / p).round() * p,
+            (Some(p), None) if p > 1e-12 && d.abs() > p * 0.5 * (1.0 + 1e-9) => {
+                d - (d / p).round() * p
+            }
+            _ => d,
+        }
+    };
+    Vec2::new(
+        along(d.x(), u_period, pcurve.map(Vec2::x)),
+        along(d.y(), v_period, pcurve.map(Vec2::y)),
+    )
+}
+
+/// A half's NURBS pcurve and its parameters at the half's start and end,
+/// when its two ends lie on the half's two ends, each on some copy of the
+/// periods, one way round only. `None` for another pcurve, for a stale one,
+/// and for one whose ends lie on the same point of the periodic plane.
+fn pcurve_along_half(
+    h: &OrientedPCurveEdge,
+    u_period: Option<f64>,
+    v_period: Option<f64>,
+) -> Option<(&brepkit_math::curves2d::NurbsCurve2D, f64, f64)> {
+    use brepkit_math::curves2d::Curve2D;
+    // Within the gap a weld leaves between a section's ends and its pcurve.
+    const NEAR: f64 = 1e-6;
+    let Curve2D::Nurbs(ref nurbs) = h.pcurve else {
+        return None;
+    };
+    let (t0, t1) = nurbs.domain();
+    let (a, b) = (nurbs.evaluate(t0), nurbs.evaluate(t1));
+    let off = |x: f64, y: f64, period: Option<f64>| {
+        let d = x - y;
+        let d = period
+            .filter(|&p| p > 1e-12)
+            .map_or(d, |p| d - (d / p).round() * p);
+        d.abs() <= NEAR * y.abs().max(1.0)
+    };
+    let on = |p: Point2, q: Point2| off(p.x(), q.x(), u_period) && off(p.y(), q.y(), v_period);
+    match (
+        on(a, h.start_uv) && on(b, h.end_uv),
+        on(b, h.start_uv) && on(a, h.end_uv),
+    ) {
+        (true, false) => Some((nurbs, t0, t1)),
+        (false, true) => Some((nurbs, t1, t0)),
+        _ => None,
+    }
+}
 
 /// Quantize a 2D point to an integer key for vertex deduplication.
 #[allow(dead_code)]
@@ -711,7 +950,8 @@ fn edge_angle_at_vertex_periodic(
     u_period: Option<f64>,
     v_period: Option<f64>,
 ) -> f64 {
-    let (mut dx, mut dy) = pcurve_tangent_at_endpoint(edge, at_start);
+    let (mut dx, mut dy) = long_pcurve_tangent(edge, at_start, u_period, v_period)
+        .unwrap_or_else(|| pcurve_tangent_at_endpoint(edge, at_start, (u_period, v_period)));
     // A step of exactly half a period reads the same either way round (a
     // rim cut in halves, as files write circles), so only a step past the
     // half by more than rounding wraps; at the half the edge keeps its
@@ -755,6 +995,33 @@ fn nurbs_endpoint(
     }
     let t0_raw = knots[0];
     let tn_raw = knots[knots.len() - 1];
+    // A closed half that goes round its surface's period has its ends a
+    // period apart, and its pcurve can lie a period from them, which no
+    // tangent depends on. It is read in the order whose span runs the way
+    // its stored span runs: read from the end nearer its start, a whole rim
+    // run against its curve read as stale, and its chord, folded by a
+    // period, gave it its twin's heading.
+    let stored = edge.end_uv - edge.start_uv;
+    if (edge.start_3d - edge.end_3d).length() < 1e-10 && stored.length() > 1e-9 {
+        let spans = nurbs.evaluate(tn_raw) - nurbs.evaluate(t0_raw);
+        let along = spans.dot(stored) > 0.0;
+        let off = if along {
+            spans - stored
+        } else {
+            spans + stored
+        };
+        if off.length() > 1e-9 {
+            return None;
+        }
+        let (t_start, t_end) = if along {
+            (t0_raw, tn_raw)
+        } else {
+            (tn_raw, t0_raw)
+        };
+        let inward = (t_end - t_start).signum() * if at_start { 1.0 } else { -1.0 };
+        let t_anchor = if at_start { t_start } else { t_end };
+        return Some((nurbs, t_anchor, inward, (t_end - t_start).abs()));
+    }
     let off_start = |t: f64| {
         let p = nurbs.evaluate(t);
         (p.x() - edge.start_uv.x()).powi(2) + (p.y() - edge.start_uv.y()).powi(2)
@@ -794,14 +1061,17 @@ fn nurbs_endpoint(
 ///
 /// For `Line2D` pcurves, returns the chord direction (exact).
 /// For `NurbsCurve2D` pcurves, evaluates the pcurve near the endpoint
-/// to approximate the true tangent -- important for half-circle arcs where
-/// the chord direction can be perpendicular to the actual tangent.
-fn pcurve_tangent_at_endpoint(edge: &OrientedPCurveEdge, at_start: bool) -> (f64, f64) {
+/// to approximate the true tangent ([`pcurve_heading`]) -- important for
+/// half-circle arcs where the chord direction can be perpendicular to the
+/// actual tangent. `periods` are the surface's periods in `u` and `v`.
+fn pcurve_tangent_at_endpoint(
+    edge: &OrientedPCurveEdge,
+    at_start: bool,
+    periods: (Option<f64>, Option<f64>),
+) -> (f64, f64) {
     // For NURBS pcurves, sample near the endpoint for tangent direction.
     if let Some((nurbs, t, inward, span)) = nurbs_endpoint(edge, at_start) {
-        let p0 = nurbs.evaluate(t);
-        let p1 = nurbs.evaluate(inward.madd(span * 0.01, t));
-        return (p1.x() - p0.x(), p1.y() - p0.y());
+        return pcurve_heading(nurbs, (t, inward.madd(span, t)), periods);
     }
 
     // For Line2D and fallback: use chord direction.
@@ -816,6 +1086,58 @@ fn pcurve_tangent_at_endpoint(edge: &OrientedPCurveEdge, at_start: bool) -> (f64
             edge.start_uv.y() - edge.end_uv.y(),
         )
     }
+}
+
+/// The tangent at an edge endpoint, pointing into the edge, of a NURBS
+/// pcurve that runs over half a period round and lies on the edge's ends
+/// on other copies ([`pcurve_along_half`]). `None` for any other edge.
+///
+/// [`nurbs_endpoint`] reads a pcurve off its edge's copy as stale, and the
+/// edge's chord, folded the short way round, points against a piece that
+/// runs most of a turn.
+fn long_pcurve_tangent(
+    edge: &OrientedPCurveEdge,
+    at_start: bool,
+    u_period: Option<f64>,
+    v_period: Option<f64>,
+) -> Option<(f64, f64)> {
+    if nurbs_endpoint(edge, at_start).is_some() {
+        return None;
+    }
+    let (nurbs, from, to) = pcurve_along_half(edge, u_period, v_period)?;
+    let run = nurbs.evaluate(to) - nurbs.evaluate(from);
+    let long = |r: f64, period: Option<f64>| period.is_some_and(|p| r.abs() > 0.5 * p);
+    if !long(run.x(), u_period) && !long(run.y(), v_period) {
+        return None;
+    }
+    let ends = if at_start { (from, to) } else { (to, from) };
+    Some(pcurve_heading(nurbs, ends, (u_period, v_period)))
+}
+
+/// The heading of a NURBS pcurve at its parameter `t`, into its span toward
+/// its parameter `toward`: the chord to a hundredth of the way along, or,
+/// where that chord runs a quarter period or more, the derivative at `t`,
+/// signed into the span and of unit length.
+///
+/// A pcurve that packs most of a turn into its first knots runs that far
+/// within the hundredth: folded the short way round, as the heading is
+/// read, the chord pointed against the pcurve. The pcurve itself has no
+/// copies to fold between, and its derivative heads the way it leaves `t`.
+fn pcurve_heading(
+    nurbs: &brepkit_math::curves2d::NurbsCurve2D,
+    (t, toward): (f64, f64),
+    (u_period, v_period): (Option<f64>, Option<f64>),
+) -> (f64, f64) {
+    let chord = nurbs.evaluate((toward - t).madd(0.01, t)) - nurbs.evaluate(t);
+    let packed = |c: f64, period: Option<f64>| period.is_some_and(|p| c.abs() >= 0.25 * p);
+    if packed(chord.x(), u_period) || packed(chord.y(), v_period) {
+        let d = nurbs.tangent(t) * (toward - t).signum();
+        let len = d.length();
+        if len.is_finite() && len > 0.0 {
+            return (d.x() / len, d.y() / len);
+        }
+    }
+    (chord.x(), chord.y())
 }
 
 /// The angle in \[0, 2pi) of a NURBS pcurve's derivative at an edge
@@ -839,6 +1161,12 @@ fn exact_nurbs_angle(edge: &OrientedPCurveEdge, at_start: bool) -> Option<f64> {
 /// agree to 2.4e-7 (a scoop's side edge). A hole's arc pieces, fitted one by
 /// one, kink by 3e-6 to 1e-5, and the hole weave relies on the walk reading
 /// those as turns (the keyholed knuckle cuts), so the band stays below them.
+///
+/// The walk does not ask this of a section that runs on into a section. Two
+/// pieces of one section curve meet with one tangent where their pcurves are
+/// exact, and that section is a turn like any other where a second section
+/// crosses it (as in [`continues_one_conic`]): ranked last, the walk turned
+/// onto the crossing section where the first curves toward the face.
 fn continues_straight(incoming: Option<f64>, outgoing: Option<f64>) -> bool {
     const STRAIGHT: f64 = 1e-6;
     let (Some(back), Some(out)) = (incoming, outgoing) else {
@@ -1503,6 +1831,63 @@ mod tests {
     }
 
     #[test]
+    fn dcel_twin_of_a_whole_rim_in_one_edge_is_no_region() {
+        // A band between the seam's two copies, its top rim one closed edge
+        // whose stored span is a period and a last bit. The rim's twin walks
+        // once round above the band, an unbounded ring. Taken the short way,
+        // the rim's step was the last bit: the ring stood as a region, and
+        // the band, with no turn left in it, read as no area.
+        let a = 4.712_388_980_384_691;
+        let turn = 6.283_185_307_179_587;
+        let p = Point2::new;
+        let mut rim = make_line_edge(p(a + turn, 1.0), p(a, 1.0));
+        rim.end_3d = rim.start_3d;
+        let edges = vec![
+            make_line_edge(p(a, 0.0), p(a + 2.0, 0.0)),
+            make_line_edge(p(a + 2.0, 0.0), p(a + 4.0, 0.0)),
+            make_line_edge(p(a + 4.0, 0.0), p(a + TAU, 0.0)),
+            make_line_edge(p(a + TAU, 0.0), p(a + TAU, 1.0)),
+            rim,
+            make_line_edge(p(a, 1.0), p(a, 0.0)),
+        ];
+        let loops = build_wire_loops_dcel(&edges, 1e-7, true, false);
+        assert_eq!(loops.len(), 1, "the band is the one region");
+        assert_eq!(loops[0].len(), 6);
+    }
+
+    #[test]
+    fn a_whole_rim_a_period_from_its_pcurve_heads_the_way_it_runs() {
+        // A top rim in one closed edge, run against its curve: its ends sit
+        // a period up from its pcurve, which bows up to v = 3.1 between
+        // them. Each half leaves its start along its pcurve, whichever copy
+        // the pcurve lies on. Read as stale, the rim took its chord, which a
+        // period folds to nothing, and headed +u like its twin.
+        use std::f64::consts::PI;
+        let a = 4.712_388_980_384_691;
+        let v = 2.963;
+        let mut rim = make_bezier_edge([
+            Point2::new(a, v),
+            Point2::new(a + PI, 3.1),
+            Point2::new(a + TAU, v),
+        ]);
+        rim.start_uv = Point2::new(a + 2.0 * TAU, v);
+        rim.end_uv = Point2::new(a + TAU, v);
+        rim.end_3d = rim.start_3d;
+        rim.forward = false;
+        // The heading is read on a chord a hundredth of the curve long,
+        // which turns it by about 5e-4 from the curve's tangent.
+        let bow = (2.0 * (3.1 - v) / TAU).atan();
+        let angle = edge_angle_at_vertex_periodic(&rim, true, Some(TAU), None);
+        assert!((angle - (PI - bow)).abs() < 1e-3, "rim leaves at {angle}");
+
+        let mut twin = rim;
+        std::mem::swap(&mut twin.start_uv, &mut twin.end_uv);
+        twin.forward = true;
+        let angle = edge_angle_at_vertex_periodic(&twin, true, Some(TAU), None);
+        assert!((angle - bow).abs() < 1e-3, "twin leaves at {angle}");
+    }
+
+    #[test]
     fn a_half_turn_step_keeps_its_stored_direction() {
         // A rim half of a cylinder, a hair past half a turn by rounding,
         // leaves its start heading +u as stored; wrapped, it read as heading
@@ -1517,6 +1902,206 @@ mod tests {
             angle.abs() < 1e-9 || (angle - TAU).abs() < 1e-9,
             "angle {angle}"
         );
+    }
+
+    /// A piece of a conic on `surface` from its parameter `from` to `to`,
+    /// with its pcurve as the face splitter fits a boundary piece and its
+    /// end UVs projected, so on the copies the projection puts them on.
+    fn conic_piece(
+        curve: &EdgeCurve,
+        surface: &brepkit_topology::face::FaceSurface,
+        from: f64,
+        to: f64,
+    ) -> OrientedPCurveEdge {
+        let at = |t: f64| match curve {
+            EdgeCurve::Circle(c) => brepkit_math::traits::ParametricCurve::evaluate(c, t),
+            EdgeCurve::Ellipse(e) => brepkit_math::traits::ParametricCurve::evaluate(e, t),
+            EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => unreachable!(),
+        };
+        let (start, end) = (at(from), at(to));
+        let uv = |p| {
+            let (u, v) = surface.project_point(p).unwrap();
+            Point2::new(u, v)
+        };
+        OrientedPCurveEdge {
+            curve_3d: curve.clone(),
+            pcurve: crate::builder::pcurve_compute::compute_pcurve_on_surface(
+                curve,
+                start,
+                end,
+                surface,
+                &[],
+                None,
+            ),
+            start_uv: uv(start),
+            end_uv: uv(end),
+            start_3d: start,
+            end_3d: end,
+            forward: to > from,
+            source_edge_idx: None,
+            pave_block_id: None,
+        }
+    }
+
+    /// The band of the cone `x^2 + y^2 = z^2` between its ellipse at slope
+    /// 0.99999 (`cone_ellipse_fixture::oblique_cone`) and the ring round the
+    /// axis at height `ring_z`, laid out counter-clockwise in UV, with a
+    /// ruling across it from the ring to the ellipse. The ellipse is cut at
+    /// its parameters pi -+ 0.02, 1.5 pi and 0: the first piece, across its
+    /// near vertex, runs most of a turn of `u`, and the others share the
+    /// rest. Below the ellipse its pieces run `-u`; above it, `+u`.
+    fn steep_cone_band(ring_z: f64) -> Vec<OrientedPCurveEdge> {
+        use crate::builder::pcurve_compute::cone_ellipse_fixture::oblique_cone;
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::vec::{Point3, Vec3};
+        use std::f64::consts::PI;
+        let (surface, ellipse) = oblique_cone(0.99999);
+        let sense = crate::builder::pcurve_compute::ellipse_u_sense(&ellipse, &surface).unwrap();
+        let below = ring_z < 0.5;
+        // Up the band's left side the ellipse runs -u below, +u above.
+        let up = if below { -sense } else { sense };
+        let ellipse_curve = EdgeCurve::Ellipse(ellipse.clone());
+        let cuts = [PI - 0.02, PI + 0.02, 1.5 * PI, 2.0 * PI];
+        let mut edges: Vec<OrientedPCurveEdge> = (0..4)
+            .map(|k| {
+                let (a, b) = (cuts[k], cuts[(k + 1) % 4] + if k == 3 { TAU } else { 0.0 });
+                if up > 0.0 {
+                    conic_piece(&ellipse_curve, &surface, a, b)
+                } else {
+                    conic_piece(&ellipse_curve, &surface, b, a)
+                }
+            })
+            .collect();
+        // The ruling through the ellipse's point at 1.5 pi, from the apex.
+        let apex = Point3::new(0.0, 0.0, 0.0);
+        let foot = ellipse.evaluate(1.5 * PI);
+        let on_ring = apex + (foot - apex) * (ring_z / foot.z());
+        let ring = EdgeCurve::Circle(
+            Circle3D::new(
+                Point3::new(0.0, 0.0, ring_z),
+                Vec3::new(0.0, 0.0, 1.0),
+                ring_z,
+            )
+            .unwrap(),
+        );
+        let start = match &ring {
+            EdgeCurve::Circle(c) => c.project(on_ring),
+            _ => unreachable!(),
+        };
+        for k in 0..3 {
+            let (a, b) = (
+                start + TAU * f64::from(k) / 3.0,
+                start + TAU * f64::from(k + 1) / 3.0,
+            );
+            edges.push(if below {
+                conic_piece(&ring, &surface, a, b)
+            } else {
+                conic_piece(&ring, &surface, b, a)
+            });
+        }
+        let uv = |p| {
+            let (u, v) = surface.project_point(p).unwrap();
+            Point2::new(u, v)
+        };
+        for (from, to) in [(on_ring, foot), (foot, on_ring)] {
+            let mut section = make_section_edge(uv(from), uv(to), 0);
+            section.start_3d = from;
+            section.end_3d = to;
+            edges.push(section);
+        }
+        edges
+    }
+
+    /// The band of [`steep_cone_band`] below its ellipse and above it, so
+    /// with the piece across the ellipse's near vertex run each way. The
+    /// piece runs over half a turn of `u`, and leaves and reaches its ends
+    /// the way it runs. The rims' twins are rings round the face, one turn
+    /// each, and are no region: read from its ends the short way round, the
+    /// piece ran a turn short, its end read as arriving against its run, and
+    /// the ellipse's ring wound nothing and stood as a region beside the
+    /// band. The band's lifted area is positive, and run the other way round,
+    /// negative.
+    #[test]
+    fn a_band_under_a_piece_over_half_a_turn_is_the_one_region() {
+        for ring_z in [0.25, 2e5] {
+            let edges = steep_cone_band(ring_z);
+            let lifted = lift_orbit(std::iter::once(&edges[0]), Some(TAU), None);
+            let run = lifted.turn.x();
+            assert!(
+                run.abs() > std::f64::consts::PI,
+                "ring {ring_z}: the piece across the near vertex runs {run}"
+            );
+            let out = edge_angle_at_vertex_periodic(&edges[0], true, Some(TAU), None);
+            let back = edge_angle_at_vertex_periodic(&edges[0], false, Some(TAU), None);
+            assert!(
+                out.cos() * run > 0.0 && back.cos() * run < 0.0,
+                "ring {ring_z}: the piece running {run} leaves at {out} and arrives from {back}"
+            );
+            let loops = build_wire_loops_dcel(&edges, 1e-7, true, false);
+            assert_eq!(loops.len(), 1, "ring {ring_z}: {} regions", loops.len());
+            assert_eq!(loops[0].len(), edges.len(), "ring {ring_z}");
+            let lift = lift_orbit(loops[0].iter(), Some(TAU), None);
+            assert!(lift.area > 0.0, "ring {ring_z}: area {}", lift.area);
+            let back: Vec<OrientedPCurveEdge> = loops[0]
+                .iter()
+                .rev()
+                .map(|e| {
+                    let mut r = e.clone();
+                    std::mem::swap(&mut r.start_uv, &mut r.end_uv);
+                    std::mem::swap(&mut r.start_3d, &mut r.end_3d);
+                    r.forward = !r.forward;
+                    r
+                })
+                .collect();
+            let lift = lift_orbit(back.iter(), Some(TAU), None);
+            assert!(
+                lift.area < 0.0,
+                "ring {ring_z}: reversed area {}",
+                lift.area
+            );
+        }
+    }
+
+    /// A half whose pcurve packs 4.5 of its 5 radians of `u` into the first
+    /// five hundredths of a percent of its knots, with its ends stored on
+    /// the pcurve's own copy and a period off it, run each way. It leaves
+    /// its start, and its twin reaches its end, heading `+u` as the pcurve
+    /// does there. A chord a hundredth of the pcurve long ran 4.5 in `u`,
+    /// and folded the short way round it pointed `-u`.
+    #[test]
+    fn a_packed_pcurve_leaves_its_end_along_its_derivative() {
+        use brepkit_math::curves2d::NurbsCurve2D;
+        let pcurve = Curve2D::Nurbs(
+            NurbsCurve2D::new(
+                1,
+                vec![0.0, 0.0, 0.0005, 1.0, 1.0],
+                vec![
+                    Point2::new(0.0, 0.0),
+                    Point2::new(4.5, 0.1),
+                    Point2::new(5.0, 1.0),
+                ],
+                vec![1.0; 3],
+            )
+            .unwrap(),
+        );
+        let heading = 0.1_f64.atan2(4.5);
+        for shift in [0.0, TAU] {
+            let mut half = make_line_edge(Point2::new(shift, 0.0), Point2::new(5.0 + shift, 1.0));
+            half.pcurve = pcurve.clone();
+            let mut twin = half.clone();
+            std::mem::swap(&mut twin.start_uv, &mut twin.end_uv);
+            std::mem::swap(&mut twin.start_3d, &mut twin.end_3d);
+            twin.forward = false;
+            for (what, edge, at_start) in [("half", &half, true), ("twin", &twin, false)] {
+                let angle = edge_angle_at_vertex_periodic(edge, at_start, Some(TAU), None);
+                let off =
+                    (angle - heading + std::f64::consts::PI).rem_euclid(TAU) - std::f64::consts::PI;
+                assert!(
+                    off.abs() < 1e-9,
+                    "{what} stored {shift} off: heads {angle}, the pcurve {heading}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1556,5 +2141,46 @@ mod tests {
             };
             assert_eq!(key(&again), key(&reference), "peel result must not vary");
         }
+    }
+
+    /// A unit circle's arc from angle 0 round to `TAU - 5e-8`, its ends 5e-8
+    /// apart, laid in the chart of its angle, and its twin.
+    fn near_turn() -> [OrientedPCurveEdge; 2] {
+        use brepkit_math::curves::Circle3D;
+        use brepkit_math::vec::{Point3, Vec3};
+        use brepkit_topology::edge::EdgeCurve;
+        let circle =
+            Circle3D::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0).unwrap();
+        let end = TAU - 5e-8;
+        let forward = OrientedPCurveEdge {
+            curve_3d: EdgeCurve::Circle(circle.clone()),
+            pcurve: Curve2D::Line(Line2D::new(Point2::new(0.0, 0.0), Vec2::new(1.0, 0.0)).unwrap()),
+            start_uv: Point2::new(0.0, 0.0),
+            end_uv: Point2::new(end, 0.0),
+            start_3d: circle.evaluate(0.0),
+            end_3d: circle.evaluate(end),
+            forward: true,
+            source_edge_idx: Some(0),
+            pave_block_id: None,
+        };
+        let back = OrientedPCurveEdge {
+            start_uv: forward.end_uv,
+            end_uv: forward.start_uv,
+            start_3d: forward.end_3d,
+            end_3d: forward.start_3d,
+            forward: false,
+            ..forward.clone()
+        };
+        [forward, back]
+    }
+
+    #[test]
+    fn an_arc_and_its_twin_close_on_themselves_alike() {
+        let [forward, back] = near_turn();
+        assert!(closes_on_itself(&forward, 1e-7));
+        assert!(closes_on_itself(&back, 1e-7));
+        // Pruned with its twin, the arc stands: its vertex is no free end.
+        let kept = remove_pendant_sections_but_loops(&[forward, back], 1e-7, true, false);
+        assert_eq!(kept.len(), 2);
     }
 }

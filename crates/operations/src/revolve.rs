@@ -865,7 +865,7 @@ fn try_ball_revolution(
     axis: Vec3,
     is_full: bool,
 ) -> Result<Option<SolidId>, crate::OperationsError> {
-    /// The chords of the equator `make_sphere` builds, as its callers ask.
+    /// A segment count `make_sphere` accepts. It has no effect on the ball.
     const EQUATOR_SEGMENTS: usize = 32;
 
     if !is_full {
@@ -1703,8 +1703,11 @@ fn profile_chart_is_ccw(
 ///
 /// # Errors
 ///
-/// Returns an error if the axis is zero-length, the angle is out of range, or a
-/// partial revolution is requested for a non-planar profile boundary.
+/// Returns an error if the axis is zero-length, the angle is out of range, the
+/// profile's sweep is shown to pass through itself (a planar profile across
+/// the axis's shadow on its plane, or a boundary in no one plane whose
+/// drawing in distance from the axis and height along it crosses itself),
+/// or a partial revolution is requested for a non-planar profile boundary.
 #[allow(clippy::too_many_lines)]
 pub fn revolve(
     topo: &mut Topology,
@@ -1758,6 +1761,57 @@ pub fn revolve(
     }
     let input_wire_id = face_data.outer_wire();
     let inner_wire_ids: Vec<brepkit_topology::wire::WireId> = face_data.inner_wires().to_vec();
+    if let Some(normal) = stored_plane_normal
+        && profile_reaches_across_axis(
+            topo,
+            topo.wire(input_wire_id)?.edges(),
+            normal,
+            axis_origin,
+            axis,
+        )?
+    {
+        return Err(crate::OperationsError::InvalidInput {
+            reason: "the revolve profile reaches across the axis, so its sweep would pass \
+                     through itself: keep the profile on one side of the axis"
+                .into(),
+        });
+    }
+
+    // A profile on a curved surface sweeps its boundary alone. A boundary
+    // shown to lie in one plane sweeps that plane's region, which is read as
+    // above; any other is read in a full turn by the drawing of its points'
+    // distance from the axis and height along it. A few samples in one
+    // plane do not show that: a spline can leave it between them.
+    if stored_plane_normal.is_none() {
+        let oriented = topo.wire(input_wire_id)?.edges().to_vec();
+        let samples = traversal_samples(topo, &oriented)?;
+        let mut flat = None;
+        if let (Ok(normal), Some(&origin)) = (
+            crate::winding::newell_normal(&samples).normalize(),
+            samples.first(),
+        ) {
+            let scale = samples
+                .iter()
+                .fold(0.0_f64, |m, p| m.max((*p - origin).length()));
+            if boundary_in_plane(topo, &oriented, (origin, normal), PLANARITY_REL_TOL * scale)? {
+                flat = Some(normal);
+            }
+        }
+        let crosses = match flat {
+            Some(normal) => {
+                normal.cross(axis).length() >= 1e-9
+                    && profile_reaches_across_axis(topo, &oriented, normal, axis_origin, axis)?
+            }
+            None => is_full && boundary_sweep_meets_itself(topo, &oriented, axis_origin, axis)?,
+        };
+        if crosses {
+            return Err(crate::OperationsError::InvalidInput {
+                reason: "the revolve profile reaches across the axis, so its sweep would pass \
+                         through itself: keep the profile on one side of the axis"
+                    .into(),
+            });
+        }
+    }
 
     // Fast exact path: a revolution of a single circular profile that clears
     // the axis is a torus (full turn: one doubly-periodic face; partial turn:
@@ -2251,6 +2305,488 @@ pub fn revolve(
     }
 
     Ok(solid)
+}
+
+/// Whether a planar profile has points of its outline on both sides of the
+/// axis's shadow on its plane, the line of the plane's points nearest the
+/// axis (the axis itself in a plane that holds it).
+///
+/// The plane meets each plane square to the axis in a line square to the
+/// shadow, whose two points at one distance from the shadow lie at one
+/// distance from the axis: the turn carries one onto the other. A profile
+/// across the shadow holds such pairs as near each other as may be, and its
+/// sweep passes through itself for any angle: a full turn of an arc over
+/// both poles covers its sphere twice. A profile on one side holds no such
+/// pair, and its sweep is clear. A point on the shadow, or off it by a
+/// millionth of the profile's size (an arc drawn about a point a hair off
+/// the axis), lies on neither side. Each edge is read at its extremes across
+/// the shadow, not at samples, which an arc can pass the shadow between.
+/// A point's distance from the shadow across the plane is its distance
+/// along `normal × axis` from the axis's origin, as that direction is square
+/// to both the axis and the plane.
+fn profile_reaches_across_axis(
+    topo: &Topology,
+    oriented: &[OrientedEdge],
+    plane_normal: Vec3,
+    axis_origin: Point3,
+    axis: Vec3,
+) -> Result<bool, crate::OperationsError> {
+    const SAMPLES: u32 = 64;
+    let normal = plane_normal.normalize()?;
+    let across = normal.cross(axis).normalize()?;
+    let mut lo = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut hi = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut edges = Vec::with_capacity(oriented.len());
+    for oe in oriented {
+        let edge = topo.edge(oe.edge())?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let curve = edge.curve();
+        let (t0, t1) = curve.domain_with_endpoints(a, b);
+        // The samples give the profile's size, which only scales the
+        // allowance.
+        for k in 0..=SAMPLES {
+            let p = curve.evaluate_with_endpoints(
+                (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0),
+                a,
+                b,
+            );
+            lo = Point3::new(lo.x().min(p.x()), lo.y().min(p.y()), lo.z().min(p.z()));
+            hi = Point3::new(hi.x().max(p.x()), hi.y().max(p.y()), hi.z().max(p.z()));
+        }
+        edges.push((curve.clone(), a, b, (t0, t1)));
+    }
+    let reach = 1e-6f64.madd((hi - lo).length(), Tolerance::new().linear);
+    // Whether some point of the outline lies farther than `reach` on the
+    // side of the axis that `sign` picks.
+    let past = |sign: f64| -> Result<bool, crate::OperationsError> {
+        let depth = |p: Point3| -sign * (p - axis_origin).dot(across);
+        for (curve, a, b, (t0, t1)) in &edges {
+            let below = match curve {
+                EdgeCurve::Line => depth(*a).min(depth(*b)) < -reach,
+                EdgeCurve::Circle(circle) => {
+                    conic_least(|t| circle.evaluate(t), &depth, (*t0, *t1)) < -reach
+                }
+                EdgeCurve::Ellipse(ellipse) => {
+                    conic_least(|t| ellipse.evaluate(t), &depth, (*t0, *t1)) < -reach
+                }
+                // An edge stored against its spline's direction reads its
+                // span backward.
+                EdgeCurve::NurbsCurve(nurbs) => spline_dips_below(
+                    &nurbs_span(nurbs, t0.min(*t1), t0.max(*t1))?,
+                    &depth,
+                    -reach,
+                )?,
+            };
+            if below {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    Ok(past(1.0)? && past(-1.0)?)
+}
+
+/// Whether each edge of a boundary lies within `slack` of the plane through
+/// `origin` square to `normal`: a line by its ends, a circle or an ellipse
+/// by its own plane, and a B-spline whose weights are all of one sign by its
+/// control points, whose hull holds it. Any other edge is not shown to.
+fn boundary_in_plane(
+    topo: &Topology,
+    oriented: &[OrientedEdge],
+    (origin, normal): (Point3, Vec3),
+    slack: f64,
+) -> Result<bool, crate::OperationsError> {
+    let off = |p: Point3| (p - origin).dot(normal).abs();
+    for oe in oriented {
+        let edge = topo.edge(oe.edge())?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let held = match edge.curve() {
+            EdgeCurve::Line => off(a) <= slack && off(b) <= slack,
+            EdgeCurve::Circle(c) => {
+                off(c.center()) <= slack && c.normal().cross(normal).length() * c.radius() <= slack
+            }
+            EdgeCurve::Ellipse(e) => {
+                off(e.center()) <= slack
+                    && e.normal().cross(normal).length() * e.semi_major() <= slack
+            }
+            EdgeCurve::NurbsCurve(spline) => {
+                let weights = spline.weights();
+                (weights.iter().all(|&w| w > 0.0) || weights.iter().all(|&w| w < 0.0))
+                    && spline.control_points().iter().all(|&p| off(p) <= slack)
+            }
+        };
+        if !held {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether a profile boundary in no one plane sweeps through itself in a
+/// full turn, where that can be shown.
+///
+/// The boundary is cut into pieces, each with a bound on how far it strays
+/// from its chord: nothing for a line, the sag of a conic's arc (an
+/// ellipse's no more than its major circle's), and the farthest control
+/// point from the chord for a B-spline piece whose weights are all of one
+/// sign (the same curve as with each weight turned). The
+/// drawing of a point in the half-plane of distance from the axis and height
+/// along it moves no two points farther apart than they are, and the drawing
+/// of a chord strays from the chord drawn straight by no more than its
+/// sideways length squared over eight times its least distance from the
+/// axis, as the distance from the axis along it is convex and bends no more
+/// than that. A piece's drawing lies within the sum of the two of its
+/// straight chord.
+///
+/// The sweep meets itself where two pieces not next to each other cross in
+/// the drawing: the ends of each straight chord lie on the two sides of the
+/// other's line, beyond the other piece's bound. Two points of the boundary
+/// then lie at one distance from the axis and at one height, and the turn
+/// carries one onto the other. A boundary that winds round the axis with a
+/// simple drawing sweeps a ring once and is kept.
+///
+/// What cannot be shown is kept: a boundary with a B-spline piece whose
+/// weights differ in sign, one whose pieces come within their bounds of
+/// each other in the drawing without such a crossing, or one whose drawing
+/// takes more than [`MOST_CHORD_PAIRS`] pairs of chords to read.
+#[allow(clippy::too_many_lines)]
+fn boundary_sweep_meets_itself(
+    topo: &Topology,
+    oriented: &[OrientedEdge],
+    axis_origin: Point3,
+    axis: Vec3,
+) -> Result<bool, crate::OperationsError> {
+    const MOST_PIECES: f64 = 512.0;
+    const NURBS_HALVINGS: u32 = 10;
+    let samples = traversal_samples(topo, oriented)?;
+    let Some(&first) = samples.first() else {
+        return Ok(false);
+    };
+    let (lo, hi) = samples.iter().fold((first, first), |(lo, hi), p| {
+        (
+            Point3::new(lo.x().min(p.x()), lo.y().min(p.y()), lo.z().min(p.z())),
+            Point3::new(hi.x().max(p.x()), hi.y().max(p.y()), hi.z().max(p.z())),
+        )
+    });
+    let size = (hi - lo).length();
+    let (step, sag) = (1e-2 * size, 1e-4 * size);
+    // Each piece's start, in the wire's order, and how far it strays from
+    // its chord.
+    let mut pieces: Vec<(Point3, f64)> = Vec::new();
+    for oe in oriented {
+        let edge = topo.edge(oe.edge())?;
+        let (ns, ne) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let curve = edge.curve();
+        let (mut a, mut b) = curve.domain_with_endpoints(ns, ne);
+        let head = curve.evaluate_with_endpoints(a, ns, ne);
+        if (head - ns).length() > (head - ne).length() {
+            std::mem::swap(&mut a, &mut b);
+        }
+        if !oe.is_forward() {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let at = |t: f64| curve.evaluate_with_endpoints(t, ns, ne);
+        // The length along the curve and the radius whose arcs bound its
+        // sag, for a line or a conic.
+        let conic = match curve {
+            EdgeCurve::Line => Some(((ne - ns).length(), 0.0)),
+            EdgeCurve::Circle(c) => Some((c.radius() * (b - a).abs(), c.radius())),
+            EdgeCurve::Ellipse(e) => Some((e.semi_major() * (b - a).abs(), e.semi_major())),
+            EdgeCurve::NurbsCurve(_) => None,
+        };
+        if let Some((length, radius)) = conic {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let count = (length / step).ceil().clamp(1.0, MOST_PIECES) as u32;
+            let half_turn = 0.5 * (b - a).abs() / f64::from(count);
+            let strays = radius * (1.0 - half_turn.cos());
+            for k in 0..count {
+                let t = (b - a).madd(f64::from(k) / f64::from(count), a);
+                pieces.push((at(t), strays));
+            }
+            continue;
+        }
+        let EdgeCurve::NurbsCurve(spline) = curve else {
+            continue;
+        };
+        let (lo, hi) = (a.min(b), a.max(b));
+        let mut ends = vec![lo];
+        ends.extend(spline.knots().iter().copied().filter(|&k| k > lo && k < hi));
+        ends.push(hi);
+        ends.dedup();
+        let mut spans: Vec<(f64, f64)> = ends.windows(2).map(|w| (w[0], w[1])).collect();
+        if a > b {
+            spans = spans.into_iter().rev().map(|(x, y)| (y, x)).collect();
+        }
+        let strays = |from: f64, to: f64| {
+            let (p, q) = (at(from), at(to));
+            brepkit_math::nurbs::decompose::curve_bezier_between(spline, from, to)
+                .ok()
+                .filter(|hull| hull.iter().all(|c| c[3] > 0.0) || hull.iter().all(|c| c[3] < 0.0))
+                .map_or(f64::INFINITY, |hull| {
+                    hull.iter()
+                        .map(|&[x, y, z, w]| off_segment(Point3::new(x / w, y / w, z / w), p, q))
+                        .fold(0.0, f64::max)
+                })
+        };
+        for (from, to) in spans {
+            let mut pending = vec![(from, to, 0_u32)];
+            while let Some((p, q, depth)) = pending.pop() {
+                let e = strays(p, q);
+                // No hull bounds the piece, and halving it gives none.
+                if !e.is_finite() {
+                    return Ok(false);
+                }
+                if e > sag && depth < NURBS_HALVINGS {
+                    let mid = f64::midpoint(p, q);
+                    pending.push((mid, q, depth + 1));
+                    pending.push((p, mid, depth + 1));
+                    continue;
+                }
+                pieces.push((at(p), e));
+            }
+        }
+    }
+    let n = pieces.len();
+    if n < 3 {
+        return Ok(false);
+    }
+    let radial = |p: Point3| {
+        let v = p - axis_origin;
+        v - axis * v.dot(axis)
+    };
+    // Each chord's least distance from the axis.
+    let nearest = |p: Point3, q: Point3| {
+        let (rp, rq) = (radial(p), radial(q));
+        let d = rq - rp;
+        let d2 = d.dot(d);
+        let s = if d2 > 0.0 {
+            (-rp.dot(d) / d2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (rp + d * s).length()
+    };
+    let drawn: Vec<(f64, f64)> = pieces
+        .iter()
+        .map(|&(p, _)| (radial(p).length(), (p - axis_origin).dot(axis)))
+        .collect();
+    // How far `x` lies to the left of the line from `a` to `b`.
+    let side = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let length = dx.hypot(dy);
+        (length > 0.0).then(|| dx.madd(x.1 - a.1, -(dy * (x.0 - a.0))) / length)
+    };
+    // Each straight chord in the drawing and how far the piece's drawing
+    // strays from it.
+    let single: Vec<f64> = (0..n)
+        .map(|i| {
+            let ((p, e), (q, _)) = (pieces[i], pieces[(i + 1) % n]);
+            let least = nearest(p, q);
+            let sideways = (radial(q) - radial(p)).length();
+            let bend = if least > 0.0 {
+                sideways * sideways / (8.0 * least)
+            } else {
+                f64::INFINITY
+            };
+            e + bend
+        })
+        .collect();
+    // The chords of single pieces, and of each two pieces in a row, which
+    // hold within them a crossing at the point between the two: each its
+    // first piece, how many pieces, its ends in the drawing and its bound.
+    // A chord with no bound (one through the axis) shows nothing.
+    let mut chords: Vec<Chord> = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        chords.push((i, 1, drawn[i], drawn[(i + 1) % n], single[i]));
+        let (a, m, b) = (drawn[i], drawn[(i + 1) % n], drawn[(i + 2) % n]);
+        let middle = side(a, b, m).map_or(f64::INFINITY, f64::abs);
+        chords.push((i, 2, a, b, single[i].max(single[(i + 1) % n]) + middle));
+    }
+    chords.retain(|chord| chord.4.is_finite());
+    // The side of the line `x` lies on, where it lies beyond `bound` of it.
+    let beyond = |d: Option<f64>, bound: f64| {
+        d.map_or(0.0, |d| if d.abs() > bound { d.signum() } else { 0.0 })
+    };
+    let crosses = |x: usize, y: usize| {
+        let ((i, li, a, b, ei), (j, lj, c, d, ej)) = (chords[x], chords[y]);
+        // Pieces that touch share a point of the boundary.
+        if (j + 2 * n - i - li).is_multiple_of(n) || (i + 2 * n - j - lj).is_multiple_of(n) {
+            return false;
+        }
+        if (j + n - i) % n < li || (i + n - j) % n < lj {
+            return false;
+        }
+        let (sc, sd) = (beyond(side(a, b, c), ei), beyond(side(a, b, d), ei));
+        let (sa, sb) = (beyond(side(c, d, a), ej), beyond(side(c, d, b), ej));
+        sc * sd < 0.0 && sa * sb < 0.0
+    };
+    // The chords by their least distance from the axis in the drawing, each
+    // read against those whose spans of that distance meet its own.
+    let span = |x: usize| {
+        let (_, _, a, b, e) = chords[x];
+        (a.0.min(b.0) - e, a.0.max(b.0) + e)
+    };
+    let mut order: Vec<usize> = (0..chords.len()).collect();
+    order.sort_by(|&x, &y| span(x).0.total_cmp(&span(y).0));
+    let mut read = 0_usize;
+    for (k, &x) in order.iter().enumerate() {
+        let top = span(x).1;
+        for &y in &order[k + 1..] {
+            if span(y).0 > top {
+                break;
+            }
+            read += 1;
+            if read > MOST_CHORD_PAIRS {
+                return Ok(false);
+            }
+            if crosses(x, y) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The most pairs of chords [`boundary_sweep_meets_itself`] reads.
+const MOST_CHORD_PAIRS: usize = 2_000_000;
+
+/// A chord of pieces of a profile's boundary in its drawing: its first
+/// piece, how many pieces, its ends and how far the pieces' drawing strays
+/// from it.
+type Chord = (usize, usize, (f64, f64), (f64, f64), f64);
+
+/// How far `x` lies from the segment from `p` to `q`.
+fn off_segment(x: Point3, p: Point3, q: Point3) -> f64 {
+    let d = q - p;
+    let d2 = d.dot(d);
+    let s = if d2 > 0.0 {
+        ((x - p).dot(d) / d2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (x - (p + d * s)).length()
+}
+
+/// The least that `f`, an affine function of the point, takes on the conic
+/// `at(t) = c + p cos t + q sin t` between `t0` and `t1 >= t0`.
+///
+/// On the conic `f` reads `f(c) + alpha cos t + beta sin t`, least at the
+/// angle opposite `atan2(beta, alpha)`. It counts where the span holds that
+/// angle, a whole turn on or back.
+fn conic_least(
+    at: impl Fn(f64) -> Point3,
+    f: &impl Fn(Point3) -> f64,
+    (t0, t1): (f64, f64),
+) -> f64 {
+    let (start, quarter, half) = (at(0.0), at(FRAC_PI_2), at(PI));
+    let centre = Point3::new(
+        0.5 * (start.x() + half.x()),
+        0.5 * (start.y() + half.y()),
+        0.5 * (start.z() + half.z()),
+    );
+    let at_centre = f(centre);
+    let (alpha, beta) = (f(start) - at_centre, f(quarter) - at_centre);
+    let ends = f(at(t0)).min(f(at(t1)));
+    let turn = 2.0 * PI;
+    let least = beta.atan2(alpha) + PI;
+    let first = least + ((t0 - least) / turn).ceil() * turn;
+    if first <= t1 {
+        ends.min(at_centre - alpha.hypot(beta))
+    } else {
+        ends
+    }
+}
+
+/// Whether `f`, an affine function of the point, falls below `floor`
+/// somewhere on `curve`.
+///
+/// Each Bezier piece of the spline is read on its own. A piece whose
+/// weights are all positive lies in the hull of its control points, where
+/// `f` is least at a control point; one whose weights are all negative is
+/// the same curve with every weight turned positive. A piece whose control
+/// points all read `floor` or more stays there, and a piece read below
+/// `floor` at a point of the curve is past it. A piece between is halved,
+/// which keeps its weights positive. Each span has its own cap on halvings,
+/// so spans that only come near `floor` do not use up the halvings of a span
+/// that dips past it.
+///
+/// # Errors
+///
+/// A piece with a zero weight, or weights of both signs, has no such hull,
+/// and samples of it prove nothing: the revolve is refused. So is a span
+/// whose cap on halvings runs out while a piece of it is still between: a
+/// hull not settled is not clear of `floor`.
+fn spline_dips_below(
+    curve: &NurbsCurve,
+    f: &impl Fn(Point3) -> f64,
+    floor: f64,
+) -> Result<bool, crate::OperationsError> {
+    const MAX_HALVINGS: usize = 4096;
+    let unbounded = || crate::OperationsError::InvalidInput {
+        reason: "the revolve profile has a rational span with a zero weight or weights of \
+                 both signs, which the test against the axis cannot bound"
+            .into(),
+    };
+    let unsettled = || crate::OperationsError::InvalidInput {
+        reason: "the revolve profile has a span whose hull still reaches across the axis after \
+                 the test against the axis has halved it as far as it may"
+            .into(),
+    };
+    let segments =
+        brepkit_math::nurbs::decompose::curve_to_bezier_segments(curve).map_err(|e| match e {
+            brepkit_math::MathError::PoleAtInfinity { .. } => unbounded(),
+            other => other.into(),
+        })?;
+    let mut pieces = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let weights = segment.weights();
+        if weights.iter().all(|&w| w > 0.0) {
+            pieces.push(segment);
+        } else if weights.iter().all(|&w| w < 0.0) {
+            pieces.push(NurbsCurve::new(
+                segment.degree(),
+                segment.knots().to_vec(),
+                segment.control_points().to_vec(),
+                weights.iter().map(|w| -w).collect(),
+            )?);
+        } else {
+            return Err(unbounded());
+        }
+    }
+    for span in pieces {
+        let mut open = vec![span];
+        let mut halvings = 0;
+        while let Some(piece) = open.pop() {
+            if piece.control_points().iter().all(|&p| f(p) >= floor) {
+                continue;
+            }
+            let (d0, d1) = piece.domain();
+            let middle = 0.5 * (d0 + d1);
+            if [d0, middle, d1]
+                .iter()
+                .any(|&t| f(piece.evaluate(t)) < floor)
+            {
+                return Ok(true);
+            }
+            if halvings >= MAX_HALVINGS {
+                return Err(unsettled());
+            }
+            halvings += 1;
+            let (left, right) = brepkit_math::nurbs::knot_ops::curve_split(&piece, middle)?;
+            open.push(left);
+            open.push(right);
+        }
+    }
+    Ok(false)
 }
 
 /// How near 1 a cap's normal may read along the axis before its plane could

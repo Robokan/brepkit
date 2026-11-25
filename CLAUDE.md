@@ -87,6 +87,8 @@ Quick reference — find the right file for any task:
 | Analytic surfaces (Cylinder, Cone, Sphere, Torus) | `surfaces.rs` |
 | Surface-surface intersection | `nurbs/intersection/` (mod, surface_marching, surface_seeding, curve_surface, plane, line, chaining, tests) |
 | Analytic-analytic intersection | `analytic_intersection.rs` |
+| Fits of a section of two analytic surfaces, bounded off both along their whole length | `analytic_intersection/section_fit.rs` |
+| Proof that the marcher's seeds reach every part of a section over a patch | `analytic_intersection/cover.rs` |
 | AABB / bounding boxes | `aabb.rs` |
 | BVH (bounding volume hierarchy) | `bvh.rs` |
 | CDT (constrained Delaunay) | `cdt/` (mod, insert, locate, constraints, adjacency, tests) |
@@ -155,11 +157,15 @@ Quick reference — find the right file for any task:
 | PaveFiller orchestrator | `pave_filler/mod.rs` |
 | Phases VV/VE/EE/VF/EF/FF | `pave_filler/phase_*.rs` |
 | Sections along loose tool edges (imprint) | `pave_filler/tool_edges.rs` |
+| A NURBS face's pcurves in its surface's parameters (on which side of its wires a point lies) | `pave_filler/nurbs_trim.rs` |
+| Whether a NURBS surface's sides keep apart (no seam, fold or pole), for phase EF and the ray cast | `nurbs_sides.rs` |
 | Pave block splitting + edge creation | `pave_filler/make_blocks.rs`, `make_split_edges.rs` |
 | FaceInfo population | `pave_filler/fill_face_info.rs` |
 | Builder (face splitting + assembly) | `builder/mod.rs`, `builder/assemble.rs` |
 | Face splitting (UV-space) | `builder/face_splitter/` (mod, containment, conversion, edge_splitting, sampling, special_cases), `builder/classify_2d.rs` |
+| A ball face with a pole of every chart on it, split about the pole it holds | `builder/face_splitter/pole_round.rs` |
 | PCurve computation | `builder/pcurve_compute.rs` |
+| Pcurves of edges on a B-spline face, each proved within a tolerance of its edge (proved in each GFA store, so phase EF boxes a face by its own part of its surface) | `builder/nurbs_pcurve.rs`, `ds/shape_store.rs` |
 | Plane frame (3D↔UV projection) | `builder/plane_frame.rs` |
 | Wire loop reconstruction | `builder/wire_builder.rs` |
 | Split types + face class | `builder/split_types.rs`, `builder/face_class.rs` |
@@ -212,6 +218,7 @@ Quick reference — find the right file for any task:
 | Shell fixing (orientation consistency) | `fix/shell.rs` |
 | Solid fixing (top-level orchestrator) | `fix/solid.rs` |
 | Small face removal | `fix/small_face.rs` |
+| Seams missing from cylinder/cone faces bounded by their rims alone | `fix/seam.rs` |
 | Wireframe repair | `fix/wireframe.rs` |
 | Split over-connected vertices | `fix/split_vertex.rs` |
 | Unify same-domain faces (merge coplanar/co-cylindrical) | `upgrade/unify_same_domain.rs` |
@@ -251,6 +258,7 @@ Quick reference — find the right file for any task:
 | Face geometric checks | `validate/face.rs` |
 | A face's holes against its outline and each other | `validate/face_wires.rs` |
 | Plane faces of one solid that cover the same area | `validate/face_overlap.rs` |
+| Faces of one solid on one sphere, cylinder, cone or torus that cover the same area | `validate/curved_overlap.rs` |
 | Validation orchestrator | `validate/mod.rs` |
 | GProps accumulator (Huygens' theorem) | `properties/accumulator.rs` |
 | Closed-form formulas (box, sphere, cylinder, etc.) | `properties/analytic.rs` |
@@ -341,7 +349,6 @@ Quick reference — find the right file for any task:
 | STEP read/write | `step/reader.rs`, `step/writer.rs` |
 | STEP length units and assembly placements | `step/assembly.rs` |
 | STEP surfaces of revolution | `step/revolution.rs` |
-| STEP seams missing from cylinder/cone faces | `step/seam.rs` |
 | IGES read/write | `iges/reader.rs`, `iges/writer.rs` |
 | STL read/write/import | `stl/reader.rs`, `stl/writer.rs`, `stl/import.rs` |
 | 3MF read/write | `threemf/reader.rs`, `threemf/writer.rs` |

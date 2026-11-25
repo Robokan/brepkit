@@ -380,6 +380,9 @@ fn piece_issues(
 
 /// Validate a solid, returning a report of all issues found.
 ///
+/// A solid with a curve, surface or pcurve that is not well formed is
+/// reported on those alone: every check below reads them.
+///
 /// Checks performed:
 /// 1. **Euler-Poincaré**: V - E + F = 2(S - g) + L for a genus-g closed
 ///    solid of S pieces (connected groups of faces: the outer shell, each
@@ -398,6 +401,15 @@ fn piece_issues(
 /// 12. **Wires apart**: no hole of a face crosses its outline or another
 ///     hole; on a plane face, no hole lies outside the outline or inside
 ///     another hole
+/// 13. **Wire turns**: no wire of a face on a closed surface runs round it
+///     more than once
+/// 14. **Pcurves**: each pcurve of an edge on a curved face, read through
+///     the face's surface, gives the edge's points at eleven fractions of
+///     its span, within a tolerance that grows with the solid's size
+/// 15. **Edge ends**: each edge's curve, read at the ends of its span,
+///     passes through its vertices within their tolerance, or within the
+///     band in which the edge's readers take a vertex to lie on its curve,
+///     and a closed edge's curve passes through its one vertex
 ///
 /// # Errors
 ///
@@ -686,6 +698,92 @@ pub(crate) fn boundary_pieces(
     Ok((0..root.len()).filter(|&i| find(&mut root, i) == i).count())
 }
 
+/// [`euler_misfit`] over all the faces of `solid`, its cavities' too.
+///
+/// # Errors
+///
+/// Returns an error if topology lookups fail.
+pub(crate) fn solid_euler_misfit(
+    topo: &Topology,
+    solid: SolidId,
+) -> Result<Option<String>, crate::OperationsError> {
+    let faces = explorer::solid_faces(topo, solid)?;
+    let piece = connected_pieces(&faces, &explorer::edge_to_face_map(topo, solid)?);
+    euler_misfit(topo, &faces, &piece)
+}
+
+/// How the counts of `faces` break the Euler-Poincaré relation, or `None`
+/// when they keep it. `piece` gives each face's piece, as
+/// [`connected_pieces`] does.
+///
+/// Each piece (its faces joined through shared edges: the outer shell, each
+/// cavity, each lump a boolean keeps apart) is a closed surface of genus
+/// `g >= 0`, so its `V - E + F - L = 2 - 2g`, `L` its faces' inner loops.
+/// Read piece by piece, one piece's surplus cannot hide another's lack. A
+/// hole that shares a vertex with another of its face's wires (a cylinder's
+/// rim tangent to a box face's edge) does not cut the face's boundary in
+/// two, so `L` counts each face's boundary pieces past the first. A piece
+/// that touches itself at a vertex (a ring cut where its two ends meet at a
+/// point) fits once that vertex counts once per sheet of faces meeting
+/// there, its faces' wires counted apart. One that touches itself along an
+/// edge, two of its edges sharing a stretch, does not.
+///
+/// # Errors
+///
+/// Returns an error if topology lookups fail.
+pub(crate) fn euler_misfit(
+    topo: &Topology,
+    faces: &[brepkit_topology::face::FaceId],
+    piece: &[usize],
+) -> Result<Option<String>, crate::OperationsError> {
+    use std::collections::{BTreeMap, HashSet};
+    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let fits = |chi: i64| chi <= 2 && (2 - chi) % 2 == 0;
+    let mut members: BTreeMap<usize, Vec<brepkit_topology::face::FaceId>> = BTreeMap::new();
+    for (&fid, &p) in faces.iter().zip(piece) {
+        members.entry(p).or_default().push(fid);
+    }
+    for group in members.values() {
+        let (mut edges, mut vertices) = (HashSet::new(), HashSet::new());
+        let (mut loops, mut wires) = (0_i64, 0_i64);
+        for &fid in group {
+            let face = topo.face(fid)?;
+            for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied())
+            {
+                for oe in topo.wire(wid)?.edges() {
+                    if edges.insert(oe.edge().index()) {
+                        let edge = topo.edge(oe.edge())?;
+                        vertices.insert(edge.start().index());
+                        vertices.insert(edge.end().index());
+                    }
+                }
+            }
+            if !face.inner_wires().is_empty() {
+                wires += count(face.inner_wires().len());
+                loops += count(boundary_pieces(topo, fid)?) - 1;
+            }
+        }
+        let euler = count(vertices.len()) - count(edges.len()) + count(group.len());
+        if fits(euler - loops) {
+            continue;
+        }
+        let fans = extra_vertex_fans(topo, group)?;
+        if fans > 0 && fits(euler + fans - wires) && !edges_lie_on_each_other(topo, group)? {
+            continue;
+        }
+        return Ok(Some(format!(
+            "Euler characteristic V-E+F = {euler} is invalid for a piece of {} faces \
+             (expected V-E+F = 2(1-g)+L for a genus g >= 0, with L={loops} inner loops, \
+             got V={}, E={}, F={})",
+            group.len(),
+            vertices.len(),
+            edges.len(),
+            group.len()
+        )));
+    }
+    Ok(None)
+}
+
 /// Validate a solid with configurable tolerance options.
 ///
 /// Same checks as [`validate_solid`] but with tolerance scaling.
@@ -701,72 +799,25 @@ pub fn validate_solid_with_options(
     solid: SolidId,
     options: &ValidationOptions,
 ) -> Result<ValidationReport, crate::OperationsError> {
+    if let Some(report) = malformed_geometry_report(topo, solid)? {
+        return Ok(report);
+    }
     let mut issues = Vec::new();
     let tol = Tolerance::new();
     // Clamp to [0.1, 1000]: below 0.1 risks false positives on exact
     // geometry, above 1000 makes the check meaningless.
     let scale = options.tolerance_scale.clamp(0.1, 1000.0);
 
-    let (f, e, v) = explorer::solid_entity_counts(topo, solid)?;
-
-    // Euler-Poincaré formula for a cell complex with inner loops:
-    //   V - E + F = 2(S - g) + L
-    // where S is the number of connected pieces, g is the total genus and L
-    // is the total number of inner loops across all faces. For a genus-0
-    // solid with no cavities or holes: V-E+F = 2. A cavity is a piece of its
-    // own (it shares no edge with the outer shell), and so is each disjoint
-    // lump a boolean keeps in the outer shell (a ball cut in two by a slab).
-    // A hole that shares a vertex with another of its face's wires (a
-    // cylinder's rim tangent to a box face's edge) does not disconnect the
-    // face's boundary, so L counts each face's boundary pieces, not its
-    // wires.
-    let mut total_inner_loops: i64 = 0;
     let faces = explorer::solid_faces(topo, solid)?;
-    for fid in &faces {
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            total_inner_loops += boundary_pieces(topo, *fid)? as i64 - 1;
-        }
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
-    let euler = (v as i64) - (e as i64) + (f as i64);
-    // Adjusted Euler: subtract inner loops to get the standard characteristic.
-    let adjusted_euler = euler - total_inner_loops;
     let edge_map = explorer::edge_to_face_map(topo, solid)?;
     let piece = connected_pieces(&faces, &edge_map);
-    #[allow(clippy::cast_possible_wrap)]
-    let pieces = piece.iter().enumerate().filter(|&(i, &p)| i == p).count() as i64;
-    let fits = |chi: i64| {
-        let genus_times_2 = 2 * pieces - chi;
-        genus_times_2 >= 0 && genus_times_2 % 2 == 0
-    };
-    // A boundary that touches itself at a vertex (a ring cut where its two
-    // ends meet at a point, two pieces sharing a corner) fits once that
-    // vertex is counted once per sheet of faces meeting there, its face's
-    // wires counted apart. One that touches itself along an edge, two of its
-    // edges sharing a stretch, does not.
-    let fits_by_sheets = || -> Result<bool, crate::OperationsError> {
-        let fans = extra_vertex_fans(topo, &faces)?;
-        let wires: i64 = faces
-            .iter()
-            .map(|&fid| topo.face(fid).map(|f| f.inner_wires().len()))
-            .sum::<Result<usize, _>>()?
-            .try_into()
-            .unwrap_or(i64::MAX);
-        Ok(fans > 0 && fits(euler + fans - wires) && !edges_lie_on_each_other(topo, &faces)?)
-    };
-    if !fits(adjusted_euler) && !fits_by_sheets()? {
+    if let Some(description) = euler_misfit(topo, &faces, &piece)? {
         issues.push(ValidationIssue {
             severity: Severity::Error,
-            description: format!(
-                "Euler characteristic V-E+F = {euler} is invalid \
-                 (expected V-E+F = 2(S-g)+L for a genus g >= 0, with S={pieces} \
-                 pieces and L={total_inner_loops} inner loops, got V={v}, E={e}, F={f})"
-            ),
+            description,
         });
     }
-    if pieces > 1 {
+    if piece.iter().enumerate().filter(|&(i, &p)| i == p).count() > 1 {
         issues.extend(piece_issues(topo, &faces, &piece)?);
     }
     let mut boundary_edges = 0;
@@ -969,8 +1020,10 @@ pub fn validate_solid_with_options(
         }
     }
 
+    issues.extend(edge_ends_issues(topo, &all_edges, scale)?);
     issues.extend(wires_apart_issues(topo, &faces, scale)?);
     issues.extend(faces_overlap_issues(topo, solid, scale)?);
+    issues.extend(pcurve_issues(topo, solid, &faces, scale)?);
 
     {
         let mut face_counts = std::collections::HashMap::new();
@@ -1049,15 +1102,111 @@ pub fn validate_solid_with_options(
     Ok(ValidationReport { issues })
 }
 
-/// An error for each face with a wire that crosses itself, with a hole that
-/// crosses its outline or another hole, or on a plane with a hole outside
-/// the outline or inside another hole.
+/// A report of the solid's malformed curves, surfaces and pcurves as errors,
+/// if it holds any (see `brepkit_check::validate::check_geometry_well_formed`).
+/// Every other check reads them, so the solid is reported on these alone.
+fn malformed_geometry_report(
+    topo: &Topology,
+    solid: SolidId,
+) -> Result<Option<ValidationReport>, crate::OperationsError> {
+    use brepkit_check::validate::EntityRef;
+    let faces = explorer::solid_faces(topo, solid)?;
+    let found = brepkit_check::validate::check_geometry_well_formed(topo, &faces).map_err(|e| {
+        crate::OperationsError::InvalidInput {
+            reason: e.to_string(),
+        }
+    })?;
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let issues = found
+        .into_iter()
+        .map(|issue| ValidationIssue {
+            severity: Severity::Error,
+            description: match issue.entity {
+                EntityRef::Edge(e) => format!("edge {}: {}", e.index(), issue.description),
+                EntityRef::Face(f) => format!("face {}: {}", f.index(), issue.description),
+                _ => issue.description,
+            },
+        })
+        .collect();
+    Ok(Some(ValidationReport { issues }))
+}
+
+/// How far a vertex may lie from its edge's curve and still be read on it:
+/// `EdgeCurve::domain_with_endpoints` reads a B-spline edge's span from
+/// vertices this near its curve. Booleans fit their section curves and
+/// leave the vertices they share up to the fit off them, with no tolerance
+/// raised to cover it.
+const WELD_BAND: f64 = 1e-5;
+
+/// An error for each end of an edge whose curve misses its vertex. Read at
+/// the end of the edge's span that the vertex bounds, the curve lies farther
+/// from the vertex than the vertex's tolerance, the linear tolerance and the
+/// edge's own tolerance together, and [`WELD_BAND`], whichever is largest,
+/// times `scale`. A closed edge's one vertex must lie on its curve. A curve
+/// that is not well formed is an error and is not read.
+fn edge_ends_issues(
+    topo: &Topology,
+    edges: &[brepkit_topology::edge::EdgeId],
+    scale: f64,
+) -> Result<Vec<ValidationIssue>, crate::OperationsError> {
+    let linear = Tolerance::new().linear;
+    let mut issues = Vec::new();
+    for &eid in edges {
+        let edge = topo.edge(eid)?;
+        if !edge.curve().is_well_formed() {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                description: format!(
+                    "edge {}: its curve is malformed, so it is not read",
+                    eid.index()
+                ),
+            });
+            continue;
+        }
+        let ends = if edge.start() == edge.end() {
+            vec![(edge.start(), "one")]
+        } else {
+            vec![(edge.start(), "start"), (edge.end(), "end")]
+        };
+        for (vid, which) in ends {
+            let tolerance = topo
+                .vertex(vid)?
+                .tolerance()
+                .max(linear + edge.tolerance().unwrap_or(0.0))
+                .max(WELD_BAND)
+                * scale;
+            let found = brepkit_check::validate::check_vertex_on_curve(topo, vid, eid, tolerance)
+                .map_err(|e| crate::OperationsError::InvalidInput {
+                reason: e.to_string(),
+            })?;
+            issues.extend(found.into_iter().map(|issue| ValidationIssue {
+                severity: Severity::Error,
+                description: format!(
+                    "edge {}: its curve misses its {which} vertex {}: {}",
+                    eid.index(),
+                    vid.index(),
+                    issue.description
+                ),
+            }));
+        }
+    }
+    Ok(issues)
+}
+
+/// An error for each face with a wire that crosses itself or runs round its
+/// surface more than once, with a hole that crosses its outline or another
+/// hole, or on a plane with a hole outside the outline or inside another
+/// hole.
 fn wires_apart_issues(
     topo: &Topology,
     faces: &[brepkit_topology::face::FaceId],
     scale: f64,
 ) -> Result<Vec<ValidationIssue>, crate::OperationsError> {
-    use brepkit_check::validate::face_wires::{check_face_wires_apart, check_face_wires_simple};
+    use brepkit_check::validate::face_wires::{
+        check_face_wire_turns, check_face_wires_apart, check_face_wires_simple,
+    };
     let mut issues = Vec::new();
     for &fid in faces {
         let read = |found: Result<Vec<_>, brepkit_check::CheckError>| {
@@ -1067,6 +1216,7 @@ fn wires_apart_issues(
         };
         let mut found = read(check_face_wires_simple(topo, fid, 1e-6 * scale))?;
         found.extend(read(check_face_wires_apart(topo, fid, 1e-6 * scale))?);
+        found.extend(read(check_face_wire_turns(topo, fid))?);
         for issue in found {
             issues.push(ValidationIssue {
                 severity: Severity::Error,
@@ -1077,18 +1227,91 @@ fn wires_apart_issues(
     Ok(issues)
 }
 
-/// An error for each pair of plane faces that lie on one plane and cover the
-/// same area.
+/// An error for each pcurve of an edge on a curved face that does not follow
+/// the edge.
+///
+/// A pcurve read at a fraction of its span, through its face's surface,
+/// gives its edge's point at that fraction of the edge's span. It is read at
+/// eleven fractions, and each reading that lies farther than the tolerance
+/// from its point of the edge is a fault: a hundred times the fit the blend
+/// engine builds a pcurve to (`1e-7` of the solid's size), and not less than
+/// `1e-4`, each times `scale`. A pcurve that passes is not proven to follow
+/// its edge between its readings. A plane face's pcurves are not read: a
+/// plane has no parameters of its own.
+fn pcurve_issues(
+    topo: &Topology,
+    solid: SolidId,
+    faces: &[brepkit_topology::face::FaceId],
+    scale: f64,
+) -> Result<Vec<ValidationIssue>, crate::OperationsError> {
+    let mut issues = Vec::new();
+    let mut tolerance = None;
+    let mut read = std::collections::HashSet::new();
+    for &fid in faces {
+        let face = topo.face(fid)?;
+        if face.surface().is_planar() || topo.pcurves().pcurves_for_face(fid).is_empty() {
+            continue;
+        }
+        let tolerance = if let Some(t) = tolerance {
+            t
+        } else {
+            let size = crate::measure::solid_bounding_box(topo, solid)
+                .map_or(0.0, |aabb| (aabb.max - aabb.min).length());
+            *tolerance.insert(1e-5_f64.madd(size, 1e-5).max(1e-4) * scale)
+        };
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(wid)?.edges() {
+                if !read.insert((oe.edge(), fid)) {
+                    continue;
+                }
+                let found = brepkit_check::validate::check_edge_same_parameter(
+                    topo,
+                    oe.edge(),
+                    fid,
+                    tolerance,
+                )
+                .map_err(|e| crate::OperationsError::InvalidInput {
+                    reason: e.to_string(),
+                })?;
+                issues.extend(found.into_iter().map(|issue| ValidationIssue {
+                    severity: Severity::Error,
+                    description: format!(
+                        "the pcurve of edge {} on face {}: {}",
+                        oe.edge().index(),
+                        fid.index(),
+                        issue.description
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(issues)
+}
+
+/// An error for each pair of faces that lie on one plane, sphere, cylinder,
+/// cone or torus and cover the same area.
 fn faces_overlap_issues(
     topo: &Topology,
     solid: SolidId,
     scale: f64,
 ) -> Result<Vec<ValidationIssue>, crate::OperationsError> {
-    let found =
-        brepkit_check::validate::face_overlap::check_faces_overlap(topo, solid, 1e-6 * scale)
-            .map_err(|e| crate::OperationsError::InvalidInput {
-                reason: e.to_string(),
-            })?;
+    let read = |found: Result<Vec<_>, brepkit_check::CheckError>| {
+        found.map_err(|e| crate::OperationsError::InvalidInput {
+            reason: e.to_string(),
+        })
+    };
+    let mut found = read(brepkit_check::validate::face_overlap::check_faces_overlap(
+        topo,
+        solid,
+        1e-6 * scale,
+    ))?;
+    found.extend(read(
+        brepkit_check::validate::curved_overlap::check_curved_faces_overlap(
+            topo,
+            solid,
+            1e-6 * scale,
+        ),
+    )?);
     Ok(found
         .into_iter()
         .map(|issue| ValidationIssue {
@@ -1164,6 +1387,9 @@ pub fn validate_solid_relaxed_with_options(
     solid: SolidId,
     options: &ValidationOptions,
 ) -> Result<ValidationReport, crate::OperationsError> {
+    if let Some(report) = malformed_geometry_report(topo, solid)? {
+        return Ok(report);
+    }
     let mut issues = Vec::new();
     let tol = Tolerance::new();
     // Clamp to [0.1, 1000]: below 0.1 risks false positives on exact

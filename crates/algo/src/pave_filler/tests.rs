@@ -2594,3 +2594,1009 @@ fn a_rim_section_divides_at_the_vertex_a_rim_keeps_across_its_wrap() {
         "the section's cut {cut:?} is not a vertex of the rim's pieces {rim_vertices:?}"
     );
 }
+
+/// Three solids' sections that cross on one face are cut at one shared
+/// vertex, and a piece of a section that also splits a third face (an arc a
+/// ball's two halves share with a box's face) splits that face as well.
+#[test]
+fn a_triple_point_cuts_each_section_and_keeps_its_extra_faces() {
+    use brepkit_topology::explorer::solid_faces;
+
+    use crate::ds::{Interference, IntersectionCurveDS, Pave, PaveBlock};
+
+    let mut topo = Topology::new();
+    let a = make_box(&mut topo, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = make_box(&mut topo, [0.2, 0.4, 0.5], [0.8, 0.6, 1.5]);
+    let c = make_box(&mut topo, [0.4, 0.2, 0.5], [0.6, 0.8, 1.5]);
+    let face = |solid| solid_faces(&topo, solid).unwrap();
+    let (fa, fb, fc) = (face(a)[0], face(b)[0], face(c)[0]);
+    let also = face(a)[1];
+
+    // Two lines on `fa`, from its pairs with `fb` and `fc`, crossing at
+    // (0.5, 0.5, 1).
+    let mut arena = GfaArena::new();
+    let mut section = |topo: &mut Topology, other, from: Point3, to: Point3| {
+        let (v0, v1) = (
+            topo.add_vertex(Vertex::new(from, 1e-7)),
+            topo.add_vertex(Vertex::new(to, 1e-7)),
+        );
+        let edge = topo.add_edge(Edge::new(v0, v1, EdgeCurve::Line));
+        let length = (to - from).length();
+        let pb = arena.pave_blocks.alloc(PaveBlock::new(
+            edge,
+            Pave::new(v0, 0.0),
+            Pave::new(v1, length),
+        ));
+        let index = arena.curves.len();
+        arena.curves.push(IntersectionCurveDS {
+            curve: EdgeCurve::Line,
+            face_a: fa,
+            face_b: other,
+            bbox: brepkit_math::aabb::Aabb3::from_points([from, to]),
+            pave_blocks: vec![pb],
+            t_range: (0.0, length),
+        });
+        arena.interference.ff.push(Interference::FF {
+            f1: fa,
+            f2: other,
+            curve_index: index,
+        });
+        index
+    };
+    let first = section(
+        &mut topo,
+        fb,
+        Point3::new(0.2, 0.5, 1.0),
+        Point3::new(0.8, 0.5, 1.0),
+    );
+    section(
+        &mut topo,
+        fc,
+        Point3::new(0.5, 0.2, 1.0),
+        Point3::new(0.5, 0.8, 1.0),
+    );
+    arena.curve_extra_faces.insert(first, vec![also]);
+
+    super::split_sections_at_triple_points(
+        &mut topo,
+        &[a, b, c],
+        brepkit_math::tolerance::Tolerance::new(),
+        &mut arena,
+    )
+    .unwrap();
+
+    assert_eq!(arena.curves.len(), 4, "each section is cut once");
+    let ends = |index: usize| {
+        let pb = arena
+            .pave_blocks
+            .get(arena.curves[index].pave_blocks[0])
+            .unwrap();
+        [pb.start.vertex, pb.end.vertex]
+    };
+    let at_cross = |index: usize| {
+        ends(index).into_iter().find(|&v| {
+            (topo.vertex(v).unwrap().point() - Point3::new(0.5, 0.5, 1.0)).length() < 1e-9
+        })
+    };
+    let cuts: Vec<_> = (0..4).map(|i| at_cross(i).unwrap()).collect();
+    assert!(
+        cuts.iter().all(|&v| v == cuts[0]),
+        "one vertex at the crossing: {cuts:?}"
+    );
+    for index in 0..4 {
+        let pair = (arena.curves[index].face_a, arena.curves[index].face_b);
+        let extra = arena.curve_extra_faces.get(&index);
+        if pair == (fa, fb) {
+            assert_eq!(
+                extra,
+                Some(&vec![also]),
+                "piece {index} of the first section"
+            );
+        } else {
+            assert_eq!(extra, None, "piece {index} of the second section");
+        }
+    }
+}
+
+/// A section from face `fa`'s pair with `fb` along `curve` over `t_range`,
+/// between new vertices at its ends (one vertex for a closed loop).
+fn push_section(
+    topo: &mut Topology,
+    arena: &mut GfaArena,
+    (fa, fb): (
+        brepkit_topology::face::FaceId,
+        brepkit_topology::face::FaceId,
+    ),
+    curve: EdgeCurve,
+    t_range: (f64, f64),
+    (from, to): (Point3, Point3),
+) -> usize {
+    use crate::ds::{Interference, IntersectionCurveDS, Pave, PaveBlock};
+
+    let v0 = topo.add_vertex(Vertex::new(from, 1e-7));
+    let v1 = if (to - from).length() < 1e-12 {
+        v0
+    } else {
+        topo.add_vertex(Vertex::new(to, 1e-7))
+    };
+    let edge = topo.add_edge(Edge::new(v0, v1, curve.clone()));
+    let pb = arena.pave_blocks.alloc(PaveBlock::new(
+        edge,
+        Pave::new(v0, t_range.0),
+        Pave::new(v1, t_range.1),
+    ));
+    let index = arena.curves.len();
+    arena.curves.push(IntersectionCurveDS {
+        curve,
+        face_a: fa,
+        face_b: fb,
+        bbox: brepkit_math::aabb::Aabb3::from_points([from, to]),
+        pave_blocks: vec![pb],
+        t_range,
+    });
+    arena.interference.ff.push(Interference::FF {
+        f1: fa,
+        f2: fb,
+        curve_index: index,
+    });
+    index
+}
+
+/// Two arcs about one centre, 3e-5 apart in radius, never meet, though
+/// their sample chords cross: no section is cut between them.
+#[test]
+fn concentric_arcs_from_two_solids_are_not_cut() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_topology::explorer::solid_faces;
+
+    let mut topo = Topology::new();
+    let a = make_box(&mut topo, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = make_box(&mut topo, [0.2, 0.4, 0.5], [0.8, 0.6, 1.5]);
+    let c = make_box(&mut topo, [0.4, 0.2, 0.5], [0.6, 0.8, 1.5]);
+    let face = |solid| solid_faces(&topo, solid).unwrap()[0];
+    let (fa, fb, fc) = (face(a), face(b), face(c));
+    let centre = Point3::new(0.5, 0.5, 1.0);
+    let mut arena = GfaArena::new();
+    for (other, radius, t0) in [(fb, 0.3, 0.0), (fc, 0.300_03, 0.05)] {
+        let circle = Circle3D::new(centre, Vec3::new(0.0, 0.0, 1.0), radius).unwrap();
+        let t1 = t0 + 3.0;
+        push_section(
+            &mut topo,
+            &mut arena,
+            (fa, other),
+            EdgeCurve::Circle(circle.clone()),
+            (t0, t1),
+            (circle.evaluate(t0), circle.evaluate(t1)),
+        );
+    }
+
+    super::split_sections_at_triple_points(
+        &mut topo,
+        &[a, b, c],
+        brepkit_math::tolerance::Tolerance::new(),
+        &mut arena,
+    )
+    .unwrap();
+
+    assert_eq!(
+        arena.curves.len(),
+        2,
+        "an arc was cut where nothing meets it"
+    );
+}
+
+/// Two whole circles of one radius on a face, from two other solids, cross
+/// at two points: each loop is cut there, at vertices both share, into
+/// pieces each less than a half turn.
+#[test]
+fn crossing_closed_sections_from_two_solids_are_cut_where_they_cross() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_topology::explorer::solid_faces;
+
+    let mut topo = Topology::new();
+    let a = make_box(&mut topo, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = make_box(&mut topo, [0.2, 0.4, 0.5], [0.8, 0.6, 1.5]);
+    let c = make_box(&mut topo, [0.4, 0.2, 0.5], [0.6, 0.8, 1.5]);
+    let face = |solid| solid_faces(&topo, solid).unwrap()[0];
+    let (fa, fb, fc) = (face(a), face(b), face(c));
+    let mut arena = GfaArena::new();
+    for (other, x) in [(fb, 0.4), (fc, 0.6)] {
+        let circle =
+            Circle3D::new(Point3::new(x, 0.5, 1.0), Vec3::new(0.0, 0.0, 1.0), 0.2).unwrap();
+        let seam = circle.evaluate(0.0);
+        push_section(
+            &mut topo,
+            &mut arena,
+            (fa, other),
+            EdgeCurve::Circle(circle),
+            (0.0, std::f64::consts::TAU),
+            (seam, seam),
+        );
+    }
+
+    super::split_sections_at_triple_points(
+        &mut topo,
+        &[a, b, c],
+        brepkit_math::tolerance::Tolerance::new(),
+        &mut arena,
+    )
+    .unwrap();
+
+    // The circles cross at (0.5, 0.5 +- sqrt(0.03), 1).
+    let h = 0.03_f64.sqrt();
+    let crossings = [
+        Point3::new(0.5, 0.5 + h, 1.0),
+        Point3::new(0.5, 0.5 - h, 1.0),
+    ];
+    let mut at_crossing: Vec<Vec<brepkit_topology::vertex::VertexId>> = vec![Vec::new(); 2];
+    let mut pieces = 0;
+    for curve in &arena.curves {
+        pieces += 1;
+        let pb = arena.pave_blocks.get(curve.pave_blocks[0]).unwrap();
+        let span = (pb.end.parameter - pb.start.parameter).abs();
+        assert!(span < std::f64::consts::PI, "a piece spans {span}");
+        for v in [pb.start.vertex, pb.end.vertex] {
+            let p = topo.vertex(v).unwrap().point();
+            for (k, q) in crossings.iter().enumerate() {
+                if (p - *q).length() < 1e-9 && !at_crossing[k].contains(&v) {
+                    at_crossing[k].push(v);
+                }
+            }
+        }
+    }
+    assert!(pieces >= 6, "the loops were cut into {pieces} pieces");
+    for (k, vertices) in at_crossing.iter().enumerate() {
+        assert_eq!(vertices.len(), 1, "crossing {k}: {vertices:?}");
+    }
+}
+
+/// Each section's start and end vertices, in the arena's order.
+fn section_vertices(arena: &GfaArena) -> Vec<[brepkit_topology::vertex::VertexId; 2]> {
+    arena
+        .curves
+        .iter()
+        .map(|curve| {
+            let pb = arena.pave_blocks.get(curve.pave_blocks[0]).unwrap();
+            [pb.start.vertex, pb.end.vertex]
+        })
+        .collect()
+}
+
+/// Two whole circles cross at the first circle's seam and at one point more.
+/// The first is cut at the second point only; the second is cut at both, at
+/// the first circle's seam vertex where they cross there.
+#[test]
+fn a_loop_crossing_another_at_its_seam_is_cut_at_that_vertex() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_topology::explorer::solid_faces;
+
+    let mut topo = Topology::new();
+    let a = make_box(&mut topo, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = make_box(&mut topo, [0.2, 0.4, 0.5], [0.8, 0.6, 1.5]);
+    let c = make_box(&mut topo, [0.4, 0.2, 0.5], [0.6, 0.8, 1.5]);
+    let face = |solid| solid_faces(&topo, solid).unwrap()[0];
+    let (fa, fb, fc) = (face(a), face(b), face(c));
+    let normal = Vec3::new(0.0, 0.0, 1.0);
+    // The circles cross at (0.6, 0.5, 1), the first one's seam, and at
+    // (0.4, 0.3, 1).
+    let first = Circle3D::new(Point3::new(0.4, 0.5, 1.0), normal, 0.2).unwrap();
+    let second = Circle3D::new(Point3::new(0.6, 0.3, 1.0), normal, 0.2).unwrap();
+    let (seam_point, other) = (Point3::new(0.6, 0.5, 1.0), Point3::new(0.4, 0.3, 1.0));
+    let mut arena = GfaArena::new();
+    for (partner, circle, seam) in [
+        (fb, &first, seam_point),
+        (fc, &second, Point3::new(0.6, 0.1, 1.0)),
+    ] {
+        let t0 = circle.project(seam);
+        push_section(
+            &mut topo,
+            &mut arena,
+            (fa, partner),
+            EdgeCurve::Circle(circle.clone()),
+            (t0, t0 + std::f64::consts::TAU),
+            (circle.evaluate(t0), circle.evaluate(t0)),
+        );
+    }
+    let seam_vertex = arena
+        .pave_blocks
+        .get(arena.curves[0].pave_blocks[0])
+        .unwrap()
+        .start
+        .vertex;
+
+    super::split_sections_at_triple_points(
+        &mut topo,
+        &[a, b, c],
+        brepkit_math::tolerance::Tolerance::new(),
+        &mut arena,
+    )
+    .unwrap();
+
+    let at = |v: brepkit_topology::vertex::VertexId, q: Point3| {
+        (topo.vertex(v).unwrap().point() - q).length() < 1e-9
+    };
+    let ends = section_vertices(&arena);
+    let mut at_other = Vec::new();
+    let mut seam_ends = 0;
+    for (curve, pair) in arena.curves.iter().zip(&ends) {
+        for &v in pair {
+            if at(v, other) && !at_other.contains(&v) {
+                at_other.push(v);
+            }
+            if curve.face_b == fc && at(v, seam_point) {
+                assert_eq!(v, seam_vertex, "the second circle is cut at a new vertex");
+                seam_ends += 1;
+            }
+        }
+    }
+    assert_eq!(
+        at_other.len(),
+        1,
+        "one vertex where both are cut: {at_other:?}"
+    );
+    assert_eq!(
+        seam_ends, 2,
+        "the second circle is not cut at the first's seam"
+    );
+}
+
+/// An open arc ends on another arc inside its span: the second arc is cut
+/// there at the first one's end vertex, and the first is left whole.
+#[test]
+fn an_arc_ending_on_another_cuts_it_at_its_end() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_topology::explorer::solid_faces;
+
+    let mut topo = Topology::new();
+    let a = make_box(&mut topo, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = make_box(&mut topo, [0.2, 0.4, 0.5], [0.8, 0.6, 1.5]);
+    let c = make_box(&mut topo, [0.4, 0.2, 0.5], [0.6, 0.8, 1.5]);
+    let face = |solid| solid_faces(&topo, solid).unwrap()[0];
+    let (fa, fb, fc) = (face(a), face(b), face(c));
+    let normal = Vec3::new(0.0, 0.0, 1.0);
+    let meet = Point3::new(0.5, 0.7, 1.0);
+    // The crossed arc runs a radian either side of `meet`; the other comes up
+    // to it from outside its circle and ends at `meet`, at an angle to it.
+    let crossed = Circle3D::new(Point3::new(0.5, 0.5, 1.0), normal, 0.2).unwrap();
+    let ending_centre = Point3::new(0.7, 0.9, 1.0);
+    let ending = Circle3D::new(ending_centre, normal, (meet - ending_centre).length()).unwrap();
+    let mut arena = GfaArena::new();
+    let tm = crossed.project(meet);
+    push_section(
+        &mut topo,
+        &mut arena,
+        (fa, fb),
+        EdgeCurve::Circle(crossed.clone()),
+        (tm - 1.0, tm + 1.0),
+        (crossed.evaluate(tm - 1.0), crossed.evaluate(tm + 1.0)),
+    );
+    let te = ending.project(meet);
+    let outside = |t: f64| (ending.evaluate(t) - crossed.center()).length() > crossed.radius();
+    let t0 = if outside(te - 0.5) {
+        te - 1.0
+    } else {
+        te + 1.0
+    };
+    let (lo, hi) = (t0.min(te), t0.max(te));
+    push_section(
+        &mut topo,
+        &mut arena,
+        (fa, fc),
+        EdgeCurve::Circle(ending.clone()),
+        (lo, hi),
+        (ending.evaluate(lo), ending.evaluate(hi)),
+    );
+    let end_vertex = section_vertices(&arena)[1]
+        .into_iter()
+        .find(|&v| (topo.vertex(v).unwrap().point() - meet).length() < 1e-9)
+        .unwrap();
+
+    super::split_sections_at_triple_points(
+        &mut topo,
+        &[a, b, c],
+        brepkit_math::tolerance::Tolerance::new(),
+        &mut arena,
+    )
+    .unwrap();
+
+    let pieces: Vec<_> = arena
+        .curves
+        .iter()
+        .zip(section_vertices(&arena))
+        .filter(|(curve, _)| curve.face_b == fb)
+        .map(|(_, ends)| ends)
+        .collect();
+    assert_eq!(pieces.len(), 2, "the crossed arc is not cut once");
+    assert_eq!(pieces[0][1], end_vertex);
+    assert_eq!(pieces[1][0], end_vertex);
+    let whole = arena
+        .curves
+        .iter()
+        .filter(|curve| curve.face_b == fc)
+        .count();
+    assert_eq!(whole, 1, "the arc that ends there is cut");
+}
+
+/// A section crossing another 9e-6 from that one's end is cut at the
+/// crossing, not at the end: the end lies 9e-6 off the crossing section,
+/// well past the tolerance. Both sections are cut at one vertex on both.
+#[test]
+fn a_crossing_near_a_sections_end_keeps_its_own_vertex() {
+    use brepkit_topology::explorer::solid_faces;
+
+    let mut topo = Topology::new();
+    let a = make_box(&mut topo, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = make_box(&mut topo, [0.2, 0.4, 0.5], [0.8, 0.6, 1.5]);
+    let c = make_box(&mut topo, [0.4, 0.2, 0.5], [0.6, 0.8, 1.5]);
+    let face = |solid| solid_faces(&topo, solid).unwrap()[0];
+    let (fa, fb, fc) = (face(a), face(b), face(c));
+    let x = 0.2 + 9e-6;
+    let mut arena = GfaArena::new();
+    for (other, from, to) in [
+        (fb, Point3::new(0.2, 0.5, 1.0), Point3::new(0.8, 0.5, 1.0)),
+        (fc, Point3::new(x, 0.3, 1.0), Point3::new(x, 0.7, 1.0)),
+    ] {
+        push_section(
+            &mut topo,
+            &mut arena,
+            (fa, other),
+            EdgeCurve::Line,
+            (0.0, (to - from).length()),
+            (from, to),
+        );
+    }
+
+    super::split_sections_at_triple_points(
+        &mut topo,
+        &[a, b, c],
+        brepkit_math::tolerance::Tolerance::new(),
+        &mut arena,
+    )
+    .unwrap();
+
+    let crossing = Point3::new(x, 0.5, 1.0);
+    let mut cut_at = Vec::new();
+    for (curve, ends) in arena.curves.iter().zip(section_vertices(&arena)) {
+        for v in ends {
+            if (topo.vertex(v).unwrap().point() - crossing).length() < 1e-7 {
+                cut_at.push((curve.face_b, v));
+            }
+        }
+    }
+    let on = |face| cut_at.iter().filter(|&&(f, _)| f == face).count();
+    assert_eq!(
+        on(fb),
+        2,
+        "the first section is not cut at the crossing: {cut_at:?}"
+    );
+    assert_eq!(
+        on(fc),
+        2,
+        "the second section is not cut at the crossing: {cut_at:?}"
+    );
+    assert!(
+        cut_at.iter().all(|&(_, v)| v == cut_at[0].1),
+        "the cuts do not share one vertex: {cut_at:?}"
+    );
+}
+
+/// A wall face holding `edges` in one open wire, for the faces of a section
+/// between two curved faces; with no edges, a stub edge of its own far off.
+fn wall_face(
+    topo: &mut Topology,
+    edges: &[brepkit_topology::edge::EdgeId],
+) -> brepkit_topology::face::FaceId {
+    let stub;
+    let edges = if edges.is_empty() {
+        let (a, b) = (
+            topo.add_vertex(Vertex::new(Point3::new(50.0, 50.0, 0.0), 1e-7)),
+            topo.add_vertex(Vertex::new(Point3::new(50.0, 51.0, 0.0), 1e-7)),
+        );
+        stub = [topo.add_edge(Edge::new(a, b, EdgeCurve::Line))];
+        &stub[..]
+    } else {
+        edges
+    };
+    let wire = topo.add_wire(
+        Wire::new(
+            edges.iter().map(|&e| OrientedEdge::new(e, true)).collect(),
+            false,
+        )
+        .unwrap(),
+    );
+    let cylinder = brepkit_math::surfaces::CylindricalSurface::new(
+        Point3::new(0.0, 0.0, -20.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        3.0,
+    )
+    .unwrap();
+    topo.add_face(Face::new(wire, vec![], FaceSurface::Cylinder(cylinder)))
+}
+
+/// The section of `face_a` and `face_b` along `x` from `(0, 0, 0)` to
+/// `(10, 0, 0)`, its paves reading 0 to 1.
+fn section_along_x(
+    topo: &mut Topology,
+    arena: &mut GfaArena,
+    face_a: brepkit_topology::face::FaceId,
+    face_b: brepkit_topology::face::FaceId,
+) -> usize {
+    use crate::ds::{IntersectionCurveDS, Pave, PaveBlock};
+    let (start, end) = (Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+    let (a, b) = (
+        topo.add_vertex(Vertex::new(start, 1e-7)),
+        topo.add_vertex(Vertex::new(end, 1e-7)),
+    );
+    let edge = topo.add_edge(Edge::new(a, b, EdgeCurve::Line));
+    let pb = arena
+        .pave_blocks
+        .alloc(PaveBlock::new(edge, Pave::new(a, 0.0), Pave::new(b, 1.0)));
+    arena.curves.push(IntersectionCurveDS {
+        curve: EdgeCurve::Line,
+        face_a,
+        face_b,
+        bbox: brepkit_math::aabb::Aabb3::from_points([start, end]),
+        pave_blocks: vec![pb],
+        t_range: (0.0, 1.0),
+    });
+    arena.curves.len() - 1
+}
+
+/// The vertices a section's pieces run between, in order.
+fn section_piece_vertices(
+    arena: &GfaArena,
+    faces: (usize, usize),
+) -> Vec<Vec<brepkit_topology::vertex::VertexId>> {
+    arena
+        .curves
+        .iter()
+        .filter(|c| (c.face_a.index(), c.face_b.index()) == faces)
+        .flat_map(|c| c.pave_blocks.iter())
+        .filter_map(|&id| arena.pave_blocks.get(id))
+        .map(|piece| vec![piece.start.vertex, piece.end.vertex])
+        .collect()
+}
+
+/// One edge of a wall crosses two faces of the other solid where they meet:
+/// the two crossings, 2e-8 apart, are one place on the edge, and the edge
+/// keeps the first along it. The section of the wall and the second face
+/// is cut at that vertex, not at its own crossing's.
+#[test]
+fn a_section_is_cut_at_the_vertex_its_boundary_edge_keeps() {
+    use crate::ds::{Interference, Pave, PaveBlock};
+    let mut topo = Topology::new();
+    let mut arena = GfaArena::new();
+    let (e0, e1) = (
+        topo.add_vertex(Vertex::new(Point3::new(5.0, -5.0, 0.0), 1e-7)),
+        topo.add_vertex(Vertex::new(Point3::new(5.0, 5.0, 0.0), 1e-7)),
+    );
+    let edge = topo.add_edge(Edge::new(e0, e1, EdgeCurve::Line));
+    let wall = wall_face(&mut topo, &[edge]);
+    let first_other = wall_face(&mut topo, &[]);
+    let second_other = wall_face(&mut topo, &[]);
+    let kept = topo.add_vertex(Vertex::new(Point3::new(5.0, 0.0, 0.0), 1e-7));
+    let later = topo.add_vertex(Vertex::new(Point3::new(5.0, 2e-8, 0.0), 1e-7));
+    let mut block = PaveBlock::new(edge, Pave::new(e0, 0.0), Pave::new(e1, 1.0));
+    block.extra_paves.push(Pave::new(later, 0.5 + 2e-9));
+    block.extra_paves.push(Pave::new(kept, 0.5));
+    let block = arena.pave_blocks.alloc(block);
+    arena.edge_pave_blocks.insert(edge, vec![block]);
+    for (face, vertex) in [(first_other, kept), (second_other, later)] {
+        arena.interference.ef.push(Interference::EF {
+            edge,
+            face,
+            new_vertex: Some(vertex),
+            parameter: None,
+            run: None,
+        });
+    }
+    section_along_x(&mut topo, &mut arena, wall, second_other);
+
+    super::split_sections_at_boundary_crossings(
+        &mut topo,
+        brepkit_math::tolerance::Tolerance::new(),
+        &mut arena,
+    )
+    .unwrap();
+    super::make_blocks::perform(&mut topo, &mut arena).unwrap();
+
+    let pieces = section_piece_vertices(&arena, (wall.index(), second_other.index()));
+    assert_eq!(pieces.len(), 2, "{pieces:?}");
+    assert_eq!(
+        pieces[0][1], kept,
+        "the section is cut off the edge's vertex"
+    );
+    let edge_vertices: Vec<_> = arena.edge_pave_blocks[&edge]
+        .iter()
+        .filter_map(|&id| arena.pave_blocks.get(id))
+        .flat_map(|piece| [piece.start.vertex, piece.end.vertex])
+        .collect();
+    assert!(edge_vertices.contains(&pieces[0][1]), "{edge_vertices:?}");
+}
+
+/// Two edges of a wall meet beside a section, and each crosses the other
+/// face 5e-8 from where the other does: one place. The section is cut there
+/// once, and no piece of it is shorter than the linear tolerance.
+#[test]
+fn two_crossings_in_one_place_cut_a_section_once() {
+    use crate::ds::{Interference, Pave, PaveBlock};
+    let mut topo = Topology::new();
+    let mut arena = GfaArena::new();
+    let corner = topo.add_vertex(Vertex::new(Point3::new(5.0, 3.0, 0.0), 1e-7));
+    let ends = [
+        topo.add_vertex(Vertex::new(Point3::new(5.0, -5.0, 0.0), 1e-7)),
+        topo.add_vertex(Vertex::new(Point3::new(5.0 + 5e-8, -5.0, 1.0), 1e-7)),
+    ];
+    let edges = ends.map(|end| topo.add_edge(Edge::new(end, corner, EdgeCurve::Line)));
+    let wall = wall_face(&mut topo, &edges);
+    let other = wall_face(&mut topo, &[]);
+    let crossings = [
+        topo.add_vertex(Vertex::new(Point3::new(5.0, 0.0, 0.0), 1e-7)),
+        topo.add_vertex(Vertex::new(Point3::new(5.0 + 5e-8, 0.0, 0.0), 1e-7)),
+    ];
+    for (k, &edge) in edges.iter().enumerate() {
+        let (s, e) = (topo.edge(edge).unwrap().start(), corner);
+        let mut block = PaveBlock::new(edge, Pave::new(s, 0.0), Pave::new(e, 1.0));
+        block.extra_paves.push(Pave::new(crossings[k], 0.625));
+        let block = arena.pave_blocks.alloc(block);
+        arena.edge_pave_blocks.insert(edge, vec![block]);
+        arena.interference.ef.push(Interference::EF {
+            edge,
+            face: other,
+            new_vertex: Some(crossings[k]),
+            parameter: None,
+            run: None,
+        });
+    }
+    section_along_x(&mut topo, &mut arena, wall, other);
+
+    let tol = brepkit_math::tolerance::Tolerance::new();
+    super::split_sections_at_boundary_crossings(&mut topo, tol, &mut arena).unwrap();
+
+    let pieces = section_piece_vertices(&arena, (wall.index(), other.index()));
+    assert_eq!(pieces.len(), 2, "{pieces:?}");
+    for piece in &pieces {
+        let (p, q) = (
+            topo.vertex(piece[0]).unwrap().point(),
+            topo.vertex(piece[1]).unwrap().point(),
+        );
+        assert!((p - q).length() > tol.linear, "a piece {p:?} to {q:?}");
+    }
+}
+
+/// The common blocks whose pave blocks come from more than one of `edges`,
+/// each as the edges' indices in `edges`, sorted.
+fn common_blocks_across(
+    arena: &GfaArena,
+    edges: &[brepkit_topology::edge::EdgeId],
+) -> Vec<Vec<usize>> {
+    let mut joined = Vec::new();
+    for (_, cb) in arena.common_blocks.iter() {
+        let mut from: Vec<usize> = cb
+            .pave_blocks
+            .iter()
+            .filter_map(|&pb| arena.pave_blocks.get(pb))
+            .filter_map(|pb| edges.iter().position(|&e| e == pb.original_edge))
+            .collect();
+        from.sort_unstable();
+        from.dedup();
+        if from.len() > 1 {
+            joined.push(from);
+        }
+    }
+    joined.sort();
+    joined
+}
+
+/// A planar sheet in `z = 0` bounded by `arc` (an edge from `p` to `q`, used
+/// forward or backward) and the line between `q` and `p`.
+fn sheet_on_arc(
+    topo: &mut Topology,
+    arc: brepkit_topology::edge::EdgeId,
+    forward: bool,
+) -> brepkit_topology::solid::SolidId {
+    let (from, to) = {
+        let e = topo.edge(arc).unwrap();
+        if forward {
+            (e.start(), e.end())
+        } else {
+            (e.end(), e.start())
+        }
+    };
+    let chord = topo.add_edge(Edge::new(to, from, EdgeCurve::Line));
+    let wire = topo.add_wire(
+        Wire::new(
+            vec![
+                OrientedEdge::new(arc, forward),
+                OrientedEdge::new(chord, true),
+            ],
+            true,
+        )
+        .unwrap(),
+    );
+    let face = topo.add_face(Face::new(
+        wire,
+        vec![],
+        FaceSurface::Plane {
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            d: 0.0,
+        },
+    ));
+    let shell = topo.add_shell(Shell::new(vec![face]).unwrap());
+    topo.add_solid(Solid::new(shell, vec![]))
+}
+
+/// An arc of a sixth of a turn and the rest of its circle, with one pair of
+/// ends, the rest stored from the arc's end or from its start about the
+/// reversed normal. As the edges of two sheets, each is paved at its middle
+/// before any block meets another, so no block is common to both. As two
+/// loose tool edges over a plate's top, each stays one block, and the two
+/// blocks stay apart.
+#[test]
+fn an_arc_and_the_rest_of_its_circle_share_no_common_block() {
+    use brepkit_math::curves::Circle3D;
+    use brepkit_math::tolerance::Tolerance;
+    let pi = std::f64::consts::PI;
+    let tol = Tolerance::new();
+    let centre = Point3::new(5.0, 5.0, 0.0);
+    let up = Circle3D::new(centre, Vec3::new(0.0, 0.0, 1.0), 2.0).unwrap();
+    let down = Circle3D::new(centre, Vec3::new(0.0, 0.0, -1.0), 2.0).unwrap();
+    for back in [false, true] {
+        // The arc and the rest, with their own vertices: the edges, and
+        // whether the rest runs from the arc's start.
+        let edges = |topo: &mut Topology| {
+            let mut vertex = |t: f64| topo.add_vertex(Vertex::new(up.evaluate(t), 1e-7));
+            let (p, q, p2, q2) = (
+                vertex(0.2),
+                vertex(0.2 + pi / 3.0),
+                vertex(0.2),
+                vertex(0.2 + pi / 3.0),
+            );
+            let arc = topo.add_edge(Edge::new(p, q, EdgeCurve::Circle(up.clone())));
+            let rest = if back {
+                topo.add_edge(Edge::new(p2, q2, EdgeCurve::Circle(down.clone())))
+            } else {
+                topo.add_edge(Edge::new(q2, p2, EdgeCurve::Circle(up.clone())))
+            };
+            (arc, rest)
+        };
+        let leaves = |arena: &GfaArena, edge| {
+            arena
+                .collect_leaf_pave_blocks(&arena.edge_pave_blocks[&edge])
+                .len()
+        };
+
+        let mut topo = Topology::default();
+        let (arc, rest) = edges(&mut topo);
+        let a = sheet_on_arc(&mut topo, arc, true);
+        let b = sheet_on_arc(&mut topo, rest, !back);
+        let mut arena = GfaArena::new();
+        crate::pave_filler::run_pave_filler(&mut topo, a, b, tol, &mut arena).unwrap();
+        assert_eq!(
+            common_blocks_across(&arena, &[arc, rest]),
+            Vec::<Vec<usize>>::new()
+        );
+        assert_eq!(
+            (leaves(&arena, arc), leaves(&arena, rest)),
+            (2, 2),
+            "sheets"
+        );
+
+        let mut topo = Topology::default();
+        let plate = make_box(&mut topo, [0.0, 0.0, -2.0], [10.0, 10.0, 0.0]);
+        let (arc, rest) = edges(&mut topo);
+        let mut arena = GfaArena::new();
+        crate::pave_filler::run_pave_filler_with_edges(
+            &mut topo,
+            &[plate],
+            &[arc, rest],
+            tol,
+            &mut arena,
+        )
+        .unwrap();
+        assert_eq!(
+            common_blocks_across(&arena, &[arc, rest]),
+            Vec::<Vec<usize>>::new(),
+            "tool edges, the rest about -z: {back}"
+        );
+        assert_eq!((leaves(&arena, arc), leaves(&arena, rest)), (1, 1), "tools");
+    }
+}
+
+/// A bicubic sheet over `[-50, 50]` squared with four knot spans each way,
+/// bent along `z`, moved by `pose`.
+fn bent_sheet(pose: &dyn Fn(Point3) -> Point3) -> brepkit_math::nurbs::surface::NurbsSurface {
+    let knots = vec![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0];
+    let points = (0..7)
+        .map(|i| {
+            (0..7)
+                .map(|j| {
+                    let (x, y) = (
+                        -50.0 + 100.0 * f64::from(i) / 6.0,
+                        -50.0 + 100.0 * f64::from(j) / 6.0,
+                    );
+                    pose(Point3::new(
+                        x,
+                        y,
+                        4.0 * ((x / 30.0).sin() + (y / 20.0).cos()),
+                    ))
+                })
+                .collect()
+        })
+        .collect();
+    brepkit_math::nurbs::surface::NurbsSurface::new(
+        3,
+        3,
+        knots.clone(),
+        knots,
+        points,
+        vec![vec![1.0; 7]; 7],
+    )
+    .unwrap()
+}
+
+/// The curve of `surface` at `at` along `v` (`along_v`) or along `u`.
+fn sheet_iso(
+    surface: &brepkit_math::nurbs::surface::NurbsSurface,
+    at: f64,
+    along_v: bool,
+) -> brepkit_math::nurbs::curve::NurbsCurve {
+    use brepkit_math::nurbs::basis::{basis_funs, find_span};
+    let net = surface.control_points();
+    let (knots, p, count) = if along_v {
+        (surface.knots_u(), surface.degree_u(), net.len())
+    } else {
+        (surface.knots_v(), surface.degree_v(), net[0].len())
+    };
+    let span = find_span(count, p, at, knots);
+    let basis = basis_funs(span, at, p, knots);
+    let length = if along_v { net[0].len() } else { net.len() };
+    let points = (0..length)
+        .map(|k| {
+            let mut sum = Vec3::new(0.0, 0.0, 0.0);
+            for (i, b) in basis.iter().enumerate() {
+                let c = if along_v {
+                    net[span - p + i][k]
+                } else {
+                    net[k][span - p + i]
+                };
+                sum += Vec3::new(c.x(), c.y(), c.z()) * *b;
+            }
+            Point3::new(sum.x(), sum.y(), sum.z())
+        })
+        .collect();
+    let (other, degree) = if along_v {
+        (surface.knots_v(), surface.degree_v())
+    } else {
+        (surface.knots_u(), surface.degree_u())
+    };
+    brepkit_math::nurbs::curve::NurbsCurve::new(degree, other.to_vec(), points, vec![1.0; length])
+        .unwrap()
+}
+
+/// A piece of a large B-spline sheet, a few hundredths of its parameters
+/// each way and bounded by four of the sheet's own curves, is the only face
+/// of one source of a GFA store, beside a box over it. The store proves a
+/// pcurve for each of the piece's edges, and phase EF boxes the piece by
+/// the sheet cut to them: a box that holds every point of the piece and is
+/// less than a tenth the size of the sheet's, where without the pcurves it
+/// takes the whole sheet's. In three poses, one mirrored and moved 1e4.
+#[test]
+fn a_small_piece_of_a_large_nurbs_sheet_is_boxed_to_the_piece() {
+    use brepkit_topology::face::FaceSurface;
+    let tol = brepkit_math::tolerance::Tolerance::new();
+    let turn = |p: Point3| {
+        let (s, c) = 0.7_f64.sin_cos();
+        Point3::new(
+            c * p.x() - s * p.y() + 30.0,
+            s * p.x() + c * p.y() - 12.0,
+            p.z() + 5.0,
+        )
+    };
+    let mirror = |p: Point3| Point3::new(-p.x() + 1.0e4, p.y() - 2.0e4, p.z() + 3.0e3);
+    let poses: [(&str, &dyn Fn(Point3) -> Point3); 3] = [
+        ("upright", &|p| p),
+        ("turned", &turn),
+        ("mirrored", &mirror),
+    ];
+    let ((u0, u1), (v0, v1)) = ((0.40, 0.47), (0.55, 0.61));
+    for (tag, pose) in poses {
+        let sheet = bent_sheet(pose);
+        let mut topo = Topology::new();
+        let corner = |u: f64, v: f64| sheet.evaluate(u, v);
+        let corners = [
+            corner(u0, v0),
+            corner(u1, v0),
+            corner(u1, v1),
+            corner(u0, v1),
+        ];
+        let vertices: Vec<_> = corners
+            .iter()
+            .map(|&p| topo.add_vertex(Vertex::new(p, 1e-7)))
+            .collect();
+        let mut edge = |a: usize, b: usize, curve| {
+            topo.add_edge(Edge::new(
+                vertices[a],
+                vertices[b],
+                EdgeCurve::NurbsCurve(curve),
+            ))
+        };
+        let bottom = edge(0, 1, sheet_iso(&sheet, v0, false));
+        let right = edge(1, 2, sheet_iso(&sheet, u1, true));
+        let top = edge(3, 2, sheet_iso(&sheet, v1, false));
+        let left = edge(0, 3, sheet_iso(&sheet, u0, true));
+        let wire = topo.add_wire(
+            Wire::new(
+                vec![
+                    OrientedEdge::new(bottom, true),
+                    OrientedEdge::new(right, true),
+                    OrientedEdge::new(top, false),
+                    OrientedEdge::new(left, false),
+                ],
+                true,
+            )
+            .unwrap(),
+        );
+        let face = topo.add_face(Face::new(wire, vec![], FaceSurface::Nurbs(sheet.clone())));
+        let shell = topo.add_shell(Shell::new(vec![face]).unwrap());
+        let piece = topo.add_solid(Solid::new(shell, vec![]));
+        let middle = corner(0.435, 0.58);
+        let over = make_box(
+            &mut topo,
+            [middle.x() - 3.0, middle.y() - 3.0, middle.z() - 3.0],
+            [middle.x() + 3.0, middle.y() + 3.0, middle.z() + 3.0],
+        );
+
+        let boxed = |with_pcurves: bool| {
+            let mut store = crate::ds::GfaShapeStore::new(&topo, piece, over).unwrap();
+            if with_pcurves {
+                crate::ds::shape_store::prove_source_pcurves(
+                    &mut store.topo,
+                    &[store.solid_a, store.solid_b],
+                    &[],
+                    tol,
+                )
+                .unwrap();
+            }
+            let fid =
+                brepkit_topology::explorer::solid_faces(&store.topo, store.solid_a).unwrap()[0];
+            let face = store.topo.face(fid).unwrap();
+            let FaceSurface::Nurbs(surface) = face.surface() else {
+                unreachable!()
+            };
+            let held =
+                super::helpers::nurbs_face_box(&store.topo, fid, surface, tol, 1e-6).unwrap();
+            let carried = brepkit_topology::explorer::face_edges(&store.topo, fid)
+                .unwrap()
+                .iter()
+                .filter(|&&e| store.topo.pcurves().contains(e, fid))
+                .count();
+            (held, carried)
+        };
+        let whole = sheet.aabb();
+        let size = |b: brepkit_math::aabb::Aabb3| (b.max - b.min).length();
+        let (bare, none) = boxed(false);
+        assert_eq!(none, 0, "{tag}");
+        assert!(
+            size(bare) >= size(whole),
+            "{tag}: {bare:?} against {whole:?}"
+        );
+        let (held, carried) = boxed(true);
+        assert_eq!(carried, 4, "{tag}: pcurves");
+        assert!(
+            size(held) < 0.1 * size(whole),
+            "{tag}: {held:?} against {whole:?}"
+        );
+        for i in 0..=20 {
+            for j in 0..=20 {
+                let u = u0 + (u1 - u0) * f64::from(i) / 20.0;
+                let v = v0 + (v1 - v0) * f64::from(j) / 20.0;
+                let p = sheet.evaluate(u, v);
+                assert!(
+                    held.contains_point(p),
+                    "{tag}: ({u}, {v}) at {p:?} off {held:?}"
+                );
+            }
+        }
+    }
+}

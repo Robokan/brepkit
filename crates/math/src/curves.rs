@@ -11,6 +11,15 @@ use crate::aabb::Aabb3;
 use crate::frame::Frame3;
 use crate::vec::{Point3, Vec3};
 
+/// The largest size a well-formed analytic curve or surface holds.
+///
+/// Each radius, semi-axis, distance and coordinate is at most this. A point
+/// of a conic or a surface is its centre plus a few radii along unit axes,
+/// so within this limit each point and derivative stays finite, as
+/// [`crate::nurbs::basis::WEIGHTED_LIMIT`] keeps a spline's. The largest in
+/// any test fixture or test file is 1.3e5.
+pub const SIZE_LIMIT: f64 = crate::nurbs::basis::WEIGHTED_LIMIT;
+
 /// The box of `center + a cos(t) u + b sin(t) v` over a full turn: along
 /// each axis the offset reaches `sqrt((a u_i)² + (b v_i)²)`.
 fn conic_aabb(center: Point3, (a, u): (f64, Vec3), (b, v): (f64, Vec3)) -> Aabb3 {
@@ -69,10 +78,10 @@ impl Line3D {
     ///
     /// # Errors
     ///
-    /// Returns an error if `direction` is zero-length.
+    /// Returns an error if `direction` is zero-length or not finite.
     pub fn new(origin: Point3, direction: Vec3) -> Result<Self, MathError> {
         let len = direction.length();
-        if len < 1e-15 {
+        if !(len >= 1e-15 && len.is_finite()) {
             return Err(MathError::ZeroVector);
         }
         Ok(Self {
@@ -147,9 +156,9 @@ impl Circle3D {
     ///
     /// # Errors
     ///
-    /// Returns an error if `radius` is non-positive or `normal` is zero.
+    /// Returns an error if `radius` is not finite and positive or `normal` is zero.
     pub fn new(center: Point3, normal: Vec3, radius: f64) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: 0.0,
@@ -176,14 +185,14 @@ impl Circle3D {
     ///
     /// # Errors
     ///
-    /// Returns an error if `radius` is non-positive or `normal` is zero.
+    /// Returns an error if `radius` is not finite and positive or `normal` is zero.
     pub fn new_with_ref(
         center: Point3,
         normal: Vec3,
         radius: f64,
         ref_dir: Vec3,
     ) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: 0.0,
@@ -287,7 +296,7 @@ impl Circle3D {
     ///
     /// # Errors
     ///
-    /// Returns an error if `radius` is non-positive.
+    /// Returns an error if `radius` is not finite and positive.
     pub fn with_axes(
         center: Point3,
         normal: Vec3,
@@ -295,7 +304,7 @@ impl Circle3D {
         u_axis: Vec3,
         v_axis: Vec3,
     ) -> Result<Self, MathError> {
-        if radius <= 0.0 {
+        if !(radius > 0.0 && radius.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: radius,
                 min: 0.0,
@@ -670,16 +679,24 @@ impl Ellipse3D {
     ///
     /// # Errors
     ///
-    /// Returns an error if either semi-axis is non-positive.
+    /// Returns an error if either semi-axis is not finite and positive.
     pub fn new(
         center: Point3,
         normal: Vec3,
         semi_major: f64,
         semi_minor: f64,
     ) -> Result<Self, MathError> {
-        if semi_major <= 0.0 || semi_minor <= 0.0 {
+        if !(semi_major > 0.0
+            && semi_major.is_finite()
+            && semi_minor > 0.0
+            && semi_minor.is_finite())
+        {
             return Err(MathError::ParameterOutOfRange {
-                value: semi_major.min(semi_minor),
+                value: if semi_major > 0.0 && semi_major.is_finite() {
+                    semi_minor
+                } else {
+                    semi_major
+                },
                 min: 0.0,
                 max: f64::INFINITY,
             });
@@ -711,7 +728,7 @@ impl Ellipse3D {
     ///
     /// # Errors
     ///
-    /// Returns an error if either semi-axis is non-positive, `semi_minor`
+    /// Returns an error if either semi-axis is not finite and positive, `semi_minor`
     /// exceeds `semi_major`, or `normal` is zero.
     pub fn new_with_ref(
         center: Point3,
@@ -720,9 +737,17 @@ impl Ellipse3D {
         semi_minor: f64,
         ref_dir: Vec3,
     ) -> Result<Self, MathError> {
-        if semi_major <= 0.0 || semi_minor <= 0.0 {
+        if !(semi_major > 0.0
+            && semi_major.is_finite()
+            && semi_minor > 0.0
+            && semi_minor.is_finite())
+        {
             return Err(MathError::ParameterOutOfRange {
-                value: semi_major.min(semi_minor),
+                value: if semi_major > 0.0 && semi_major.is_finite() {
+                    semi_minor
+                } else {
+                    semi_major
+                },
                 min: 0.0,
                 max: f64::INFINITY,
             });
@@ -796,13 +821,76 @@ impl Ellipse3D {
         PI * (a + b) * (1.0 + 3.0 * h / (10.0 + (3.0f64.madd(-h, 4.0)).sqrt()))
     }
 
-    /// Project a point onto the ellipse, returning the angle parameter.
+    /// Project a point onto the ellipse, returning the angle parameter of
+    /// its nearest point, in `(-π, π]`.
+    ///
+    /// The point is taken into the ellipse's plane, in units of about the
+    /// longer semi-axis, and reflected into the quadrant of its positive
+    /// semi-axes, where its nearest point lies too. There the nearest point
+    /// is the root of a monotone function of one variable, found by Newton
+    /// kept inside a closing bracket. A point more than `1e100` semi-axes off
+    /// reads its nearest point from its direction alone, where the normal
+    /// runs along it, which is exact to the last digit there; an ellipse
+    /// whose shorter semi-axis is below the rounding of its longer is read
+    /// as that axis, run along twice. Where more
+    /// than one point of the ellipse is nearest, the one with no negative
+    /// coordinate along either axis is taken: the centre of a circle gives
+    /// `0`, the centre of a longer ellipse the end of its shorter semi-axis,
+    /// and a point on the longer axis within its evolute the nearest point
+    /// on the positive side of the shorter one.
     #[must_use]
     pub fn project(&self, point: Point3) -> f64 {
-        let v = point - self.center;
-        let u_comp = self.u_axis.dot(v) / self.semi_major;
-        let v_comp = self.v_axis.dot(v) / self.semi_minor;
-        v_comp.atan2(u_comp)
+        let q = point - self.center;
+        let (x, y) = (self.u_axis.dot(q), self.v_axis.dot(q));
+        let (a, b) = (self.semi_major, self.semi_minor);
+        if !(x.is_finite() && y.is_finite()) {
+            return (y / b).atan2(x / a);
+        }
+        // A shorter semi-axis below the rounding of the longer leaves, to
+        // working precision, the longer axis run along twice: the nearest
+        // point lies square across from the point, on the point's side. So
+        // long as its term in the stationary condition, `b |y|`, is below
+        // the rounding of `a max(a, |x|)`: a point far enough off across
+        // the axis still turns the nearest point round the end.
+        let (b_on_a, a_on_b) = (b / a, a / b);
+        if b_on_a < f64::EPSILON && b_on_a * (y.abs() / a) < f64::EPSILON * (x.abs() / a).max(1.0) {
+            let t = (x / a).clamp(-1.0, 1.0).acos();
+            return if y < 0.0 && t < PI { -t } else { t };
+        }
+        if a_on_b < f64::EPSILON && a_on_b * (x.abs() / b) < f64::EPSILON * (y.abs() / b).max(1.0) {
+            let t = (y / b).clamp(-1.0, 1.0).asin();
+            return if x >= 0.0 {
+                t
+            } else if t >= 0.0 {
+                PI - t
+            } else {
+                -PI - t
+            };
+        }
+        // In units of about the longer semi-axis no square of the steps
+        // below leaves the range of a double. The unit is a power of two,
+        // which scales without rounding.
+        let unit = a.max(b);
+        let exponent = (unit.to_bits() >> 52) & 0x7ff;
+        let per_unit = f64::from_bits(2046_u64.saturating_sub(exponent).max(1) << 52);
+        let (a, b) = (a * per_unit, b * per_unit);
+        let reach = x.abs().max(y.abs());
+        let t = if reach > 1e100 * unit {
+            (b * (y / reach)).atan2(a * (x / reach))
+        } else {
+            let (x, y) = (x * per_unit, y * per_unit);
+            let (nx, ny) = if a >= b {
+                nearest_in_quadrant((a, b), (x.abs(), y.abs()))
+            } else {
+                let (ny, nx) = nearest_in_quadrant((b, a), (y.abs(), x.abs()));
+                (nx, ny)
+            };
+            let nx = if x < 0.0 { -nx } else { nx };
+            let ny = if y < 0.0 { -ny } else { ny };
+            (ny / b).atan2(nx / a)
+        };
+        // `atan2` reads a point a hair below the negative axis as `-π`.
+        if t <= -PI { t + 2.0 * PI } else { t }
     }
 
     /// The u-axis direction (major axis direction).
@@ -843,7 +931,7 @@ impl Ellipse3D {
     ///
     /// # Errors
     ///
-    /// Returns an error if either semi-axis is non-positive.
+    /// Returns an error if either semi-axis is not finite and positive.
     pub fn with_axes(
         center: Point3,
         normal: Vec3,
@@ -852,9 +940,17 @@ impl Ellipse3D {
         u_axis: Vec3,
         v_axis: Vec3,
     ) -> Result<Self, MathError> {
-        if semi_major <= 0.0 || semi_minor <= 0.0 {
+        if !(semi_major > 0.0
+            && semi_major.is_finite()
+            && semi_minor > 0.0
+            && semi_minor.is_finite())
+        {
             return Err(MathError::ParameterOutOfRange {
-                value: semi_major.min(semi_minor),
+                value: if semi_major > 0.0 && semi_major.is_finite() {
+                    semi_minor
+                } else {
+                    semi_major
+                },
                 min: 0.0,
                 max: f64::INFINITY,
             });
@@ -868,6 +964,93 @@ impl Ellipse3D {
             v_axis,
         })
     }
+}
+
+/// The point of the ellipse `(x / e0)² + (y / e1)² = 1`, `e0 >= e1 > 0`,
+/// nearest the point `(y0, y1)` with neither coordinate negative: it lies in
+/// the same quadrant.
+///
+/// Off both axes the nearest point is `(r y0 / (σ + r - 1), y1 / σ)` with
+/// `r = (e0 / e1)²` and `σ` the root `lagrange_root` finds. On the shorter
+/// axis it is that axis's end. On the longer axis it leaves the axis while
+/// the point lies within the evolute, `e0 y0 < e0² - e1²`, and is the
+/// axis's end beyond.
+fn nearest_in_quadrant((e0, e1): (f64, f64), (y0, y1): (f64, f64)) -> (f64, f64) {
+    if y1 > 0.0 {
+        if y0 > 0.0 {
+            let ratio = e0 / e1;
+            let r = ratio * ratio;
+            let wider = (e0 - e1) * (e0 + e1) / (e1 * e1);
+            let sigma = lagrange_root(r * (y0 / e0), wider, y1 / e1);
+            (r * y0 / (sigma + wider), y1 / sigma)
+        } else {
+            (0.0, e1)
+        }
+    } else {
+        let (reach, span) = (e0 * y0, (e0 - e1) * (e0 + e1));
+        if reach < span {
+            let c = reach / span;
+            (e0 * c, e1 * c.madd(-c, 1.0).sqrt())
+        } else {
+            (e0, 0.0)
+        }
+    }
+}
+
+/// The root `σ` of `f(σ) = (n0 / (σ + d))² + (z1 / σ)² - 1` for `n0, z1 > 0`
+/// and `d >= 0`, where `f` falls and bends up.
+///
+/// `σ` is one more than the Lagrange multiplier scaled to the shorter
+/// semi-axis, so a root near nothing (a point a hair off the longer axis,
+/// within the evolute) keeps its digits. The root lies between `z1` (where
+/// the second term alone is one) and `1` for a point inside the ellipse,
+/// and between `1` and `|(n0, z1)|` (where the two terms together are at
+/// most one) for a point outside; both ends are positive. Newton starts at
+/// `1`, where a point on the curve has its root, and each step that would
+/// leave the bracket halves it instead; the bracket closes round the root
+/// at every step, so the search ends on it. A square that underflows is
+/// below the rounding of the sum it joins.
+fn lagrange_root(n0: f64, d: f64, z1: f64) -> f64 {
+    let at = |sigma: f64| {
+        let (near, far) = (1.0 / (sigma + d), 1.0 / sigma);
+        let (p, q) = (n0 * near, z1 * far);
+        let (pp, qq) = (p * p, q * q);
+        (pp + qq - 1.0, -2.0 * pp.madd(near, qq * far))
+    };
+    let mut sigma = 1.0;
+    let (mut f, mut slope) = at(sigma);
+    let (mut lo, mut hi) = if f < 0.0 {
+        (z1, 1.0)
+    } else {
+        (1.0, n0.hypot(z1))
+    };
+    // Halving alone ends within the 2100 halvings a double's exponent range
+    // allows; Newton ends far sooner.
+    for _ in 0..2100 {
+        if f > 0.0 {
+            lo = sigma;
+        } else if f < 0.0 {
+            hi = sigma;
+        } else {
+            return sigma;
+        }
+        let newton = sigma - f / slope;
+        // A bracket across orders of magnitude (a point near the centre or
+        // far off) is halved in its exponent.
+        let next = if newton > lo && newton < hi {
+            newton
+        } else if hi > 4.0 * lo {
+            lo.sqrt() * hi.sqrt()
+        } else {
+            f64::midpoint(lo, hi)
+        };
+        if next <= lo || next >= hi || next.to_bits() == sigma.to_bits() {
+            return sigma;
+        }
+        sigma = next;
+        (f, slope) = at(sigma);
+    }
+    sigma
 }
 
 /// A 3D parabola defined by vertex, axis direction, and focal length.
@@ -893,9 +1076,9 @@ impl Parabola3D {
     /// from vertex to focus.
     ///
     /// # Errors
-    /// Returns an error if `focal_length` is not positive or `axis_dir` is zero.
+    /// Returns an error if `focal_length` is not finite and positive or `axis_dir` is zero.
     pub fn new(vertex: Point3, axis_dir: Vec3, focal_length: f64) -> Result<Self, MathError> {
-        if focal_length <= 0.0 {
+        if !(focal_length > 0.0 && focal_length.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: focal_length,
                 min: f64::EPSILON,
@@ -916,7 +1099,7 @@ impl Parabola3D {
     /// perpendicular to `axis_dir`.
     ///
     /// # Errors
-    /// Returns an error if `focal_length` is not positive, or if either
+    /// Returns an error if `focal_length` is not finite and positive, or if either
     /// direction is zero or they are parallel.
     pub fn with_axes(
         vertex: Point3,
@@ -924,7 +1107,7 @@ impl Parabola3D {
         u_axis: Vec3,
         focal_length: f64,
     ) -> Result<Self, MathError> {
-        if focal_length <= 0.0 {
+        if !(focal_length > 0.0 && focal_length.is_finite()) {
             return Err(MathError::ParameterOutOfRange {
                 value: focal_length,
                 min: f64::EPSILON,
@@ -1022,16 +1205,24 @@ impl Hyperbola3D {
     /// `semi_minor` is the imaginary semi-axis.
     ///
     /// # Errors
-    /// Returns an error if either semi-axis is non-positive.
+    /// Returns an error if either semi-axis is not finite and positive.
     pub fn new(
         center: Point3,
         normal: Vec3,
         semi_major: f64,
         semi_minor: f64,
     ) -> Result<Self, MathError> {
-        if semi_major <= 0.0 || semi_minor <= 0.0 {
+        if !(semi_major > 0.0
+            && semi_major.is_finite()
+            && semi_minor > 0.0
+            && semi_minor.is_finite())
+        {
             return Err(MathError::ParameterOutOfRange {
-                value: semi_major.min(semi_minor),
+                value: if semi_major > 0.0 && semi_major.is_finite() {
+                    semi_minor
+                } else {
+                    semi_major
+                },
                 min: f64::EPSILON,
                 max: f64::MAX,
             });
@@ -1053,7 +1244,7 @@ impl Hyperbola3D {
     /// to `u_axis`, and the normal is `u_axis × v_axis`.
     ///
     /// # Errors
-    /// Returns an error if either semi-axis is non-positive, or if either
+    /// Returns an error if either semi-axis is not finite and positive, or if either
     /// direction is zero or they are parallel.
     pub fn with_axes(
         center: Point3,
@@ -1062,9 +1253,17 @@ impl Hyperbola3D {
         u_axis: Vec3,
         v_axis: Vec3,
     ) -> Result<Self, MathError> {
-        if semi_major <= 0.0 || semi_minor <= 0.0 {
+        if !(semi_major > 0.0
+            && semi_major.is_finite()
+            && semi_minor > 0.0
+            && semi_minor.is_finite())
+        {
             return Err(MathError::ParameterOutOfRange {
-                value: semi_major.min(semi_minor),
+                value: if semi_major > 0.0 && semi_major.is_finite() {
+                    semi_minor
+                } else {
+                    semi_major
+                },
                 min: f64::EPSILON,
                 max: f64::MAX,
             });

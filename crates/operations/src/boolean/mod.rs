@@ -155,6 +155,9 @@ fn boolean_inner(
     b: SolidId,
 ) -> Result<SolidId, crate::OperationsError> {
     LAST_USED_MESH_FALLBACK.with(|f| f.set(false));
+    if let Some((result, _)) = empty_operand_result(topo, op, a, b)? {
+        return Ok(result);
+    }
     let tol = brepkit_math::tolerance::Tolerance::new();
 
     // A tool of NURBS faces wholly inside a blank of them, the two
@@ -569,6 +572,8 @@ fn boolean_inner(
     } else {
         b
     };
+    let gfa_a = crate::heal::with_seams(topo, gfa_a)?;
+    let gfa_b = crate::heal::with_seams(topo, gfa_b)?;
     let gfa_start = timer_now();
     match brepkit_algo::gfa::boolean(topo, algo_op, gfa_a, gfa_b) {
         Ok(result) => {
@@ -842,7 +847,9 @@ fn boolean_inner(
                 // raw Euler here rejected every pocketed piece. This mirrors the
                 // `euler_balanced` correction the single-component gate above
                 // applies — which is why the bound below is `2 * components`
-                // rather than an equality against it.
+                // rather than an equality against it. A cavity's shell adds 2
+                // to the count, as it does for one piece, so the bound takes
+                // `euler_eff`.
                 let components_vec = crate::boolean::assembly::face_components(topo, result);
                 let components = components_vec.len();
                 // For Cut, also verify no component is a "B-interior piece" —
@@ -906,12 +913,12 @@ fn boolean_inner(
                 if matches!(op, BooleanOp::Cut | BooleanOp::Fuse | BooleanOp::Intersect)
                     && components >= 2
                     && (euler_balanced(
-                        euler,
+                        euler_eff,
                         inner_wire_count,
                         i64::try_from(components).unwrap_or(i64::MAX),
                     ) || (extra_fans > 0
                         && euler_balanced(
-                            euler + extra_fans,
+                            euler_eff + extra_fans,
                             inner_wire_count,
                             i64::try_from(components).unwrap_or(i64::MAX),
                         )
@@ -1015,11 +1022,11 @@ fn boolean_inner(
                      cut_safe={cut_safe} intersect_safe={intersect_safe} \
                      euler_multi_ok={} surplus={} bound={} disjoint={}",
                     euler_balanced(
-                        euler,
+                        euler_eff,
                         inner_wire_count,
                         i64::try_from(components).unwrap_or(i64::MAX)
                     ),
-                    euler - inner_wire_count,
+                    euler_eff - inner_wire_count,
                     i64::try_from(components)
                         .unwrap_or(i64::MAX)
                         .saturating_mul(2),
@@ -1049,11 +1056,12 @@ fn boolean_inner(
     // more complex interaction semantics so we leave those to mesh.
     if op == BooleanOp::Cut {
         let components = crate::boolean::assembly::face_components(topo, a);
-        if components.len() >= 2
-            && components_are_disjoint_pieces(topo, &components)
-            && let Ok(result) = cut_multi_region_input(topo, a, b, components.len())
-        {
-            return Ok(result);
+        if components.len() >= 2 && components_are_disjoint_pieces(topo, &components) {
+            match cut_multi_region_input(topo, a, b, components.len()) {
+                Ok(result) => return Ok(result),
+                Err(e @ crate::OperationsError::EmptyResult { .. }) => return Err(e),
+                Err(_) => {}
+            }
         }
     }
 
@@ -1106,6 +1114,45 @@ fn boolean_inner(
         }
     }
     Ok(enforce_manifold_shell(topo, result).unwrap_or(result))
+}
+
+/// The result of `op` when `a` or `b` is the empty solid, as a new solid: a
+/// fuse gives a copy of the other operand, a cut gives a copy of `a` or the
+/// empty solid, and an intersect gives the empty solid. Returns the result
+/// and the operand it copies, or `None` when neither operand is empty.
+///
+/// # Errors
+///
+/// Returns an error if either operand, or a shell of it, does not resolve.
+fn empty_operand_result(
+    topo: &mut Topology,
+    op: BooleanOp,
+    a: SolidId,
+    b: SolidId,
+) -> Result<Option<(SolidId, Option<SolidId>)>, crate::OperationsError> {
+    let (a_empty, b_empty) = (topo.is_empty_solid(a), topo.is_empty_solid(b));
+    if !a_empty && !b_empty {
+        return Ok(None);
+    }
+    // An operand that is not copied is not read below, so a handle that
+    // does not resolve would pass unseen.
+    for s in [a, b] {
+        let solid = topo.solid(s)?;
+        topo.shell(solid.outer_shell())?;
+        for &shell in solid.inner_shells() {
+            topo.shell(shell)?;
+        }
+    }
+    let kept = match op {
+        BooleanOp::Fuse if a_empty => (!b_empty).then_some(b),
+        BooleanOp::Fuse | BooleanOp::Cut => (!a_empty).then_some(a),
+        BooleanOp::Intersect => None,
+    };
+    let result = match kept {
+        Some(s) => crate::copy::copy_solid(topo, s)?,
+        None => topo.add_empty_solid(),
+    };
+    Ok(Some((result, kept)))
 }
 
 /// Perform a boolean operation with custom options.
@@ -1442,13 +1489,22 @@ pub(crate) fn fuse_cluster(
     topo: &mut Topology,
     cluster: &[SolidId],
 ) -> Result<SolidId, crate::OperationsError> {
+    fuse_cluster_with(topo, cluster, brepkit_algo::gfa::fuse_n)
+}
+
+/// [`fuse_cluster`] with `fuse_n` as the one-pass fuse.
+pub(crate) fn fuse_cluster_with(
+    topo: &mut Topology,
+    cluster: &[SolidId],
+    fuse_n: impl FnOnce(&mut Topology, &[SolidId]) -> Result<SolidId, brepkit_algo::error::AlgoError>,
+) -> Result<SolidId, crate::OperationsError> {
     let Some((&first, rest)) = cluster.split_first() else {
         return Err(crate::OperationsError::InvalidInput {
             reason: "fuse_cluster requires a non-empty cluster".into(),
         });
     };
     if cluster.len() >= 3
-        && let Ok(fused) = brepkit_algo::gfa::fuse_n(topo, cluster)
+        && let Ok(fused) = fuse_n(topo, cluster)
         && validate_boolean_result(topo, fused).is_ok()
     {
         return Ok(fused);
@@ -1563,6 +1619,33 @@ pub fn boolean_with_evolution(
     b: SolidId,
 ) -> Result<(SolidId, crate::evolution::EvolutionMap), crate::OperationsError> {
     use brepkit_topology::explorer::solid_faces;
+
+    // With an empty operand the result is a copy of the other operand or the
+    // empty solid. A copy keeps its source's shells and faces in order, so
+    // each face, a cavity's too, maps to the face it copies; the faces of an
+    // operand not copied are all gone.
+    if let Some((result, kept)) = empty_operand_result(topo, op, a, b)? {
+        let mut evo = crate::evolution::EvolutionMap::new();
+        if let Some(source) = kept {
+            let (inputs, outputs) = (solid_faces(topo, source)?, solid_faces(topo, result)?);
+            if inputs.len() != outputs.len() {
+                return Err(crate::OperationsError::InvalidInput {
+                    reason: "a copied operand has another face count".into(),
+                });
+            }
+            for (input, output) in inputs.into_iter().zip(outputs) {
+                evo.add_modified(input.index(), output.index());
+            }
+        }
+        for s in [a, b] {
+            if Some(s) != kept {
+                for face in solid_faces(topo, s)? {
+                    evo.add_deleted(face.index());
+                }
+            }
+        }
+        return Ok((result, evo));
+    }
 
     // A tool of NURBS faces wholly inside the blank: each face of the result
     // is a copy of one input face, so the provenance is exact with no engine
@@ -2879,6 +2962,7 @@ fn detect_trivial_relation(
                     .is_ok_and(|d| d.distance > tol.linear * 10.0)
             };
             let planes = outward_planes(topo, outer);
+            let rounds = round_faces(topo, outer);
             // Every edge is probed, the longest first: an edge that leaves the
             // outer solid can lie among sides split into many short collinear
             // edges, which a sample of the edges can skip over.
@@ -2933,7 +3017,33 @@ fn detect_trivial_relation(
                     reach.sort_by(|a, b| b.0.total_cmp(&a.0));
                     reach.dedup_by(|a, b| (a.1 - b.1).length() < tol.linear);
                     reach.into_iter().take(4).any(|(_, p)| clear_outside(p))
-                }
+                } || conic_center(e.curve()).is_some_and(|c| {
+                    // Past a curved face of the outer solid, a rim reaches
+                    // farthest straight out from the face's axis (or centre)
+                    // through its own centre: a short rod parallel to a
+                    // drum's axis pokes out of the wall only over an arc of
+                    // its rims that the samples above can miss. The deepest
+                    // few past their faces are probed.
+                    let radial = |origin: Point3, axis: Option<Vec3>, p: Point3| {
+                        let w = p - origin;
+                        axis.map_or(w, |a| w - a * w.dot(a)).length()
+                    };
+                    let mut reach: Vec<(f64, Point3)> = rounds
+                        .iter()
+                        .filter_map(|&(origin, axis, surface)| {
+                            let w = c - origin;
+                            let out = axis.map_or(w, |a| w - a * w.dot(a));
+                            let p = rim_reach(e.curve(), (t0, t1), out.normalize().ok()?)?;
+                            let (u, v) = surface.project_point(p)?;
+                            let depth = radial(origin, axis, p)
+                                - radial(origin, axis, surface.evaluate(u, v)?);
+                            (depth > tol.linear * 10.0).then_some((depth, p))
+                        })
+                        .collect();
+                    reach.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    reach.dedup_by(|a, b| (a.1 - b.1).length() < tol.linear);
+                    reach.into_iter().take(4).any(|(_, p)| clear_outside(p))
+                })
             }) || round_of(topo, inner).is_some_and(|round| {
                 // A ball whose centre lies nearer the outer solid's boundary
                 // than its radius holds a boundary point inside it, so it
@@ -3219,6 +3329,37 @@ fn round_of(topo: &Topology, solid: SolidId) -> Option<Round> {
         }
     }
     round
+}
+
+/// The centre of a circle or ellipse edge; `None` for other curves.
+fn conic_center(curve: &brepkit_topology::edge::EdgeCurve) -> Option<Point3> {
+    use brepkit_topology::edge::EdgeCurve;
+    match curve {
+        EdgeCurve::Circle(c) => Some(c.center()),
+        EdgeCurve::Ellipse(e) => Some(e.center()),
+        EdgeCurve::Line | EdgeCurve::NurbsCurve(_) => None,
+    }
+}
+
+/// The cylinder, cone, torus and sphere faces of `solid`, each with the
+/// axis it turns about (a point on it and its unit direction) or, for a
+/// sphere, its centre and no direction.
+fn round_faces(topo: &Topology, solid: SolidId) -> Vec<(Point3, Option<Vec3>, &FaceSurface)> {
+    brepkit_topology::explorer::solid_faces(topo, solid)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|fid| {
+            let surface = topo.face(fid).ok()?.surface();
+            let (origin, axis) = match surface {
+                FaceSurface::Cylinder(c) => (c.origin(), Some(c.axis())),
+                FaceSurface::Cone(c) => (c.apex(), Some(c.axis())),
+                FaceSurface::Torus(t) => (t.center(), Some(t.z_axis())),
+                FaceSurface::Sphere(s) => (s.center(), None),
+                FaceSurface::Plane { .. } | FaceSurface::Nurbs(_) => return None,
+            };
+            Some((origin, axis, surface))
+        })
+        .collect()
 }
 
 /// A solid's planar faces as outward unit normals `n` with offsets `d`, the
@@ -4245,114 +4386,221 @@ fn component_aabb(topo: &Topology, comp: &[FaceId]) -> Option<(Point3, Point3)> 
     Some((aabb.min, aabb.max))
 }
 
-/// Does the closed surface made of `faces` enclose `p`?
+/// Whether the closed surface that `classifier` holds encloses the piece made
+/// of `inner`, read at the first point of `inner` that lies off that surface
+/// by more than the boolean's linear tolerance: a vertex, else the middle of
+/// an edge, else a point inside a face.
 ///
-/// Ray-parity against the component's own tessellation. Read-only by design:
-/// building a temporary solid per component would add entities to an arena that
-/// never reclaims, which is the growth cliff fixed in #1237.
-///
-/// `watertight_ray_triangle_intersect` reports exactly one hit on a shared edge,
-/// so parity is meaningful across face boundaries. The direction is deliberately
-/// irrational so the ray does not graze a face boundary or lie in a face plane —
-/// the degeneracy that makes axis-aligned probes unreliable on the feature-plane
-/// intersections these pieces are full of. Returns `None` when the component
-/// cannot be tessellated, so callers can fall back rather than guess.
-fn component_encloses_point(
+/// The classifier casts rays against the faces' own surfaces, analytic and
+/// NURBS, trimmed by their wires: a piece just inside the wall reads as
+/// inside however near it lies, which a mesh of the wall cannot promise
+/// (its chords pass inside the surface by up to the deflection). It builds
+/// nothing in the arena, which never reclaims what it holds. A piece can
+/// meet the surface at every vertex and along every edge (a plug in a hole
+/// of its own size), so the points inside its faces are read last, from
+/// [`face_grid_points`]: a 3 by 3 grid first, a 7 by 7 one only when the
+/// coarse one decides nothing. `None` when no point of `inner` read stands
+/// off the surface or a face cannot be read, so callers can fall back
+/// rather than guess.
+fn piece_encloses(
     topo: &Topology,
-    faces: &[FaceId],
-    p: Point3,
-    deflection: f64,
+    classifier: &brepkit_check::classify::SolidClassifier<'_>,
+    inner: &[FaceId],
 ) -> Option<bool> {
-    // A sqrt-prime direction: irrational in every component, so the ray cannot
-    // lie in a face plane or run along an edge — the same generic-direction
-    // escape the ray-cast classifier uses for degenerate probes.
-    let dir = Vec3::new(2.0_f64.sqrt(), 3.0_f64.sqrt(), 5.0_f64.sqrt())
-        .normalize()
-        .ok()?;
-    let mut crossings = 0usize;
-    let mut any_triangle = false;
-    for &fid in faces {
-        let mesh = crate::tessellate::tessellate_with_uvs(topo, fid, deflection).ok()?;
-        let pos = &mesh.mesh.positions;
-        for tri in mesh.mesh.indices.chunks_exact(3) {
-            let (a, b, c) = (
-                pos[tri[0] as usize],
-                pos[tri[1] as usize],
-                pos[tri[2] as usize],
-            );
-            any_triangle = true;
-            if let Some(hit) =
-                brepkit_math::ray_triangle::watertight_ray_triangle_intersect(p, dir, a, b, c)
-                && hit.t > 1e-9
-            {
-                crossings += 1;
+    use brepkit_check::classify::{ClassifyOptions, PointClassification};
+    let options = ClassifyOptions {
+        tolerance: brepkit_math::tolerance::Tolerance::new().linear,
+        ..ClassifyOptions::default()
+    };
+    // `Some(None)` for a point on the surface.
+    let read = |p: Point3| -> Option<Option<bool>> {
+        match classifier.classify(p, &options).ok()? {
+            PointClassification::Inside => Some(Some(true)),
+            PointClassification::Outside => Some(Some(false)),
+            PointClassification::OnBoundary => Some(None),
+        }
+    };
+    let mut edges = Vec::new();
+    for &fid in inner {
+        let face = topo.face(fid).ok()?;
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(wid).ok()?.edges() {
+                let edge = topo.edge(oe.edge()).ok()?;
+                let (sp, ep) = (
+                    topo.vertex(edge.start()).ok()?.point(),
+                    topo.vertex(edge.end()).ok()?.point(),
+                );
+                if let Some(inside) = read(sp)? {
+                    return Some(inside);
+                }
+                edges.push((edge.curve().clone(), sp, ep));
             }
         }
     }
-    any_triangle.then_some(crossings % 2 == 1)
-}
-
-/// Any vertex position on `faces`, for use as a probe point.
-fn any_vertex_of(topo: &Topology, faces: &[FaceId]) -> Option<Point3> {
-    for &fid in faces {
-        let face = topo.face(fid).ok()?;
-        let wire = topo.wire(face.outer_wire()).ok()?;
-        if let Some(oe) = wire.edges().first()
-            && let Ok(edge) = topo.edge(oe.edge())
-            && let Ok(v) = topo.vertex(edge.start())
-        {
-            return Some(v.point());
+    for (curve, sp, ep) in &edges {
+        let (t0, t1) = curve.domain_with_endpoints(*sp, *ep);
+        let middle = curve.evaluate_with_endpoints(0.5 * (t0 + t1), *sp, *ep);
+        if let Some(inside) = read(middle)? {
+            return Some(inside);
+        }
+    }
+    for n in [3, 7] {
+        for &fid in inner {
+            for p in face_grid_points(topo, fid, n)? {
+                if let Some(inside) = read(p)? {
+                    return Some(inside);
+                }
+            }
         }
     }
     None
 }
 
-/// True when the face components are side-by-side pieces (a cut split one
-/// solid into N parts), false when one nests inside another (a hollow solid:
-/// outer surface and cavity surface in one shell). Overlapping boxes pass;
-/// a box inside another's is only a suspect, rejected when a ray-parity
-/// probe finds the inner piece enclosed.
-fn components_are_disjoint_pieces(topo: &Topology, components: &[Vec<FaceId>]) -> bool {
-    let aabbs: Vec<(Point3, Point3)> = components
-        .iter()
-        .map(|comp| {
-            let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-            let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-            for &fid in comp {
-                let Ok(face) = topo.face(fid) else {
-                    continue;
-                };
-                for wid in
-                    std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied())
-                {
-                    let Ok(wire) = topo.wire(wid) else {
-                        continue;
-                    };
-                    for oe in wire.edges() {
-                        let Ok(edge) = topo.edge(oe.edge()) else {
-                            continue;
-                        };
-                        for vid in [edge.start(), edge.end()] {
-                            if let Ok(v) = topo.vertex(vid) {
-                                let p = v.point();
-                                min = Point3::new(
-                                    min.x().min(p.x()),
-                                    min.y().min(p.y()),
-                                    min.z().min(p.z()),
-                                );
-                                max = Point3::new(
-                                    max.x().max(p.x()),
-                                    max.y().max(p.y()),
-                                    max.z().max(p.z()),
-                                );
-                            }
-                        }
-                    }
+/// Points on `face`, held by it, from an `n` by `n` grid over its parameter
+/// box: the box of its wire's points read in the surface's `(u, v)`, the
+/// whole domain for a NURBS face, and for a plane the box of its wire's
+/// points in a frame of the plane. Each grid point is put on the surface and
+/// kept where `face_contains` holds it. No mesh: tessellation stays out of
+/// booleans. Empty for a face with no wire to read; `None` when a topology
+/// lookup fails.
+fn face_grid_points(topo: &Topology, fid: FaceId, n: usize) -> Option<Vec<Point3>> {
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+    const PER_EDGE: usize = 8;
+    let face = topo.face(fid).ok()?;
+    let surface = face.surface();
+    let mut wire_points = Vec::new();
+    for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+        for oe in topo.wire(wid).ok()?.edges() {
+            let edge = topo.edge(oe.edge()).ok()?;
+            let (sp, ep) = (
+                topo.vertex(edge.start()).ok()?.point(),
+                topo.vertex(edge.end()).ok()?.point(),
+            );
+            let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
+            #[allow(clippy::cast_precision_loss)]
+            wire_points.extend((0..=PER_EDGE).map(|k| {
+                let t = (t1 - t0).madd(k as f64 / PER_EDGE as f64, t0);
+                edge.curve().evaluate_with_endpoints(t, sp, ep)
+            }));
+        }
+    }
+    let Some(&first) = wire_points.first() else {
+        return Some(Vec::new());
+    };
+    let plane = match surface {
+        FaceSurface::Plane { normal, .. } => {
+            Some(brepkit_math::frame::Frame3::from_normal(first, *normal).ok()?)
+        }
+        _ => None,
+    };
+    let (u_range, v_range) = if let FaceSurface::Nurbs(nurbs) = surface {
+        (nurbs.domain_u(), nurbs.domain_v())
+    } else {
+        let mut lo = (f64::INFINITY, f64::INFINITY);
+        let mut hi = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &p in &wire_points {
+            let Some((u, v)) = plane.as_ref().map_or_else(
+                || surface.project_point(p),
+                |frame| {
+                    Some((
+                        (p - frame.origin).dot(frame.x),
+                        (p - frame.origin).dot(frame.y),
+                    ))
+                },
+            ) else {
+                continue;
+            };
+            lo = (lo.0.min(u), lo.1.min(v));
+            hi = (hi.0.max(u), hi.1.max(v));
+        }
+        // A wire can span next to none of a direction the face spans: seam
+        // edges of no length at one vertex (a whole ring), or one circle of
+        // latitude round a ball's cap. Such a direction takes the surface's
+        // whole span, its period or a ball's latitudes, and `face_contains`
+        // keeps the points the face holds.
+        let whole = |(a, b): (f64, f64), (from, span): (f64, f64)| {
+            if b - a < span * 1e-3 {
+                (from, from + span)
+            } else {
+                (a, b)
+            }
+        };
+        let (u, v) = ((lo.0, hi.0), (lo.1, hi.1));
+        match surface {
+            FaceSurface::Cylinder(_) | FaceSurface::Cone(_) => (whole(u, (u.0, TAU)), v),
+            FaceSurface::Sphere(_) => (whole(u, (u.0, TAU)), whole(v, (-FRAC_PI_2, PI))),
+            FaceSurface::Torus(_) => (whole(u, (u.0, TAU)), whole(v, (v.0, TAU))),
+            FaceSurface::Plane { .. } | FaceSurface::Nurbs(_) => (u, v),
+        }
+    };
+    let mut held = Vec::new();
+    for i in 1..=n {
+        for j in 1..=n {
+            #[allow(clippy::cast_precision_loss)]
+            let (fu, fv) = (i as f64 / (n + 1) as f64, j as f64 / (n + 1) as f64);
+            let u = (u_range.1 - u_range.0).madd(fu, u_range.0);
+            let v = (v_range.1 - v_range.0).madd(fv, v_range.0);
+            let Some(p) = plane.as_ref().map_or_else(
+                || surface.evaluate(u, v),
+                |frame| Some(frame.origin + frame.x * u + frame.y * v),
+            ) else {
+                continue;
+            };
+            if brepkit_check::classify::face_contains(topo, fid, p).unwrap_or(false) {
+                held.push(p);
+            }
+        }
+    }
+    Some(held)
+}
+
+/// The box of the vertices of `faces`, or `None` for faces with no vertex.
+/// Its extremes are points on the faces.
+fn vertex_box(topo: &Topology, faces: &[FaceId]) -> Option<brepkit_math::aabb::Aabb3> {
+    let mut points = Vec::new();
+    for &fid in faces {
+        let face = topo.face(fid).ok()?;
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(wid).ok()?.edges() {
+                let edge = topo.edge(oe.edge()).ok()?;
+                for vid in [edge.start(), edge.end()] {
+                    points.push(topo.vertex(vid).ok()?.point());
                 }
             }
-            (min, max)
-        })
-        .collect();
+        }
+    }
+    brepkit_math::aabb::Aabb3::try_from_points(points)
+}
+
+/// True when the face components are side-by-side pieces (a cut split one
+/// solid into N parts), false when one nests inside another (a hollow solid:
+/// outer surface and cavity surface in one shell). A piece is a suspect
+/// inside another when all its vertices lie in a box that holds the other
+/// whole; a ray-parity probe then decides. Each order of each pair is tried.
+fn components_are_disjoint_pieces(topo: &Topology, components: &[Vec<FaceId>]) -> bool {
+    // Each piece has two boxes. The box of its vertices has points on the
+    // piece at its extremes. The other holds the piece whole: its curved
+    // edges and faces read by their extremes, and each NURBS face's control
+    // net. A piece nested in another lies in the other's whole box, its
+    // vertices too. Only the vertices stand for the inner piece: a box read
+    // off its faces can reach past it (a NURBS face is sampled over its
+    // untrimmed surface, a NURBS edge read by its control hull), and such a
+    // box can miss the nesting. A ball's vertices all lie on its own rims, so
+    // the box of its vertices cannot stand for the outer piece. A piece that
+    // cannot be boxed gives the conservative answer.
+    let mut boxes: Vec<(brepkit_math::aabb::Aabb3, brepkit_math::aabb::Aabb3)> =
+        Vec::with_capacity(components.len());
+    for comp in components {
+        let Some(on) = vertex_box(topo, comp) else {
+            return false;
+        };
+        let Ok(whole) = crate::measure::face_set_bounding_box(topo, comp)
+            .and_then(|tight| crate::measure::hold_nurbs_faces(topo, comp, tight))
+        else {
+            return false;
+        };
+        boxes.push((on, whole));
+    }
 
     // Reject NESTING, not mere AABB overlap.
     //
@@ -4378,43 +4626,41 @@ fn components_are_disjoint_pieces(topo: &Topology, components: &[Vec<FaceId>]) -
     // `tests::rotated_separate_pieces_are_recognised_as_disjoint`). Containment
     // is tight in the direction that matters: nesting implies it, and rotation
     // does not manufacture it.
-    let eps = 1e-7;
-    let contains = |(o_min, o_max): (Point3, Point3), (i_min, i_max): (Point3, Point3)| {
-        o_min.x() - eps <= i_min.x()
-            && o_min.y() - eps <= i_min.y()
-            && o_min.z() - eps <= i_min.z()
-            && o_max.x() + eps >= i_max.x()
-            && o_max.y() + eps >= i_max.y()
-            && o_max.z() + eps >= i_max.z()
+    let eps = brepkit_math::tolerance::Tolerance::new().linear;
+    let may_nest = |outer: usize, inner: usize| {
+        let (o, i) = (boxes[outer].1, boxes[inner].0);
+        o.min.x() - eps <= i.min.x()
+            && o.min.y() - eps <= i.min.y()
+            && o.min.z() - eps <= i.min.z()
+            && o.max.x() + eps >= i.max.x()
+            && o.max.y() + eps >= i.max.y()
+            && o.max.z() + eps >= i.max.z()
     };
-    // AABB containment is only the PRE-FILTER. It is necessary for nesting but
-    // far from sufficient: a ring's box contains the box of a separate piece
-    // sitting in its HOLE, and a lattice is full of rings. So a suspect pair
-    // gets a real ray-parity test against the enclosing candidate's own surface,
-    // and only genuine enclosure rejects. If the probe cannot be evaluated the
+    // The box test is only the PRE-FILTER. It is necessary for nesting but far
+    // from sufficient: a ring's box holds a separate piece sitting in its
+    // HOLE, and a lattice is full of rings. So a suspect pair gets a real
+    // ray-parity test against the enclosing candidate's own surface, and only
+    // genuine enclosure rejects. Both orders of a pair can pass the box test
+    // (a NURBS piece's control net can reach past the piece round it), so
+    // each order is probed on its own. If the probe cannot be evaluated the
     // pair falls back to the conservative answer.
-    for i in 0..aabbs.len() {
-        for j in (i + 1)..aabbs.len() {
-            let (outer, inner) = if contains(aabbs[i], aabbs[j]) {
-                (i, j)
-            } else if contains(aabbs[j], aabbs[i]) {
-                (j, i)
-            } else {
+    for outer in 0..boxes.len() {
+        let mut classifier = None;
+        for inner in 0..boxes.len() {
+            if outer == inner || !may_nest(outer, inner) {
                 continue;
-            };
-            let (o_min, o_max) = aabbs[outer];
-            let diag = ((o_max.x() - o_min.x()).powi(2)
-                + (o_max.y() - o_min.y()).powi(2)
-                + (o_max.z() - o_min.z()).powi(2))
-            .sqrt();
-            let deflection = (diag / 200.0).max(1e-4);
-            let Some(probe) = any_vertex_of(topo, &components[inner]) else {
+            }
+            if classifier.is_none() {
+                classifier =
+                    brepkit_check::classify::SolidClassifier::of_faces(topo, &components[outer])
+                        .ok();
+            }
+            let Some(classifier) = classifier.as_ref() else {
                 return false;
             };
-            match component_encloses_point(topo, &components[outer], probe, deflection) {
-                Some(true) => return false,
+            match piece_encloses(topo, classifier, &components[inner]) {
+                Some(true) | None => return false,
                 Some(false) => {}
-                None => return false,
             }
         }
     }
@@ -4459,14 +4705,22 @@ fn cut_multi_region_input(
     b: SolidId,
     comp_count: usize,
 ) -> Result<SolidId, crate::OperationsError> {
+    use brepkit_topology::shell::Shell;
+
     let components = crate::boolean::assembly::face_components(topo, a);
     debug_assert_eq!(components.len(), comp_count);
+    let cavities = component_cavities(topo, a, &components)?;
 
     let mut per_component_results: Vec<SolidId> = Vec::with_capacity(components.len());
-    for comp_faces in components {
+    for (comp_faces, comp_cavities) in components.iter().zip(cavities) {
         // Copy the component's faces into a fresh single-component solid
         // so the boolean engine sees a connected manifold.
-        let comp_solid_raw = make_solid_from_face_subset(topo, &comp_faces)?;
+        let comp_solid_raw = make_solid_from_face_subset(topo, comp_faces)?;
+        for faces in comp_cavities {
+            let shell = Shell::new(faces).map_err(crate::OperationsError::Topology)?;
+            let shell = topo.add_shell(shell);
+            topo.solid_mut(comp_solid_raw)?.add_inner_shell(shell);
+        }
         // Deep-copy the component into a fresh solid so its faces/edges/
         // vertices have fresh IDs disjoint from the original multi-region
         // input — GFA's pavefiller can stumble on shared vertex IDs across
@@ -4474,12 +4728,8 @@ fn cut_multi_region_input(
         let comp_solid = crate::copy::copy_solid(topo, comp_solid_raw)?;
         match boolean(topo, BooleanOp::Cut, comp_solid, b) {
             Ok(r) => per_component_results.push(r),
-            Err(
-                crate::OperationsError::EmptyResult { .. }
-                | crate::OperationsError::InvalidInput { .. },
-            ) => {
-                per_component_results.push(comp_solid);
-            }
+            // The piece lies wholly inside the tool: none of it remains.
+            Err(crate::OperationsError::EmptyResult { .. }) => {}
             Err(e) => return Err(e),
         }
     }
@@ -4488,15 +4738,66 @@ fn cut_multi_region_input(
     // Collect every face from every result into one outer shell. The
     // results are pairwise disjoint by construction (each came from a
     // disjoint input component cut by the same tool), so a single shell
-    // containing all their faces is a valid manifold representation.
+    // containing all their faces is a valid manifold representation. Each
+    // result's cavities stay inner shells.
     let mut all_faces: Vec<brepkit_topology::face::FaceId> = Vec::new();
+    let mut cavity_faces: Vec<Vec<brepkit_topology::face::FaceId>> = Vec::new();
     for &r in &per_component_results {
         let r_data = topo.solid(r)?;
         for &fid in topo.shell(r_data.outer_shell())?.faces() {
             all_faces.push(fid);
         }
+        for &shell in r_data.inner_shells() {
+            cavity_faces.push(topo.shell(shell)?.faces().to_vec());
+        }
     }
-    make_solid_from_face_subset(topo, &all_faces)
+    if all_faces.is_empty() {
+        return Err(crate::OperationsError::EmptyResult {
+            reason: "Cut with every piece of the target inside the tool".into(),
+        });
+    }
+    let combined = make_solid_from_face_subset(topo, &all_faces)?;
+    for faces in cavity_faces {
+        let shell = Shell::new(faces).map_err(crate::OperationsError::Topology)?;
+        let shell = topo.add_shell(shell);
+        topo.solid_mut(combined)?.add_inner_shell(shell);
+    }
+    Ok(combined)
+}
+
+/// The faces of each cavity of `solid`, given to the piece of `components`
+/// (the sets of its outer shell's faces) that holds it. A cavity that no
+/// piece holds, or a piece inside a cavity, is an error.
+fn component_cavities(
+    topo: &mut Topology,
+    solid: SolidId,
+    components: &[Vec<FaceId>],
+) -> Result<Vec<Vec<Vec<FaceId>>>, crate::OperationsError> {
+    let mut out: Vec<Vec<Vec<FaceId>>> = vec![Vec::new(); components.len()];
+    let count = topo.solid(solid)?.inner_shells().len();
+    if count == 0 {
+        return Ok(out);
+    }
+    let unplaced = || crate::OperationsError::InvalidInput {
+        reason: "a cavity of a solid in separate pieces lies in none of them".into(),
+    };
+    let mut placed = 0;
+    for piece in crate::compound_ops::solid_pieces(topo, solid)? {
+        let data = topo.solid(piece)?;
+        let first = topo.shell(data.outer_shell())?.faces().first().copied();
+        let k = first
+            .and_then(|f| components.iter().position(|c| c.contains(&f)))
+            .ok_or_else(unplaced)?;
+        for &shell in data.inner_shells() {
+            out[k].push(topo.shell(shell)?.faces().to_vec());
+            placed += 1;
+        }
+    }
+    if placed == count {
+        Ok(out)
+    } else {
+        Err(unplaced())
+    }
 }
 
 /// Build a new solid whose outer shell consists exactly of the given

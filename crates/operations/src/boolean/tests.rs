@@ -2561,47 +2561,72 @@ fn compound_cut_single_tool_matches_boolean() {
     assert_volume_near(&topo, result, box_vol - cyl_vol, 0.05);
 }
 
-/// One tool of two disjoint pieces, a dent in the tube's top whose cut stays
-/// exact and a rod through the ring off its tube's centre whose cut needs the
-/// mesh fallback, is cut piece by piece: the dent exactly, the rod last, and
-/// the result holds what cutting by the dent and then the rod leaves.
+/// A block (40 x 6 x 70) less a bore of radius 2.25 through it, its seam
+/// turned 270 degrees, and a pin of radius 1.7 standing across the bore's
+/// mouth, its seam turned 180 degrees: a pose whose cut still takes the mesh
+/// fallback (`a_pin_across_a_bores_mouth_with_both_seams_at_the_fold` in
+/// `tests/pin_through_hole_mouth.rs`).
+fn pin_across_a_bores_mouth(topo: &mut Topology) -> (SolidId, SolidId) {
+    use brepkit_math::mat::Mat4;
+    let block = crate::primitives::make_box(topo, 40.0, 6.0, 70.0).unwrap();
+    crate::transform::transform_solid(topo, block, &Mat4::translation(-20.0, -360.0, 751.0))
+        .unwrap();
+    let bore = crate::primitives::make_cylinder(topo, 2.25, 10.0).unwrap();
+    crate::transform::transform_solid(
+        topo,
+        bore,
+        &(Mat4::translation(0.0, -352.0, 796.0)
+            * Mat4::rotation_x(std::f64::consts::FRAC_PI_2)
+            * Mat4::rotation_z(270f64.to_radians())),
+    )
+    .unwrap();
+    let part = boolean(topo, BooleanOp::Cut, block, bore).unwrap();
+    let pin = crate::primitives::make_cylinder(topo, 1.7, 444.0).unwrap();
+    crate::transform::transform_solid(
+        topo,
+        pin,
+        &(Mat4::translation(0.0, -355.0, 706.2) * Mat4::rotation_z(180f64.to_radians())),
+    )
+    .unwrap();
+    (part, pin)
+}
+
+/// One tool of two disjoint pieces, a notch in the bored block's corner
+/// whose cut stays exact and a pin across the bore's mouth whose cut needs
+/// the mesh fallback, is cut piece by piece: the notch exactly, the pin
+/// last, and the result holds what cutting by the notch and then the pin
+/// leaves.
 #[test]
 fn compound_cut_cuts_the_exact_piece_and_defers_the_other() {
     use brepkit_math::mat::Mat4;
 
     let mut topo = Topology::new();
     let parts = |topo: &mut Topology| {
-        let torus = crate::primitives::make_torus(topo, 4.0, 1.5, 32).unwrap();
-        let dent = crate::primitives::make_box(topo, 1.0, 1.0, 1.0).unwrap();
-        crate::transform::transform_solid(topo, dent, &Mat4::translation(-4.5, -0.5, 1.0)).unwrap();
-        let rod = crate::primitives::make_cylinder(topo, 0.6, 20.0).unwrap();
-        crate::transform::transform_solid(
-            topo,
-            rod,
-            &(Mat4::translation(0.5, 10.0, 1.0) * Mat4::rotation_x(std::f64::consts::FRAC_PI_2)),
-        )
-        .unwrap();
-        (torus, dent, rod)
+        let (part, pin) = pin_across_a_bores_mouth(topo);
+        let notch = crate::primitives::make_box(topo, 2.0, 4.0, 10.0).unwrap();
+        crate::transform::transform_solid(topo, notch, &Mat4::translation(15.0, -356.0, 815.0))
+            .unwrap();
+        (part, notch, pin)
     };
 
-    let (torus, dent, rod) = parts(&mut topo);
-    let dented = boolean(&mut topo, BooleanOp::Cut, torus, dent).unwrap();
-    let torus_faces = brepkit_topology::explorer::solid_faces(&topo, dented)
+    let (part, notch, pin) = parts(&mut topo);
+    let notched = boolean(&mut topo, BooleanOp::Cut, part, notch).unwrap();
+    let bore_faces = brepkit_topology::explorer::solid_faces(&topo, notched)
         .unwrap()
         .into_iter()
-        .filter(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Torus(_)))
+        .filter(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Cylinder(_)))
         .count();
-    assert!(torus_faces > 0, "the dent's cut stays exact");
-    let reference = boolean(&mut topo, BooleanOp::Cut, dented, rod).unwrap();
+    assert!(bore_faces > 0, "the notch's cut stays exact");
+    let reference = boolean(&mut topo, BooleanOp::Cut, notched, pin).unwrap();
     let expected = crate::measure::solid_volume(&topo, reference, 0.05).unwrap();
 
-    let (torus, dent, rod) = parts(&mut topo);
-    let tool = crate::compound_ops::merge_disjoint_solids(&mut topo, &[dent, rod]).unwrap();
+    let (part, notch, pin) = parts(&mut topo);
+    let tool = crate::compound_ops::merge_disjoint_solids(&mut topo, &[notch, pin]).unwrap();
     let before = super::mesh_fallback_count();
-    let result = compound_cut(&mut topo, torus, &[tool], BooleanOptions::default()).unwrap();
+    let result = compound_cut(&mut topo, part, &[tool], BooleanOptions::default()).unwrap();
     assert!(
         super::mesh_fallback_count() > before,
-        "the rod's cut takes the mesh fallback"
+        "the pin's cut takes the mesh fallback"
     );
     assert_volume_near(&topo, result, expected, 1e-3);
 }
@@ -8042,6 +8067,382 @@ fn nested_pieces_are_not_disjoint() {
     );
 }
 
+/// A ball's cavity off the ball's centre nests in the ball, though the box of
+/// its vertices does not lie in the ball's: each ball's vertices all lie on
+/// its own equator, so each box of vertices is a flat slice through its own
+/// centre. Read by its faces' extremes, the ball's box holds the cavity's
+/// vertices, and the ray probe finds the cavity inside the ball.
+#[test]
+fn a_ball_cavity_off_the_balls_centre_is_nested() {
+    use brepkit_math::mat::Mat4;
+    let vertex_box = |topo: &Topology, faces: &[FaceId]| {
+        let points = faces.iter().flat_map(|&f| {
+            let face = topo.face(f).unwrap();
+            std::iter::once(face.outer_wire())
+                .chain(face.inner_wires().iter().copied())
+                .flat_map(|w| topo.wire(w).unwrap().edges().to_vec())
+                .flat_map(|oe| {
+                    let e = topo.edge(oe.edge()).unwrap();
+                    [e.start(), e.end()]
+                })
+                .map(|v| topo.vertex(v).unwrap().point())
+                .collect::<Vec<_>>()
+        });
+        brepkit_math::aabb::Aabb3::try_from_points(points).unwrap()
+    };
+    // Poses that keep the equators level: a tilted equator spans enough
+    // height that the boxes of the vertices nest anyway.
+    for (name, pose) in [
+        ("upright", Mat4::identity()),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+        ("rolled about z", Mat4::rotation_z(2.0)),
+    ] {
+        let mut topo = Topology::new();
+        let ball = crate::primitives::make_sphere(&mut topo, 10.0, 32).unwrap();
+        let small = crate::primitives::make_sphere(&mut topo, 2.0, 32).unwrap();
+        crate::transform::transform_solid(&mut topo, small, &Mat4::translation(0.0, 0.0, 5.0))
+            .unwrap();
+        for s in [ball, small] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let hollow = boolean(&mut topo, BooleanOp::Cut, ball, small).unwrap();
+        assert_eq!(
+            topo.solid(hollow).unwrap().inner_shells().len(),
+            1,
+            "{name}"
+        );
+        let faces = brepkit_topology::explorer::solid_faces(&topo, hollow).unwrap();
+        let comps = super::assembly::edge_connected_faces(&topo, &faces);
+        assert_eq!(comps.len(), 2, "{name}: the ball and its cavity");
+
+        let boxes: Vec<_> = comps.iter().map(|c| vertex_box(&topo, c)).collect();
+        let holds = |o: &brepkit_math::aabb::Aabb3, i: &brepkit_math::aabb::Aabb3| {
+            o.min.x() <= i.min.x()
+                && o.min.y() <= i.min.y()
+                && o.min.z() <= i.min.z()
+                && o.max.x() >= i.max.x()
+                && o.max.y() >= i.max.y()
+                && o.max.z() >= i.max.z()
+        };
+        assert!(
+            !holds(&boxes[0], &boxes[1]) && !holds(&boxes[1], &boxes[0]),
+            "{name}: the boxes of the vertices must miss the nesting for this test to mean anything"
+        );
+        assert!(
+            !super::components_are_disjoint_pieces(&topo, &comps),
+            "{name}: the cavity nests in the ball"
+        );
+    }
+}
+
+/// The box `face_set_bounding_box` gives a component, and the box that also
+/// holds its NURBS faces' control nets.
+fn face_and_net_boxes(
+    topo: &Topology,
+    comp: &[FaceId],
+) -> (brepkit_math::aabb::Aabb3, brepkit_math::aabb::Aabb3) {
+    let faces = crate::measure::face_set_bounding_box(topo, comp).unwrap();
+    let nets = crate::measure::hold_nurbs_faces(topo, comp, faces).unwrap();
+    (faces, nets)
+}
+
+fn box_holds(o: brepkit_math::aabb::Aabb3, i: brepkit_math::aabb::Aabb3) -> bool {
+    o.min.x() <= i.min.x()
+        && o.min.y() <= i.min.y()
+        && o.min.z() <= i.min.z()
+        && o.max.x() >= i.max.x()
+        && o.max.y() >= i.max.y()
+        && o.max.z() >= i.max.z()
+}
+
+/// A ball in B-spline form, off the centre of a slightly larger ball, nests
+/// in it whichever order the two come in. The cavity's control net reaches
+/// past the outer ball's faces, so each box held the other: the check
+/// probed only one way round, and with the cavity listed first it probed the
+/// outer ball's vertex against the cavity, found it outside, and read the
+/// pair as disjoint.
+#[test]
+fn a_spline_ball_cavity_nests_whichever_order_it_comes_in() {
+    use brepkit_math::mat::Mat4;
+    use brepkit_topology::explorer::solid_faces;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    for (name, pose) in [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+    ] {
+        let mut topo = Topology::new();
+        let ball = crate::primitives::make_sphere(&mut topo, 3.5, 32).unwrap();
+        crate::transform::transform_solid(&mut topo, ball, &Mat4::translation(0.0, 0.0, 7.7))
+            .unwrap();
+        let cavity = crate::primitives::make_sphere(&mut topo, 3.0, 32).unwrap();
+        let place =
+            Mat4::translation(0.0, 0.0, 8.0) * Mat4::rotation_x(0.9) * Mat4::rotation_y(0.4);
+        crate::transform::transform_solid(&mut topo, cavity, &place).unwrap();
+        assert!(crate::heal::convert_to_bspline(&mut topo, cavity).unwrap() > 0);
+        for s in [ball, cavity] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let (ball_faces, cavity_faces) = (
+            solid_faces(&topo, ball).unwrap(),
+            solid_faces(&topo, cavity).unwrap(),
+        );
+        assert!(
+            cavity_faces
+                .iter()
+                .all(|&f| matches!(topo.face(f).unwrap().surface(), FaceSurface::Nurbs(_))),
+            "{name}: the cavity's walls are B-splines"
+        );
+        if name == "upright" {
+            let (ball_box, ball_whole) = face_and_net_boxes(&topo, &ball_faces);
+            let (cavity_box, cavity_whole) = face_and_net_boxes(&topo, &cavity_faces);
+            assert!(
+                box_holds(ball_whole, cavity_box) && box_holds(cavity_whole, ball_box),
+                "each box must hold the other for this test to mean anything"
+            );
+        }
+        for comps in [
+            vec![cavity_faces.clone(), ball_faces.clone()],
+            vec![ball_faces.clone(), cavity_faces.clone()],
+        ] {
+            assert!(
+                !super::components_are_disjoint_pieces(&topo, &comps),
+                "{name}: the cavity nests in the ball, listed {}",
+                if comps[0] == cavity_faces {
+                    "first"
+                } else {
+                    "second"
+                }
+            );
+        }
+    }
+}
+
+/// A cavity cut from a ball and put in B-spline form, nested off the
+/// centre of a ball. Its faces are sampled over their untrimmed surfaces, so
+/// the box they give reaches above the cut and past the outer ball's own
+/// box, though every point of the cavity lies inside the ball. The check
+/// read that box against the ball's and found no nesting to probe.
+#[test]
+fn a_cavity_whose_face_box_reaches_past_its_ball_is_nested() {
+    use brepkit_math::mat::Mat4;
+    use brepkit_topology::explorer::solid_faces;
+    let mut topo = Topology::new();
+    let ball = crate::primitives::make_sphere(&mut topo, 9.0, 32).unwrap();
+    let small = crate::primitives::make_sphere(&mut topo, 3.0, 32).unwrap();
+    let place = Mat4::translation(0.0, 0.0, 8.0) * Mat4::rotation_x(0.9) * Mat4::rotation_y(0.4);
+    crate::transform::transform_solid(&mut topo, small, &place).unwrap();
+    let lid = crate::primitives::make_box(&mut topo, 20.0, 20.0, 10.0).unwrap();
+    crate::transform::transform_solid(&mut topo, lid, &Mat4::translation(-10.0, -10.0, 8.0))
+        .unwrap();
+    // The ball of radius 3 below z = 8: its farthest point from the origin
+    // is on the rim, sqrt(8^2 + 3^2) = 8.54, inside the ball of radius 9.
+    let cavity = boolean(&mut topo, BooleanOp::Cut, small, lid).unwrap();
+    assert!(crate::heal::convert_to_bspline(&mut topo, cavity).unwrap() > 0);
+    let (ball_faces, cavity_faces) = (
+        solid_faces(&topo, ball).unwrap(),
+        solid_faces(&topo, cavity).unwrap(),
+    );
+    let (ball_box, _) = face_and_net_boxes(&topo, &ball_faces);
+    let (cavity_box, _) = face_and_net_boxes(&topo, &cavity_faces);
+    assert!(
+        cavity_box.max.z() > ball_box.max.z(),
+        "the cavity's face box must reach past the ball's for this test to mean anything: {} against {}",
+        cavity_box.max.z(),
+        ball_box.max.z()
+    );
+    for comps in [
+        vec![cavity_faces.clone(), ball_faces.clone()],
+        vec![ball_faces, cavity_faces],
+    ] {
+        assert!(
+            !super::components_are_disjoint_pieces(&topo, &comps),
+            "the cavity nests in the ball"
+        );
+    }
+}
+
+/// A ball 0.07 inside the wall of a ball round it, turned about the axis so
+/// that its vertices sit between the outer ball's, nests in it whichever
+/// order the two come in, and so does one 0.001 inside. Read against a mesh
+/// of the outer ball, whose chords pass inside its surface by up to the
+/// deflection, the count of crossings read the inner ball's vertex as
+/// outside; which wall gaps passed hung on the mesh's sample count.
+#[test]
+fn a_ball_just_inside_its_balls_wall_nests_whichever_order_it_comes_in() {
+    use brepkit_math::mat::Mat4;
+    use brepkit_topology::explorer::solid_faces;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    for ((name, pose), radius) in [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+    ]
+    .into_iter()
+    .flat_map(|p| [9.93, 9.999].map(|r| (p, r)))
+    {
+        let mut topo = Topology::new();
+        let ball = crate::primitives::make_sphere(&mut topo, 10.0, 32).unwrap();
+        let inner = crate::primitives::make_sphere(&mut topo, radius, 32).unwrap();
+        crate::transform::transform_solid(
+            &mut topo,
+            inner,
+            &Mat4::rotation_z(std::f64::consts::PI / 27.0),
+        )
+        .unwrap();
+        for s in [ball, inner] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let (ball_faces, inner_faces) = (
+            solid_faces(&topo, ball).unwrap(),
+            solid_faces(&topo, inner).unwrap(),
+        );
+        for (order, comps) in [
+            ("first", vec![inner_faces.clone(), ball_faces.clone()]),
+            ("second", vec![ball_faces, inner_faces]),
+        ] {
+            assert!(
+                !super::components_are_disjoint_pieces(&topo, &comps),
+                "{name}: the inner ball of radius {radius} nests in the ball, listed {order}"
+            );
+        }
+    }
+}
+
+/// A ball 5e-7 clear of the inside of a ring's hole is a separate piece,
+/// whichever order the two come in. All the ball's vertices lie on its
+/// equator, each 5e-7 from the ring, and the probe read them as on the ring
+/// at the classifier's default tolerance of 1e-6; with no point of the ball
+/// to read, the check gave its conservative answer and refused the pair.
+#[test]
+fn a_ball_just_clear_of_a_rings_hole_is_a_separate_piece() {
+    use brepkit_math::mat::Mat4;
+    use brepkit_topology::explorer::solid_faces;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    for (name, pose) in [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+    ] {
+        let mut topo = Topology::new();
+        let ring = crate::primitives::make_torus(&mut topo, 10.0, 2.0, 48).unwrap();
+        let ball = crate::primitives::make_sphere(&mut topo, 7.999_999_5, 32).unwrap();
+        for s in [ring, ball] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let (ring_faces, ball_faces) = (
+            solid_faces(&topo, ring).unwrap(),
+            solid_faces(&topo, ball).unwrap(),
+        );
+        for (order, comps) in [
+            ("first", vec![ball_faces.clone(), ring_faces.clone()]),
+            ("second", vec![ring_faces, ball_faces]),
+        ] {
+            assert!(
+                super::components_are_disjoint_pieces(&topo, &comps),
+                "{name}: the ball in the ring's hole is a separate piece, listed {order}"
+            );
+        }
+    }
+}
+
+/// A piece that meets the piece round it at its vertices, or along its
+/// edges too, is read at a point off that piece's surface. A ball whose
+/// equator lies on a ring's hole is read at the middle of an equator chord;
+/// a plug that fills a tube's hole, its rims on the tube's inner rims and
+/// its wall on the tube's wall, at a point inside its flat end. Both are
+/// separate pieces: with no point of them to read, the check gave its
+/// conservative answer and refused them.
+#[test]
+fn a_piece_that_meets_its_rings_hole_is_read_off_the_ring() {
+    use brepkit_math::mat::Mat4;
+    use brepkit_topology::explorer::solid_faces;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    for (name, pose) in [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+    ] {
+        let mut topo = Topology::new();
+        let ring = crate::primitives::make_torus(&mut topo, 10.0, 2.0, 48).unwrap();
+        let ball = crate::primitives::make_sphere(&mut topo, 8.0, 32).unwrap();
+        let drum = crate::primitives::make_cylinder(&mut topo, 10.0, 1.0).unwrap();
+        let bore = crate::primitives::make_cylinder(&mut topo, 8.0, 1.0).unwrap();
+        let tube = boolean(&mut topo, BooleanOp::Cut, drum, bore).unwrap();
+        let plug = crate::primitives::make_cylinder(&mut topo, 8.0, 1.0).unwrap();
+        for s in [ring, ball, tube, plug] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let faces = |s| solid_faces(&topo, s).unwrap();
+        for (what, outer, inner) in [
+            ("ball in the ring", faces(ring), faces(ball)),
+            ("plug in the tube", faces(tube), faces(plug)),
+        ] {
+            for (order, comps) in [
+                ("first", vec![inner.clone(), outer.clone()]),
+                ("second", vec![outer, inner]),
+            ] {
+                assert!(
+                    super::components_are_disjoint_pieces(&topo, &comps),
+                    "{name}: {what}, listed {order}, is a separate piece"
+                );
+            }
+        }
+    }
+}
+
+/// A ball touching a ring's outside, and a ball's cap resting on a block,
+/// are separate pieces whichever order they come in. The ring's wire is
+/// four seam edges of no length at one vertex, the point the ball touches;
+/// the cap's wire is the one circle it rests on. Each face's points were
+/// read over the box of its wire's points in `(u, v)`, which shrank to the
+/// contact, so every point read lay on the other piece and the check
+/// refused the pair. A face's whole period, or a ball's whole span of
+/// latitude, is read where the wire's box spans next to none of it.
+#[test]
+fn a_ball_on_a_ring_and_a_cap_on_a_block_are_separate_pieces() {
+    use brepkit_math::mat::Mat4;
+    use brepkit_topology::explorer::solid_faces;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    for (name, pose) in [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+    ] {
+        let mut topo = Topology::new();
+        let ring = crate::primitives::make_torus(&mut topo, 10.0, 2.0, 48).unwrap();
+        let ball = crate::primitives::make_sphere(&mut topo, 1.0, 32).unwrap();
+        crate::transform::transform_solid(&mut topo, ball, &Mat4::translation(13.0, 0.0, 0.0))
+            .unwrap();
+        let dome = crate::primitives::make_sphere(&mut topo, 2.0, 32).unwrap();
+        let top = crate::primitives::make_box(&mut topo, 6.0, 6.0, 2.0).unwrap();
+        crate::transform::transform_solid(&mut topo, top, &Mat4::translation(-3.0, -3.0, 1.0))
+            .unwrap();
+        let cap = boolean(&mut topo, BooleanOp::Intersect, dome, top).unwrap();
+        let block = crate::primitives::make_box(&mut topo, 10.0, 10.0, 4.0).unwrap();
+        crate::transform::transform_solid(&mut topo, block, &Mat4::translation(-5.0, -5.0, -3.0))
+            .unwrap();
+        for s in [ring, ball, cap, block] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let faces = |s| solid_faces(&topo, s).unwrap();
+        for (what, a, b) in [
+            ("ball on the ring", faces(ring), faces(ball)),
+            ("cap on the block", faces(block), faces(cap)),
+        ] {
+            for (order, comps) in [
+                ("first", vec![a.clone(), b.clone()]),
+                ("second", vec![b, a]),
+            ] {
+                assert!(
+                    super::components_are_disjoint_pieces(&topo, &comps),
+                    "{name}: {what}, listed {order}, is a separate piece"
+                );
+            }
+        }
+    }
+}
+
 /// Multi-region Euler acceptance must tolerate genus per piece.
 ///
 /// `euler_balanced` used to compare against a fixed bound of 2, i.e. it assumed
@@ -8536,10 +8937,9 @@ fn mesh_fallback_counter_records_fallbacks() {
     // tolerate concurrent increments from unrelated tests; only the
     // ordering within this test is load-bearing.
     //
-    // Phase 1: a clean overlapping-box fuse stays analytic. Phase 2: a rod
-    // cut through a torus's wall takes the mesh fallback (see
-    // `compound_cut_cuts_the_exact_piece_and_defers_the_other`), and the
-    // counter must record it.
+    // Phase 1: a clean overlapping-box fuse stays analytic. Phase 2: a pin
+    // cut across a bore's mouth takes the mesh fallback (see
+    // `pin_across_a_bores_mouth`), and the counter must record it.
     let mut topo = Topology::new();
     let a = crate::primitives::make_box(&mut topo, 2.0, 2.0, 2.0).unwrap();
     let b = crate::primitives::make_box(&mut topo, 2.0, 2.0, 2.0).unwrap();
@@ -8548,16 +8948,12 @@ fn mesh_fallback_counter_records_fallbacks() {
     let clean = boolean(&mut topo, BooleanOp::Fuse, a, b).unwrap();
     assert!(crate::measure::solid_volume(&topo, clean, 0.1).unwrap() > 0.0);
 
-    let torus = crate::primitives::make_torus(&mut topo, 4.0, 1.5, 32).unwrap();
-    let rod = crate::primitives::make_cylinder(&mut topo, 0.6, 20.0).unwrap();
-    let m = brepkit_math::mat::Mat4::translation(0.5, 10.0, 1.0)
-        * brepkit_math::mat::Mat4::rotation_x(std::f64::consts::FRAC_PI_2);
-    crate::transform::transform_solid(&mut topo, rod, &m).unwrap();
+    let (part, pin) = pin_across_a_bores_mouth(&mut topo);
     let before = super::mesh_fallback_count();
-    let _ = boolean(&mut topo, BooleanOp::Cut, torus, rod);
+    let _ = boolean(&mut topo, BooleanOp::Cut, part, pin);
     assert!(
         super::mesh_fallback_count() > before,
-        "the rod's cut should route through the mesh fallback and increment the counter"
+        "the pin's cut should route through the mesh fallback and increment the counter"
     );
 }
 
@@ -9708,6 +10104,106 @@ fn fuse_box_top_crossing_plate_hole_keeps_the_open_part() {
     }
 }
 
+/// A unit cube from `(x, 0, 0)` whose top face carries two holes at its
+/// centre, each one closed edge of no length, the same edge once each way.
+/// Every edge has two uses, every wire closes and every edge lies on its
+/// faces, but with the two holes one loop, `V - E + F - L = 9 - 13 + 6 - 1 =
+/// 1`, and no closed surface has an odd count.
+fn cube_with_a_hole_of_no_size_both_ways(topo: &mut Topology, x: f64) -> SolidId {
+    let cube = make_unit_cube_manifold_at(topo, x, 0.0, 0.0);
+    let top = brepkit_topology::explorer::solid_faces(topo, cube)
+        .unwrap()
+        .into_iter()
+        .find(|&f| {
+            matches!(topo.face(f).unwrap().surface(), FaceSurface::Plane { normal, .. }
+                if normal.z() > 0.5)
+        })
+        .unwrap();
+    let centre = topo.add_vertex(Vertex::new(Point3::new(x + 0.5, 0.5, 1.0), 1e-7));
+    let point = topo.add_edge(Edge::new(centre, centre, EdgeCurve::Line));
+    let holes = [true, false].map(|forward| {
+        topo.add_wire(Wire::new(vec![OrientedEdge::new(point, forward)], true).unwrap())
+    });
+    let (outer, surface) = {
+        let face = topo.face(top).unwrap();
+        (face.outer_wire(), face.surface().clone())
+    };
+    *topo.face_mut(top).unwrap() = Face::new(outer, holes.to_vec(), surface);
+    cube
+}
+
+/// The strict gate refuses a solid whose counts break the Euler-Poincaré
+/// relation, though its edges, wires and faces pass every other test.
+#[test]
+fn the_strict_gate_rejects_a_solid_with_a_wrong_euler_count() {
+    let mut topo = Topology::new();
+    let cube = cube_with_a_hole_of_no_size_both_ways(&mut topo, 0.0);
+    assert_eq!(
+        brepkit_topology::explorer::solid_entity_counts(&topo, cube).unwrap(),
+        (6, 13, 9)
+    );
+    let err = super::assembly::validate_boolean_result(&topo, cube).unwrap_err();
+    assert!(err.to_string().contains("Euler"), "{err}");
+}
+
+/// Two copies of [`cube_with_a_hole_of_no_size_both_ways`], apart, as one
+/// solid. Each piece reads `V - E + F - L = 1`, which no closed surface has,
+/// but the two together read 2, the count of one sphere. Read piece by
+/// piece, both the validator and the strict gate report the Euler fault.
+#[test]
+fn two_pieces_with_odd_euler_counts_do_not_pass_as_one_sphere() {
+    let mut topo = Topology::new();
+    let faces: Vec<FaceId> = [0.0, 3.0]
+        .into_iter()
+        .flat_map(|x| {
+            let cube = cube_with_a_hole_of_no_size_both_ways(&mut topo, x);
+            brepkit_topology::explorer::solid_faces(&topo, cube).unwrap()
+        })
+        .collect();
+    let shell = topo.add_shell(brepkit_topology::shell::Shell::new(faces).unwrap());
+    let both = topo.add_solid(brepkit_topology::solid::Solid::new(shell, vec![]));
+    assert_eq!(
+        brepkit_topology::explorer::solid_entity_counts(&topo, both).unwrap(),
+        (12, 26, 18)
+    );
+    let report = crate::validate::validate_solid(&topo, both).unwrap();
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.description.contains("Euler")),
+        "{:?}",
+        report.issues
+    );
+    let err = super::assembly::validate_boolean_result(&topo, both).unwrap_err();
+    assert!(err.to_string().contains("Euler"), "{err}");
+}
+
+/// A cluster of three overlapping cubes whose one-pass fuse gives a solid
+/// with a wrong Euler count: `fuse_cluster` does not return it, and fuses the
+/// cubes one at a time instead, to the union's volume.
+#[test]
+fn fuse_cluster_refuses_a_one_pass_fuse_with_a_wrong_euler_count() {
+    let mut topo = Topology::new();
+    let cluster = [0.0, 0.5, 1.0].map(|x| make_unit_cube_manifold_at(&mut topo, x, 0.25 * x, 0.0));
+    let mut bad = None;
+    let fused = super::fuse_cluster_with(&mut topo, &cluster, |topo, _| {
+        let solid = cube_with_a_hole_of_no_size_both_ways(topo, 0.0);
+        bad = Some(solid);
+        Ok(solid)
+    })
+    .unwrap();
+    assert_ne!(Some(fused), bad, "the cluster kept the one-pass result");
+    let report = crate::validate::validate_solid(&topo, fused).unwrap();
+    assert!(report.is_valid(), "{:?}", report.issues);
+    let volume = crate::measure::solid_volume(&topo, fused, 1e-3).unwrap();
+    // Three unit cubes, each overlapping the next in 0.5 x 0.875 x 1.
+    assert!(
+        (volume - (3.0 - 2.0 * 0.5 * 0.875)).abs() < 1e-9,
+        "volume {volume}"
+    );
+}
+
 /// A hole that lies outside its face's outline passes the edge counts of the
 /// strict gate, but its face bounds the wrong region: the gate rejects it.
 #[test]
@@ -9739,4 +10235,442 @@ fn the_strict_gate_rejects_a_hole_outside_its_face() {
     *topo.face_mut(top).unwrap() = Face::new(outer, vec![hole], surface);
     let err = super::assembly::validate_boolean_result(&topo, cube).unwrap_err();
     assert!(err.to_string().contains("misplaced hole"), "{err}");
+}
+
+/// Two unit boxes on one shell that share the edge from (1, 1, 0) to
+/// (1, 1, 1) and its two vertices by id, as a union of boxes touching edge
+/// to edge can: the second box's edges and wires are moved on to the first
+/// box's edge and vertices there. The ids of each face's edges and their
+/// vertices once the pieces are separated, in the faces' order.
+fn touching_boxes_separated() -> Vec<(usize, usize, usize)> {
+    let mut topo = Topology::new();
+    let a = crate::primitives::make_box(&mut topo, 1.0, 1.0, 1.0).unwrap();
+    let b = crate::primitives::make_box(&mut topo, 1.0, 1.0, 1.0).unwrap();
+    crate::transform::transform_solid(
+        &mut topo,
+        b,
+        &brepkit_math::mat::Mat4::translation(1.0, 1.0, 0.0),
+    )
+    .unwrap();
+    let corner = |z: f64| Point3::new(1.0, 1.0, z);
+    let near = |p: Point3, q: Point3| (p - q).length() < 1e-9;
+    let vertex_at = |topo: &Topology, solid: SolidId, at: Point3| {
+        brepkit_topology::explorer::solid_vertices(topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&v| near(topo.vertex(v).unwrap().point(), at))
+            .unwrap()
+    };
+    let (a0, a1) = (
+        vertex_at(&topo, a, corner(0.0)),
+        vertex_at(&topo, a, corner(1.0)),
+    );
+    let (b0, b1) = (
+        vertex_at(&topo, b, corner(0.0)),
+        vertex_at(&topo, b, corner(1.0)),
+    );
+    let joining = |topo: &Topology, solid: SolidId, v0, v1| {
+        brepkit_topology::explorer::solid_edges(topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&e| {
+                let edge = topo.edge(e).unwrap();
+                [edge.start(), edge.end()] == [v0, v1] || [edge.start(), edge.end()] == [v1, v0]
+            })
+            .unwrap()
+    };
+    let (shared, gone) = (joining(&topo, a, a0, a1), joining(&topo, b, b0, b1));
+    let shared_start = topo.edge(shared).unwrap().start();
+    for e in brepkit_topology::explorer::solid_edges(&topo, b).unwrap() {
+        let edge = topo.edge_mut(e).unwrap();
+        for (from, to) in [(b0, a0), (b1, a1)] {
+            if edge.start() == from {
+                edge.set_start(to);
+            }
+            if edge.end() == from {
+                edge.set_end(to);
+            }
+        }
+    }
+    let gone_start = topo.edge(gone).unwrap().start();
+    let b_faces = brepkit_topology::explorer::solid_faces(&topo, b).unwrap();
+    for &f in &b_faces {
+        let wire = topo.face(f).unwrap().outer_wire();
+        for oe in topo.wire_mut(wire).unwrap().edges_mut() {
+            if oe.edge() == gone {
+                let forward = oe.is_forward() == (gone_start == shared_start);
+                *oe = OrientedEdge::new(shared, forward);
+            }
+        }
+    }
+    let mut faces = brepkit_topology::explorer::solid_faces(&topo, a).unwrap();
+    faces.extend(b_faces);
+    let shell = topo.add_shell(brepkit_topology::shell::Shell::new(faces).unwrap());
+    let both = topo.add_solid(brepkit_topology::solid::Solid::new(shell, vec![]));
+    assert_eq!(
+        assembly::separate_touching_pieces(&mut topo, both).unwrap(),
+        2
+    );
+    let mut uses: std::collections::HashMap<EdgeId, usize> = std::collections::HashMap::new();
+    let mut ids = Vec::new();
+    for f in brepkit_topology::explorer::solid_faces(&topo, both).unwrap() {
+        let wire = topo.face(f).unwrap().outer_wire();
+        for oe in topo.wire(wire).unwrap().edges() {
+            *uses.entry(oe.edge()).or_default() += 1;
+            let edge = topo.edge(oe.edge()).unwrap();
+            ids.push((oe.edge().index(), edge.start().index(), edge.end().index()));
+        }
+    }
+    assert!(uses.values().all(|&n| n == 2), "an edge without two uses");
+    ids
+}
+
+/// Pieces of one shell that share an edge by id come apart with their own
+/// copies of it and of the edges and vertices round it, made in the same
+/// order on every run.
+#[test]
+fn touching_pieces_take_their_copies_in_one_order() {
+    let first = touching_boxes_separated();
+    for run in 1..24 {
+        assert!(
+            touching_boxes_separated() == first,
+            "run {run} gives other ids than run 0"
+        );
+    }
+}
+
+/// The cut per piece of a solid in separate pieces keeps the cavity of its
+/// input and the cavity its cut makes as inner shells: a ball with a cavity
+/// off its centre, beside a box, less a small ball at the ball's centre.
+#[test]
+fn cut_per_piece_keeps_the_cavities() {
+    use brepkit_math::mat::Mat4;
+
+    let ball_volume = |r: f64| 4.0 / 3.0 * std::f64::consts::PI * r.powi(3);
+    let truth = ball_volume(1.0) - ball_volume(0.25) - ball_volume(0.2) + 1.0;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    for (name, pose) in [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+    ] {
+        let mut topo = Topology::new();
+        let ball = crate::primitives::make_sphere(&mut topo, 1.0, 32).unwrap();
+        let cavity = crate::primitives::make_sphere(&mut topo, 0.25, 32).unwrap();
+        let place = Mat4::translation(0.5, 0.1, 0.0);
+        crate::transform::transform_solid(&mut topo, cavity, &place).unwrap();
+        let block = crate::primitives::make_box(&mut topo, 1.0, 1.0, 1.0).unwrap();
+        let place = Mat4::translation(1.5, -0.5, -0.5);
+        crate::transform::transform_solid(&mut topo, block, &place).unwrap();
+        let tool = crate::primitives::make_sphere(&mut topo, 0.2, 32).unwrap();
+        for s in [ball, cavity, block, tool] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let hollow = boolean(&mut topo, BooleanOp::Cut, ball, cavity).unwrap();
+        let both = boolean(&mut topo, BooleanOp::Fuse, hollow, block).unwrap();
+        assert_eq!(topo.solid(both).unwrap().inner_shells().len(), 1, "{name}");
+
+        let cut = cut_multi_region_input(&mut topo, both, tool, 2).unwrap();
+        assert_eq!(
+            topo.solid(cut).unwrap().inner_shells().len(),
+            2,
+            "{name}: cavities"
+        );
+        let report = crate::validate::validate_solid(&topo, cut).unwrap();
+        assert!(report.is_valid(), "{name}: {:?}", report.issues);
+        let mesh = crate::tessellate::tessellate_solid(&topo, cut, 0.01).unwrap();
+        assert_eq!(crate::tessellate::boundary_edge_count(&mesh), 0, "{name}");
+        let volume = crate::measure::solid_volume(&topo, cut, 0.0005).unwrap();
+        assert!(
+            ((volume - truth) / truth).abs() < 1e-5,
+            "{name}: volume {volume} against {truth}"
+        );
+    }
+}
+
+/// Upright, turned, mirrored, turned and mirrored, and rolled.
+fn five_poses() -> [(&'static str, brepkit_math::mat::Mat4); 5] {
+    use brepkit_math::mat::Mat4;
+    let turn = Mat4::rotation_z(0.7) * Mat4::rotation_x(0.4) * Mat4::rotation_y(1.1);
+    [
+        ("upright", Mat4::identity()),
+        ("turned", turn),
+        ("mirrored", Mat4::scale(1.0, -1.0, 1.0)),
+        ("turned+mirrored", turn * Mat4::scale(-1.0, 1.0, 1.0)),
+        ("rolled", Mat4::rotation_x(std::f64::consts::FRAC_PI_2)),
+    ]
+}
+
+/// A boolean with an empty operand gives the trivial result, with the mesh
+/// fallback on and off: a fuse gives a copy of the other operand, a cut of
+/// the empty solid and an intersect give the empty solid, and a cut by the
+/// empty solid gives a copy of the solid.
+#[test]
+fn an_empty_operand_gives_the_trivial_result() {
+    use BooleanOp::{Cut, Fuse, Intersect};
+
+    for (name, pose) in five_poses() {
+        for mesh_fallback in [true, false] {
+            let mut topo = Topology::new();
+            let ball = crate::primitives::make_sphere(&mut topo, 1.0, 32).unwrap();
+            crate::transform::transform_solid(&mut topo, ball, &pose).unwrap();
+            let truth = crate::measure::solid_volume(&topo, ball, 0.0005).unwrap();
+            let ball_faces = brepkit_topology::explorer::solid_faces(&topo, ball).unwrap();
+            let empty = topo.add_empty_solid();
+            let opts = BooleanOptions {
+                mesh_fallback,
+                ..BooleanOptions::default()
+            };
+            for (op, empty_first, gives_ball) in [
+                (Fuse, true, true),
+                (Fuse, false, true),
+                (Cut, true, false),
+                (Cut, false, true),
+                (Intersect, true, false),
+                (Intersect, false, false),
+            ] {
+                let case =
+                    format!("{name} fallback={mesh_fallback} {op:?} empty_first={empty_first}");
+                let (a, b) = if empty_first {
+                    (empty, ball)
+                } else {
+                    (ball, empty)
+                };
+                let r = boolean_with_options(&mut topo, op, a, b, opts)
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
+                assert!(r != ball && r != empty, "{case}: not a new solid");
+                if gives_ball {
+                    let faces = brepkit_topology::explorer::solid_faces(&topo, r).unwrap();
+                    assert_eq!(faces.len(), ball_faces.len(), "{case}");
+                    assert!(
+                        faces.iter().all(|f| !ball_faces.contains(f)),
+                        "{case}: not a copy"
+                    );
+                    let report = crate::validate::validate_solid(&topo, r).unwrap();
+                    assert!(report.is_valid(), "{case}: {:?}", report.issues);
+                    let volume = crate::measure::solid_volume(&topo, r, 0.0005).unwrap();
+                    assert!(
+                        ((volume - truth) / truth).abs() < 1e-9,
+                        "{case}: volume {volume} against {truth}"
+                    );
+                } else {
+                    assert!(topo.is_empty_solid(r), "{case}: not empty");
+                }
+                let (r, _) = boolean_with_evolution(&mut topo, op, a, b)
+                    .unwrap_or_else(|e| panic!("{case} with evolution: {e}"));
+                assert_eq!(topo.is_empty_solid(r), !gives_ball, "{case} with evolution");
+            }
+            for op in [Fuse, Cut, Intersect] {
+                let r = boolean_with_options(&mut topo, op, empty, empty, opts).unwrap();
+                assert!(
+                    r != empty && topo.is_empty_solid(r),
+                    "{name} {op:?} of two empty solids"
+                );
+            }
+            assert_eq!(
+                brepkit_topology::explorer::solid_faces(&topo, ball).unwrap(),
+                ball_faces,
+                "{name}: the operand changed"
+            );
+        }
+    }
+}
+
+/// A chain of booleans goes on past a step whose result is empty, with the
+/// mesh fallback off: a ball less a box far from it, intersected with that
+/// box, is empty, and a fuse of it with a second box gives that box.
+#[test]
+fn a_chain_goes_on_past_an_empty_step() {
+    use brepkit_math::mat::Mat4;
+
+    let opts = BooleanOptions {
+        mesh_fallback: false,
+        unify_faces: false,
+        ..BooleanOptions::default()
+    };
+    for (name, pose) in five_poses() {
+        let mut topo = Topology::new();
+        let ball = crate::primitives::make_sphere(&mut topo, 1.0, 32).unwrap();
+        let far = crate::primitives::make_box(&mut topo, 0.5, 0.5, 0.5).unwrap();
+        let place = Mat4::translation(2.0, 0.3, -0.2);
+        crate::transform::transform_solid(&mut topo, far, &place).unwrap();
+        let block = crate::primitives::make_box(&mut topo, 0.4, 0.6, 0.8).unwrap();
+        let place = Mat4::translation(0.2, -0.1, 0.3);
+        crate::transform::transform_solid(&mut topo, block, &place).unwrap();
+        for s in [ball, far, block] {
+            crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+        }
+        let common =
+            boolean_with_options(&mut topo, BooleanOp::Intersect, ball, far, opts).unwrap();
+        assert!(topo.is_empty_solid(common), "{name}");
+        for op in [BooleanOp::Fuse, BooleanOp::Cut, BooleanOp::Intersect] {
+            let r = boolean_with_options(&mut topo, op, common, block, opts)
+                .unwrap_or_else(|e| panic!("{name} {op:?}: {e}"));
+            if op == BooleanOp::Fuse {
+                let volume = crate::measure::solid_volume(&topo, r, 0.0005).unwrap();
+                assert!((volume - 0.192).abs() < 1e-12, "{name}: volume {volume}");
+            } else {
+                assert!(topo.is_empty_solid(r), "{name} {op:?}");
+            }
+        }
+    }
+}
+
+/// A boolean of the empty solid and a solid with a handle that does not
+/// resolve (the solid itself, its outer shell or a cavity shell) fails, on
+/// either side, as it does without the empty solid.
+#[test]
+fn an_empty_operand_does_not_hide_an_invalid_one() {
+    use brepkit_topology::solid::Solid;
+
+    let mut topo = Topology::new();
+    let empty = topo.add_empty_solid();
+    let block = crate::primitives::make_box(&mut topo, 1.0, 1.0, 1.0).unwrap();
+    let outer = topo.solid(block).unwrap().outer_shell();
+    // Handles past the end of `topo`'s arenas, taken from a larger one.
+    let mut other = Topology::new();
+    let mut stray_solid = block;
+    for _ in 0..8 {
+        stray_solid = crate::primitives::make_box(&mut other, 1.0, 1.0, 1.0).unwrap();
+    }
+    let stray_shell = other.solid(stray_solid).unwrap().outer_shell();
+    let no_outer = topo.add_solid(Solid::new(stray_shell, vec![]));
+    let no_cavity = topo.add_solid(Solid::new(outer, vec![stray_shell]));
+    assert!(topo.solid(stray_solid).is_err() && topo.shell(stray_shell).is_err());
+
+    for (what, bad) in [
+        ("missing solid", stray_solid),
+        ("missing outer shell", no_outer),
+        ("missing cavity shell", no_cavity),
+    ] {
+        for op in [BooleanOp::Fuse, BooleanOp::Cut, BooleanOp::Intersect] {
+            for (a, b) in [(empty, bad), (bad, empty)] {
+                let case = format!("{what} {op:?} empty_first={}", a == empty);
+                assert!(boolean(&mut topo, op, a, b).is_err(), "{case}");
+                assert!(
+                    boolean_with_evolution(&mut topo, op, a, b).is_err(),
+                    "{case} with evolution"
+                );
+            }
+        }
+    }
+}
+
+/// A boolean with an empty operand and a box with a cavity reports each
+/// face of the box, the cavity's too, as kept in the face copied from it
+/// when the result is a copy of the box, and as deleted when it is empty.
+#[test]
+fn an_empty_operand_tracks_every_face_of_a_hollow_solid() {
+    use BooleanOp::{Cut, Fuse, Intersect};
+    use brepkit_math::mat::Mat4;
+    use brepkit_topology::explorer::solid_faces;
+
+    let mut topo = Topology::new();
+    let block = crate::primitives::make_box(&mut topo, 4.0, 4.0, 4.0).unwrap();
+    let hole = crate::primitives::make_box(&mut topo, 1.0, 1.0, 1.0).unwrap();
+    crate::transform::transform_solid(&mut topo, hole, &Mat4::translation(1.5, 1.5, 1.5)).unwrap();
+    let hollow = boolean(&mut topo, Cut, block, hole).unwrap();
+    assert_eq!(topo.solid(hollow).unwrap().inner_shells().len(), 1);
+    let inputs = solid_faces(&topo, hollow).unwrap();
+    assert_eq!(inputs.len(), 12);
+    let empty = topo.add_empty_solid();
+
+    for (op, a, b, kept) in [
+        (Fuse, hollow, empty, true),
+        (Fuse, empty, hollow, true),
+        (Cut, hollow, empty, true),
+        (Cut, empty, hollow, false),
+        (Intersect, hollow, empty, false),
+        (Intersect, empty, hollow, false),
+    ] {
+        let case = format!("{op:?} empty_first={}", a == empty);
+        let (result, evo) = boolean_with_evolution(&mut topo, op, a, b).unwrap();
+        assert!(evo.generated.is_empty(), "{case}");
+        if kept {
+            let outputs = solid_faces(&topo, result).unwrap();
+            assert_eq!(outputs.len(), inputs.len(), "{case}");
+            assert!(evo.deleted.is_empty(), "{case}: deleted {:?}", evo.deleted);
+            assert_eq!(evo.modified.len(), inputs.len(), "{case}");
+            for &input in &inputs {
+                let images = &evo.modified[&input.index()];
+                assert_eq!(images.len(), 1, "{case}");
+                let output = outputs
+                    .iter()
+                    .copied()
+                    .find(|f| f.index() == images[0])
+                    .unwrap_or_else(|| panic!("{case}: image not in the result"));
+                assert_ne!(output, input, "{case}: not a copy");
+                let (i, o) = (topo.face(input).unwrap(), topo.face(output).unwrap());
+                let (
+                    FaceSurface::Plane { normal: ni, d: di },
+                    FaceSurface::Plane { normal: no, d: dop },
+                ) = (i.surface(), o.surface())
+                else {
+                    panic!("{case}: not planes");
+                };
+                assert!(
+                    (*ni - *no).length() < 1e-12 && (di - dop).abs() < 1e-12,
+                    "{case}: face {} maps to another plane",
+                    input.index()
+                );
+                assert_eq!(i.is_reversed(), o.is_reversed(), "{case}");
+            }
+        } else {
+            assert!(topo.is_empty_solid(result), "{case}");
+            assert!(evo.modified.is_empty(), "{case}");
+            let deleted: std::collections::HashSet<usize> =
+                inputs.iter().map(|f| f.index()).collect();
+            assert_eq!(evo.deleted, deleted, "{case}");
+        }
+    }
+}
+
+/// A solid in two separate pieces, a ball and a box, cut by a tool that
+/// holds the box whole and takes a slice off the ball: only the ball less
+/// its slice remains, by the public cut and by the cut per piece.
+#[test]
+fn cut_per_piece_drops_a_piece_inside_the_tool() {
+    use brepkit_math::mat::Mat4;
+
+    let (r, h) = (1.0_f64, 0.5_f64);
+    let truth = 4.0 / 3.0 * std::f64::consts::PI * r.powi(3)
+        - std::f64::consts::PI * h * h * (3.0 * r - h) / 3.0;
+    for (name, pose) in five_poses() {
+        for per_piece in [false, true] {
+            let case = format!("{name} per_piece={per_piece}");
+            let mut topo = Topology::new();
+            let ball = crate::primitives::make_sphere(&mut topo, r, 32).unwrap();
+            let block = crate::primitives::make_box(&mut topo, 1.0, 1.0, 1.0).unwrap();
+            let place = Mat4::translation(1.5, -0.5, -0.5);
+            crate::transform::transform_solid(&mut topo, block, &place).unwrap();
+            let tool = crate::primitives::make_box(&mut topo, 2.5, 3.0, 3.0).unwrap();
+            let place = Mat4::translation(r - h, -1.5, -1.5);
+            crate::transform::transform_solid(&mut topo, tool, &place).unwrap();
+            for s in [ball, block, tool] {
+                crate::transform::transform_solid(&mut topo, s, &pose).unwrap();
+            }
+            let both = boolean(&mut topo, BooleanOp::Fuse, ball, block).unwrap();
+            assert_eq!(assembly::face_components(&topo, both).len(), 2, "{case}");
+
+            let cut = if per_piece {
+                cut_multi_region_input(&mut topo, both, tool, 2).unwrap()
+            } else {
+                boolean(&mut topo, BooleanOp::Cut, both, tool).unwrap()
+            };
+            assert_eq!(
+                assembly::face_components(&topo, cut).len(),
+                1,
+                "{case}: pieces"
+            );
+            let report = crate::validate::validate_solid(&topo, cut).unwrap();
+            assert!(report.is_valid(), "{case}: {:?}", report.issues);
+            let mesh = crate::tessellate::tessellate_solid(&topo, cut, 0.01).unwrap();
+            assert_eq!(crate::tessellate::boundary_edge_count(&mesh), 0, "{case}");
+            let volume = crate::measure::solid_volume(&topo, cut, 0.0005).unwrap();
+            assert!(
+                ((volume - truth) / truth).abs() < 1e-6,
+                "{case}: volume {volume} against {truth}"
+            );
+        }
+    }
 }

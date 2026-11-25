@@ -36,6 +36,7 @@ use crate::{BlendError, BlendResult};
 
 mod concave_first;
 mod junction_carry;
+mod one_sphere;
 mod wall_run_up;
 
 type BlendCrossEdge = (EdgeId, VertexId, VertexId);
@@ -61,6 +62,14 @@ fn distinct_edges(edges: &[EdgeId]) -> Vec<EdgeId> {
 ///
 /// Collects edge sets with their radius laws, then computes and assembles
 /// the filleted solid in a single `build()` call.
+///
+/// The builder does not check its result. It checks how its faces share
+/// edges, not where the faces lie, so a result can have a face whose wire
+/// crosses itself, a hole across its face's outline, or two plane faces over
+/// one area, with no edge in [`BlendResult::failed`]. Those checks live in
+/// a crate above this one. Use `brepkit_operations::blend_ops::fillet_v2`
+/// or `fillet_v2_variable`, which refuse such a result and make a fillet
+/// across flat seams again with the seams merged.
 pub struct FilletBuilder<'a> {
     topo: &'a mut Topology,
     solid: SolidId,
@@ -107,6 +116,9 @@ impl<'a> FilletBuilder<'a> {
     /// 5. Assemble new solid from trimmed faces, blend faces, and untouched
     ///    original faces.
     ///
+    /// The result is not checked for faults in where its faces lie (see
+    /// [`FilletBuilder`]).
+    ///
     /// # Errors
     ///
     /// Returns [`BlendError`] if no edges were specified, or if topology
@@ -139,21 +151,44 @@ impl<'a> FilletBuilder<'a> {
             }
         }
         let snapshot = SolidSnapshot::capture(topo, solid)?;
-        let result = build_in_place(topo, solid, edge_sets);
-        match result {
-            Ok(result) => {
-                let preserve = snapshot.clone_result_source_faces(topo, result.solid);
-                let restore = snapshot.restore(topo);
-                match (preserve, restore) {
-                    (Ok(()), Ok(())) => Ok(result),
-                    (Err(error), _) | (_, Err(error)) => Err(error),
-                }
-            }
-            Err(error) => {
-                snapshot.restore(topo)?;
-                Err(error)
-            }
+        let picked: Vec<EdgeId> = edge_sets
+            .iter()
+            .flat_map(|(edges, _)| edges.iter().copied())
+            .collect();
+        let shared: Vec<(Vec<EdgeId>, std::sync::Arc<RadiusLaw>)> = edge_sets
+            .into_iter()
+            .map(|(edges, law)| (edges, std::sync::Arc::new(law)))
+            .collect();
+        let first = build_after_joins(topo, solid, &snapshot, &shared, |topo| {
+            one_sphere::join_sphere_faces_the_rim_crosses(topo, solid, &picked).map(Some)
+        })
+        .and_then(|built| {
+            built.ok_or_else(|| BlendError::PlanningFailure {
+                reason: "the fillet was not built".into(),
+            })
+        });
+        if first.as_ref().is_ok_and(|result| result.failed.is_empty()) {
+            return first;
         }
+        // A round of a rim on a sphere's narrow band whose contact runs past
+        // the band's far loop in part is made again with the band and the
+        // face beyond joined. It is kept only where it rounds every edge.
+        let joined = topo.transaction(|topo| {
+            let built = build_after_joins(topo, solid, &snapshot, &shared, |topo| {
+                let bands = one_sphere::join_sphere_bands_at_picked_rims(topo, solid, &picked)?;
+                if bands.is_empty() {
+                    return Ok(None);
+                }
+                let mut gone = one_sphere::join_sphere_faces_the_rim_crosses(topo, solid, &picked)?;
+                gone.extend(bands);
+                Ok(Some(gone))
+            });
+            match built {
+                Ok(Some(result)) if result.failed.is_empty() => Ok(result),
+                _ => Err(()),
+            }
+        });
+        joined.or(first)
     }
 
     fn build_in_place(self) -> Result<BlendResult, BlendError> {
@@ -2155,8 +2190,8 @@ fn outward_normal_at(
     Ok(Some(if face.is_reversed() { -normal } else { normal }))
 }
 
-/// Fold out a spur where a face's wire runs along a straight edge and back
-/// along a longer straight edge that overlaps it.
+/// Fold out a spur where a face's wire runs along an edge and back along a
+/// longer edge that overlaps it.
 ///
 /// A terminal whose cap cannot be notched keeps the edge leaving the spine's
 /// end (the spoke) whole, and the trim bridges the contact's end to that
@@ -2179,6 +2214,11 @@ fn outward_normal_at(
 /// a step's edge): the face's wire runs along those edges and back along the
 /// contact. Folding one edge at a time, the contact takes the input's edges,
 /// and the round meets each face beyond them along its own edge.
+///
+/// The spoke may be curved: a round ending on a floor that flat seams cut
+/// in pieces at the spine's end keeps the arc where the floor meets a bore
+/// whole, and the runout edge runs back along it to the contact. The arc is
+/// split there the same way.
 fn fold_spoke_spurs(
     topo: &mut Topology,
     faces: &[FaceId],
@@ -2213,9 +2253,8 @@ fn fold_spoke_spurs(
                     if v != v2 || p == q {
                         continue;
                     }
-                    if !straight_edge(topo, e1, ON_LINE)? || !straight_edge(topo, e2, ON_LINE)? {
-                        continue;
-                    }
+                    let straight =
+                        straight_edge(topo, e1, ON_LINE)? && straight_edge(topo, e2, ON_LINE)?;
                     let (pp, vp, qp) = (point(topo, p)?, point(topo, v)?, point(topo, q)?);
                     // Which of the two is the short one doubling back over
                     // the other: its far end lies inside the long one.
@@ -2228,9 +2267,17 @@ fn fold_spoke_spurs(
                         let t = (far - vp).dot(span) / length2;
                         t > 1e-9 && t < 1.0 - 1e-9 && (vp + span * t - far).length() <= ON_LINE
                     };
-                    let (short, long, short_first) = if inside(pp, qp) {
+                    let (short, long, short_first) = if straight {
+                        if inside(pp, qp) {
+                            (first, second, true)
+                        } else if inside(qp, pp) {
+                            (second, first, false)
+                        } else {
+                            continue;
+                        }
+                    } else if curved_spur(topo, first.edge(), second.edge(), v, ON_LINE)? {
                         (first, second, true)
-                    } else if inside(qp, pp) {
+                    } else if curved_spur(topo, second.edge(), first.edge(), v, ON_LINE)? {
                         (second, first, false)
                     } else {
                         continue;
@@ -2311,10 +2358,35 @@ fn fold_spoke_spurs(
                         long.edge(),
                         point(topo, split)?
                     );
-                    let rest = topo.add_edge(Edge::new(split, far, EdgeCurve::Line));
+                    // The far piece, stored the way the long edge is: from
+                    // the split to the far end, or (where the long edge
+                    // starts at the far end) back from it.
+                    let rest_from_split = long_edge.end() == far;
+                    let rest = if straight {
+                        topo.add_edge(Edge::new(split, far, EdgeCurve::Line))
+                    } else {
+                        let ends = (
+                            point(topo, long_edge.start())?,
+                            point(topo, long_edge.end())?,
+                        );
+                        let Some(piece) =
+                            long_piece(&long_edge, ends, point(topo, split)?, rest_from_split)
+                        else {
+                            continue;
+                        };
+                        topo.add_edge(if rest_from_split {
+                            Edge::new(split, far, piece)
+                        } else {
+                            Edge::new(far, split, piece)
+                        })
+                    };
+                    let rest_from_split = straight || rest_from_split;
                     // In this wire the pair becomes the far piece alone, run
                     // the way the long edge was.
-                    let rest_here = OrientedEdge::new(rest, long.oriented_start(&long_edge) == v);
+                    let rest_here = OrientedEdge::new(
+                        rest,
+                        (long.oriented_start(&long_edge) == v) == rest_from_split,
+                    );
                     let mut folded = Vec::with_capacity(n - 1);
                     for (k, &oe) in edges.iter().enumerate() {
                         if k == i {
@@ -2341,9 +2413,9 @@ fn fold_spoke_spurs(
                             OrientedEdge::new(short.edge(), short.is_forward() == short_from_v);
                         if from_v {
                             rewritten.push(short_away);
-                            rewritten.push(OrientedEdge::new(rest, true));
+                            rewritten.push(OrientedEdge::new(rest, rest_from_split));
                         } else {
-                            rewritten.push(OrientedEdge::new(rest, false));
+                            rewritten.push(OrientedEdge::new(rest, !rest_from_split));
                             rewritten
                                 .push(OrientedEdge::new(short.edge(), !short_away.is_forward()));
                         }
@@ -2356,6 +2428,96 @@ fn fold_spoke_spurs(
         }
     }
     Ok(())
+}
+
+/// Whether `short`, leaving `v`, runs back along `long`, which also leaves
+/// `v`: each of its points lies within `tol` of `long`, and its far end
+/// lies inside `long`, clear of both of its ends. For a pair where either
+/// edge is curved (a cap's arc kept whole past a round's contact, and the
+/// runout edge along it).
+fn curved_spur(
+    topo: &Topology,
+    short: EdgeId,
+    long: EdgeId,
+    v: VertexId,
+    tol: f64,
+) -> Result<bool, BlendError> {
+    const SAMPLES: u32 = 8;
+    // The cosine of the most angle between the two edges' directions at
+    // `v`: a runout edge fitted along an arc leaves it within a degree.
+    const SAME_WAY: f64 = 0.999;
+    let (s, l) = (topo.edge(short)?, topo.edge(long)?);
+    if s.start() == s.end() || l.start() == l.end() {
+        return Ok(false);
+    }
+    let far = if s.start() == v { s.end() } else { s.start() };
+    let far_point = topo.vertex(far)?.point();
+    for end in [l.start(), l.end()] {
+        if (topo.vertex(end)?.point() - far_point).length() <= tol {
+            return Ok(false);
+        }
+    }
+    // Both leave `v` the same way, which most pairs of a face's edges do
+    // not: read first, before the samples.
+    let away = |edge: &Edge| -> Result<Option<Vec3>, BlendError> {
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let (t0, t1) = edge.curve().domain_with_endpoints(a, b);
+        let tangent = if edge.start() == v {
+            edge.curve().tangent_with_endpoints(t0, a, b)
+        } else {
+            -edge.curve().tangent_with_endpoints(t1, a, b)
+        };
+        Ok(tangent.normalize().ok())
+    };
+    let (Some(ts), Some(tl)) = (away(s)?, away(l)?) else {
+        return Ok(false);
+    };
+    if ts.dot(tl) < SAME_WAY {
+        return Ok(false);
+    }
+    if edge_nearest(topo, long, far_point, None)?.0 > tol {
+        return Ok(false);
+    }
+    let (a, b) = (
+        topo.vertex(s.start())?.point(),
+        topo.vertex(s.end())?.point(),
+    );
+    let (t0, t1) = s.curve().domain_with_endpoints(a, b);
+    for k in 1..SAMPLES {
+        let t = (t1 - t0).madd(f64::from(k) / f64::from(SAMPLES), t0);
+        let at = s.curve().evaluate_with_endpoints(t, a, b);
+        if edge_nearest(topo, long, at, None)?.0 > tol {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The curve of `edge`'s piece between `split` (a point on it) and its end
+/// vertex (`toward_end`) or its start vertex, run from the piece's first
+/// vertex to its last: from `split` toward the end, or from the start to
+/// `split`. `ends` are the points of `edge`'s start and end vertices. An
+/// analytic curve is its own piece, its span given by the piece's ends. A
+/// B-spline is cut to the piece's span of the edge's own span, which runs
+/// against the curve where the edge is stored so. `None` where `split` does
+/// not project on to it.
+fn long_piece(
+    edge: &Edge,
+    (start, end): (Point3, Point3),
+    split: Point3,
+    toward_end: bool,
+) -> Option<EdgeCurve> {
+    let EdgeCurve::NurbsCurve(curve) = edge.curve() else {
+        return Some(edge.curve().clone());
+    };
+    let (t0, t1) = edge.curve().domain_with_endpoints(start, end);
+    let found = brepkit_math::nurbs::projection::project_point_to_curve(curve, split, 1e-9).ok()?;
+    let at = found.parameter.clamp(t0.min(t1), t0.max(t1));
+    let (from, to) = if toward_end { (at, t1) } else { (t0, at) };
+    trimmer::edge_curve_for_span(edge.curve(), from, to).ok()
 }
 
 /// Split a face pinched along a contact that runs over one of the face's
@@ -4254,6 +4416,67 @@ fn build_in_place(
     Ok(result)
 }
 
+/// The fillet of `shared` built in place on `solid` after `join` edits its
+/// shell, with `solid` then put back as `snapshot` holds it. `join` returns
+/// the edges it took out of the shell, which lie between faces tangent along
+/// them and leave the selection, or `None` to build nothing.
+fn build_after_joins(
+    topo: &mut Topology,
+    solid: SolidId,
+    snapshot: &SolidSnapshot,
+    shared: &[(Vec<EdgeId>, std::sync::Arc<RadiusLaw>)],
+    join: impl FnOnce(&mut Topology) -> Result<Option<HashSet<EdgeId>>, BlendError>,
+) -> Result<Option<BlendResult>, BlendError> {
+    let built = join(topo).and_then(|gone| {
+        let Some(gone) = gone else {
+            return Ok(None);
+        };
+        let edge_sets = shared
+            .iter()
+            .map(|(edges, law)| {
+                let edges = edges
+                    .iter()
+                    .copied()
+                    .filter(|e| !gone.contains(e))
+                    .collect();
+                (edges, read_law(law))
+            })
+            .collect();
+        build_in_place(topo, solid, edge_sets).map(Some)
+    });
+    match built {
+        Ok(Some(result)) => {
+            let preserve = snapshot.clone_result_source_faces(topo, result.solid);
+            let restore = snapshot.restore(topo);
+            match (preserve, restore) {
+                (Ok(()), Ok(())) => Ok(Some(result)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        Ok(None) => {
+            snapshot.restore(topo)?;
+            Ok(None)
+        }
+        Err(error) => {
+            snapshot.restore(topo)?;
+            Err(error)
+        }
+    }
+}
+
+/// A law that reads as `law` does, for one more build.
+fn read_law(law: &std::sync::Arc<RadiusLaw>) -> RadiusLaw {
+    match **law {
+        RadiusLaw::Constant(r) => RadiusLaw::Constant(r),
+        RadiusLaw::Linear { start, end } => RadiusLaw::Linear { start, end },
+        RadiusLaw::SCurve { start, end } => RadiusLaw::SCurve { start, end },
+        RadiusLaw::Custom(_) => {
+            let law = std::sync::Arc::clone(law);
+            RadiusLaw::Custom(Box::new(move |t| law.evaluate(t)))
+        }
+    }
+}
+
 /// Geometry of a full-revolution rim fillet (a closed circular edge between a
 /// bounded disc cap and an axisymmetric wall), recovered from a stripe whose
 /// blend surface is a torus.
@@ -5036,8 +5259,9 @@ fn point_on_edge(
 }
 
 /// `point`'s distance from an edge, or from its trace on `onto` (each of
-/// its points projected on to that surface): its nearest sample, refined
-/// by golden section between the sample's neighbours.
+/// its points projected on to that surface): with no `onto`, as
+/// [`EdgeReads`] reads it; else its nearest sample, refined by golden
+/// section between the sample's neighbours.
 fn edge_distance(
     topo: &Topology,
     edge_id: EdgeId,
@@ -5055,41 +5279,56 @@ fn edge_nearest(
     point: Point3,
     onto: Option<&FaceSurface>,
 ) -> Result<(f64, Point3), BlendError> {
-    const SAMPLES: usize = 64;
+    let Some(onto) = onto else {
+        return Ok(EdgeReads::new(topo, edge_id)?.nearest(point));
+    };
     let edge = topo.edge(edge_id)?;
     let (a, b) = (
         topo.vertex(edge.start())?.point(),
         topo.vertex(edge.end())?.point(),
     );
     let curve = edge.curve();
-    let (t0, t1) = curve.domain_with_endpoints(a, b);
     let at = |t: f64| {
         let on = curve.evaluate_with_endpoints(t, a, b);
         let on = match onto {
-            Some(FaceSurface::Plane { normal, d }) => {
+            FaceSurface::Plane { normal, d } => {
                 on - *normal
                     * ((normal.dot(Vec3::new(on.x(), on.y(), on.z())) - d)
                         / normal.length_squared())
             }
-            Some(surface) => surface
+            surface => surface
                 .project_point(on)
                 .and_then(|(u, v)| surface.evaluate(u, v))
                 .unwrap_or(on),
-            None => on,
         };
         ((on - point).length(), on)
     };
-    let dist = |t: f64| at(t).0;
+    let (t0, t1) = curve.domain_with_endpoints(a, b);
+    let (lo, hi) = nearest_bracket(t0, t1, |t| at(t).0);
+    Ok(at(golden_least(lo, hi, |t| at(t).0)))
+}
+
+/// Points along a curve's domain `t0` to `t1` at which a nearest point is
+/// first looked for.
+const NEAREST_SAMPLES: usize = 64;
+
+/// The parameters of the even samples either side of the sample of `t0`
+/// to `t1` at which `dist` is least.
+fn nearest_bracket(t0: f64, t1: f64, dist: impl Fn(f64) -> f64) -> (f64, f64) {
     #[allow(clippy::cast_precision_loss)]
-    let param = |k: usize| t0 + (t1 - t0) * (k as f64) / (SAMPLES as f64);
-    let nearest = (0..=SAMPLES)
-        .min_by(|&i, &j| dist(param(i)).total_cmp(&dist(param(j))))
-        .unwrap_or(0);
-    // Golden-section refinement between the nearest sample's neighbours.
-    let (mut lo, mut hi) = (
+    let param = |k: usize| t0 + (t1 - t0) * (k as f64) / (NEAREST_SAMPLES as f64);
+    let nearest = (0..=NEAREST_SAMPLES)
+        .map(|k| (k, dist(param(k))))
+        .min_by(|x, y| x.1.total_cmp(&y.1))
+        .map_or(0, |(k, _)| k);
+    (
         param(nearest.saturating_sub(1)),
-        param((nearest + 1).min(SAMPLES)),
-    );
+        param((nearest + 1).min(NEAREST_SAMPLES)),
+    )
+}
+
+/// Where `dist` is least between `lo` and `hi`, by golden section.
+fn golden_least(mut lo: f64, mut hi: f64, dist: impl Fn(f64) -> f64) -> f64 {
     let ratio = 0.5 * (5.0_f64.sqrt() - 1.0);
     for _ in 0..80 {
         let (x1, x2) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
@@ -5099,7 +5338,201 @@ fn edge_nearest(
             lo = x1;
         }
     }
-    Ok(at(f64::midpoint(lo, hi)))
+    f64::midpoint(lo, hi)
+}
+
+/// One edge, read for the distances of many points from it: a line or an
+/// arc in closed form; any other curve from the nearest of its even samples,
+/// taken once. A B-spline is refined from that sample by Newton steps on the
+/// squared distance, each step halved until it comes nearer, an ellipse by
+/// golden section, each between the samples either side.
+struct EdgeReads<'a> {
+    curve: &'a EdgeCurve,
+    a: Point3,
+    b: Point3,
+    samples: Vec<(f64, Point3)>,
+}
+
+impl<'a> EdgeReads<'a> {
+    fn new(topo: &'a Topology, edge_id: EdgeId) -> Result<Self, BlendError> {
+        let edge = topo.edge(edge_id)?;
+        let (a, b) = (
+            topo.vertex(edge.start())?.point(),
+            topo.vertex(edge.end())?.point(),
+        );
+        let curve = edge.curve();
+        let samples = match curve {
+            EdgeCurve::Line | EdgeCurve::Circle(_) => Vec::new(),
+            EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_) => {
+                let (t0, t1) = curve.domain_with_endpoints(a, b);
+                (0..=NEAREST_SAMPLES)
+                    .map(|k| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let t = t0 + (t1 - t0) * (k as f64) / (NEAREST_SAMPLES as f64);
+                        (t, curve.evaluate_with_endpoints(t, a, b))
+                    })
+                    .collect()
+            }
+        };
+        Ok(Self {
+            curve,
+            a,
+            b,
+            samples,
+        })
+    }
+
+    /// `point`'s distance from the edge, and the edge's point nearest it.
+    fn nearest(&self, point: Point3) -> (f64, Point3) {
+        if let Some(on) = nearest_on_line_or_arc(self.curve, self.a, self.b, point) {
+            return ((on - point).length(), on);
+        }
+        let Some((k, &(t, at))) = self.samples.iter().enumerate().min_by(|x, y| {
+            (x.1.1 - point)
+                .length_squared()
+                .total_cmp(&(y.1.1 - point).length_squared())
+        }) else {
+            return ((self.a - point).length(), self.a);
+        };
+        let last = self.samples.len() - 1;
+        let (lo, hi) = (
+            self.samples[k.saturating_sub(1)].0,
+            self.samples[(k + 1).min(last)].0,
+        );
+        let on = match self.curve {
+            EdgeCurve::NurbsCurve(nurbs) => {
+                newton_nearest(nurbs, point, (t, at), (lo.min(hi), lo.max(hi)))
+            }
+            curve => {
+                let dist =
+                    |t: f64| (curve.evaluate_with_endpoints(t, self.a, self.b) - point).length();
+                curve.evaluate_with_endpoints(golden_least(lo, hi, dist), self.a, self.b)
+            }
+        };
+        ((on - point).length(), on)
+    }
+}
+
+/// The point of `curve` between `lo` and `hi` nearest `point`, from its point
+/// `at` at `t`: Gauss-Newton steps on the squared distance, each halved until
+/// it comes nearer, so each point taken is nearer than the last. The steps
+/// are kept where they stop at a point the distance curves up from, or at
+/// an end of the span they step out past. Where they stop anywhere else (a
+/// peak of the distance, where a step is zero), at a point of no speed, or
+/// without settling, the span is searched instead ([`span_nearest`]).
+fn newton_nearest(
+    curve: &brepkit_math::nurbs::curve::NurbsCurve,
+    point: Point3,
+    (mut t, mut at): (f64, Point3),
+    (lo, hi): (f64, f64),
+) -> Point3 {
+    const MOST_STEPS: usize = 64;
+    const MOST_HALVINGS: usize = 8;
+    let mut gap = (at - point).length_squared();
+    for _ in 0..MOST_STEPS {
+        let derivatives = curve.derivatives(t, 2);
+        let (Some(&speed), Some(&bend)) = (derivatives.get(1), derivatives.get(2)) else {
+            break;
+        };
+        let speed_sq = speed.dot(speed);
+        if speed_sq <= 0.0 {
+            break;
+        }
+        let off = at - point;
+        let mut step = -speed.dot(off) / speed_sq;
+        let mut nearer = false;
+        let mut settled = false;
+        for _ in 0..MOST_HALVINGS {
+            let next = (t + step).clamp(lo, hi);
+            if (next - t).abs() <= f64::EPSILON * t.abs().max(hi - lo) {
+                // Half the second derivative of the squared distance.
+                let curving = speed_sq + bend.dot(off);
+                settled = t + step < lo || t + step > hi || curving > 0.0;
+                break;
+            }
+            let on = curve.evaluate(next);
+            let next_gap = (on - point).length_squared();
+            if next_gap < gap {
+                (t, at, gap) = (next, on, next_gap);
+                nearer = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        if settled {
+            return at;
+        }
+        if !nearer {
+            break;
+        }
+    }
+    span_nearest(curve, point, (lo, hi), (gap, at))
+}
+
+/// The point of `curve` between `lo` and `hi` nearest `point`, by search: the
+/// nearest of 17 even points of the span, refined by golden section between
+/// its neighbours, or `best` (a squared distance and its point) where that
+/// is nearer. Never farther than `best` or the span's ends.
+fn span_nearest(
+    curve: &brepkit_math::nurbs::curve::NurbsCurve,
+    point: Point3,
+    (lo, hi): (f64, f64),
+    best: (f64, Point3),
+) -> Point3 {
+    const POINTS: usize = 16;
+    let gap = |t: f64| (curve.evaluate(t) - point).length_squared();
+    #[allow(clippy::cast_precision_loss)]
+    let param = |k: usize| lo + (hi - lo) * (k as f64) / (POINTS as f64);
+    let (k, sampled) = (0..=POINTS)
+        .map(|k| (k, gap(param(k))))
+        .min_by(|x, y| x.1.total_cmp(&y.1))
+        .unwrap_or((0, f64::INFINITY));
+    let refined = golden_least(param(k.saturating_sub(1)), param((k + 1).min(POINTS)), gap);
+    [(gap(refined), refined), (sampled, param(k))]
+        .into_iter()
+        .map(|(g, t)| (g, curve.evaluate(t)))
+        .chain(std::iter::once(best))
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .map_or(best.1, |(_, on)| on)
+}
+
+/// The point of a line or a circular arc from `a` to `b` nearest `point`:
+/// on the segment, its foot clamped to the ends; on the arc, the point at
+/// `point`'s angle about the axis where the arc spans it, else the end
+/// nearer in angle (the distance grows with the turn from that angle).
+/// `None` for any other curve.
+fn nearest_on_line_or_arc(
+    curve: &EdgeCurve,
+    a: Point3,
+    b: Point3,
+    point: Point3,
+) -> Option<Point3> {
+    match curve {
+        EdgeCurve::Line => {
+            let along = b - a;
+            let length_sq = along.dot(along);
+            let s = if length_sq > 0.0 {
+                ((point - a).dot(along) / length_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            Some(a + along * s)
+        }
+        EdgeCurve::Circle(circle) => {
+            let (t0, t1) = curve.domain_with_endpoints(a, b);
+            let (lo, hi) = (t0.min(t1), t0.max(t1));
+            let t = lo + (circle.project(point) - lo).rem_euclid(std::f64::consts::TAU);
+            let on = |t: f64| curve.evaluate_with_endpoints(t, a, b);
+            Some(if t <= hi {
+                on(t)
+            } else if (point - on(lo)).length() <= (point - on(hi)).length() {
+                on(lo)
+            } else {
+                on(hi)
+            })
+        }
+        EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_) => None,
+    }
 }
 
 /// Where the line `origin + run * s` passes through an edge: the edge's
@@ -8772,7 +9205,15 @@ fn compute_stripe_for_spine(
         let blend = ConstRadBlend { radius: *r };
         let walker = Walker::new(&blend, ps1, ps2, &spine, topo, config);
         let start = walker.find_start(0.0)?;
-        let mut result = walker.walk(start, 0.0, spine.length())?;
+        // A closed round whose stations square to the spine fold over the
+        // curve of its ball's centres is walked along that curve instead.
+        let mut result = match walker.walk(start, 0.0, spine.length()) {
+            Ok(result) => result,
+            Err(error @ BlendError::WalkingFailure { .. }) if closed => {
+                walker.walk_by_centres(start).map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
         if !closed
             && check_contacts_run_on(&result.sections).is_err()
             && let Some(cut) =
@@ -11144,7 +11585,7 @@ fn rebuild_closed_rim_loop_faces(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use brepkit_topology::adjacency::AdjacencyIndex;
     use brepkit_topology::edge::{Edge, EdgeCurve};
@@ -11156,6 +11597,230 @@ mod tests {
     /// The notch triangle at a corner filleted r 6: the arc's ends on the two
     /// corner edges and the corner itself.
     const NOTCH: [(f64, f64); 3] = [(6.0, 0.0), (0.0, 0.0), (0.0, 6.0)];
+
+    /// The nearest point of a line or an arc, in closed form, is the nearest
+    /// of 200001 even samples to within the samples' spacing: on a segment,
+    /// on a quarter arc tilted out of its plane's frame, run either way, and
+    /// on a whole circle, from points beside, past the ends and off the
+    /// plane.
+    #[test]
+    fn the_nearest_point_of_a_line_or_arc_is_the_nearest_sample() {
+        use brepkit_math::curves::Circle3D;
+        const SAMPLES: u32 = 200_000;
+        let p = Point3::new;
+        let tilted = Circle3D::new(p(1.0, -2.0, 0.5), Vec3::new(0.2, 0.3, 1.0), 3.0).unwrap();
+        let (t0, t1) = (0.4, 0.4 + std::f64::consts::FRAC_PI_2);
+        let (s, e) = (tilted.evaluate(t0), tilted.evaluate(t1));
+        let whole = tilted.evaluate(1.0);
+        let cases = [
+            (EdgeCurve::Line, p(0.0, 0.0, 0.0), p(10.0, 2.0, -1.0)),
+            (EdgeCurve::Circle(tilted.clone()), s, e),
+            (EdgeCurve::Circle(tilted.clone()), e, s),
+            (EdgeCurve::Circle(tilted), whole, whole),
+        ];
+        let points = [
+            p(4.0, 3.0, 0.0),
+            p(-3.0, -1.0, 2.0),
+            p(12.0, 5.0, -4.0),
+            p(1.0, -2.0, 6.0),
+            p(3.0, 1.0, 0.7),
+            p(-2.5, -4.0, 0.0),
+        ];
+        for (curve, a, b) in &cases {
+            let (t0, t1) = curve.domain_with_endpoints(*a, *b);
+            let at = |k: u32| {
+                curve.evaluate_with_endpoints(
+                    t0 + (t1 - t0) * f64::from(k) / f64::from(SAMPLES),
+                    *a,
+                    *b,
+                )
+            };
+            let spacing = (0..SAMPLES)
+                .map(|k| (at(k + 1) - at(k)).length())
+                .fold(0.0, f64::max);
+            for &point in &points {
+                let on = nearest_on_line_or_arc(curve, *a, *b, point).unwrap();
+                let sampled = (0..=SAMPLES)
+                    .map(|k| (at(k) - point).length())
+                    .fold(f64::INFINITY, f64::min);
+                let found = (on - point).length();
+                assert!(
+                    found <= sampled + 1e-12 && sampled - found <= spacing,
+                    "{curve:?} from {point:?}: {found}, sampled {sampled}"
+                );
+            }
+        }
+    }
+
+    /// Checks that an edge on `curve` (on the domain 0 to 1), run either way,
+    /// reads each of `points` at the distance of the nearest of 200001 even
+    /// samples, to within their spacing, and each of `on_it` as on it.
+    fn assert_spline_reads_as_a_dense_scan(
+        curve: &brepkit_math::nurbs::curve::NurbsCurve,
+        points: &[Point3],
+        on_it: &[Point3],
+    ) {
+        const SAMPLES: u32 = 200_000;
+        let (start, end) = (curve.evaluate(0.0), curve.evaluate(1.0));
+        let at = |k: u32| curve.evaluate(f64::from(k) / f64::from(SAMPLES));
+        let spacing = (0..SAMPLES)
+            .map(|k| (at(k + 1) - at(k)).length())
+            .fold(0.0, f64::max);
+        for reversed in [false, true] {
+            let mut topo = Topology::new();
+            let v0 = topo.add_vertex(Vertex::new(start, 1e-7));
+            let v1 = topo.add_vertex(Vertex::new(end, 1e-7));
+            let (from, to) = if reversed { (v1, v0) } else { (v0, v1) };
+            let edge = topo.add_edge(Edge::new(from, to, EdgeCurve::NurbsCurve(curve.clone())));
+            let reads = EdgeReads::new(&topo, edge).unwrap();
+            for &point in points.iter().chain(on_it) {
+                let (found, on) = reads.nearest(point);
+                assert!(((on - point).length() - found).abs() < 1e-15);
+                let sampled = (0..=SAMPLES)
+                    .map(|k| (at(k) - point).length())
+                    .fold(f64::INFINITY, f64::min);
+                assert!(
+                    found <= sampled + 1e-12 && sampled - found <= spacing,
+                    "reversed {reversed}, from {point:?}: {found}, sampled {sampled}"
+                );
+            }
+            for &point in on_it {
+                let found = reads.nearest(point).0;
+                assert!(
+                    found < 1e-12,
+                    "reversed {reversed}, {point:?} reads {found} off"
+                );
+            }
+        }
+    }
+
+    /// A B-spline edge's nearest point, from its nearest sample by Newton
+    /// steps, is the nearest of the dense samples; a point on the edge reads
+    /// as on it.
+    #[test]
+    fn the_nearest_point_of_a_spline_edge_is_the_nearest_sample() {
+        let p = Point3::new;
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            3,
+            vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+            vec![
+                p(0.0, 0.0, 0.0),
+                p(2.0, 3.0, 0.5),
+                p(4.0, -2.0, 1.0),
+                p(6.0, 4.0, -0.5),
+                p(8.0, 0.0, 0.0),
+            ],
+            vec![1.0, 0.8, 1.2, 0.9, 1.0],
+        )
+        .unwrap();
+        let points = [
+            p(3.0, 2.0, 0.0),
+            p(-1.0, -1.0, 1.0),
+            p(9.0, 1.0, -1.0),
+            p(5.0, 0.5, 3.0),
+        ];
+        assert_spline_reads_as_a_dense_scan(&curve, &points, &[curve.evaluate(0.37)]);
+    }
+
+    /// The parabola `(u - 256 u^2, 256 u^2)`, `u = t - 1/2`: its point at
+    /// `u = 1/256` is nearest the sample at `u = 0`, where the distance to
+    /// it is a maximum along the curve and a Newton step is zero. The read
+    /// still finds the point on the curve.
+    #[test]
+    fn a_read_from_a_sample_where_the_distance_peaks_finds_the_curve() {
+        let p = Point3::new;
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![
+                p(-64.5, 64.0, 0.0),
+                p(64.0, -64.0, 0.0),
+                p(-63.5, 64.0, 0.0),
+            ],
+            vec![1.0; 3],
+        )
+        .unwrap();
+        assert!((curve.evaluate(0.5) - p(0.0, 0.0, 0.0)).length() < 1e-12);
+        let on_it = curve.evaluate(0.503_906_25);
+        assert!((on_it - p(0.0, 1.0 / 256.0, 0.0)).length() < 1e-12);
+        assert_spline_reads_as_a_dense_scan(&curve, &[p(0.0, 0.002, 0.0)], &[on_it]);
+    }
+
+    /// A cubic whose first two poles coincide leaves its start at no speed.
+    /// The nearest sample to a point just off the curve near that end is the
+    /// end itself, where no Newton step can be taken; the read still finds
+    /// the nearest point a little way in.
+    #[test]
+    fn a_read_from_a_spline_end_at_no_speed_finds_the_nearest_point() {
+        let p = Point3::new;
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            3,
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            vec![
+                p(0.0, 0.0, 0.0),
+                p(0.0, 0.0, 0.0),
+                p(1.0, 0.0, 0.0),
+                p(2.0, 1.0, 0.0),
+            ],
+            vec![1.0; 4],
+        )
+        .unwrap();
+        let points = [p(2e-4, 1e-4, 0.0), p(5e-5, -3e-5, 1e-5)];
+        assert_spline_reads_as_a_dense_scan(&curve, &points, &[curve.evaluate(0.004)]);
+    }
+
+    /// The piece of a B-spline edge a spur leaves runs between the split and
+    /// the edge's own vertex: where the edge runs against its curve, and
+    /// where it takes only a span of its curve.
+    #[test]
+    fn a_spline_spokes_piece_keeps_to_the_edge() {
+        let curve = brepkit_math::nurbs::curve::NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(5.0, 5.0, 0.0),
+                Point3::new(10.0, 0.0, 0.0),
+            ],
+            vec![1.0, 1.0, 1.0],
+        )
+        .unwrap();
+        let at = |t: f64| curve.evaluate(t);
+        let mut topo = Topology::new();
+        let mut piece_ends = |from: f64, to: f64, split: f64, toward_end: bool| {
+            let (a, b) = (at(from), at(to));
+            let edge = Edge::new(
+                topo.add_vertex(Vertex::new(a, 1e-7)),
+                topo.add_vertex(Vertex::new(b, 1e-7)),
+                EdgeCurve::NurbsCurve(curve.clone()),
+            );
+            let Some(EdgeCurve::NurbsCurve(piece)) =
+                long_piece(&edge, (a, b), at(split), toward_end)
+            else {
+                panic!("no piece");
+            };
+            let (lo, hi) = piece.domain();
+            (piece.evaluate(lo), piece.evaluate(hi))
+        };
+        let near = |p: Point3, q: Point3| (p - q).length() < 1e-9;
+        // Stored from C(1) to C(0): toward its end runs to C(0).
+        let (first, last) = piece_ends(1.0, 0.0, 0.5, true);
+        assert!(
+            near(first, at(0.5)) && near(last, at(0.0)),
+            "{first:?} {last:?}"
+        );
+        let (first, last) = piece_ends(1.0, 0.0, 0.5, false);
+        assert!(
+            near(first, at(1.0)) && near(last, at(0.5)),
+            "{first:?} {last:?}"
+        );
+        // A span from C(0.2) to C(0.8): toward its end stops at C(0.8).
+        let (first, last) = piece_ends(0.2, 0.8, 0.5, true);
+        assert!(
+            near(first, at(0.5)) && near(last, at(0.8)),
+            "{first:?} {last:?}"
+        );
+    }
 
     /// An arc from the corner at angle 0 to a contact's end at `turn`, on a
     /// unit circle in the plane z = 0, seen along z.
@@ -11793,6 +12458,37 @@ mod tests {
             found_cylinder,
             "fillet should produce a cylindrical blend surface"
         );
+    }
+
+    /// An edge the solid's arena does not hold, picked with one it does: the
+    /// one it holds is rounded, and the other fails alone.
+    #[test]
+    fn an_edge_outside_the_arena_fails_alone() {
+        let mut topo = Topology::new();
+        let solid = make_unit_cube_manifold(&mut topo);
+        let adjacency = AdjacencyIndex::build(&topo, solid).unwrap();
+        let edge = brepkit_topology::explorer::solid_edges(&topo, solid)
+            .unwrap()
+            .into_iter()
+            .find(|&edge| adjacency.faces_for_edge(edge).len() == 2)
+            .expect("a manifold edge");
+        let mut other = Topology::new();
+        while other.num_edges() <= topo.num_edges() {
+            let _ = make_unit_cube_manifold(&mut other);
+        }
+        let stale = other.edge_id_from_index(other.num_edges() - 1).unwrap();
+        assert!(topo.edge(stale).is_err());
+        let mut builder = FilletBuilder::new(&mut topo, solid);
+        builder.add_edges(&[edge, stale], 0.1);
+        let result = builder.build().expect("fillet build should succeed");
+        assert_eq!(result.succeeded, vec![edge]);
+        assert!(
+            result.failed.iter().any(|(failed, _)| *failed == stale),
+            "{:?}",
+            result.failed
+        );
+        assert!(result.failed.iter().all(|(failed, _)| *failed == stale));
+        assert_shell_edges_are_closed(&topo, result.solid);
     }
 
     /// An edge picked twice in one set is the same request: it is rounded
