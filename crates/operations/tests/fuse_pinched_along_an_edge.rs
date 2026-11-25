@@ -13,7 +13,7 @@ use brepkit_operations::boolean::{BooleanOp, boolean, mesh_fallback_count};
 use brepkit_operations::measure::solid_volume;
 use brepkit_operations::primitives::make_box;
 use brepkit_operations::tessellate::{
-    boundary_edge_count, is_watertight, non_manifold_edge_count, tessellate_solid,
+    boundary_edge_count, non_manifold_edge_count, tessellate_solid,
 };
 use brepkit_operations::transform::transform_solid;
 use brepkit_operations::validate::validate_solid;
@@ -118,7 +118,17 @@ fn rod_lying_on_a_plate_into_a_block_fuses_exactly() {
                 "pose {p}, turn {turn}: volume {volume}, want {want}"
             );
             let mesh = tessellate_solid(&topo, fused, 0.01).unwrap();
-            assert!(is_watertight(&mesh), "pose {p}, turn {turn}: open mesh");
+            // The rod touches the plate along a line, one mesh edge with
+            // four triangles on it once the mesh welds by position.
+            assert_eq!(
+                boundary_edge_count(&mesh),
+                0,
+                "pose {p}, turn {turn}: open mesh"
+            );
+            assert!(
+                non_manifold_edge_count(&mesh) <= 1,
+                "pose {p}, turn {turn}: mesh edges past the pinch"
+            );
         }
     }
 }

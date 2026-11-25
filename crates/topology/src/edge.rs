@@ -284,9 +284,17 @@ impl EdgeCurve {
                             None
                         }
                     };
+                    // The point on the curve must lie inside it: at one of
+                    // the curve's own ends, the piece is the whole curve,
+                    // which reads the way it runs.
+                    let inside = |t: f64| (t - d0).min(d1 - t) > 1e-6 * (d1 - d0);
                     let snapped = match (pa.distance < WELD_EPS, pb.distance < WELD_EPS) {
-                        (true, false) => to_end(end).map(|t| (pa.parameter, t)),
-                        (false, true) => to_end(start).map(|t| (t, pb.parameter)),
+                        (true, false) if inside(pa.parameter) => {
+                            to_end(end).map(|t| (pa.parameter, t))
+                        }
+                        (false, true) if inside(pb.parameter) => {
+                            to_end(start).map(|t| (t, pb.parameter))
+                        }
                         _ => None,
                     };
                     if let Some((t0, t1)) =
