@@ -20,14 +20,14 @@ The free `build_in_place` now runs both pre-passes and the tip rounding around t
 ## Tests
 
 - `crates/operations/tests/fillet_tight_tip.rs`: an elliptic slab (8 x 5, so it bends to 3.125 at the ends of its major axis), one rim and both rims, at r 3.25 and 3.5.
-  - Checks: valid, watertight at 0.01, 9 or 15 faces, and the removed volume within `1e-4 r^3` a rim of Pappus' smooth round.
+  - Checks: valid, watertight at 0.01, 9 or 15 faces, and the removed volume within `1e-3 r^3` a rim of Pappus' smooth round (the bands' volume is read from their mesh; with an exact band measure it agrees to `1e-4 r^3`).
   - A second test puts a tip across the wall's seam and checks that it is refused.
 - `crates/io/tests/fillet_tight_tip_plate.rs`: a 22 mm plate read from STEP (`tests/data/tight_tip_plate.step`, written by brepkit's own writer).
   - Its outline bends to 7.46 at two tips. Both rims are rounded at r = 8.
   - Checks: valid, 16 faces, watertight at 0.05, and volume within `1e-3 r^3` a rim of Pappus.
   - The other kernel's result of this part agrees to 3e-5 in area and 1.1e-4 in volume.
 
-Both new tests fail on this branch's base with the refusal above.
+The rounding tests fail on this branch's base with the refusal above; the seam test is a guard and passes there too.
 
 Stacked on #2876, whose helpers in `kinked_rim.rs` this uses.
 

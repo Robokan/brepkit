@@ -229,6 +229,19 @@ impl EdgeCurve {
                     {
                         return (t0, t1);
                     }
+                    // A file's vertices stand off its edge's curve by up to
+                    // the edge's tolerance, past the weld band (4e-5 on a
+                    // degree-7 piece of a longer section). On an open curve
+                    // both ends within that read at their projections: read
+                    // whole, the edge ran on to the curve's own ends, and the
+                    // faces it bounds took in area past their vertices.
+                    if curve_open
+                        && pa.distance < FILE_EPS
+                        && pb.distance < FILE_EPS
+                        && dt.abs() > 1e-6 * (d1 - d0)
+                    {
+                        return (pa.parameter, pb.parameter);
+                    }
                     // The forward sub-arc across the seam has a `(t0, t1)`
                     // form too when it ends or starts on the closure point,
                     // which projects to the domain's start: it runs to the
@@ -641,6 +654,30 @@ mod tests {
         let tc = d0 + 0.9 * (d1 - d0);
         let pc = brepkit_math::traits::ParametricCurve::evaluate(&n, tc);
         assert_full_domain(curve.domain_with_endpoints(pc, pb), d0, d1);
+    }
+
+    /// A file's vertices stand off their edge's curve by up to the edge's
+    /// tolerance, past the weld band: the edge is still the piece between
+    /// them, not the whole curve.
+    #[test]
+    fn nurbs_domain_ends_a_file_s_tolerance_off_the_curve_are_trimmed() {
+        let curve = open_nurbs();
+        let EdgeCurve::NurbsCurve(n) = &curve else {
+            unreachable!()
+        };
+        let (d0, d1) = brepkit_math::traits::ParametricCurve::domain(n);
+        let ta = d0 + 0.25 * (d1 - d0);
+        let tb = d0 + 0.7 * (d1 - d0);
+        let off = Vec3::new(0.0, 0.0, 4e-5);
+        let pa = brepkit_math::traits::ParametricCurve::evaluate(n, ta);
+        let pb = brepkit_math::traits::ParametricCurve::evaluate(n, tb) + off;
+        for (start, end, want) in [(pa, pb, (ta, tb)), (pb, pa, (tb, ta))] {
+            let (t0, t1) = curve.domain_with_endpoints(start, end);
+            assert!(
+                (t0 - want.0).abs() < 1e-6 && (t1 - want.1).abs() < 1e-6,
+                "got ({t0}, {t1}), expected {want:?}"
+            );
+        }
     }
 
     #[test]
