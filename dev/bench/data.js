@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795585432806,
+  "lastUpdate": 1795588675927,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7667,6 +7667,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19587873,
             "range": "± 1125869",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "f48847268dd99c01f1ec2cd0ef77d2d10138f629",
+          "message": "fix(blend): a kinked rim's pre-pass leaves an unreadable edge to fail alone\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-24T22:34:23-08:00",
+          "tree_id": "5feab8dc2bce5f9d0f7a7e71101c3894ecb28384",
+          "url": "https://github.com/Robokan/brepkit/commit/f48847268dd99c01f1ec2cd0ef77d2d10138f629"
+        },
+        "date": 1795588675117,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 820919,
+            "range": "± 15370",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 908818,
+            "range": "± 20296",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9989,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 566297,
+            "range": "± 7097",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 19367682,
+            "range": "± 34007",
             "unit": "ns/iter"
           }
         ]
