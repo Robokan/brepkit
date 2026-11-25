@@ -42,25 +42,25 @@ const KINK: f64 = 1e-3;
 const ON: f64 = 1e-7;
 
 /// The angle between the end and start tangents of a closed B-spline edge.
-fn closure_kink(topo: &Topology, edge: EdgeId) -> Result<Option<f64>, BlendError> {
+fn closure_kink(topo: &Topology, edge: EdgeId) -> Option<f64> {
     // An edge the topology does not hold fails on its own later.
     let Ok(data) = topo.edge(edge) else {
-        return Ok(None);
+        return None;
     };
     if data.start() != data.end() {
-        return Ok(None);
+        return None;
     }
     let EdgeCurve::NurbsCurve(nurbs) = data.curve() else {
-        return Ok(None);
+        return None;
     };
     let (u0, u1) = nurbs.domain();
     let (Ok(start), Ok(end)) = (
         nurbs.derivatives(u0, 1)[1].normalize(),
         nurbs.derivatives(u1, 1)[1].normalize(),
     ) else {
-        return Ok(None);
+        return None;
     };
-    Ok(Some(start.dot(end).clamp(-1.0, 1.0).acos()))
+    Some(start.dot(end).clamp(-1.0, 1.0).acos())
 }
 
 /// The faces of `solid`'s outer shell whose outer wire uses `edge`.
@@ -430,7 +430,7 @@ fn split_kinked_rim(
     solid: SolidId,
     edge: EdgeId,
 ) -> Result<Vec<Cut>, BlendError> {
-    if !closure_kink(topo, edge)?.is_some_and(|kink| kink > KINK) {
+    if !closure_kink(topo, edge).is_some_and(|kink| kink > KINK) {
         return Ok(Vec::new());
     }
     let EdgeCurve::NurbsCurve(nurbs) = topo.edge(edge)?.curve().clone() else {
