@@ -1,4 +1,4 @@
-Builds on #MITRE (the plane cut through mitred rounds), which this needs for the plate's cut. Review that first; this branch holds its commit.
+Builds on #2846 (the plane cut through mitred rounds), which this needs for the plate's cut. Review that first; this branch holds its commit.
 
 ## What
 

@@ -409,7 +409,15 @@ impl<'a, F: BlendFunction> Walker<'a, F> {
     ) -> Result<WalkResult, BlendError> {
         let span = (s_end - s_start).abs();
         let direction = if s_end >= s_start { 1.0 } else { -1.0 };
-        let mut step = self.config.max_step_fraction * span;
+        // Round a closed spine the first step starts short and grows as
+        // steps are taken: a long first step beside the short ones a bend
+        // then takes leaves the band's sections spaced unevenly where the
+        // band closes on itself, and the curves through them swing off the
+        // faces across the long gap. An open walk's first step is left as
+        // it was: its end sections are where the round's run-ons and cuts
+        // to its end faces start.
+        let first = if self.spine.is_closed() { 0.125 } else { 1.0 };
+        let mut step = first * self.config.max_step_fraction * span;
         let mut s = s_start;
         let mut params = start_params;
         let mut sections = Vec::new();
