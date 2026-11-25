@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795592751117,
+  "lastUpdate": 1795599540200,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7775,6 +7775,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 21670288,
             "range": "± 173594",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "f15bd3ec84cdea2b0f9156d24e186ddd9d36c493",
+          "message": "fix(blend): round a closed rim past its outline's tightest bend\n\nA plane cap's closed rim on a wall square to it, rounded at a radius\nlarger than the outline's tightest convex bend, was refused: the cap\ncontact, the outline inset by the radius, crosses itself at each tip.\nThe rim is now split at each crossing's feet before the build and only\nthe pieces between the tips are rounded; after it, each tip is rounded\non by two faces meeting along the crease where the round folds over\nitself, and below it along the section through the tightest bend.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-25T01:35:05-08:00",
+          "tree_id": "3ddffdd45c0ca6cf63a38911775e1ae6d2bc8ea3",
+          "url": "https://github.com/Robokan/brepkit/commit/f15bd3ec84cdea2b0f9156d24e186ddd9d36c493"
+        },
+        "date": 1795599539668,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1184231,
+            "range": "± 31942",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1249331,
+            "range": "± 6270",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13680,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 794477,
+            "range": "± 6671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 26514670,
+            "range": "± 263615",
             "unit": "ns/iter"
           }
         ]
