@@ -43,7 +43,10 @@ const ON: f64 = 1e-7;
 
 /// The angle between the end and start tangents of a closed B-spline edge.
 fn closure_kink(topo: &Topology, edge: EdgeId) -> Result<Option<f64>, BlendError> {
-    let data = topo.edge(edge)?;
+    // An edge the topology does not hold fails on its own later.
+    let Ok(data) = topo.edge(edge) else {
+        return Ok(None);
+    };
     if data.start() != data.end() {
         return Ok(None);
     }
