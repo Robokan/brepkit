@@ -1013,6 +1013,15 @@ fn nurbs_endpoint(
         if off.length() > 1e-9 {
             return None;
         }
+        // A half whose stored span runs against its sense along its pcurve
+        // (a forward half running against it, a reversed one along it) is
+        // laid out by a walk that kept its traversal's way a period off the
+        // pcurve (a closed spline rim walked against its curve): its span
+        // gives no heading, and it is read from the pcurve's end on its
+        // start, or by its chord.
+        if along != edge.forward {
+            return nurbs_endpoint_by_ends(edge, nurbs, (t0_raw, tn_raw), at_start);
+        }
         let (t_start, t_end) = if along {
             (t0_raw, tn_raw)
         } else {
@@ -1022,6 +1031,17 @@ fn nurbs_endpoint(
         let t_anchor = if at_start { t_start } else { t_end };
         return Some((nurbs, t_anchor, inward, (t_end - t_start).abs()));
     }
+    nurbs_endpoint_by_ends(edge, nurbs, (t0_raw, tn_raw), at_start)
+}
+
+/// [`nurbs_endpoint`] read from whichever end of the pcurve sits on the
+/// edge's start, `None` for a stale pcurve.
+fn nurbs_endpoint_by_ends<'a>(
+    edge: &OrientedPCurveEdge,
+    nurbs: &'a brepkit_math::curves2d::NurbsCurve2D,
+    (t0_raw, tn_raw): (f64, f64),
+    at_start: bool,
+) -> Option<(&'a brepkit_math::curves2d::NurbsCurve2D, f64, f64, f64)> {
     let off_start = |t: f64| {
         let p = nurbs.evaluate(t);
         (p.x() - edge.start_uv.x()).powi(2) + (p.y() - edge.start_uv.y()).powi(2)
