@@ -1263,7 +1263,7 @@ pub(super) fn edge_point_at(
         EdgeCurve::Line => None,
         EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) if (start - end).length() > 1e-12 => None,
         EdgeCurve::Circle(_) | EdgeCurve::Ellipse(_) | EdgeCurve::NurbsCurve(_) => {
-            Some(curve.domain_with_endpoints(start, end))
+            Some(curve.traversal_domain_with_endpoints(start, end))
         }
     };
     move |t| match span {

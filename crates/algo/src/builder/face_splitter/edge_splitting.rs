@@ -700,7 +700,7 @@ pub(super) fn circle_edge_is_iso_v_rim(
 /// reversed copy, and sampling the whole loop found the far piece's ends on
 /// it.
 fn traversal_domain(curve: &EdgeCurve, start: Point3, end: Point3) -> (f64, f64) {
-    let span = curve.domain_with_endpoints(start, end);
+    let span = curve.traversal_domain_with_endpoints(start, end);
     if let EdgeCurve::NurbsCurve(n) = curve
         && (start - end).length() > 1e-9
     {
@@ -708,7 +708,7 @@ fn traversal_domain(curve: &EdgeCurve, start: Point3, end: Point3) -> (f64, f64)
         let is_whole =
             |d: (f64, f64)| (d.0 - whole.0).abs() < 1e-12 && (d.1 - whole.1).abs() < 1e-12;
         if is_whole(span) {
-            let back = curve.domain_with_endpoints(end, start);
+            let back = curve.traversal_domain_with_endpoints(end, start);
             if !is_whole(back) && !is_whole((back.1, back.0)) {
                 return (back.1, back.0);
             }

@@ -185,6 +185,21 @@ impl EdgeCurve {
     /// opposite of [`Self::tangent_with_endpoints`].
     #[must_use]
     pub fn domain_with_endpoints(&self, start: Point3, end: Point3) -> (f64, f64) {
+        self.domain_read(start, end, false)
+    }
+
+    /// [`Self::domain_with_endpoints`] for a traversal from `start` to `end`,
+    /// which may run against the edge's stored sense. An open B-spline whose
+    /// one end lies on the curve's own end, and whose other stands off the
+    /// curve's other end past the weld band, is the whole curve, run the way
+    /// its ends lie nearer `start` and `end`. Read as an edge's own ends, such
+    /// a curve runs the way it is stored, and its vertices miss it.
+    #[must_use]
+    pub fn traversal_domain_with_endpoints(&self, start: Point3, end: Point3) -> (f64, f64) {
+        self.domain_read(start, end, true)
+    }
+
+    fn domain_read(&self, start: Point3, end: Point3, traversal: bool) -> (f64, f64) {
         const TAU: f64 = std::f64::consts::TAU;
         // Below this chord the endpoints are considered coincident and the
         // edge is treated as a closed (full) curve.
@@ -284,19 +299,27 @@ impl EdgeCurve {
                             None
                         }
                     };
-                    // The point on the curve must lie inside it: at one of
-                    // the curve's own ends, the piece is the whole curve,
-                    // which reads the way it runs.
-                    let inside = |t: f64| (t - d0).min(d1 - t) > 1e-6 * (d1 - d0);
                     let snapped = match (pa.distance < WELD_EPS, pb.distance < WELD_EPS) {
-                        (true, false) if inside(pa.parameter) => {
-                            to_end(end).map(|t| (pa.parameter, t))
-                        }
-                        (false, true) if inside(pb.parameter) => {
-                            to_end(start).map(|t| (t, pb.parameter))
-                        }
+                        (true, false) => to_end(end).map(|t| (pa.parameter, t)),
+                        (false, true) => to_end(start).map(|t| (t, pb.parameter)),
                         _ => None,
                     };
+                    // A snap from one of the curve's own ends to the other is
+                    // the whole curve. An edge's own ends read it the way it
+                    // runs; a traversal runs it the way its ends lie nearer
+                    // the traversal's.
+                    let at_end = |t: f64| (t - d0).min(d1 - t) <= 1e-6 * (d1 - d0);
+                    let snapped = snapped.and_then(|(t0, t1)| {
+                        if !(at_end(t0) && at_end(t1)) {
+                            Some((t0, t1))
+                        } else if traversal {
+                            let along = (p0 - start).length() + (p1 - end).length();
+                            let against = (p1 - start).length() + (p0 - end).length();
+                            Some(if along <= against { (d0, d1) } else { (d1, d0) })
+                        } else {
+                            None
+                        }
+                    });
                     if let Some((t0, t1)) =
                         snapped.filter(|&(t0, t1)| curve_open && (t1 - t0).abs() > 1e-6 * (d1 - d0))
                     {
