@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795671050235,
+  "lastUpdate": 1795730834354,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7937,6 +7937,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 27479972,
             "range": "± 125910",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "ceea342fc104e2f510eb131be7e8f3b2bd45ce65",
+          "message": "fix(operations): a part turn of an ellipse or spline edge sweeps one wall\n\nA part turn built the wall of a curved profile edge other than a circle\none face per quarter turn, while its line and circle neighbours' bands\nmerged into one face each: a half turn of an ellipse arc gave two wall\nfaces, three quarters three. The wall is now one rational surface with a\nspan per quarter turn, bounded by the edge at each end and the rim arcs\nof every quarter. An edge with an end on the axis keeps its wedges.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-26T13:43:37-08:00",
+          "tree_id": "094854f0a7391213734fa00282cc4293499fb01b",
+          "url": "https://github.com/Robokan/brepkit/commit/ceea342fc104e2f510eb131be7e8f3b2bd45ce65"
+        },
+        "date": 1795730833828,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 878890,
+            "range": "± 16810",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 941296,
+            "range": "± 15870",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9941,
+            "range": "± 188",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 551944,
+            "range": "± 3146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 19800924,
+            "range": "± 95155",
             "unit": "ns/iter"
           }
         ]
