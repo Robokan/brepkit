@@ -51,10 +51,13 @@ fn oval() -> NurbsCurve {
     NurbsCurve::new(3, knots, pts, vec![1.0; n]).unwrap()
 }
 
-/// The prism with its wall one face closed round the profile.
-fn closed_prism(topo: &mut Topology) -> SolidId {
+/// The prism with its wall one face closed round the profile. The wall's
+/// surface reaches `beyond` past each cap, so with `beyond > 0` the face is
+/// a band of it between two closed curves round its middle.
+fn closed_prism(topo: &mut Topology, beyond: f64) -> SolidId {
     let curve = oval();
     let up = |p: Point3| Point3::new(p.x(), p.y(), p.z() + HEIGHT);
+    let at = |p: Point3, z: f64| Point3::new(p.x(), p.y(), z);
     let wall = NurbsSurface::new(
         curve.degree(),
         1,
@@ -63,7 +66,7 @@ fn closed_prism(topo: &mut Topology) -> SolidId {
         curve
             .control_points()
             .iter()
-            .map(|&p| vec![p, up(p)])
+            .map(|&p| vec![at(p, -beyond), at(p, HEIGHT + beyond)])
             .collect(),
         curve.weights().iter().map(|&w| vec![w, w]).collect(),
     )
@@ -149,7 +152,7 @@ fn a_box_cut_through_a_closed_bspline_wall_stays_exact() {
         (-5.0, 8.0, 2.0),
     ] {
         let mut topo = Topology::new();
-        let prism = closed_prism(&mut topo);
+        let prism = closed_prism(&mut topo, 0.0);
         assert!(validate_solid(&topo, prism).unwrap().is_valid(), "{at:?}");
         let cut = cut_by_box(&mut topo, prism, at);
         let report = validate_solid(&topo, cut).unwrap();
@@ -168,5 +171,32 @@ fn a_box_cut_through_a_closed_bspline_wall_stays_exact() {
             (volume - expected).abs() < 1e-6 * expected,
             "{at:?}: {volume} against {expected}"
         );
+    }
+}
+
+/// A band of a longer closed wall, between two closed curves round its
+/// middle, bounds only its own part of the wall: points past the caps, where
+/// the wall's surface runs on, classify outside.
+#[test]
+fn a_band_of_a_closed_bspline_wall_bounds_only_its_part() {
+    use brepkit_operations::classify::{PointClassification, classify_point};
+    let mut topo = Topology::new();
+    let prism = closed_prism(&mut topo, 5.0);
+    assert!(validate_solid(&topo, prism).unwrap().is_valid());
+    for (p, inside) in [
+        (Point3::new(0.0, 0.0, 5.0), true),
+        (Point3::new(15.0, 3.0, 9.0), true),
+        (Point3::new(0.0, 0.0, 12.0), false),
+        (Point3::new(0.0, 0.0, -2.0), false),
+        (Point3::new(25.0, 0.0, 5.0), false),
+        (Point3::new(5.0, 2.0, 13.0), false),
+    ] {
+        let got = classify_point(&topo, prism, p, 0.01, 1e-7).unwrap();
+        let expected = if inside {
+            PointClassification::Inside
+        } else {
+            PointClassification::Outside
+        };
+        assert_eq!(got, expected, "{p:?}");
     }
 }
