@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795761200285,
+  "lastUpdate": 1795771487248,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -8153,6 +8153,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 27064638,
             "range": "± 42595",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "b5463e121178e56597294a7836be6d1fe284e81d",
+          "message": "fix(check,operations): a closed B-spline wall is whole only where its rims are its surface's ends\n\nThe whole-surface reading of a closed B-spline face (its wire the seam\nboth ways plus closed rims) also caught a band cut from the middle of a\ntaller wall, whose rims are closed curves round the surface away from\nits ends. The containment pre-check then read the band as the whole\nsurface and dropped a piece of a boolean, which fell back to a mesh.\nEach closed rim must now lie on an end of the surface (sampled at three\npoints, projected and evaluated back), and the egg mesher takes only a\nseam-only wire.\n\nTest: a band of a longer closed wall classifies points past its caps\noutside.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-27T01:21:19-08:00",
+          "tree_id": "c4bb817823e5c9226bb65dec4c4c2eeb1ef69cd7",
+          "url": "https://github.com/Robokan/brepkit/commit/b5463e121178e56597294a7836be6d1fe284e81d"
+        },
+        "date": 1795771486295,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 679634,
+            "range": "± 10274",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 741014,
+            "range": "± 9369",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 8869,
+            "range": "± 533",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 441579,
+            "range": "± 5321",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 15505612,
+            "range": "± 309040",
             "unit": "ns/iter"
           }
         ]
