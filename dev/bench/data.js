@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795771487248,
+  "lastUpdate": 1795817577493,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -8207,6 +8207,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 15505612,
             "range": "± 309040",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "e08e1321fb6331f5e6bdf9c3346bede19ac06d04",
+          "message": "perf(check): settle a B-spline face's volume at its partials' noise, and match its sides through their knots' rounding\n\nA degree-5 wall whose 48-pole curve ends in a knot span about 4000 times\nnarrower than its domain took seconds to measure, for two reasons.\n\nThe adaptive quadrature asked for 1e-12 of the integral, but in that span\nthe de Boor partials carry rounding noise of about 1e-11, so the halving\nnever settled and ran to its depth limit. It now stops once a halving\nshrinks the gap by less than eight times, provided the gap is already\nwithin 1e-9 of the integral: past that the gap is the samples' noise.\n\nThe whole-domain path needs the face's edges to be its surface's sides,\nand their knots had to match exactly forward or to 4 ulps of the span\nreversed. A file's edges differ from the surface's knots by the domain's\nrounding (one mirrored, one in the last digit), so the face fell to the\nslower integral that projects every boundary point. Knot spans now match\neither way within that rounding, so long as it also stays within 1e-9 of\nthe span.\n\nOn two such parts the volume takes 0.017 s and 0.13 s, from 10 s and 78 s (on a loaded machine),\nunchanged to the digits shown (38.8308, 1885.7562).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-27T14:09:06-08:00",
+          "tree_id": "6fc75bb6eab0eb3c4f4d07e424105037ca840ef1",
+          "url": "https://github.com/Robokan/brepkit/commit/e08e1321fb6331f5e6bdf9c3346bede19ac06d04"
+        },
+        "date": 1795817576961,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 864399,
+            "range": "± 24947",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 937657,
+            "range": "± 19689",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9864,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 549459,
+            "range": "± 8021",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 19773450,
+            "range": "± 66727",
             "unit": "ns/iter"
           }
         ]
