@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795817577493,
+  "lastUpdate": 1795817824768,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -8261,6 +8261,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19773450,
             "range": "± 66727",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "cd77f2ff514863fe1bfa14fc5b9ed376ac2703c2",
+          "message": "docs: note the closed B-spline wall retry, the band fix and the slow-volume fix\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-27T14:10:36-08:00",
+          "tree_id": "f800ce2fcfd885e0e015aab78118391e1322866d",
+          "url": "https://github.com/Robokan/brepkit/commit/cd77f2ff514863fe1bfa14fc5b9ed376ac2703c2"
+        },
+        "date": 1795817824004,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1196695,
+            "range": "± 5871",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1262828,
+            "range": "± 1989",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 14326,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 738304,
+            "range": "± 17955",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 27332546,
+            "range": "± 459600",
             "unit": "ns/iter"
           }
         ]
