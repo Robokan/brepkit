@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795730834354,
+  "lastUpdate": 1795747521004,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -7991,6 +7991,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19800924,
             "range": "± 95155",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "24259a925beb6095a6039c7776939156b9d4cbe4",
+          "message": "perf(check): integrate a wall closed along u over its domain\n\nA full turn of an ellipse or spline profile edge sweeps one rational\nB-spline wall with the turn along u. The whole-domain integral took walls\nclosed along v only, so this one fell to Green's theorem along its\nboundary, which projects every boundary point: 15 ms for one wall. It is\nnow read as its transpose, u and v swapped and the sign negated, and its\nsolid's volume takes 2.65 ms rather than 24.8 ms, the same value to 3e-15.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-26T18:41:43-08:00",
+          "tree_id": "7a9e83012fc69b565749c8a137a6cfb0fdc8012a",
+          "url": "https://github.com/Robokan/brepkit/commit/24259a925beb6095a6039c7776939156b9d4cbe4"
+        },
+        "date": 1795747520295,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 892162,
+            "range": "± 12486",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 950028,
+            "range": "± 20094",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9679,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 554959,
+            "range": "± 30175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 19877142,
+            "range": "± 74119",
             "unit": "ns/iter"
           }
         ]
