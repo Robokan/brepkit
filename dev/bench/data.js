@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795752780466,
+  "lastUpdate": 1795761200285,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -8099,6 +8099,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 27906933,
             "range": "± 74927",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "5b13a663719872da102370b47cab41d7fbeb2584",
+          "message": "fix(operations): retry a boolean with B-spline walls closed round a turn split in two\n\nA wall closed round a turn as one B-spline (a tube, or a prism's side on a\nclosed profile, as files write them) splits into nothing in a boolean: the\nface splitter reads every B-spline surface as an open patch, so its rims\nclose to points in (u, v) and its seam's two runs lie on one line. When the\nexact boolean fails, each such wall is split along its middle into two open\nhalves, its rims cut where the middle line meets them and the other faces on\nthose rims (a prism's caps) given the two pieces, and the boolean is tried\nagain. The retry is kept only where it stays exact; otherwise the boolean\ngoes on as before with the inputs as they came.\n\nOf 116 failing corpus steps whose first fault is such a wall, 12 now come\nout exact at Open CASCADE's volume, and one where Open CASCADE's own result\nis wrong; most of the rest fail next on another face.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-26T22:29:16-08:00",
+          "tree_id": "5c7d3e2ac008ffec1049acd916435529bf824eee",
+          "url": "https://github.com/Robokan/brepkit/commit/5b13a663719872da102370b47cab41d7fbeb2584"
+        },
+        "date": 1795761199304,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1199437,
+            "range": "± 1888",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1264665,
+            "range": "± 10773",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13727,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 741552,
+            "range": "± 3221",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 27064638,
+            "range": "± 42595",
             "unit": "ns/iter"
           }
         ]
