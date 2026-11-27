@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795747521004,
+  "lastUpdate": 1795752780466,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -8045,6 +8045,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 19877142,
             "range": "± 74119",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "f0312e25b43cb36b13ea2461a557746d514d2346",
+          "message": "fix(operations,check): revolve a dome or an egg as one wall, full or part turn\n\nA profile's ellipse or spline edge with an end on the axis (a dome's\nmeridian) or both (an egg's) was swept a quarter turn at a time, and a full\nturn left every face four times. It now sweeps one wall, as an edge clear of\nthe axis does: a full turn closes the wall to a point at each end on the\naxis, its wire the rim and seam (a dome) or the seam alone (an egg), and a\npart turn builds the wall whole, its quarters closing at the axis, and\nmerges the line bands beside it. An edge meeting the axis between its ends\nkeeps its wedges.\n\nTwo readers took such a wall wrong. The ray cast's inside test drew the\nwall's wire in (u, v), where the pole projects to any u, and read the\ndome's wall as a sliver, so every point classified inside out: a wall\nbounded by its rims and seam is now the whole surface. And the egg, closed\nround u with a pole at each end of v, went to the adaptive mesher, which\nleft T-junctions by the poles: it now takes the structured grid, each pole\none vertex.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-26T20:08:32-08:00",
+          "tree_id": "820f080985941ec5e4d7ec0fa5839da2a4c4deb1",
+          "url": "https://github.com/Robokan/brepkit/commit/f0312e25b43cb36b13ea2461a557746d514d2346"
+        },
+        "date": 1795752779663,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1211803,
+            "range": "± 3437",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1280062,
+            "range": "± 5525",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13805,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 759430,
+            "range": "± 6171",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 27906933,
+            "range": "± 74927",
             "unit": "ns/iter"
           }
         ]
