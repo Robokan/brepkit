@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795817824768,
+  "lastUpdate": 1795863454514,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -8315,6 +8315,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 27332546,
             "range": "± 459600",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "c04fdb10e17390f938ddb6f232203c2345b9e7a9",
+          "message": "fix(algo): split a plane face's B-spline boundary edges where sections end on them\n\nA plane face with a hole reaches the splitter with its outer wire whole,\nand `split_plane_boundary_arcs_at_points` split its lines, circles and\nellipses where a section ends on them, but never a B-spline edge. A\nsection ending on a B-spline edge (a pocket cut from below across a\nplate's arched outline) then dangled, was pruned as a pendant, and the\nface stood whole, so the boolean fell back to a mesh.\n\nA B-spline boundary piece is now split at each section end within the\ntolerance of its curve and strictly inside its own span. A piece of a\nsplit edge keeps the whole curve, so its span is read from its own two\nends projected on the curve, not from the curve's domain (which reads as\nthe whole curve and split each piece at every end on it). A closed curve,\nwhose parameter wraps, is left alone, and points off the piece's control\nbox are not projected. A section whose other end lies on the curve too\nruns along the boundary (a coplanar face's outline lying on the edge,\ncut at its own vertices) rather than crossing into the face, and does not\nsplit it: splitting there let a fuse fall back and a cut come out valid\nwith too much volume.\n\nTest `pocket_across_a_spline_rim.rs`: a drilled plate with a B-spline\narch, pocketed from below across the arch; the cut is exact and valid,\nand with the intersection makes up the plate. It falls back to a mesh\nwithout the change.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-28T02:54:05-08:00",
+          "tree_id": "9854d937f4f7cc2ffd8a07312f09f5c4ee408d6a",
+          "url": "https://github.com/Robokan/brepkit/commit/c04fdb10e17390f938ddb6f232203c2345b9e7a9"
+        },
+        "date": 1795863453094,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 730411,
+            "range": "± 9069",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 782936,
+            "range": "± 3960",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9113,
+            "range": "± 356",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 471972,
+            "range": "± 3856",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 17544726,
+            "range": "± 257253",
             "unit": "ns/iter"
           }
         ]
