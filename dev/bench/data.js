@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795863454514,
+  "lastUpdate": 1795867713704,
   "repoUrl": "https://github.com/Robokan/brepkit",
   "entries": {
     "Boolean perf": [
@@ -8369,6 +8369,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 17544726,
             "range": "± 257253",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "committer": {
+            "email": "66281732+Robokan@users.noreply.github.com",
+            "name": "Eric Vaughan",
+            "username": "Robokan"
+          },
+          "distinct": true,
+          "id": "acf1c47c18273509fe4d24762c14d46b1c9fdd44",
+          "message": "docs(buzzcad): record the B-spline boundary split and the volume sample budget\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-28T04:04:38-08:00",
+          "tree_id": "ecc38824c9144fc96d009cd99fce20a20e6a0103",
+          "url": "https://github.com/Robokan/brepkit/commit/acf1c47c18273509fe4d24762c14d46b1c9fdd44"
+        },
+        "date": 1795867712862,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 879477,
+            "range": "± 14079",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 931974,
+            "range": "± 22569",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 9449,
+            "range": "± 303",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 559999,
+            "range": "± 11010",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 19644497,
+            "range": "± 989380",
             "unit": "ns/iter"
           }
         ]
